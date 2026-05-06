@@ -76,9 +76,7 @@ class TestMethodOverrideEndToEnd:
         assert resp.status_code == 400
         assert resp.json()["error"]["code"] == "method_override_not_allowed"
 
-    async def test_invalid_method_value_falls_through(
-        self, client: httpx.AsyncClient
-    ) -> None:
+    async def test_invalid_method_value_falls_through(self, client: httpx.AsyncClient) -> None:
         csrf = await _login(client)
         # _method=GET should be ignored — POST is used. Then route mapping
         # gets a regular POST, and POST /api/mail-accounts is the create

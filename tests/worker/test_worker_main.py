@@ -13,7 +13,6 @@ Source of truth: ``worker/app/main.py``.
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -44,9 +43,7 @@ class TestTouchAlive:
         worker_main._touch_alive()
         assert target.stat().st_mtime >= first_mtime
 
-    def test_touch_swallows_oserror(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_touch_swallows_oserror(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """If the file system raises (e.g. read-only mount), the worker
         must not crash — only log a warning.
         """
@@ -73,9 +70,7 @@ class TestTouchAlive:
 
 class TestSafeSyncCycle:
     @pytest.mark.asyncio
-    async def test_propagates_nothing_on_success(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_propagates_nothing_on_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
         called: list[bool] = []
 
         async def _ok() -> None:
@@ -86,9 +81,7 @@ class TestSafeSyncCycle:
         assert called == [True]
 
     @pytest.mark.asyncio
-    async def test_swallows_exception(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_swallows_exception(self, monkeypatch: pytest.MonkeyPatch) -> None:
         async def _boom() -> None:
             raise RuntimeError("kaboom")
 
@@ -104,9 +97,7 @@ class TestSafeSyncCycle:
 
 class TestSafeCleanup:
     @pytest.mark.asyncio
-    async def test_swallows_exception(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_swallows_exception(self, monkeypatch: pytest.MonkeyPatch) -> None:
         async def _boom() -> None:
             raise RuntimeError("retention boom")
 
@@ -114,9 +105,7 @@ class TestSafeCleanup:
         await worker_main._safe_cleanup()  # — must not raise
 
     @pytest.mark.asyncio
-    async def test_succeeds_quietly(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_succeeds_quietly(self, monkeypatch: pytest.MonkeyPatch) -> None:
         called: list[bool] = []
 
         async def _ok() -> None:
@@ -134,9 +123,7 @@ class TestSafeCleanup:
 
 class TestBootstrap:
     @pytest.mark.asyncio
-    async def test_swallows_bucket_failure(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_swallows_bucket_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
         class _BadStorage:
             async def ensure_bucket(self) -> None:
                 raise RuntimeError("minio down")
@@ -145,9 +132,7 @@ class TestBootstrap:
         await worker_main._bootstrap()  # — must not raise
 
     @pytest.mark.asyncio
-    async def test_calls_ensure_bucket(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_calls_ensure_bucket(self, monkeypatch: pytest.MonkeyPatch) -> None:
         called: list[bool] = []
 
         class _OkStorage:
@@ -165,9 +150,7 @@ class TestBootstrap:
 
 
 class TestEntrypoint:
-    def test_keyboard_interrupt_exits_zero(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_keyboard_interrupt_exits_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
         async def _boom() -> None:
             raise KeyboardInterrupt()
 
@@ -177,9 +160,7 @@ class TestEntrypoint:
             worker_main._entrypoint()
         assert ei.value.code == 0
 
-    def test_other_exception_propagates(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_other_exception_propagates(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Non-KeyboardInterrupt errors should propagate so docker
         restarts the container.
         """

@@ -54,9 +54,9 @@ async def test_bug001_create_user_endpoint_returns_201(
         json={"username": "bug001_user", "email": None},
         headers={"X-CSRF-Token": csrf},
     )
-    assert resp.status_code == 201, (
-        f"BUG-001 regression: got {resp.status_code} body={resp.text[:200]}"
-    )
+    assert (
+        resp.status_code == 201
+    ), f"BUG-001 regression: got {resp.status_code} body={resp.text[:200]}"
     body = resp.json()
     assert body["username"] == "bug001_user"
 
@@ -78,8 +78,6 @@ async def test_bug002_missing_csrf_returns_403(
         json={"username": "bug002", "email": None},
         # No X-CSRF-Token header, no csrf_token in body.
     )
-    assert resp.status_code == 403, (
-        f"BUG-002 regression: got {resp.status_code}"
-    )
+    assert resp.status_code == 403, f"BUG-002 regression: got {resp.status_code}"
     body = resp.json()
     assert body["error"]["code"] == "csrf_failed"

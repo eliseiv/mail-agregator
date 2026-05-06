@@ -77,9 +77,7 @@ class TestIsCurrentlyLocked:
 
 
 class TestLoginErrorPaths:
-    async def test_unknown_user_returns_invalid(
-        self, db_session: AsyncSession
-    ) -> None:
+    async def test_unknown_user_returns_invalid(self, db_session: AsyncSession) -> None:
         svc = AuthService(db_session)
         async with db_session.begin():
             result = await svc.login(
@@ -92,7 +90,7 @@ class TestLoginErrorPaths:
         assert result.session_token is None
 
     async def test_wrong_password_returns_invalid(
-        self, db_session: AsyncSession, fresh_user: int  # noqa: ARG002
+        self, db_session: AsyncSession, fresh_user: int
     ) -> None:
         svc = AuthService(db_session)
         async with db_session.begin():
@@ -105,7 +103,7 @@ class TestLoginErrorPaths:
         assert result.kind == "invalid"
 
     async def test_correct_password_creates_session(
-        self, db_session: AsyncSession, fresh_user: int  # noqa: ARG002
+        self, db_session: AsyncSession, fresh_user: int
     ) -> None:
         svc = AuthService(db_session)
         async with db_session.begin():
@@ -166,7 +164,7 @@ class TestLockout:
         self, db_session: AsyncSession, fresh_user: int
     ) -> None:
         # Manually set lockout_until in the future.
-        repo = UsersRepo(db_session)
+        UsersRepo(db_session)
         future = datetime.now(UTC) + timedelta(minutes=5)
         async with db_session.begin():
             from sqlalchemy import update
@@ -193,7 +191,7 @@ class TestLockout:
         self, db_session: AsyncSession, fresh_user: int
     ) -> None:
         # lockout_until in the past -> should not block.
-        repo = UsersRepo(db_session)
+        UsersRepo(db_session)
         past = datetime.now(UTC) - timedelta(minutes=5)
         async with db_session.begin():
             from sqlalchemy import update
@@ -310,9 +308,7 @@ class TestSetPassword:
 
 
 class TestLogout:
-    async def test_logout_revokes_session(
-        self, db_session: AsyncSession, fresh_user: int  # noqa: ARG002
-    ) -> None:
+    async def test_logout_revokes_session(self, db_session: AsyncSession, fresh_user: int) -> None:
         from backend.app.sessions import SessionStore
 
         svc = AuthService(db_session)
@@ -350,9 +346,7 @@ class TestLogout:
 
 
 class TestSeedSuperAdmin:
-    async def test_seed_then_reseed_is_unchanged(
-        self, db_session: AsyncSession
-    ) -> None:
+    async def test_seed_then_reseed_is_unchanged(self, db_session: AsyncSession) -> None:
         # First seed creates.
         async with db_session.begin():
             status1 = await seed_super_admin(db_session)

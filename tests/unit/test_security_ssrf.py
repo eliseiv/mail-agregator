@@ -134,9 +134,7 @@ class TestProdRejectsPrivate:
             "100.127.255.255",
         ],
     )
-    def test_each_ipv4_private_class_blocked(
-        self, prod_env: None, resolver, ip: str  # noqa: ANN001
-    ) -> None:
+    def test_each_ipv4_private_class_blocked(self, prod_env: None, resolver, ip: str) -> None:
         resolver({"target.example.com": [ip]})
         with pytest.raises(InvalidHostError) as ei:
             assert_public_host("target.example.com", port=993)
@@ -152,9 +150,7 @@ class TestProdRejectsPrivate:
             "fe80::dead:beef",
         ],
     )
-    def test_each_ipv6_private_class_blocked(
-        self, prod_env: None, resolver, ip: str  # noqa: ANN001
-    ) -> None:
+    def test_each_ipv6_private_class_blocked(self, prod_env: None, resolver, ip: str) -> None:
         resolver({"v6.example.com": [ip]})
         with pytest.raises(InvalidHostError):
             assert_public_host("v6.example.com", port=993)
@@ -169,21 +165,17 @@ class TestProdAllowsPublic:
             "142.250.31.27",  # imap.gmail.com (one of)
         ],
     )
-    def test_public_ipv4_allowed(
-        self, prod_env: None, resolver, ip: str  # noqa: ANN001
-    ) -> None:
+    def test_public_ipv4_allowed(self, prod_env: None, resolver, ip: str) -> None:
         resolver({"public.example.com": [ip]})
         # Must not raise.
         assert_public_host("public.example.com", port=993)
 
-    def test_public_ipv6_allowed(self, prod_env: None, resolver) -> None:  # noqa: ANN001
+    def test_public_ipv6_allowed(self, prod_env: None, resolver) -> None:
         # 2001:4860:: is a Google global address.
         resolver({"v6public.example.com": ["2001:4860:4860::8888"]})
         assert_public_host("v6public.example.com", port=993)
 
-    def test_one_private_alongside_public_still_blocks(
-        self, prod_env: None, resolver  # noqa: ANN001
-    ) -> None:
+    def test_one_private_alongside_public_still_blocks(self, prod_env: None, resolver) -> None:
         """If a host has BOTH a public and a private A-record, we still
         block — an attacker could otherwise win the race by getting the
         private one picked first.
@@ -199,9 +191,7 @@ class TestProdAllowsPublic:
 
 
 class TestResolverFailure:
-    def test_unresolvable_host_in_prod_raises_invalid_host(
-        self, prod_env: None, resolver  # noqa: ANN001
-    ) -> None:
+    def test_unresolvable_host_in_prod_raises_invalid_host(self, prod_env: None, resolver) -> None:
         resolver({})  # empty mapping -> gaierror for any lookup
         with pytest.raises(InvalidHostError) as ei:
             assert_public_host("nope.example.invalid", port=993)

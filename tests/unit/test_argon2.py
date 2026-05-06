@@ -6,6 +6,7 @@ Source of truth: ``backend/app/auth/service.py`` (``_DUMMY_HASH``,
 
 from __future__ import annotations
 
+import contextlib
 import time
 
 import pytest
@@ -58,34 +59,27 @@ class TestAntiTimingParity:
     paths to take the *same* time within a sane envelope.
     """
 
-    def test_verify_known_and_unknown_take_similar_time(
-        self, ph: PasswordHasher
-    ) -> None:
+    def test_verify_known_and_unknown_take_similar_time(self, ph: PasswordHasher) -> None:
         real_hash = ph.hash("real-password")
 
         # Verify real hash w/ wrong password — same code path login takes
         # for "user exists, wrong password".
         t0 = time.perf_counter()
-        try:
+        with contextlib.suppress(VerifyMismatchError):
             ph.verify(real_hash, "wrong-password")
-        except VerifyMismatchError:
-            pass
         t_known = time.perf_counter() - t0
 
         # Verify against dummy — login does the same when user is missing.
         t0 = time.perf_counter()
-        try:
+        with contextlib.suppress(VerifyMismatchError):
             ph.verify(_DUMMY_HASH, "wrong-password")
-        except VerifyMismatchError:
-            pass
         t_dummy = time.perf_counter() - t0
 
         # Allow generous tolerance — argon2 cost can vary by GC pauses, etc.
         # We expect the ratio to stay within 4x on a healthy machine.
         ratio = max(t_known, t_dummy) / max(min(t_known, t_dummy), 1e-9)
         assert ratio < 4.0, (
-            f"timing parity broken: known={t_known:.4f}s "
-            f"dummy={t_dummy:.4f}s ratio={ratio:.2f}"
+            f"timing parity broken: known={t_known:.4f}s " f"dummy={t_dummy:.4f}s ratio={ratio:.2f}"
         )
 
 

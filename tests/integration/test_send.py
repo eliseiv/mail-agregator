@@ -50,9 +50,7 @@ def _mock_smtp_and_imap(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
 
 @pytest.fixture
-async def admin_account(
-    client: httpx.AsyncClient, db_engine: AsyncEngine
-) -> dict[str, Any]:
+async def admin_account(client: httpx.AsyncClient, db_engine: AsyncEngine) -> dict[str, Any]:
     s = get_settings()
     resp = await client.post(
         "/login",
@@ -64,9 +62,7 @@ async def admin_account(
 
     factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
     async with factory() as ses, ses.begin():
-        admin = (
-            await ses.execute(select(User).where(User.username == s.ADMIN_LOGIN))
-        ).scalar_one()
+        admin = (await ses.execute(select(User).where(User.username == s.ADMIN_LOGIN))).scalar_one()
         from backend.app.repositories.mail_accounts import MailAccountsRepo
 
         repo = MailAccountsRepo(ses)

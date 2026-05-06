@@ -21,9 +21,7 @@ pytestmark = pytest.mark.integration
 
 
 @pytest.fixture
-async def seeded_old_and_new(
-    db_engine: AsyncEngine, storage: Any
-) -> dict[str, Any]:
+async def seeded_old_and_new(db_engine: AsyncEngine, storage: Any) -> dict[str, Any]:
     factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
     keys: list[str] = []
     async with factory() as ses, ses.begin():
@@ -66,9 +64,8 @@ async def seeded_old_and_new(
         )
         ses.add(old)
         await ses.flush()
-        from shared.storage import Storage
-
         from backend.app.repositories.messages import MessagesRepo
+        from shared.storage import Storage
 
         mrepo = MessagesRepo(ses)
         att_id = await mrepo.reserve_attachment_id()
@@ -119,9 +116,7 @@ class TestRetention:
         # Verify the young message survived.
         factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
         async with factory() as ses:
-            remaining = (
-                await ses.execute(select(Message))
-            ).scalars().all()
+            remaining = (await ses.execute(select(Message))).scalars().all()
         assert len(remaining) == 1
         assert remaining[0].uid == 2
 

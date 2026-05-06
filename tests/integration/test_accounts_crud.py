@@ -102,13 +102,9 @@ class TestCreateAccount:
             "imap_host": "imap.example.com",
             "smtp_host": "smtp.example.com",
         }
-        a = await client.post(
-            "/api/mail-accounts", json=body, headers={"X-CSRF-Token": csrf}
-        )
+        a = await client.post("/api/mail-accounts", json=body, headers={"X-CSRF-Token": csrf})
         assert a.status_code == 201
-        b = await client.post(
-            "/api/mail-accounts", json=body, headers={"X-CSRF-Token": csrf}
-        )
+        b = await client.post("/api/mail-accounts", json=body, headers={"X-CSRF-Token": csrf})
         assert b.status_code == 409
         assert b.json()["error"]["code"] == "conflict"
 
@@ -160,9 +156,7 @@ class TestPatchAccount:
         assert resp.status_code == 200, resp.text
         assert resp.json()["smtp_host"] == "smtp2.example.com"
 
-    async def test_patch_via_method_override(
-        self, client: httpx.AsyncClient
-    ) -> None:
+    async def test_patch_via_method_override(self, client: httpx.AsyncClient) -> None:
         csrf = await _login(client)
         a = await client.post(
             "/api/mail-accounts",
@@ -195,9 +189,7 @@ class TestPatchAccount:
 
 
 class TestDeleteAccount:
-    async def test_delete_via_canonical_method(
-        self, client: httpx.AsyncClient
-    ) -> None:
+    async def test_delete_via_canonical_method(self, client: httpx.AsyncClient) -> None:
         csrf = await _login(client)
         a = await client.post(
             "/api/mail-accounts",
@@ -270,9 +262,7 @@ class TestDeleteAccount:
 
 
 class TestUnauthenticated:
-    async def test_unauthenticated_get_returns_401_json(
-        self, client: httpx.AsyncClient
-    ) -> None:
+    async def test_unauthenticated_get_returns_401_json(self, client: httpx.AsyncClient) -> None:
         resp = await client.get("/api/mail-accounts")
         assert resp.status_code == 401
         assert resp.json()["error"]["code"] == "not_authenticated"

@@ -36,9 +36,7 @@ class TestSeed:
             status = await seed_super_admin(db_session)
         assert status == "unchanged"
 
-    async def test_password_change_triggers_update(
-        self, db_session: AsyncSession
-    ) -> None:
+    async def test_password_change_triggers_update(self, db_session: AsyncSession) -> None:
         # First seed + commit so we can start a fresh transaction.
         async with db_session.begin():
             await seed_super_admin(db_session)
@@ -65,6 +63,4 @@ class TestSeed:
             assert updated.password_hash != original_hash
         finally:
             # Restore so other tests still log in with the original password.
-            object.__setattr__(
-                s, "ADMIN_PASSWORD", "qa_admin_password_for_tests_long_enough"
-            )
+            object.__setattr__(s, "ADMIN_PASSWORD", "qa_admin_password_for_tests_long_enough")

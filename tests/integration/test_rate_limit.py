@@ -15,10 +15,8 @@ pytestmark = pytest.mark.integration
 
 
 class TestLoginRateLimit:
-    async def test_excessive_login_returns_429_or_lockout(
-        self, client: httpx.AsyncClient
-    ) -> None:
-        s = get_settings()
+    async def test_excessive_login_returns_429_or_lockout(self, client: httpx.AsyncClient) -> None:
+        get_settings()
         # Capacity is 5 / 15 min on (username + IP). The 6th attempt within
         # the window must be rejected. Either with 423 (account already
         # locked, server-side prefers that) or 429 (rate-limit) — both are

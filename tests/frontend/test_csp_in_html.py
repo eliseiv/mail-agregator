@@ -28,10 +28,7 @@ pytestmark = pytest.mark.frontend
 import pathlib
 
 TEMPLATES = pathlib.Path(
-    pathlib.Path(__file__).parent.parent.parent
-    / "backend"
-    / "app"
-    / "templates"
+    pathlib.Path(__file__).parent.parent.parent / "backend" / "app" / "templates"
 )
 
 
@@ -45,9 +42,7 @@ def _env() -> Environment:
     env.globals["flash_messages"] = _flash_messages
     env.filters["format_bytes"] = _format_bytes
     env.globals["url_for"] = lambda name, **_: f"/{name}"
-    env.globals["request"] = SimpleNamespace(
-        url=SimpleNamespace(path="/"), scope={"path": "/"}
-    )
+    env.globals["request"] = SimpleNamespace(url=SimpleNamespace(path="/"), scope={"path": "/"})
     return env
 
 
@@ -64,18 +59,10 @@ def _ctx(extra: dict[str, Any] | None = None) -> dict[str, Any]:
 
 # Inline-content / inline-event regexes. We deliberately permit
 # ``<script src="...">`` and ``<link rel="stylesheet">`` (external assets).
-_INLINE_SCRIPT_RE = re.compile(
-    r"<script(?![^>]*\bsrc=)[^>]*>", re.IGNORECASE
-)
-_INLINE_STYLE_BLOCK_RE = re.compile(
-    r"<style[^>]*>", re.IGNORECASE
-)
-_INLINE_STYLE_ATTR_RE = re.compile(
-    r'\sstyle\s*=\s*"', re.IGNORECASE
-)
-_INLINE_EVENT_RE = re.compile(
-    r'\son[a-z]+\s*=\s*"', re.IGNORECASE
-)
+_INLINE_SCRIPT_RE = re.compile(r"<script(?![^>]*\bsrc=)[^>]*>", re.IGNORECASE)
+_INLINE_STYLE_BLOCK_RE = re.compile(r"<style[^>]*>", re.IGNORECASE)
+_INLINE_STYLE_ATTR_RE = re.compile(r'\sstyle\s*=\s*"', re.IGNORECASE)
+_INLINE_EVENT_RE = re.compile(r'\son[a-z]+\s*=\s*"', re.IGNORECASE)
 
 
 def _render(name: str, ctx: dict[str, Any]) -> str:
@@ -167,23 +154,17 @@ class TestCspCompliance:
         m = _INLINE_STYLE_BLOCK_RE.search(html)
         assert m is None, f"{name}: inline <style> block found"
 
-    def test_no_inline_style_attribute(
-        self, name: str, ctx: dict[str, Any]
-    ) -> None:
+    def test_no_inline_style_attribute(self, name: str, ctx: dict[str, Any]) -> None:
         html = _render(name, ctx)
         m = _INLINE_STYLE_ATTR_RE.search(html)
-        assert m is None, (
-            f"{name}: inline style=\"...\" attribute at offset {m.start() if m else None}"
-        )
+        assert (
+            m is None
+        ), f'{name}: inline style="..." attribute at offset {m.start() if m else None}'
 
-    def test_no_inline_event_handler(
-        self, name: str, ctx: dict[str, Any]
-    ) -> None:
+    def test_no_inline_event_handler(self, name: str, ctx: dict[str, Any]) -> None:
         html = _render(name, ctx)
         m = _INLINE_EVENT_RE.search(html)
-        assert m is None, (
-            f"{name}: inline on*= handler at offset {m.start() if m else None}"
-        )
+        assert m is None, f"{name}: inline on*= handler at offset {m.start() if m else None}"
 
 
 # Special: message_view needs a constructed message object.

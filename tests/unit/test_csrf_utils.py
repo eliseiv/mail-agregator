@@ -56,21 +56,15 @@ class TestExtractTokenFromForm:
 
     def test_content_type_match_is_case_insensitive(self) -> None:
         body = b"csrf_token=t"
-        assert (
-            _extract_token_from_form(body, "Application/X-WWW-Form-URLEncoded") == "t"
-        )
+        assert _extract_token_from_form(body, "Application/X-WWW-Form-URLEncoded") == "t"
 
     def test_first_csrf_token_wins(self) -> None:
         body = b"csrf_token=first&csrf_token=second"
         # urlencoded with duplicate keys — implementation takes the first one.
         # (Per current code: it iterates pairs and returns on first match.)
-        assert (
-            _extract_token_from_form(body, "application/x-www-form-urlencoded") == "first"
-        )
+        assert _extract_token_from_form(body, "application/x-www-form-urlencoded") == "first"
 
     def test_charset_in_content_type_still_matches(self) -> None:
         body = b"csrf_token=abc"
-        token = _extract_token_from_form(
-            body, "application/x-www-form-urlencoded; charset=utf-8"
-        )
+        token = _extract_token_from_form(body, "application/x-www-form-urlencoded; charset=utf-8")
         assert token == "abc"

@@ -75,9 +75,7 @@ class TestCsrf:
         )
         assert resp.status_code != 403, resp.text
 
-    async def test_post_with_form_csrf_token_passes(
-        self, client: httpx.AsyncClient
-    ) -> None:
+    async def test_post_with_form_csrf_token_passes(self, client: httpx.AsyncClient) -> None:
         csrf = await _login(client)
         # Form-encoded POST with csrf_token in body.
         resp = await client.post(

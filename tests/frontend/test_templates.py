@@ -22,10 +22,7 @@ pytestmark = pytest.mark.frontend
 import pathlib
 
 TEMPLATES = pathlib.Path(
-    pathlib.Path(__file__).parent.parent.parent
-    / "backend"
-    / "app"
-    / "templates"
+    pathlib.Path(__file__).parent.parent.parent / "backend" / "app" / "templates"
 )
 
 
@@ -69,36 +66,46 @@ class TestTemplatesRender:
         assert "<form" in out
 
     def test_set_password(self) -> None:
-        out = _env().get_template("set_password.html").render(
-            _ctx({"username": "alice", "flash": None})
+        out = (
+            _env()
+            .get_template("set_password.html")
+            .render(_ctx({"username": "alice", "flash": None}))
         )
         assert "<form" in out
 
     def test_inbox(self) -> None:
-        out = _env().get_template("inbox.html").render(
-            _ctx(
-                {
-                    "items": [],
-                    "next_cursor": None,
-                    "accounts": [],
-                    "selected_account_id": None,
-                    "unread_only": False,
-                    "unread_count": 0,
-                }
+        out = (
+            _env()
+            .get_template("inbox.html")
+            .render(
+                _ctx(
+                    {
+                        "items": [],
+                        "next_cursor": None,
+                        "accounts": [],
+                        "selected_account_id": None,
+                        "unread_only": False,
+                        "unread_count": 0,
+                    }
+                )
             )
         )
         assert "<" in out
 
     def test_compose(self) -> None:
-        out = _env().get_template("compose.html").render(
-            _ctx(
-                {
-                    "accounts": [],
-                    "form": {"to": "", "cc": "", "bcc": "", "subject": "", "body": ""},
-                    "default_from_account_id": None,
-                    "reply_to": None,
-                    "error_message": None,
-                }
+        out = (
+            _env()
+            .get_template("compose.html")
+            .render(
+                _ctx(
+                    {
+                        "accounts": [],
+                        "form": {"to": "", "cc": "", "bcc": "", "subject": "", "body": ""},
+                        "default_from_account_id": None,
+                        "reply_to": None,
+                        "error_message": None,
+                    }
+                )
             )
         )
         assert "<form" in out
@@ -125,49 +132,55 @@ class TestTemplatesRender:
         assert "hi" in out
 
     def test_accounts_list(self) -> None:
-        out = _env().get_template("accounts/list.html").render(
-            _ctx({"accounts": []})
-        )
+        out = _env().get_template("accounts/list.html").render(_ctx({"accounts": []}))
         assert "<" in out
 
     def test_accounts_form_create(self) -> None:
-        out = _env().get_template("accounts/form.html").render(
-            _ctx({"account": None})
-        )
+        out = _env().get_template("accounts/form.html").render(_ctx({"account": None}))
         assert "<form" in out
 
     def test_admin_users(self) -> None:
-        out = _env().get_template("admin/users.html").render(
-            _ctx(
-                {
-                    "users": [],
-                    "total": 0,
-                    "page": 1,
-                    "limit": 50,
-                    "q": "",
-                    "current_admin_id": 1,
-                }
+        out = (
+            _env()
+            .get_template("admin/users.html")
+            .render(
+                _ctx(
+                    {
+                        "users": [],
+                        "total": 0,
+                        "page": 1,
+                        "limit": 50,
+                        "q": "",
+                        "current_admin_id": 1,
+                    }
+                )
             )
         )
         assert "<" in out
 
     def test_admin_audit(self) -> None:
-        out = _env().get_template("admin/audit.html").render(
-            _ctx(
-                {
-                    "items": [],
-                    "total": 0,
-                    "page": 1,
-                    "limit": 50,
-                    "action_filter": "",
-                }
+        out = (
+            _env()
+            .get_template("admin/audit.html")
+            .render(
+                _ctx(
+                    {
+                        "items": [],
+                        "total": 0,
+                        "page": 1,
+                        "limit": 50,
+                        "action_filter": "",
+                    }
+                )
             )
         )
         assert "<" in out
 
     @pytest.mark.parametrize("name", ["403.html", "404.html", "4xx.html", "500.html", "5xx.html"])
     def test_error_pages(self, name: str) -> None:
-        out = _env().get_template(f"errors/{name}").render(
-            _ctx({"detail": None, "request_id": "rid"})
+        out = (
+            _env()
+            .get_template(f"errors/{name}")
+            .render(_ctx({"detail": None, "request_id": "rid"}))
         )
         assert "<" in out

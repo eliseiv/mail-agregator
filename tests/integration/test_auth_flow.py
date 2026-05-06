@@ -33,9 +33,7 @@ pytestmark = pytest.mark.integration
 # ---------------------------------------------------------------------------
 
 
-async def _post_login(
-    client: httpx.AsyncClient, *, username: str, password: str
-) -> httpx.Response:
+async def _post_login(client: httpx.AsyncClient, *, username: str, password: str) -> httpx.Response:
     return await client.post(
         "/login",
         data={"username": username, "password": password},
@@ -49,13 +47,9 @@ async def _post_login(
 
 
 class TestLogin:
-    async def test_admin_login_form_redirects_with_cookies(
-        self, client: httpx.AsyncClient
-    ) -> None:
+    async def test_admin_login_form_redirects_with_cookies(self, client: httpx.AsyncClient) -> None:
         s = get_settings()
-        resp = await _post_login(
-            client, username=s.ADMIN_LOGIN, password=s.ADMIN_PASSWORD
-        )
+        resp = await _post_login(client, username=s.ADMIN_LOGIN, password=s.ADMIN_PASSWORD)
         assert resp.status_code == 302
         assert resp.cookies.get("mas_session") is not None
         assert resp.cookies.get("mas_csrf") is not None
@@ -117,30 +111,28 @@ class TestLockout:
         # username+IP — we exhaust on the 5th attempt).
         last: httpx.Response | None = None
         for i in range(s.LOGIN_FAILURE_THRESHOLD):
-            last = await _post_login(
-                client, username=s.ADMIN_LOGIN, password=f"wrong{i}"
-            )
+            last = await _post_login(client, username=s.ADMIN_LOGIN, password=f"wrong{i}")
         assert last is not None
         # The 5th *failure* triggers the lockout, which returns 423 to the
         # caller per the API contract.
         assert last.status_code in (401, 423), last.text
 
         # 6th attempt: rate-limit OR lockout. Either way NOT 200.
-        sixth = await _post_login(
-            client, username=s.ADMIN_LOGIN, password="wrong-final"
-        )
+        sixth = await _post_login(client, username=s.ADMIN_LOGIN, password="wrong-final")
         assert sixth.status_code in (401, 423, 429)
 
         # Audit row should mention lockout.
         factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
         async with factory() as ses:
             audits = (
-                await ses.execute(
-                    select(AdminAudit).where(
-                        AdminAudit.action == "lockout_triggered"
+                (
+                    await ses.execute(
+                        select(AdminAudit).where(AdminAudit.action == "lockout_triggered")
                     )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
         assert len(audits) >= 1, "expected lockout_triggered audit row"
 
     async def test_locked_account_rejects_correct_password(
@@ -151,17 +143,13 @@ class TestLockout:
         s = get_settings()
         # Burn through threshold first.
         for i in range(s.LOGIN_FAILURE_THRESHOLD):
-            await _post_login(
-                client, username=s.ADMIN_LOGIN, password=f"wrong{i}"
-            )
+            await _post_login(client, username=s.ADMIN_LOGIN, password=f"wrong{i}")
         # Now even the right password is rejected.
-        resp = await _post_login(
-            client, username=s.ADMIN_LOGIN, password=s.ADMIN_PASSWORD
-        )
+        resp = await _post_login(client, username=s.ADMIN_LOGIN, password=s.ADMIN_PASSWORD)
         assert resp.status_code in (423, 429)
         if resp.status_code == 423:
             # 423 must come with Retry-After.
-            assert "retry-after" in {h.lower() for h in resp.headers.keys()}
+            assert "retry-after" in {h.lower() for h in resp.headers}
 
 
 # ---------------------------------------------------------------------------
@@ -170,14 +158,10 @@ class TestLockout:
 
 
 class TestAntiTiming:
-    async def test_unknown_user_still_takes_time(
-        self, client: httpx.AsyncClient
-    ) -> None:
+    async def test_unknown_user_still_takes_time(self, client: httpx.AsyncClient) -> None:
         # A purely "user does not exist" path should not short-circuit.
         # We just check the response is 401 (not e.g. 404).
-        resp = await _post_login(
-            client, username="nonexistent_user", password="x"
-        )
+        resp = await _post_login(client, username="nonexistent_user", password="x")
         assert resp.status_code == 401
 
 
@@ -220,9 +204,7 @@ class TestSetPassword:
 class TestLogout:
     async def test_logout_clears_session(self, client: httpx.AsyncClient) -> None:
         s = get_settings()
-        login = await _post_login(
-            client, username=s.ADMIN_LOGIN, password=s.ADMIN_PASSWORD
-        )
+        login = await _post_login(client, username=s.ADMIN_LOGIN, password=s.ADMIN_PASSWORD)
         assert login.status_code == 302
         csrf = login.cookies.get("mas_csrf")
         assert csrf is not None

@@ -301,10 +301,10 @@ class TestDelete:
         called_objects: list[list[str]] = []
         called_prefixes: list[str] = []
 
-        async def _spy_objs(self: Storage, keys: list[str]) -> None:  # noqa: ARG001
+        async def _spy_objs(self: Storage, keys: list[str]) -> None:
             called_objects.append(list(keys))
 
-        async def _spy_prefix(self: Storage, prefix: str) -> int:  # noqa: ARG001
+        async def _spy_prefix(self: Storage, prefix: str) -> int:
             called_prefixes.append(prefix)
             return 0
 
@@ -343,7 +343,7 @@ class TestForceSync:
 
         r = get_redis()
         val = await r.get(f"force_sync:{created.id}")
-        assert val == b"1" or val == "1"
+        assert val in (b"1", "1")
         ttl = await r.ttl(f"force_sync:{created.id}")
         # 60s set; allow some clock slack.
         assert 1 <= ttl <= 60

@@ -41,34 +41,26 @@ async def _login(client: httpx.AsyncClient) -> str:
 
 
 class TestListEndpoints:
-    async def test_get_messages_response_matches_schema(
-        self, client: httpx.AsyncClient
-    ) -> None:
+    async def test_get_messages_response_matches_schema(self, client: httpx.AsyncClient) -> None:
         await _login(client)
         resp = await client.get("/api/messages")
         assert resp.status_code == 200, resp.text
         # Round-trip through Pydantic.
         MessageListResponse.model_validate(resp.json())
 
-    async def test_get_admin_users_matches_schema(
-        self, client: httpx.AsyncClient
-    ) -> None:
+    async def test_get_admin_users_matches_schema(self, client: httpx.AsyncClient) -> None:
         await _login(client)
         resp = await client.get("/api/admin/users")
         assert resp.status_code == 200, resp.text
         UsersListResponse.model_validate(resp.json())
 
-    async def test_get_admin_audit_matches_schema(
-        self, client: httpx.AsyncClient
-    ) -> None:
+    async def test_get_admin_audit_matches_schema(self, client: httpx.AsyncClient) -> None:
         await _login(client)
         resp = await client.get("/api/admin/audit")
         assert resp.status_code == 200, resp.text
         AuditListResponse.model_validate(resp.json())
 
-    async def test_get_mail_accounts_matches_schema(
-        self, client: httpx.AsyncClient
-    ) -> None:
+    async def test_get_mail_accounts_matches_schema(self, client: httpx.AsyncClient) -> None:
         await _login(client)
         resp = await client.get("/api/mail-accounts")
         assert resp.status_code == 200, resp.text
@@ -83,9 +75,7 @@ class TestListEndpoints:
 
 
 class TestErrorEnvelope:
-    async def test_unauthenticated_envelope(
-        self, client: httpx.AsyncClient
-    ) -> None:
+    async def test_unauthenticated_envelope(self, client: httpx.AsyncClient) -> None:
         resp = await client.get("/api/me")
         assert resp.status_code == 401
         body = resp.json()
@@ -94,9 +84,7 @@ class TestErrorEnvelope:
         assert "message" in body["error"]
         assert body["error"]["code"] == "not_authenticated"
 
-    async def test_validation_error_envelope(
-        self, client: httpx.AsyncClient
-    ) -> None:
+    async def test_validation_error_envelope(self, client: httpx.AsyncClient) -> None:
         await _login(client)
         # Send invalid JSON to a JSON endpoint.
         resp = await client.get("/api/messages?cursor=NOT_A_VALID_BASE64_CURSOR!")

@@ -103,9 +103,7 @@ class TestCheckConstraints:
 
 
 class TestUnique:
-    async def test_message_uid_unique_per_account(
-        self, db_session: AsyncSession
-    ) -> None:
+    async def test_message_uid_unique_per_account(self, db_session: AsyncSession) -> None:
         async with db_session.begin():
             user = User(username="bob", is_admin=False, password_reset_required=False)
             db_session.add(user)
@@ -137,9 +135,7 @@ class TestUnique:
 
         with pytest.raises(IntegrityError):
             async with db_session.begin():
-                acc = (
-                    await db_session.execute(select(MailAccount).limit(1))
-                ).scalar_one()
+                acc = (await db_session.execute(select(MailAccount).limit(1))).scalar_one()
                 db_session.add(
                     Message(
                         mail_account_id=acc.id,
@@ -173,9 +169,7 @@ class TestUnique:
         with pytest.raises(IntegrityError):
             async with db_session.begin():
                 user_row = (
-                    await db_session.execute(
-                        select(User).where(User.username == "carol")
-                    )
+                    await db_session.execute(select(User).where(User.username == "carol"))
                 ).scalar_one()
                 db_session.add(
                     MailAccount(
@@ -243,22 +237,18 @@ class TestCascade:
 
         # Delete the user — everything below should vanish.
         async with db_session.begin():
-            await db_session.execute(
-                text("DELETE FROM users WHERE id = :u"), {"u": user_id}
-            )
+            await db_session.execute(text("DELETE FROM users WHERE id = :u"), {"u": user_id})
 
         n_accounts = (
-            await db_session.execute(
-                select(MailAccount).where(MailAccount.user_id == user_id)
-            )
-        ).scalars().all()
+            (await db_session.execute(select(MailAccount).where(MailAccount.user_id == user_id)))
+            .scalars()
+            .all()
+        )
         assert n_accounts == []
         # Counts via direct SQL (more robust than re-issuing ORM through
         # potentially expired objects).
         for table in ("messages", "attachments"):
-            n = (
-                await db_session.execute(text(f"SELECT count(*) FROM {table}"))
-            ).scalar_one()
+            n = (await db_session.execute(text(f"SELECT count(*) FROM {table}"))).scalar_one()
             assert n == 0, f"{table} not cascaded"
 
     async def test_delete_user_does_not_remove_admin_audit_rows(
@@ -281,9 +271,7 @@ class TestCascade:
             user_id = user.id
 
         async with db_session.begin():
-            await db_session.execute(
-                text("DELETE FROM users WHERE id = :u"), {"u": user_id}
-            )
+            await db_session.execute(text("DELETE FROM users WHERE id = :u"), {"u": user_id})
 
         # admin_audit row preserved.
         rows = (await db_session.execute(select(AdminAudit))).scalars().all()

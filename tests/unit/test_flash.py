@@ -78,9 +78,7 @@ class TestFlash:
         req = _build_request(session_token=None)
         assert await flash_mod.consume_flashes(req) == []
 
-    async def test_setup_session_used_when_no_full_session(
-        self, _patch_redis: Any
-    ) -> None:
+    async def test_setup_session_used_when_no_full_session(self, _patch_redis: Any) -> None:
         # When the full session is absent but the password-setup cookie is
         # present (e.g. after first-login), flash uses the setup token.
         req = _build_request(session_token=None, setup_token="setup-tok")
@@ -98,9 +96,7 @@ class TestFlash:
     ) -> None:
         # Inject a malformed entry directly.
         await _patch_redis.rpush("flash:sess-bad", "this is not json")
-        await _patch_redis.rpush(
-            "flash:sess-bad", '{"category":"hax","text":"weird"}'
-        )
+        await _patch_redis.rpush("flash:sess-bad", '{"category":"hax","text":"weird"}')
         req = _build_request(session_token="sess-bad")
         result = await flash_mod.consume_flashes(req)
         # Bad json dropped; unknown category normalised to "info".

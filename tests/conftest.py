@@ -25,6 +25,7 @@ Design:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import socket
 from collections.abc import AsyncIterator
@@ -32,8 +33,12 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
-
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 # ---------------------------------------------------------------------------
 # Event loop policy — session-scoped so async clients survive across tests
@@ -227,10 +232,8 @@ async def _close_singletons_after_each_test() -> AsyncIterator[None]:
     from shared import db as _shared_db
 
     if _shared_db._engine is not None:
-        try:
+        with contextlib.suppress(Exception):
             await _shared_db.dispose_engine()
-        except Exception:
-            pass
 
 
 # ---------------------------------------------------------------------------

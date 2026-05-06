@@ -74,9 +74,7 @@ class TestFromImapMsg:
         assert out.body_present is True
 
     def test_no_body_marks_body_present_false(self) -> None:
-        out = _from_imap_msg(
-            self._msg(text="", html=""), max_body_bytes=1024, max_att_bytes=1024
-        )
+        out = _from_imap_msg(self._msg(text="", html=""), max_body_bytes=1024, max_att_bytes=1024)
         assert out.body_present is False
         assert out.body_text == ""
 
@@ -85,9 +83,7 @@ class TestFromImapMsg:
         att.filename = "big.bin"
         att.content_type = "application/octet-stream"
         att.payload = b"x" * 200
-        out = _from_imap_msg(
-            self._msg(attachments=[att]), max_body_bytes=1024, max_att_bytes=100
-        )
+        out = _from_imap_msg(self._msg(attachments=[att]), max_body_bytes=1024, max_att_bytes=100)
         assert len(out.attachments) == 1
         assert out.attachments[0].size_bytes == 200
         assert out.attachments[0].payload == b""  # skipped over limit
@@ -102,8 +98,6 @@ class TestFromImapMsg:
 
     def test_missing_date_uses_now_utc(self) -> None:
         before = _dt.datetime.now(_dt.UTC)
-        out = _from_imap_msg(
-            self._msg(date=None), max_body_bytes=1024, max_att_bytes=1024
-        )
+        out = _from_imap_msg(self._msg(date=None), max_body_bytes=1024, max_att_bytes=1024)
         after = _dt.datetime.now(_dt.UTC)
         assert before <= out.internal_date <= after

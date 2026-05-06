@@ -48,16 +48,14 @@ class TestCreateUser:
         factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
         async with factory() as ses:
             audits = (
-                await ses.execute(
-                    select(AdminAudit).where(AdminAudit.action == "create_user")
-                )
-            ).scalars().all()
+                (await ses.execute(select(AdminAudit).where(AdminAudit.action == "create_user")))
+                .scalars()
+                .all()
+            )
         assert len(audits) == 1
         assert audits[0].target_username == "alice"
 
-    async def test_create_user_via_form_redirects(
-        self, client: httpx.AsyncClient
-    ) -> None:
+    async def test_create_user_via_form_redirects(self, client: httpx.AsyncClient) -> None:
         csrf = await _login_admin(client)
         resp = await client.post(
             "/api/admin/users",
@@ -67,18 +65,12 @@ class TestCreateUser:
         assert resp.status_code == 303
         assert resp.headers["location"] == "/admin"
 
-    async def test_duplicate_username_returns_409(
-        self, client: httpx.AsyncClient
-    ) -> None:
+    async def test_duplicate_username_returns_409(self, client: httpx.AsyncClient) -> None:
         csrf = await _login_admin(client)
         body = {"username": "carol", "email": None}
-        a = await client.post(
-            "/api/admin/users", json=body, headers={"X-CSRF-Token": csrf}
-        )
+        a = await client.post("/api/admin/users", json=body, headers={"X-CSRF-Token": csrf})
         assert a.status_code == 201
-        b = await client.post(
-            "/api/admin/users", json=body, headers={"X-CSRF-Token": csrf}
-        )
+        b = await client.post("/api/admin/users", json=body, headers={"X-CSRF-Token": csrf})
         assert b.status_code == 409
         assert b.json()["error"]["code"] == "conflict"
 
@@ -130,10 +122,10 @@ class TestResetPassword:
         # Audit written.
         async with factory() as ses:
             audits = (
-                await ses.execute(
-                    select(AdminAudit).where(AdminAudit.action == "reset_password")
-                )
-            ).scalars().all()
+                (await ses.execute(select(AdminAudit).where(AdminAudit.action == "reset_password")))
+                .scalars()
+                .all()
+            )
         assert len(audits) == 1
 
     async def test_reset_admin_self_rejected(
@@ -145,9 +137,7 @@ class TestResetPassword:
         factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
         async with factory() as ses:
             admin = (
-                await ses.execute(
-                    select(User).where(User.username == s.ADMIN_LOGIN)
-                )
+                await ses.execute(select(User).where(User.username == s.ADMIN_LOGIN))
             ).scalar_one()
         resp = await client.post(
             f"/api/admin/users/{admin.id}/reset",
@@ -181,10 +171,10 @@ class TestDeleteUser:
         async with factory() as ses:
             assert await ses.get(User, target_id) is None
             audits = (
-                await ses.execute(
-                    select(AdminAudit).where(AdminAudit.action == "delete_user")
-                )
-            ).scalars().all()
+                (await ses.execute(select(AdminAudit).where(AdminAudit.action == "delete_user")))
+                .scalars()
+                .all()
+            )
         assert len(audits) == 1
 
     async def test_delete_admin_rejected(
@@ -195,9 +185,7 @@ class TestDeleteUser:
         factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
         async with factory() as ses:
             admin = (
-                await ses.execute(
-                    select(User).where(User.username == s.ADMIN_LOGIN)
-                )
+                await ses.execute(select(User).where(User.username == s.ADMIN_LOGIN))
             ).scalar_one()
         resp = await client.delete(
             f"/api/admin/users/{admin.id}",
@@ -208,9 +196,7 @@ class TestDeleteUser:
 
 
 class TestAudit:
-    async def test_audit_list_pagination(
-        self, client: httpx.AsyncClient
-    ) -> None:
+    async def test_audit_list_pagination(self, client: httpx.AsyncClient) -> None:
         csrf = await _login_admin(client)
         # Create 3 users -> 3 audit rows + 1 admin_login. Usernames must be
         # ``min_length=3`` per ``CreateUserRequest`` (admin/schemas.py) — using
@@ -222,9 +208,9 @@ class TestAudit:
                 json={"username": u, "email": None},
                 headers={"X-CSRF-Token": csrf},
             )
-            assert r.status_code == 201, (
-                f"create_user setup failed for {u}: {r.status_code} {r.text[:200]}"
-            )
+            assert (
+                r.status_code == 201
+            ), f"create_user setup failed for {u}: {r.status_code} {r.text[:200]}"
         resp = await client.get("/api/admin/audit?page=1&limit=2")
         assert resp.status_code == 200
         body = resp.json()
@@ -252,11 +238,7 @@ class TestAudit:
         new_hash = ph.hash("regular-pwd-12345!")
         factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
         async with factory() as ses, ses.begin():
-            user = (
-                await ses.execute(
-                    select(User).where(User.username == "regular")
-                )
-            ).scalar_one()
+            user = (await ses.execute(select(User).where(User.username == "regular"))).scalar_one()
             user.password_hash = new_hash
             user.password_reset_required = False
 

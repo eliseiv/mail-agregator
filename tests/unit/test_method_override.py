@@ -72,7 +72,7 @@ class TestWhitelist:
 
 class TestAllowedMethods:
     def test_allowed_set(self) -> None:
-        assert _ALLOWED_OVERRIDE_METHODS == frozenset({"DELETE", "PATCH", "PUT"})
+        assert frozenset({"DELETE", "PATCH", "PUT"}) == _ALLOWED_OVERRIDE_METHODS
 
     def test_get_post_not_allowed_as_overrides(self) -> None:
         # Even though they're valid HTTP verbs, _method=GET / POST shouldn't
@@ -99,23 +99,16 @@ class TestExtractMethodFromForm:
 
     def test_returns_none_when_method_field_missing(self) -> None:
         body = b"csrf_token=abc"
-        assert (
-            _extract_method_from_form(body, "application/x-www-form-urlencoded") is None
-        )
+        assert _extract_method_from_form(body, "application/x-www-form-urlencoded") is None
 
     def test_returns_none_for_non_form_content_type(self) -> None:
         body = b'{"_method":"DELETE"}'
         assert _extract_method_from_form(body, "application/json") is None
         # multipart is also ignored — only plain form-encoded inspected.
-        assert (
-            _extract_method_from_form(body, "multipart/form-data; boundary=----")
-            is None
-        )
+        assert _extract_method_from_form(body, "multipart/form-data; boundary=----") is None
 
     def test_handles_empty_body(self) -> None:
-        assert (
-            _extract_method_from_form(b"", "application/x-www-form-urlencoded") is None
-        )
+        assert _extract_method_from_form(b"", "application/x-www-form-urlencoded") is None
 
 
 # ---------------------------------------------------------------------------

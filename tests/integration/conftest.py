@@ -23,7 +23,6 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.conftest import _pg_available, _redis_available, _s3_available
 
-
 # Order matters for TRUNCATE: child tables first (or use CASCADE).
 _TABLES_TRUNCATE_ORDER = [
     "sent_attachments",

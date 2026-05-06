@@ -262,7 +262,7 @@ class TestOwnership:
         self,
         db_session: AsyncSession,
         user_id: int,
-        stub_smtp: dict[str, Any],  # noqa: ARG002
+        stub_smtp: dict[str, Any],
     ) -> None:
         svc = SendService(db_session)
         with pytest.raises(NotFoundError):
@@ -282,7 +282,7 @@ class TestOwnership:
         db_session: AsyncSession,
         user_id: int,
         account: MailAccount,
-        stub_smtp: dict[str, Any],  # noqa: ARG002
+        stub_smtp: dict[str, Any],
     ) -> None:
         # bob exists and tries to send from alice's account.
         bob = await UsersRepo(db_session).create(
@@ -319,7 +319,7 @@ class TestReplyHeaders:
         db_session: AsyncSession,
         user_id: int,
         account: MailAccount,
-        stub_smtp: dict[str, Any],  # noqa: ARG002
+        stub_smtp: dict[str, Any],
     ) -> None:
         svc = SendService(db_session)
         with pytest.raises(NotFoundError):

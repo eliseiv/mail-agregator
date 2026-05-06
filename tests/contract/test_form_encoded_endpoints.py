@@ -43,9 +43,7 @@ async def _login(client: httpx.AsyncClient) -> str:
 
 
 class TestFormEncodedFallback:
-    async def test_admin_create_user_form_returns_303(
-        self, client: httpx.AsyncClient
-    ) -> None:
+    async def test_admin_create_user_form_returns_303(self, client: httpx.AsyncClient) -> None:
         csrf = await _login(client)
         resp = await client.post(
             "/api/admin/users",
@@ -56,9 +54,7 @@ class TestFormEncodedFallback:
         assert resp.status_code == 303
         assert resp.headers["location"] == "/admin"
 
-    async def test_admin_create_user_json_returns_201(
-        self, client: httpx.AsyncClient
-    ) -> None:
+    async def test_admin_create_user_json_returns_201(self, client: httpx.AsyncClient) -> None:
         csrf = await _login(client)
         resp = await client.post(
             "/api/admin/users",

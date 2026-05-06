@@ -64,9 +64,7 @@ async def admin_user_with_account(
 
 
 class TestForceSyncDrain:
-    async def test_drain_returns_account_ids_and_deletes_keys(
-        self, redis_client: Any
-    ) -> None:
+    async def test_drain_returns_account_ids_and_deletes_keys(self, redis_client: Any) -> None:
         await redis_client.set("force_sync:42", "1")
         await redis_client.set("force_sync:99", "1")
         await redis_client.set("unrelated:7", "x")
@@ -143,12 +141,14 @@ class TestSyncOneAccount:
         assert acc2.consecutive_failures >= 3
         async with factory() as ses:
             audits = (
-                await ses.execute(
-                    select(AdminAudit).where(
-                        AdminAudit.action == "account_auto_disabled"
+                (
+                    await ses.execute(
+                        select(AdminAudit).where(AdminAudit.action == "account_auto_disabled")
                     )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
         assert len(audits) >= 1
         assert audits[0].target_user_id == admin_user_with_account["user_id"]
 
@@ -192,7 +192,8 @@ class TestSyncOneAccount:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # Build a fake FetchedBox with one message.
-        from datetime import UTC, datetime as _dt
+        from datetime import UTC
+        from datetime import datetime as _dt
 
         from worker.app.imap_fetcher import (
             FetchedAttachment,

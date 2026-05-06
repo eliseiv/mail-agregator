@@ -62,9 +62,7 @@ async def seeded(
         # ``begin()`` after a previous read autobegan a tx).
         async with ses.begin():
             admin = (
-                await ses.execute(
-                    select(User).where(User.username == s.ADMIN_LOGIN)
-                )
+                await ses.execute(select(User).where(User.username == s.ADMIN_LOGIN))
             ).scalar_one()
             from backend.app.repositories.mail_accounts import MailAccountsRepo
 
@@ -107,9 +105,7 @@ async def seeded(
 
             first_msg_id = message_ids[0]
             att_id_seq = (
-                await ses.execute(
-                    select(Attachment.id).order_by(Attachment.id.desc()).limit(1)
-                )
+                await ses.execute(select(Attachment.id).order_by(Attachment.id.desc()).limit(1))
             ).scalar_one_or_none()
             # Reserve via repo helper for parity.
             from backend.app.repositories.messages import MessagesRepo
@@ -168,9 +164,7 @@ class TestList:
         self, client: httpx.AsyncClient, seeded: dict[str, Any]
     ) -> None:
         # Filter to the seeded account; should still return all 5.
-        resp = await client.get(
-            f"/api/messages?account_id={seeded['account_id']}"
-        )
+        resp = await client.get(f"/api/messages?account_id={seeded['account_id']}")
         assert resp.status_code == 200
         assert len(resp.json()["items"]) == 5
         # Filter to a non-existent account.
@@ -187,9 +181,7 @@ class TestList:
         assert len(body["items"]) == 2
         assert body["next_cursor"] is not None
 
-        nxt = await client.get(
-            f"/api/messages?limit=2&cursor={body['next_cursor']}"
-        )
+        nxt = await client.get(f"/api/messages?limit=2&cursor={body['next_cursor']}")
         assert nxt.status_code == 200
         nxt_body = nxt.json()
         # Second page should not overlap the first.
@@ -269,7 +261,5 @@ class TestAttachmentDownload:
         self, client: httpx.AsyncClient, seeded: dict[str, Any]
     ) -> None:
         msg_id = seeded["message_ids"][0]
-        resp = await client.get(
-            f"/api/messages/{msg_id}/attachments/999999"
-        )
+        resp = await client.get(f"/api/messages/{msg_id}/attachments/999999")
         assert resp.status_code == 404
