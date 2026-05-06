@@ -132,21 +132,8 @@ jobs:
           --health-timeout 3s
           --health-retries 10
 
-      minio:
-        # Bitnami's image auto-starts `minio server /bitnami/minio/data` without
-        # needing an explicit `command:` (which GH Actions services don't support).
-        image: bitnami/minio:latest
-        env:
-          MINIO_ROOT_USER: ci_root_user
-          MINIO_ROOT_PASSWORD: ci_root_password_change_in_real_envs
-          MINIO_DEFAULT_BUCKETS: mail-attachments-ci
-        ports:
-          - 9000:9000
-        options: >-
-          --health-cmd "curl -fsS http://localhost:9000/minio/health/live"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 20
+      # MinIO is started via `docker run` below — GH Actions services don't
+      # let us override `command:` and the official image needs `server /data`.
 
     env:
       # Test config — local-host endpoints because services map to the runner host.
@@ -182,14 +169,31 @@ jobs:
       - name: Sync deps
         run: uv sync --frozen --all-extras --dev
 
+      - name: Start MinIO server
+        run: |
+          docker run -d --name minio --network host \
+            -e MINIO_ROOT_USER=ci_root_user \
+            -e MINIO_ROOT_PASSWORD=ci_root_password_change_in_real_envs \
+            minio/minio:RELEASE.2024-08-29T01-40-52Z \
+            server /data
+          # Wait up to 60s for the service to become healthy.
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:9000/minio/health/live > /dev/null 2>&1; then
+              echo "MinIO ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "MinIO failed to start"
+          docker logs minio
+          exit 1
+
       - name: Bootstrap MinIO bucket for tests
-        # bitnami/minio already auto-creates MINIO_DEFAULT_BUCKETS, but run mc
-        # belt-and-braces in case the env var is ignored on a future image bump.
         run: |
           docker run --rm --network host \
             -e MC_HOST_local=http://ci_root_user:ci_root_password_change_in_real_envs@localhost:9000 \
             minio/mc:latest \
-            mb --ignore-existing local/mail-attachments-ci || true
+            mb --ignore-existing local/mail-attachments-ci
 
       - name: Apply migrations
         run: uv run alembic upgrade head
