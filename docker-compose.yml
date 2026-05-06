@@ -85,7 +85,8 @@ services:
   # -------------------------------------------------------------------------
   redis:
     # Bullseye-based image (glibc 2.31) — works on CPUs without x86-64-v2.
-    image: redis:7.2-bullseye
+    # 7.2 was never bullseye-tagged on Docker Hub; use 7.0-bullseye.
+    image: redis:7.0-bullseye
     container_name: mas-redis
     <<: [*restart_default, *logging_default]
     # AOF off by default — sessions are recoverable by re-login (TD says
