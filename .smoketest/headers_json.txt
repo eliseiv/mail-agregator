@@ -1,0 +1,9 @@
+HTTP/1.1 200 OK
+date: Tue, 05 May 2026 16:34:32 GMT
+server: uvicorn
+content-length: 54
+content-type: application/json
+set-cookie: mas_login=admin; HttpOnly; Max-Age=900; Path=/; SameSite=lax
+x-content-type-options: nosniff
+x-request-id: f5fcb3f4-12b5-4cf7-b049-cff15a89695e
+

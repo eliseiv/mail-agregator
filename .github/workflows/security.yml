@@ -1,0 +1,109 @@
+# ---------------------------------------------------------------------------
+# Security scans — Trivy (containers + IaC) + Bandit (Python).
+#
+# Runs:
+#   - on push to main
+#   - nightly at 02:00 UTC (catches new CVE feed updates against unchanged code)
+#   - manual dispatch
+#
+# Findings: SARIF uploaded to GitHub code-scanning UI (requires
+#   "security-events: write" permission). Job does NOT fail the build —
+#   reviewer triages. Severity bumps to fail-the-build can be added later
+#   once we know baseline noise.
+# ---------------------------------------------------------------------------
+
+name: Security
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write   # required for SARIF upload to code-scanning
+
+jobs:
+
+  trivy-fs:
+    name: Trivy — filesystem (deps + IaC)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trivy scan (config + secrets + deps)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-fs.sarif
+          severity: CRITICAL,HIGH,MEDIUM
+          # Catch hard-coded secrets too (defence in depth — pre-commit and
+          # .gitignore are first line, this is last line).
+          scanners: vuln,secret,config
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+  trivy-image:
+    name: Trivy — built images (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [api, worker]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image for scan
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          target: ${{ matrix.target }}
+          push: false
+          load: true
+          tags: mail-aggregator/${{ matrix.target }}:scan
+          cache-from: type=gha,scope=${{ matrix.target }}
+
+      # Two-pass strategy:
+      #   1. SARIF report (CRITICAL+HIGH) — never blocks, always uploaded.
+      #   2. Gating scan (CRITICAL only) — exits 1 on PR/push, never on
+      #      nightly cron (so feed updates against unchanged code only
+      #      surface as warnings, not red builds).
+      - name: Trivy scan image (SARIF report — non-blocking)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: mail-aggregator/${{ matrix.target }}:scan
+          format: sarif
+          output: trivy-image-${{ matrix.target }}.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true   # noise reduction — only show actionable
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-image-${{ matrix.target }}.sarif
+          category: trivy-image-${{ matrix.target }}
+
+      - name: Trivy scan image (gating — fail on CRITICAL)
+        if: github.event_name != 'schedule'
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: mail-aggregator/${{ matrix.target }}:scan
+          severity: CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true

@@ -1,0 +1,160 @@
+"""Application settings loaded from environment.
+
+Single source of truth for env-driven configuration. Imported by api and
+worker. Documented env variables: ``docs/07-deployment.md`` sec. 4.
+
+Invariants (``docs/05-modules.md`` sec. 1):
+- Missing required env -> process aborts with a clear message at startup.
+- ``MAIL_ENCRYPTION_KEY`` is base64; decoded length MUST equal 32 bytes.
+- In ``APP_ENV=prod`` we hard-disable ``ENABLE_DOCS`` regardless of env.
+- ``get_settings()`` is a singleton (``lru_cache``).
+- Nothing here is logged (see redact-list in ``shared/logging.py``).
+"""
+
+from __future__ import annotations
+
+import base64
+from functools import lru_cache
+from typing import Literal
+
+from pydantic import Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+AppEnv = Literal["dev", "prod"]
+
+
+class Settings(BaseSettings):
+    """Process-wide configuration.
+
+    All values are sourced from environment variables. ``.env`` is read
+    when present (dev convenience) but production injects via ``docker
+    compose`` env_file.
+    """
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=True,
+        extra="ignore",
+    )
+
+    # --- General ---
+    APP_ENV: AppEnv = "prod"
+    APP_BASE_URL: str = "https://mail.example.com"
+    LOG_LEVEL: str = "INFO"
+    ENABLE_DOCS: bool = False
+    SERVICE_NAME: str = "api"  # overridden to "worker" by worker.app.main
+
+    # --- Database ---
+    DATABASE_URL: str = "postgresql+asyncpg://mas:CHANGE_ME@postgres:5432/mail_aggregator"
+
+    # --- Redis ---
+    REDIS_URL: str = "redis://redis:6379/0"
+
+    # --- MinIO / S3 ---
+    S3_ENDPOINT_URL: str = "http://minio:9000"
+    S3_ACCESS_KEY: str = ""
+    S3_SECRET_KEY: str = ""
+    S3_BUCKET_NAME: str = "mail-attachments"
+    S3_REGION: str = "us-east-1"
+
+    # --- Crypto (mail account passwords, AES-256-GCM, ADR-0005) ---
+    MAIL_ENCRYPTION_KEY: str = ""  # base64 of exactly 32 raw bytes
+    MAIL_ENCRYPTION_KEY_PREV: str | None = None  # only during rotation
+
+    # --- Admin seed ---
+    ADMIN_LOGIN: str = "admin"
+    ADMIN_PASSWORD: str = ""
+
+    # --- Worker / sync ---
+    MAX_CONCURRENT_IMAP: int = Field(default=10, ge=1, le=100)
+    WORKER_THREAD_POOL_SIZE: int = Field(default=14, ge=1, le=200)
+    SYNC_INTERVAL_MINUTES: int = Field(default=5, ge=1, le=60)
+    RETENTION_DAYS: int = Field(default=30, ge=1, le=3650)
+    IMAP_TIMEOUT_SECONDS: int = Field(default=60, ge=5, le=600)
+    INITIAL_SYNC_DAYS: int = Field(default=30, ge=1, le=365)
+    MAX_ATTACHMENT_BYTES: int = Field(default=26_214_400, ge=1024, le=1_073_741_824)
+    MAX_BODY_BYTES: int = Field(default=1_048_576, ge=1024, le=10_485_760)
+
+    # --- Sessions / auth ---
+    SESSION_TTL_SECONDS: int = Field(default=43_200, ge=60)
+    SESSION_ABSOLUTE_TTL_SECONDS: int = Field(default=604_800, ge=60)
+    SETUP_SESSION_TTL_SECONDS: int = Field(default=900, ge=60)
+    COOKIE_DOMAIN: str | None = None
+    LOGIN_FAILURE_THRESHOLD: int = Field(default=5, ge=1, le=100)
+    LOGIN_LOCKOUT_MINUTES: int = Field(default=15, ge=1, le=1440)
+
+    # --- HTTP ---
+    SAFE_REDIRECT_AFTER_LOGIN: str = "/"
+    LOGIN_PATH: str = "/login"
+
+    @field_validator("MAIL_ENCRYPTION_KEY")
+    @classmethod
+    def _validate_master_key(cls, v: str) -> str:
+        """Reject anything that doesn't decode to exactly 32 bytes."""
+        if not v:
+            return v  # validated again in model_validator if required
+        try:
+            raw = base64.b64decode(v, validate=True)
+        except Exception as exc:  # - want to wrap any decode error
+            raise ValueError("MAIL_ENCRYPTION_KEY: not valid base64") from exc
+        if len(raw) != 32:
+            raise ValueError(f"MAIL_ENCRYPTION_KEY: must decode to 32 bytes, got {len(raw)}")
+        return v
+
+    @field_validator("MAIL_ENCRYPTION_KEY_PREV")
+    @classmethod
+    def _validate_master_key_prev(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        try:
+            raw = base64.b64decode(v, validate=True)
+        except Exception as exc:
+            raise ValueError("MAIL_ENCRYPTION_KEY_PREV: not valid base64") from exc
+        if len(raw) != 32:
+            raise ValueError(f"MAIL_ENCRYPTION_KEY_PREV: must decode to 32 bytes, got {len(raw)}")
+        return v
+
+    @model_validator(mode="after")
+    def _enforce_required(self) -> Settings:
+        """Required-in-prod env values; harden ENABLE_DOCS in prod."""
+        missing: list[str] = []
+        if not self.MAIL_ENCRYPTION_KEY:
+            missing.append("MAIL_ENCRYPTION_KEY")
+        if not self.ADMIN_PASSWORD:
+            missing.append("ADMIN_PASSWORD")
+        if not self.S3_ACCESS_KEY:
+            missing.append("S3_ACCESS_KEY")
+        if not self.S3_SECRET_KEY:
+            missing.append("S3_SECRET_KEY")
+        if missing:
+            raise ValueError("Missing required env: " + ", ".join(missing))
+
+        # Hardcoded prod policy: docs disabled regardless of env value.
+        if self.APP_ENV == "prod":
+            object.__setattr__(self, "ENABLE_DOCS", False)
+        return self
+
+    @property
+    def is_prod(self) -> bool:
+        return self.APP_ENV == "prod"
+
+    @property
+    def cookie_secure(self) -> bool:
+        """Set-Cookie ``Secure`` flag — only in prod (TLS terminated upstream)."""
+        return self.is_prod
+
+    def mail_master_key_bytes(self) -> bytes:
+        """Decoded current key — never logged, never cached on disk."""
+        return base64.b64decode(self.MAIL_ENCRYPTION_KEY)
+
+    def mail_master_key_prev_bytes(self) -> bytes | None:
+        if not self.MAIL_ENCRYPTION_KEY_PREV:
+            return None
+        return base64.b64decode(self.MAIL_ENCRYPTION_KEY_PREV)
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    """Cached singleton so that repeated calls don't re-parse env."""
+    return Settings()

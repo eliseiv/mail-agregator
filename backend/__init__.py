@@ -1,0 +1,1 @@
+"""Mail Aggregator backend (FastAPI)."""

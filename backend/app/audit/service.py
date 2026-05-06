@@ -1,0 +1,54 @@
+"""AuditWriter — wraps :class:`AuditRepo` so callers don't reach into ORM.
+
+Per ``docs/05-modules.md`` sec. 12: an audit-write failure must propagate so
+the calling business operation can roll back. We intentionally do not swallow.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Final
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from backend.app.repositories.audit import AuditRepo
+
+# Closed enum from ``docs/03-data-model.md`` table ``admin_audit``.
+ALLOWED_ACTIONS: Final[frozenset[str]] = frozenset(
+    {
+        "admin_login",
+        "admin_logout",
+        "create_user",
+        "reset_password",
+        "delete_user",
+        "lockout_triggered",
+        "account_auto_disabled",
+    }
+)
+
+
+class AuditWriter:
+    def __init__(self, session: AsyncSession) -> None:
+        self._repo = AuditRepo(session)
+
+    async def log(
+        self,
+        *,
+        actor_user_id: int,
+        action: str,
+        target_user_id: int | None = None,
+        target_username: str | None = None,
+        details: dict[str, Any] | None = None,
+        ip: str | None = None,
+        user_agent: str | None = None,
+    ) -> None:
+        if action not in ALLOWED_ACTIONS:
+            raise ValueError(f"Audit action not in enum: {action!r}")
+        await self._repo.insert(
+            actor_user_id=actor_user_id,
+            action=action,
+            target_user_id=target_user_id,
+            target_username=target_username,
+            details=details,
+            ip=ip,
+            user_agent=user_agent,
+        )

@@ -1,0 +1,176 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m with context %}
+
+{% block title %}Admin &middot; Users{% endblock %}
+{% block body_class %}admin-users{% endblock %}
+
+{% block content %}
+<section class="admin" aria-labelledby="admin-heading">
+  <header class="admin__toolbar">
+    <h1 id="admin-heading" class="admin__title">Users</h1>
+    <div class="admin__actions">
+      <a class="topnav__link" href="/admin/audit">Audit log &rarr;</a>
+      <button type="button" class="btn btn--primary" data-admin-create-user>+ Create user</button>
+    </div>
+  </header>
+
+  <form method="GET" action="/admin" class="admin__search inline-form" role="search">
+    <label class="visually-hidden" for="admin-search">Search users</label>
+    <input
+      class="field__input"
+      id="admin-search"
+      type="search"
+      name="q"
+      value="{{ q | default('') | e }}"
+      placeholder="Search by username">
+    <button class="btn btn--secondary" type="submit">Search</button>
+  </form>
+
+  {% if not users %}
+    <div class="admin__empty" role="status">
+      <p>No users match your query.</p>
+    </div>
+  {% else %}
+    <ul class="admin-user-list">
+      {% for u in users %}
+        <li class="admin-user-list__item" data-user-id="{{ u.id }}">
+          <details class="admin-user" {% if u.expanded %}open{% endif %}>
+            <summary class="admin-user__summary">
+              <span class="admin-user__name">{{ u.username | e }}</span>
+              {% if u.is_admin %}<span class="admin-user__badge">super-admin</span>{% endif %}
+              {% if u.email %}<span class="admin-user__email">{{ u.email | e }}</span>{% endif %}
+              <span class="admin-user__meta">
+                created {{ m.time_tag(u.created_at, u.created_at_human if u.created_at_human is defined else None) }}
+              </span>
+              <span class="admin-user__meta">
+                last login:
+                {% if u.last_login_at %}
+                  {{ m.time_tag(u.last_login_at, u.last_login_at_human if u.last_login_at_human is defined else None) }}
+                {% else %}
+                  never
+                {% endif %}
+              </span>
+              {% if u.password_reset_required %}
+                <span class="admin-user__warn">password not set</span>
+              {% endif %}
+            </summary>
+
+            <div class="admin-user__body">
+              {% if u.mail_accounts %}
+                <h3 class="admin-user__sub">Mail accounts</h3>
+                <ul class="admin-user__accounts">
+                  {% for ma in u.mail_accounts %}
+                    <li class="admin-user__account {% if not ma.is_active %}admin-user__account--disabled{% endif %}">
+                      <span class="admin-user__account-email">{{ ma.email | e }}</span>
+                      <span class="admin-user__account-meta">
+                        {% if ma.last_synced_at %}
+                          last sync {{ m.time_tag(ma.last_synced_at, ma.last_synced_at_human if ma.last_synced_at_human is defined else None) }}
+                        {% else %}
+                          never synced
+                        {% endif %}
+                      </span>
+                      {% if not ma.is_active %}
+                        <span class="admin-user__warn">DISABLED{% if ma.last_sync_error %}: {{ ma.last_sync_error | e }}{% endif %}</span>
+                      {% endif %}
+                    </li>
+                  {% endfor %}
+                </ul>
+              {% else %}
+                <p class="admin-user__notice">No mail accounts configured.</p>
+              {% endif %}
+
+              {% if not u.is_admin %}
+                <div class="admin-user__actions">
+                  <form method="POST" action="/api/admin/users/{{ u.id }}/reset"
+                        class="inline-form" data-admin-reset-form
+                        data-confirm="Reset password for user {{ u.username | e }}? They will be required to set a new password on next login.">
+                    {{ m.csrf_input() }}
+                    <button type="submit" class="btn btn--secondary btn--small">Reset password</button>
+                  </form>
+
+                  <form method="POST" action="/api/admin/users/{{ u.id }}/delete"
+                        class="inline-form" data-admin-delete-form
+                        data-username="{{ u.username | e }}">
+                    {{ m.csrf_input() }}
+                    <input type="hidden" name="_method" value="DELETE">
+                    <button type="submit" class="btn btn--danger btn--small">Delete</button>
+                  </form>
+                </div>
+              {% else %}
+                <p class="admin-user__notice">No actions available (system account).</p>
+              {% endif %}
+            </div>
+          </details>
+        </li>
+      {% endfor %}
+    </ul>
+
+    {{ m.page_pagination(page | default(1), total | default(0), limit | default(50), '/admin?' + ('q=' + (q | urlencode) + '&' if q else '')) }}
+  {% endif %}
+
+  {# Create-user dialog (progressive enhancement: opens via JS).
+     For no-JS fallback the form below works as a plain submit. #}
+  <dialog class="dialog" id="dialog-create-user" data-admin-create-dialog>
+    <form method="dialog" class="dialog__form-cancel">
+      <button type="submit" class="btn btn--link" aria-label="Close">&times;</button>
+    </form>
+    <h2 class="dialog__title">Create user</h2>
+    <form
+      method="POST"
+      action="/api/admin/users"
+      class="form"
+      data-admin-create-user-form>
+      {{ m.csrf_input() }}
+      <div class="field">
+        <label class="field__label" for="new-user-username">Username</label>
+        <input
+          class="field__input"
+          type="text"
+          id="new-user-username"
+          name="username"
+          required
+          minlength="3"
+          maxlength="64"
+          pattern="[A-Za-z0-9_.\-]+"
+          autocomplete="off">
+      </div>
+      <div class="field">
+        <label class="field__label" for="new-user-email">Email <span class="field__optional">(optional)</span></label>
+        <input
+          class="field__input"
+          type="email"
+          id="new-user-email"
+          name="email"
+          autocomplete="off">
+      </div>
+      <div class="form-actions">
+        <button type="submit" class="btn btn--primary">Create</button>
+      </div>
+    </form>
+  </dialog>
+
+  {# Delete-confirmation dialog. #}
+  <dialog class="dialog" id="dialog-delete-user" data-admin-delete-dialog>
+    <form method="dialog" class="dialog__form-cancel">
+      <button type="submit" class="btn btn--link" aria-label="Close">&times;</button>
+    </form>
+    <h2 class="dialog__title">Delete user</h2>
+    <p>This action is permanent. All mail accounts, messages, and attachments belonging to this user will be removed.</p>
+    <p>To confirm, type the username <strong data-admin-delete-username></strong> below.</p>
+    <form data-admin-delete-confirm-form class="form">
+      <div class="field">
+        <label class="field__label" for="delete-confirm-input">Type username to confirm</label>
+        <input class="field__input" type="text" id="delete-confirm-input" autocomplete="off" required>
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn btn--secondary" data-admin-delete-cancel>Cancel</button>
+        <button type="submit" class="btn btn--danger" data-admin-delete-go disabled>Delete</button>
+      </div>
+    </form>
+  </dialog>
+</section>
+{% endblock %}
+
+{% block extra_js %}
+<script src="/static/js/admin_users.js"></script>
+{% endblock %}

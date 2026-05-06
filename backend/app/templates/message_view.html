@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m with context %}
+
+{% block title %}{{ message.subject | default('(no subject)') | e }} &middot; Mail Aggregator{% endblock %}
+{% block body_class %}message-view{% endblock %}
+
+{% block content %}
+<article class="message" aria-labelledby="msg-subject" data-message-id="{{ message.id }}">
+
+  <nav class="message__toolbar" aria-label="Message actions">
+    <a class="btn btn--secondary" href="/">&larr; Inbox</a>
+    <a class="btn btn--primary" href="/compose?reply_to={{ message.id }}">Reply</a>
+    <button
+      type="button"
+      class="btn btn--secondary"
+      data-message-mark-unread
+      data-message-id="{{ message.id }}">
+      Mark as unread
+    </button>
+  </nav>
+
+  <header class="message__header">
+    <h1 id="msg-subject" class="message__subject">
+      {% if message.subject %}{{ message.subject | e }}{% else %}<em>(no subject)</em>{% endif %}
+    </h1>
+
+    <dl class="message__meta">
+      <div class="message__meta-row">
+        <dt>From</dt>
+        <dd>
+          {% if message.from_name %}{{ message.from_name | e }}
+            &lt;{{ message.from_addr | e }}&gt;
+          {% else %}{{ message.from_addr | e }}{% endif %}
+        </dd>
+      </div>
+      <div class="message__meta-row">
+        <dt>To</dt>
+        <dd>
+          {% if message.to_addrs %}{{ message.to_addrs | join(', ') | e }}{% else %}&mdash;{% endif %}
+        </dd>
+      </div>
+      {% if message.cc_addrs %}
+        <div class="message__meta-row">
+          <dt>Cc</dt>
+          <dd>{{ message.cc_addrs | join(', ') | e }}</dd>
+        </div>
+      {% endif %}
+      <div class="message__meta-row">
+        <dt>Date</dt>
+        <dd>{{ m.time_tag(message.internal_date, message.internal_date_human if message.internal_date_human is defined else None) }}</dd>
+      </div>
+      <div class="message__meta-row">
+        <dt>Account</dt>
+        <dd>{{ message.mail_account_email | e }}</dd>
+      </div>
+    </dl>
+  </header>
+
+  <section class="message__body" aria-label="Message body">
+    {% if message.body_present %}
+      <pre class="message__body-text">{{ message.body_text | e }}</pre>
+      {% if message.body_truncated %}
+        <p class="message__notice" role="note">
+          &#9432; Body truncated at 1 MiB.
+        </p>
+      {% endif %}
+    {% else %}
+      <p class="message__notice" role="note">
+        &#9432; This message has no readable text body.
+      </p>
+    {% endif %}
+  </section>
+
+  {% if message.attachments %}
+    <section class="message__attachments" aria-label="Attachments">
+      <h2 class="message__attachments-title">Attachments</h2>
+      <ul class="attachment-list">
+        {% for att in message.attachments %}
+          <li class="attachment-list__item {% if att.skipped_too_large %}attachment-list__item--skipped{% endif %}">
+            <span class="attachment-list__name">{{ att.filename | default('(unnamed)') | e }}</span>
+            <span class="attachment-list__meta">
+              {% if att.content_type %}{{ att.content_type | e }}{% endif %}
+              {% if att.size_human %}&middot; {{ att.size_human | e }}{% elif att.size_bytes %}&middot; {{ att.size_bytes }} bytes{% endif %}
+            </span>
+            {% if att.skipped_too_large %}
+              <span class="attachment-list__skipped" title="Attachment exceeds the 25 MiB download limit and was not stored.">
+                Skipped: too large (&gt; 25 MiB)
+              </span>
+            {% else %}
+              <a class="btn btn--link"
+                 href="/api/messages/{{ message.id }}/attachments/{{ att.id }}"
+                 download="{{ att.filename | default('attachment') | e }}">
+                Download
+              </a>
+            {% endif %}
+          </li>
+        {% endfor %}
+      </ul>
+    </section>
+  {% endif %}
+
+</article>
+{% endblock %}
+
+{% block extra_js %}
+<script src="/static/js/inbox.js"></script>
+{% endblock %}

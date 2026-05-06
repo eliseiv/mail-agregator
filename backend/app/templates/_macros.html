@@ -1,0 +1,85 @@
+{# ---------------------------------------------------------------------------
+   Reusable Jinja2 macros.
+
+   Imported with:  {% import "_macros.html" as m with context %}
+   The "with context" is REQUIRED — without it, calling-template variables
+   such as ``csrf_token`` are NOT visible inside the macros and the rendered
+   hidden input ends up empty, which causes CSRF failures (round-6 bug fix).
+
+   Backend contract:
+     - `csrf_token` MUST be present in template context for any page that
+       renders a state-changing form (login, set-password, logout, compose,
+       account create/edit/delete, admin actions). Pages that contain only
+       safe GETs may omit it.
+     - `flashes` is an iterable of objects/dicts with attributes/keys
+       `category` (one of "info" | "success" | "warning" | "error") and
+       `text` (str). May be empty/missing.
+     - `pagination` (for pagination_macro) is an object/dict with
+       `prev_url` (str|None) and `next_url` (str|None).
+   --------------------------------------------------------------------------- #}
+
+{# Hidden CSRF input. Reads `csrf_token` from current Jinja2 context. #}
+{%- macro csrf_input() -%}
+<input type="hidden" name="csrf_token" value="{{ csrf_token | default('') }}">
+{%- endmacro -%}
+
+{# Render a single flash message strip. Backend may pass `flashes` directly,
+   or include {{ m.flash_messages(flashes) }} in templates. #}
+{%- macro flash_messages(flashes=None) -%}
+{%- set _items = flashes if flashes is not none else (request.state.flashes if request is defined and request.state is defined and request.state.flashes is defined else []) -%}
+{%- if _items -%}
+<ul class="flashes" role="status" aria-live="polite">
+  {%- for item in _items -%}
+    {%- set cat = (item.category if item.category is defined else item['category']) | default('info') -%}
+    {%- set txt = (item.text if item.text is defined else item['text']) | default('') -%}
+    <li class="flash flash--{{ cat | e }}">{{ txt | e }}</li>
+  {%- endfor -%}
+</ul>
+{%- endif -%}
+{%- endmacro -%}
+
+{# Cursor pagination links (keyset; only prev/next URLs). #}
+{%- macro pagination_links(prev_url=None, next_url=None) -%}
+<nav class="pagination" aria-label="Pagination">
+  {%- if prev_url -%}
+    <a class="pagination__link" rel="prev" href="{{ prev_url | e }}">&larr; Prev</a>
+  {%- else -%}
+    <span class="pagination__link pagination__link--disabled" aria-disabled="true">&larr; Prev</span>
+  {%- endif -%}
+  {%- if next_url -%}
+    <a class="pagination__link" rel="next" href="{{ next_url | e }}">Next &rarr;</a>
+  {%- else -%}
+    <span class="pagination__link pagination__link--disabled" aria-disabled="true">Next &rarr;</span>
+  {%- endif -%}
+</nav>
+{%- endmacro -%}
+
+{# Page-based pagination (admin audit). Pages object: {page, total, limit, query_base}. #}
+{%- macro page_pagination(page, total, limit, base_url) -%}
+{%- set total_pages = ((total // limit) + (1 if total % limit else 0)) if total else 1 -%}
+{%- if total_pages > 1 -%}
+<nav class="pagination" aria-label="Pagination">
+  {%- set prev_p = page - 1 -%}
+  {%- set next_p = page + 1 -%}
+  {%- if page > 1 -%}
+    <a class="pagination__link" rel="prev" href="{{ base_url | e }}page={{ prev_p }}">&larr; Prev</a>
+  {%- else -%}
+    <span class="pagination__link pagination__link--disabled" aria-disabled="true">&larr; Prev</span>
+  {%- endif -%}
+  <span class="pagination__info">Page {{ page }} of {{ total_pages }}</span>
+  {%- if page < total_pages -%}
+    <a class="pagination__link" rel="next" href="{{ base_url | e }}page={{ next_p }}">Next &rarr;</a>
+  {%- else -%}
+    <span class="pagination__link pagination__link--disabled" aria-disabled="true">Next &rarr;</span>
+  {%- endif -%}
+</nav>
+{%- endif -%}
+{%- endmacro -%}
+
+{# Render a relative time string fallback. Backend should pre-format dates,
+   but this gives a uniform <time> tag with ISO datetime and human label. #}
+{%- macro time_tag(iso_value, human_value=None) -%}
+{%- if iso_value -%}
+<time datetime="{{ iso_value | e }}">{{ (human_value if human_value else iso_value) | e }}</time>
+{%- endif -%}
+{%- endmacro -%}

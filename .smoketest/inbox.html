@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="same-origin">
+  
+  
+    <meta name="csrf-token" content="owBMMuyP3QMiug_biUq07da0bzfmRbeWfV9umGvRfjs">
+  
+  <title>Inbox &middot; Mail Aggregator</title>
+  <link rel="stylesheet" href="/static/css/main.css">
+  <link rel="icon" href="data:," >
+</head>
+<body class="page page--inbox">
+  <a class="skip-link" href="#main">Skip to main content</a>
+
+  <header class="topbar" role="banner">
+    <div class="topbar__inner">
+      <a href="/" class="brand" aria-label="Mail Aggregator home">Mail Aggregator</a>
+
+      
+        <nav class="topnav" aria-label="Primary">
+          <a class="topnav__link" href="/">Inbox</a>
+          <a class="topnav__link" href="/accounts">Accounts</a>
+          
+            <a class="topnav__link" href="/admin">Admin</a>
+          
+        </nav>
+        <div class="topbar__user">
+          <span class="topbar__username" title="Signed in user">
+            
+          </span>
+          <form method="POST" action="/logout" class="inline-form">
+            
+            <input type="hidden" name="csrf_token" value="owBMMuyP3QMiug_biUq07da0bzfmRbeWfV9umGvRfjs">
+            <button type="submit" class="btn btn--link" aria-label="Log out">Log out</button>
+          </form>
+        </div>
+      
+    </div>
+  </header>
+
+  <main id="main" class="main" role="main">
+    
+    
+
+    
+<section class="inbox" aria-labelledby="inbox-heading">
+
+  <header class="inbox__toolbar">
+    <h1 id="inbox-heading" class="inbox__title">Inbox</h1>
+
+    <div class="inbox__actions">
+      <a class="btn btn--primary" href="/compose">Compose new</a>
+
+      <form method="GET" action="/" class="inbox__filter inline-form" role="search">
+        <label class="visually-hidden" for="filter-account">Filter by account</label>
+        <select
+          class="field__input field__input--compact"
+          id="filter-account"
+          name="account_id"
+          data-inbox-filter>
+          <option value="">All accounts</option>
+          
+        </select>
+
+        <label class="checkbox">
+          <input
+            type="checkbox"
+            name="unread"
+            value="1"
+            data-inbox-unread
+            >
+          <span>Unread only</span>
+        </label>
+
+        <noscript>
+          <button type="submit" class="btn btn--secondary">Apply</button>
+        </noscript>
+      </form>
+
+      <button type="button" class="btn btn--secondary" data-inbox-refresh>Refresh</button>
+    </div>
+  </header>
+
+  
+    
+    <div class="inbox__empty" role="status">
+      <p>No messages yet. Add a mail account to start syncing.</p>
+      <a href="/accounts/new" class="btn btn--primary">Add account</a>
+    </div>
+  
+
+</section>
+
+  </main>
+
+  <footer class="footer" role="contentinfo">
+    <small>Mail Aggregator</small>
+  </footer>
+
+  <script src="/static/js/csrf.js"></script>
+  
+<script src="/static/js/inbox.js"></script>
+
+</body>
+</html>

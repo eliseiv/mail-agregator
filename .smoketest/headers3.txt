@@ -1,0 +1,9 @@
+HTTP/1.1 303 See Other
+date: Tue, 05 May 2026 16:33:52 GMT
+server: uvicorn
+content-length: 0
+location: /login/password
+set-cookie: mas_login=nonexistent; HttpOnly; Max-Age=900; Path=/; SameSite=lax
+x-content-type-options: nosniff
+x-request-id: 7351b277-705b-4eca-88c1-d43f3a191f6b
+

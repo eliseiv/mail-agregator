@@ -1,0 +1,68 @@
+# Keep build context small and never leak secrets / local state into images.
+
+# Secrets — explicit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# VCS
+.git/
+.gitignore
+.gitattributes
+
+# Docs / repo meta (not needed at runtime)
+docs/
+# README.md is referenced by pyproject.toml (hatchling) — must be included
+TZ.md
+CLAUDE.md
+.claude/
+LICENSE
+
+# CI / IDE
+.github/
+.idea/
+.vscode/
+
+# Python tooling artefacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.tox/
+.nox/
+
+# Local build / dist
+build/
+dist/
+*.egg
+node_modules/
+
+# Tests are NOT shipped into the runtime image
+backend/tests/
+worker/tests/
+shared/tests/
+
+# Docker / compose self-references (avoid recursive context bloat)
+deploy/docker-compose.yml
+deploy/caddy/
+deploy/minio-bootstrap.sh
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/

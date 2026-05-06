@@ -1,0 +1,86 @@
+HTTP/1.1 200 OK
+date: Tue, 05 May 2026 16:33:11 GMT
+server: uvicorn
+content-length: 1726
+content-type: text/html; charset=utf-8
+x-content-type-options: nosniff
+content-security-policy: default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'self'
+x-frame-options: DENY
+referrer-policy: same-origin
+permissions-policy: geolocation=(), camera=(), microphone=()
+cache-control: no-store
+x-request-id: a5509758-2327-487b-b4fd-bbb38148cb76
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="same-origin">
+  
+  
+  <title>Sign in &middot; Mail Aggregator</title>
+  <link rel="stylesheet" href="/static/css/main.css">
+  <link rel="icon" href="data:," >
+</head>
+<body class="page page--login">
+  <a class="skip-link" href="#main">Skip to main content</a>
+
+  <header class="topbar" role="banner">
+    <div class="topbar__inner">
+      <a href="/" class="brand" aria-label="Mail Aggregator home">Mail Aggregator</a>
+
+      
+    </div>
+  </header>
+
+  <main id="main" class="main" role="main">
+    
+    
+
+    
+<section class="auth-card" aria-labelledby="login-heading">
+  <h1 id="login-heading" class="auth-card__title">Sign in</h1>
+
+  
+  
+
+  
+  <form method="POST" action="/login" class="form" autocomplete="on" novalidate>
+    <input type="hidden" name="csrf_token" value="">
+
+    <div class="field">
+      <label class="field__label" for="login-username">Username</label>
+      <input
+        class="field__input"
+        type="text"
+        id="login-username"
+        name="username"
+        autocomplete="username"
+        required
+        minlength="1"
+        maxlength="64"
+        autofocus
+        value="">
+    </div>
+
+    <div class="form-actions">
+      <button type="submit" class="btn btn--primary">Next</button>
+    </div>
+  </form>
+
+  <p class="auth-card__hint">
+    Accounts are created by an administrator. Contact your admin if you do not have one.
+  </p>
+</section>
+
+  </main>
+
+  <footer class="footer" role="contentinfo">
+    <small>Mail Aggregator</small>
+  </footer>
+
+  <script src="/static/js/csrf.js"></script>
+  
+</body>
+</html>

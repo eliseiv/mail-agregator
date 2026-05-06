@@ -1,0 +1,11 @@
+HTTP/1.1 302 Found
+date: Tue, 05 May 2026 16:34:25 GMT
+server: uvicorn
+content-length: 0
+location: /login
+set-cookie: mas_session=""; expires=Tue, 05 May 2026 16:34:25 GMT; Max-Age=0; Path=/; SameSite=lax
+set-cookie: mas_csrf=""; expires=Tue, 05 May 2026 16:34:25 GMT; Max-Age=0; Path=/; SameSite=lax
+set-cookie: mas_login=""; expires=Tue, 05 May 2026 16:34:25 GMT; Max-Age=0; Path=/; SameSite=lax
+x-content-type-options: nosniff
+x-request-id: fb6837e9-1ed1-436e-8106-be6b4fba404a
+

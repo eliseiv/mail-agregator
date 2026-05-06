@@ -1,0 +1,13 @@
+HTTP/1.1 200 OK
+date: Tue, 05 May 2026 16:33:59 GMT
+server: uvicorn
+content-length: 1970
+content-type: text/html; charset=utf-8
+x-content-type-options: nosniff
+content-security-policy: default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'self'
+x-frame-options: DENY
+referrer-policy: same-origin
+permissions-policy: geolocation=(), camera=(), microphone=()
+cache-control: no-store
+x-request-id: 8a44ff5b-f4da-4a2d-bc41-3813ef8e4494
+

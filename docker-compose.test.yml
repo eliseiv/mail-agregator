@@ -1,0 +1,30 @@
+# Test override: expose postgres/redis/minio on host so QA can run pytest
+# directly on Windows without docker-in-docker shenanigans.
+#
+# Usage: docker compose -f docker-compose.yml -f docker-compose.test.yml up -d postgres redis minio minio-bootstrap
+name: mail-aggregator
+
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:55432:5432"
+
+  redis:
+    ports:
+      - "127.0.0.1:56379:6379"
+    # Test override: alpine redis needs SETUID/SETGID to drop privileges to
+    # the redis user. Prod compose drops ALL caps which works on Linux hosts
+    # where docker has fakeroot/usernamespaces; on Windows Docker Desktop the
+    # cap drop blocks the user-switch and Redis crashloops.
+    cap_drop: []
+    cap_add:
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+      - CHOWN
+      - FOWNER
+
+  minio:
+    ports:
+      - "127.0.0.1:59000:9000"
+      - "127.0.0.1:59001:9001"

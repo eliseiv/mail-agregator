@@ -1,0 +1,260 @@
+# ---------------------------------------------------------------------------
+# Mail Aggregator — CI
+#
+# Stages (per docs/07-deployment.md sec.9):
+#   1. lint         ruff check + ruff format --check
+#   2. type-check   mypy backend worker shared
+#   3. test         pytest with postgres+redis+minio service containers,
+#                   coverage gate >= 75% on backend/worker/shared
+#   4. build        docker buildx build for both targets (no push in v1)
+#
+# Triggers: push to main, pull_request to main, manual.
+#
+# Secrets used: NONE (no registry push in v1; deploy is manual).
+# When push is added later, store registry creds as GitHub Secrets.
+# ---------------------------------------------------------------------------
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel previous runs of the same ref — saves CI minutes on rapid pushes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Default to read-only token; jobs that need more (none today) opt in.
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+  UV_VERSION: "0.4.27"
+  # Coverage gate from docs/02-tech-stack.md "Минимальный coverage gate: 75%".
+  COVERAGE_MIN: "75"
+
+jobs:
+
+  # -------------------------------------------------------------------------
+  # 1. Lint — ruff check + ruff format --check
+  # -------------------------------------------------------------------------
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Sync dev deps
+        run: uv sync --frozen --all-extras --dev
+
+      - name: ruff check
+        run: uv run ruff check .
+
+      - name: ruff format --check
+        run: uv run ruff format --check .
+
+  # -------------------------------------------------------------------------
+  # 2. Type-check — mypy on backend, worker, shared
+  # -------------------------------------------------------------------------
+  type-check:
+    name: Type-check (mypy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Sync deps
+        run: uv sync --frozen --all-extras --dev
+
+      - name: mypy
+        run: uv run mypy backend worker shared
+
+  # -------------------------------------------------------------------------
+  # 3. Test — pytest with real postgres / redis / minio service containers.
+  #    Coverage gate enforced via --cov-fail-under in pytest itself.
+  # -------------------------------------------------------------------------
+  test:
+    name: Test (pytest + coverage ≥ ${{ env.COVERAGE_MIN }}%)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [lint]
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: mas
+          POSTGRES_PASSWORD: mas_test_password
+          POSTGRES_DB: mail_aggregator_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mas -d mail_aggregator_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+      redis:
+        image: redis:7.2-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+      minio:
+        image: minio/minio:RELEASE.2024-08-29T01-40-52Z
+        env:
+          MINIO_ROOT_USER: ci_root_user
+          MINIO_ROOT_PASSWORD: ci_root_password_change_in_real_envs
+        ports:
+          - 9000:9000
+        # GitHub services don't accept `command:` directly, but the minio
+        # image's default entrypoint runs `minio server /data` — for CI
+        # the data dir is the in-container default and that's fine.
+        options: >-
+          --health-cmd "curl -fsS http://localhost:9000/minio/health/live"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Test config — local-host endpoints because services map to the runner host.
+      APP_ENV: dev
+      APP_BASE_URL: http://localhost:8080
+      LOG_LEVEL: WARNING
+      DATABASE_URL: postgresql+asyncpg://mas:mas_test_password@localhost:5432/mail_aggregator_test
+      REDIS_URL: redis://localhost:6379/0
+      S3_ENDPOINT_URL: http://localhost:9000
+      S3_ACCESS_KEY: ci_root_user
+      S3_SECRET_KEY: ci_root_password_change_in_real_envs
+      S3_BUCKET_NAME: mail-attachments-ci
+      S3_REGION: us-east-1
+      # 32-byte test-only key. Regenerate with: python -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"
+      MAIL_ENCRYPTION_KEY: HSoYMcwRZLguwQpz+kHPwifN9LvO/H86royMLyRgclo=
+      ADMIN_LOGIN: admin
+      ADMIN_PASSWORD: ci_admin_password_change_me
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Sync deps
+        run: uv sync --frozen --all-extras --dev
+
+      - name: Bootstrap MinIO bucket for tests
+        # CI uses root creds straight (no separate svcacct) — simpler and
+        # acceptable because the bucket is wiped each run.
+        run: |
+          docker run --rm --network host \
+            -e MC_HOST_local=http://ci_root_user:ci_root_password_change_in_real_envs@localhost:9000 \
+            minio/mc:RELEASE.2024-08-26T15-33-30Z \
+            mb --ignore-existing local/mail-attachments-ci
+
+      - name: Apply migrations
+        run: uv run alembic upgrade head
+
+      - name: Run pytest
+        run: |
+          uv run pytest -v \
+            --cov=backend \
+            --cov=worker \
+            --cov=shared \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            --cov-fail-under=${{ env.COVERAGE_MIN }}
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # -------------------------------------------------------------------------
+  # 4. Build — docker build for both api and worker targets.
+  #    No push in v1 (deploy is manual via SSH + git pull).
+  # -------------------------------------------------------------------------
+  build:
+    name: Build images (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [lint, type-check, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [api, worker]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build (${{ matrix.target }})
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          target: ${{ matrix.target }}
+          push: false
+          load: true
+          tags: |
+            mail-aggregator/${{ matrix.target }}:${{ github.sha }}
+            mail-aggregator/${{ matrix.target }}:ci
+          cache-from: type=gha,scope=${{ matrix.target }}
+          cache-to: type=gha,scope=${{ matrix.target }},mode=max
+          # Sanity-check that the image actually runs python.
+          provenance: false
+
+      - name: Smoke-test image
+        # Strict: if structlog/fastapi can't import, the build is broken.
+        run: |
+          docker run --rm \
+            --entrypoint python \
+            mail-aggregator/${{ matrix.target }}:${{ github.sha }} \
+            -c "import sys; print('python', sys.version); import structlog, fastapi" \
+          || exit 1

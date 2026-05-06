@@ -1,0 +1,388 @@
+# ---------------------------------------------------------------------------
+# Mail Aggregator — docker-compose stack
+#
+# Source of truth: docs/07-deployment.md (services, env, healthchecks,
+# bootstrap order) and docs/06-security.md sec.12 (MinIO least-privilege).
+#
+# Layout:
+#   - api       : FastAPI (HTTP, internal :8080, fronted by caddy)
+#   - worker    : APScheduler sync_cycle + cleanup
+#   - postgres  : metadata + audit
+#   - redis     : sessions, rate-limit, force_sync flags
+#   - minio     : object storage for attachments
+#   - minio-bootstrap : one-shot init container (creates bucket, policy,
+#                      service account from MINIO_APP_*). Idempotent.
+#   - caddy     : TLS + reverse proxy (only in prod profile, see profiles)
+#
+# All services live on a single user-defined bridge network so DNS resolves
+# by service name (postgres / redis / minio / api). No host-port mapping
+# for postgres/redis/minio — only caddy publishes 80/443.
+#
+# Local dev:  docker compose up -d
+# Prod:       docker compose --profile prod up -d
+# ---------------------------------------------------------------------------
+
+name: mail-aggregator
+
+# ---------------------------------------------------------------------------
+# Reusable healthcheck/restart fragments (YAML anchors)
+# ---------------------------------------------------------------------------
+x-restart-default: &restart_default
+  restart: unless-stopped
+
+x-logging-default: &logging_default
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
+services:
+
+  # -------------------------------------------------------------------------
+  # PostgreSQL 16 — metadata + audit log
+  # -------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: mas-postgres
+    <<: [*restart_default, *logging_default]
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:-mas}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB:       ${POSTGRES_DB:-mail_aggregator}
+      # Reject connections from outside the docker network even if a
+      # misconfiguration would expose the port.
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
+    volumes:
+      - mas_pg_data:/var/lib/postgresql/data
+    networks:
+      - mas-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-mas} -d $${POSTGRES_DB:-mail_aggregator}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    # Hardening: read-only rootfs is not viable for postgres (writes to
+    # /var/run/postgresql). Drop all caps and add back only what initdb
+    # needs: CHOWN/SETUID/SETGID/DAC_READ_SEARCH/FOWNER.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_READ_SEARCH
+      - FOWNER
+
+  # -------------------------------------------------------------------------
+  # Redis 7.2 — sessions, rate-limit, force_sync flags
+  # -------------------------------------------------------------------------
+  redis:
+    image: redis:7.2-alpine
+    container_name: mas-redis
+    <<: [*restart_default, *logging_default]
+    # AOF off by default — sessions are recoverable by re-login (TD says
+    # losing redis is acceptable). Enable with REDIS_APPENDONLY=yes if needed.
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "${REDIS_APPENDONLY:-no}"
+      - --maxmemory-policy
+      - allkeys-lru
+      - --maxmemory
+      - "256mb"
+    volumes:
+      - mas_redis_data:/data
+    networks:
+      - mas-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "PING"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  # -------------------------------------------------------------------------
+  # MinIO — object storage. Boots with ROOT credentials only used by
+  # itself and the bootstrap init container; api/worker NEVER see them.
+  # -------------------------------------------------------------------------
+  minio:
+    image: minio/minio:RELEASE.2024-08-29T01-40-52Z
+    container_name: mas-minio
+    <<: [*restart_default, *logging_default]
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER:     ${MINIO_ROOT_USER:?MINIO_ROOT_USER must be set}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set}
+      # Disable telemetry / update checks.
+      MINIO_UPDATE: "off"
+      MINIO_BROWSER: "on"
+    volumes:
+      - mas_minio_data:/data
+    networks:
+      - mas-net
+    # Console port :9001 is published ONLY in dev (override via profile).
+    # In prod the console must stay behind VPN — comment out or remove.
+    ports:
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+
+  # -------------------------------------------------------------------------
+  # MinIO bootstrap — one-shot init container. Creates bucket + policy +
+  # service account from MINIO_APP_*. Idempotent (safe to re-run).
+  # See docs/07-deployment.md sec.12 + docs/06-security.md sec.12.
+  # -------------------------------------------------------------------------
+  minio-bootstrap:
+    image: minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+    container_name: mas-minio-bootstrap
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER:      ${MINIO_ROOT_USER:?}
+      MINIO_ROOT_PASSWORD:  ${MINIO_ROOT_PASSWORD:?}
+      MINIO_APP_ACCESS_KEY: ${MINIO_APP_ACCESS_KEY:?MINIO_APP_ACCESS_KEY must be set}
+      MINIO_APP_SECRET_KEY: ${MINIO_APP_SECRET_KEY:?MINIO_APP_SECRET_KEY must be set}
+      S3_BUCKET_NAME:       ${S3_BUCKET_NAME:-mail-attachments}
+    volumes:
+      - ./deploy/minio-bootstrap.sh:/usr/local/bin/bootstrap.sh:ro
+    entrypoint: ["/bin/sh", "/usr/local/bin/bootstrap.sh"]
+    networks:
+      - mas-net
+    restart: "no"
+    <<: *logging_default
+
+  # -------------------------------------------------------------------------
+  # Migrations — one-shot init container. Runs `alembic upgrade head` and
+  # exits. Both api and worker depend on its successful completion, so
+  # neither boots against a schema-less database (race-free).
+  #
+  # Backend keeps `alembic` available as a CLI inside the api image; this
+  # container just invokes it. seed_super_admin remains a startup hook in
+  # api — by then tables exist.
+  # -------------------------------------------------------------------------
+  mas-migrations:
+    image: mail-aggregator/api:${IMAGE_TAG:-local}
+    container_name: mas-migrations
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+      target: api
+      args:
+        PYTHON_VERSION: "3.12"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://mas:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-mail_aggregator}}
+    command: ["alembic", "upgrade", "head"]
+    networks:
+      - mas-net
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    <<: *logging_default
+
+  # -------------------------------------------------------------------------
+  # API — FastAPI behind gunicorn+uvicorn workers
+  # -------------------------------------------------------------------------
+  api:
+    image: mail-aggregator/api:${IMAGE_TAG:-local}
+    container_name: mas-api
+    <<: [*restart_default, *logging_default]
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+      target: api
+      args:
+        PYTHON_VERSION: "3.12"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-bootstrap:
+        condition: service_completed_successfully
+      mas-migrations:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+    environment:
+      # Override / pin a few values that must NEVER come from .env
+      # ambiguity. S3_* are explicitly mapped to APP keys (least-privilege).
+      DATABASE_URL:    ${DATABASE_URL:-postgresql+asyncpg://mas:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-mail_aggregator}}
+      REDIS_URL:       ${REDIS_URL:-redis://redis:6379/0}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://minio:9000}
+      S3_ACCESS_KEY:   ${MINIO_APP_ACCESS_KEY}
+      S3_SECRET_KEY:   ${MINIO_APP_SECRET_KEY}
+      S3_BUCKET_NAME:  ${S3_BUCKET_NAME:-mail-attachments}
+      S3_REGION:       ${S3_REGION:-us-east-1}
+    networks:
+      - mas-net
+    # Per docs/07-deployment.md sec.5: try read-only rootfs.
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    ulimits:
+      core: 0   # never write core dumps (mail master key would leak)
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import urllib.request, sys
+          r = urllib.request.urlopen("http://localhost:8080/healthz", timeout=3)
+          sys.exit(0 if r.status == 200 else 1)
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # -------------------------------------------------------------------------
+  # Worker — APScheduler sync_cycle + cleanup
+  # -------------------------------------------------------------------------
+  worker:
+    image: mail-aggregator/worker:${IMAGE_TAG:-local}
+    container_name: mas-worker
+    <<: [*restart_default, *logging_default]
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+      target: worker
+      args:
+        PYTHON_VERSION: "3.12"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-bootstrap:
+        condition: service_completed_successfully
+      # Worker waits for mas-migrations to finish so the schema is in
+      # place before any DB calls. No coupling to api lifecycle — worker
+      # can start in parallel with api once migrations are done.
+      mas-migrations:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL:    ${DATABASE_URL:-postgresql+asyncpg://mas:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-mail_aggregator}}
+      REDIS_URL:       ${REDIS_URL:-redis://redis:6379/0}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://minio:9000}
+      S3_ACCESS_KEY:   ${MINIO_APP_ACCESS_KEY}
+      S3_SECRET_KEY:   ${MINIO_APP_SECRET_KEY}
+      S3_BUCKET_NAME:  ${S3_BUCKET_NAME:-mail-attachments}
+      S3_REGION:       ${S3_REGION:-us-east-1}
+    networks:
+      - mas-net
+    read_only: true
+    tmpfs:
+      # Worker writes /tmp/worker_alive for healthcheck.
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    ulimits:
+      core: 0
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import time, os, sys
+          m = os.stat("/tmp/worker_alive").st_mtime
+          sys.exit(0 if (time.time() - m) < 360 else 1)
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # -------------------------------------------------------------------------
+  # Caddy — TLS + reverse proxy. Prod-only (profile: prod).
+  # In dev, hit api directly: `docker compose port api 8080`.
+  # -------------------------------------------------------------------------
+  caddy:
+    image: caddy:2.8-alpine
+    container_name: mas-caddy
+    <<: [*restart_default, *logging_default]
+    profiles: ["prod"]
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      CADDY_DOMAIN: ${CADDY_DOMAIN:?CADDY_DOMAIN must be set in prod profile}
+      CADDY_ACME_EMAIL: ${CADDY_ACME_EMAIL:?CADDY_ACME_EMAIL must be set in prod profile}
+    volumes:
+      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - mas_caddy_data:/data
+      - mas_caddy_config:/config
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - mas-net
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:2019/config/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+# ---------------------------------------------------------------------------
+# Volumes — all named, all on default driver. Backup policy in
+# docs/07-deployment.md sec.8.
+# ---------------------------------------------------------------------------
+volumes:
+  mas_pg_data:
+    name: mas_pg_data
+  mas_redis_data:
+    name: mas_redis_data
+  mas_minio_data:
+    name: mas_minio_data
+  mas_caddy_data:
+    name: mas_caddy_data
+  mas_caddy_config:
+    name: mas_caddy_config
+
+# ---------------------------------------------------------------------------
+# Network — single user-defined bridge. Service-to-service traffic stays
+# inside this network; only caddy publishes ports to the host.
+# ---------------------------------------------------------------------------
+networks:
+  mas-net:
+    name: mas-net
+    driver: bridge

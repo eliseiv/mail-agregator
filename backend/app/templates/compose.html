@@ -1,0 +1,140 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m with context %}
+
+{% block title %}{% if reply_to %}Reply{% else %}Compose{% endif %} &middot; Mail Aggregator{% endblock %}
+{% block body_class %}compose{% endblock %}
+
+{% block content %}
+<section class="compose" aria-labelledby="compose-heading">
+
+  <nav class="compose__toolbar" aria-label="Compose actions">
+    <a class="btn btn--secondary" href="{% if reply_to %}/messages/{{ reply_to }}{% else %}/{% endif %}">
+      &larr; Cancel
+    </a>
+  </nav>
+
+  <h1 id="compose-heading" class="compose__title">
+    {% if reply_to %}Reply{% else %}New message{% endif %}
+  </h1>
+
+  {% if error_message %}
+    <p class="form-error" role="alert" data-compose-error>{{ error_message | e }}</p>
+  {% else %}
+    <p class="form-error" role="alert" data-compose-error hidden></p>
+  {% endif %}
+
+  {# Form-encoded POST is supported by the backend (see 08-frontend.md sec 8) so
+     compose works without JS. JS upgrades it to fetch+JSON via compose.js. #}
+  <form
+    method="POST"
+    action="/api/messages/send"
+    class="form compose__form"
+    enctype="application/x-www-form-urlencoded"
+    novalidate
+    data-compose-form>
+    {{ m.csrf_input() }}
+
+    {% if reply_to %}
+      <input type="hidden" name="in_reply_to_message_id" value="{{ reply_to }}">
+    {% endif %}
+
+    <div class="field">
+      <label class="field__label" for="compose-from">From</label>
+      <select
+        class="field__input"
+        id="compose-from"
+        name="from_account_id"
+        required>
+        {% if not accounts %}
+          <option value="" disabled selected>(no mail accounts — add one first)</option>
+        {% endif %}
+        {% for acc in accounts | default([]) %}
+          <option
+            value="{{ acc.id }}"
+            {% if default_from_account_id is defined and default_from_account_id and default_from_account_id == acc.id %}selected{% elif loop.first and not default_from_account_id %}selected{% endif %}>
+            {{ acc.email | e }}
+          </option>
+        {% endfor %}
+      </select>
+    </div>
+
+    <div class="field">
+      <label class="field__label" for="compose-to">To</label>
+      <input
+        class="field__input"
+        type="text"
+        id="compose-to"
+        name="to"
+        required
+        autocomplete="off"
+        placeholder="comma,separated@addresses"
+        value="{{ form.to | default('') | e }}"
+        data-compose-emails>
+      <p class="field__hint">Separate multiple addresses with commas.</p>
+    </div>
+
+    <div class="field">
+      <label class="field__label" for="compose-cc">Cc <span class="field__optional">(optional)</span></label>
+      <input
+        class="field__input"
+        type="text"
+        id="compose-cc"
+        name="cc"
+        autocomplete="off"
+        value="{{ form.cc | default('') | e }}"
+        data-compose-emails>
+    </div>
+
+    <div class="field">
+      <label class="field__label" for="compose-bcc">Bcc <span class="field__optional">(optional)</span></label>
+      <input
+        class="field__input"
+        type="text"
+        id="compose-bcc"
+        name="bcc"
+        autocomplete="off"
+        value="{{ form.bcc | default('') | e }}"
+        data-compose-emails>
+    </div>
+
+    <div class="field">
+      <label class="field__label" for="compose-subject">Subject</label>
+      <input
+        class="field__input"
+        type="text"
+        id="compose-subject"
+        name="subject"
+        maxlength="998"
+        autocomplete="off"
+        value="{{ form.subject | default('') | e }}"
+        data-compose-subject>
+      <p class="field__hint">
+        <span data-compose-subject-count>0</span>/998
+      </p>
+    </div>
+
+    <div class="field">
+      <label class="field__label" for="compose-body">Message</label>
+      <textarea
+        class="field__input field__input--textarea"
+        id="compose-body"
+        name="body"
+        rows="16"
+        maxlength="1048576"
+        data-compose-body>{{ form.body | default('') | e }}</textarea>
+      <p class="field__hint">Plain text only. Maximum 1 MiB.</p>
+    </div>
+
+    <div class="form-actions">
+      <button type="submit" class="btn btn--primary" data-compose-submit
+              {% if not accounts %}disabled{% endif %}>
+        Send
+      </button>
+    </div>
+  </form>
+</section>
+{% endblock %}
+
+{% block extra_js %}
+<script src="/static/js/compose.js"></script>
+{% endblock %}

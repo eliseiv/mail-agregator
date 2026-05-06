@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m with context %}
+
+{% block title %}Mail accounts &middot; Mail Aggregator{% endblock %}
+{% block body_class %}accounts-list{% endblock %}
+
+{% block content %}
+<section class="accounts" aria-labelledby="accounts-heading">
+  <header class="accounts__toolbar">
+    <h1 id="accounts-heading" class="accounts__title">Your mail accounts</h1>
+    <a class="btn btn--primary" href="/accounts/new">+ Add account</a>
+  </header>
+
+  {% if not accounts %}
+    <div class="accounts__empty" role="status">
+      <p>No mail accounts yet. Add one to start receiving mail.</p>
+      <a href="/accounts/new" class="btn btn--primary">Add account</a>
+    </div>
+  {% else %}
+    <ul class="account-list">
+      {% for acc in accounts %}
+        <li class="account-list__item {% if not acc.is_active %}account-list__item--disabled{% endif %}">
+          <div class="account-list__row">
+            <span class="account-list__indicator" aria-hidden="true">
+              {% if acc.is_active %}&#9679;{% else %}&#10006;{% endif %}
+            </span>
+            <span class="visually-hidden">{% if acc.is_active %}Active{% else %}Disabled{% endif %}</span>
+
+            <span class="account-list__email">{{ acc.email | e }}</span>
+
+            {% if acc.provider_label %}
+              <span class="account-list__provider">{{ acc.provider_label | e }}</span>
+            {% endif %}
+
+            <span class="account-list__sync">
+              {% if acc.last_synced_at %}
+                Last sync: {{ m.time_tag(acc.last_synced_at, acc.last_synced_at_human if acc.last_synced_at_human is defined else None) }}
+              {% else %}
+                Never synced
+              {% endif %}
+            </span>
+
+            <span class="account-list__actions">
+              <a class="btn btn--secondary btn--small" href="/accounts/{{ acc.id }}/edit">Edit</a>
+
+              <form
+                method="POST"
+                action="/api/mail-accounts/{{ acc.id }}/sync-now"
+                class="inline-form"
+                data-account-sync-form>
+                {{ m.csrf_input() }}
+                <button type="submit" class="btn btn--secondary btn--small">Sync now</button>
+              </form>
+
+              <form
+                method="POST"
+                action="/api/mail-accounts/{{ acc.id }}/delete"
+                class="inline-form"
+                data-account-delete-form
+                data-confirm="Delete account {{ acc.email | e }}? All cached messages will be removed.">
+                {{ m.csrf_input() }}
+                {# Backend exposes DELETE /api/mail-accounts/{id} for AJAX (account_form.js intercepts).
+                   For no-JS fallback this POST endpoint should accept a method-override; if the
+                   backend prefers the canonical DELETE, the JS handler still wins for users with JS. #}
+                <input type="hidden" name="_method" value="DELETE">
+                <button type="submit" class="btn btn--danger btn--small">Delete</button>
+              </form>
+            </span>
+          </div>
+
+          {% if acc.last_sync_error %}
+            <p class="account-list__error" role="alert">
+              <strong>Sync error:</strong> {{ acc.last_sync_error | e }}
+            </p>
+          {% endif %}
+        </li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+</section>
+{% endblock %}
+
+{% block extra_js %}
+<script src="/static/js/account_form.js"></script>
+{% endblock %}

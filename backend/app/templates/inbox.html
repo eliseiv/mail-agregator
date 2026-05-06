@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m with context %}
+
+{% block title %}Inbox &middot; Mail Aggregator{% endblock %}
+{% block body_class %}inbox{% endblock %}
+
+{% block content %}
+<section class="inbox" aria-labelledby="inbox-heading">
+
+  <header class="inbox__toolbar">
+    <h1 id="inbox-heading" class="inbox__title">Inbox</h1>
+
+    <div class="inbox__actions">
+      <a class="btn btn--primary" href="/compose">Compose new</a>
+
+      <form method="GET" action="/" class="inbox__filter inline-form" role="search">
+        <label class="visually-hidden" for="filter-account">Filter by account</label>
+        <select
+          class="field__input field__input--compact"
+          id="filter-account"
+          name="account_id"
+          data-inbox-filter>
+          <option value="">All accounts</option>
+          {% for acc in accounts | default([]) %}
+            <option
+              value="{{ acc.id }}"
+              {% if selected_account_id is defined and selected_account_id and selected_account_id == acc.id %}selected{% endif %}>
+              {{ acc.email | e }}
+            </option>
+          {% endfor %}
+        </select>
+
+        <label class="checkbox">
+          <input
+            type="checkbox"
+            name="unread"
+            value="1"
+            data-inbox-unread
+            {% if unread_only %}checked{% endif %}>
+          <span>Unread only</span>
+        </label>
+
+        <noscript>
+          <button type="submit" class="btn btn--secondary">Apply</button>
+        </noscript>
+      </form>
+
+      <button type="button" class="btn btn--secondary" data-inbox-refresh>Refresh</button>
+    </div>
+  </header>
+
+  {% if not accounts %}
+    {# Empty state — no mail accounts at all. #}
+    <div class="inbox__empty" role="status">
+      <p>No messages yet. Add a mail account to start syncing.</p>
+      <a href="/accounts/new" class="btn btn--primary">Add account</a>
+    </div>
+  {% elif not items %}
+    {# Has accounts, no messages match the current filter. #}
+    <div class="inbox__empty" role="status">
+      <p>
+        {% if unread_only or selected_account_id %}
+          No messages match this filter.
+        {% else %}
+          No messages yet. Sync runs automatically every few minutes.
+        {% endif %}
+      </p>
+    </div>
+  {% else %}
+    <ul class="inbox__list" data-inbox-list>
+      {% for msg in items %}
+        {% include "_message_row.html" %}
+      {% endfor %}
+    </ul>
+
+    {# Forward-only cursor pagination: backend returns ``next_cursor`` (opaque
+       base64). We build the next-page URL preserving the active filters so a
+       no-JS browser can keep paging. There is no ``prev_url`` because the
+       service layer does not expose a back-cursor. #}
+    {% if next_cursor %}
+      {% set next_qs = "?cursor=" ~ next_cursor %}
+      {% if selected_account_id %}{% set next_qs = next_qs ~ "&account_id=" ~ selected_account_id %}{% endif %}
+      {% if unread_only %}{% set next_qs = next_qs ~ "&unread=1" %}{% endif %}
+      {{ m.pagination_links(prev_url=None, next_url=next_qs) }}
+    {% endif %}
+  {% endif %}
+
+</section>
+{% endblock %}
+
+{% block extra_js %}
+<script src="/static/js/inbox.js"></script>
+{% endblock %}
