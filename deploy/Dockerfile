@@ -28,7 +28,7 @@ ARG APP_GID=1000
 # ---------------------------------------------------------------------------
 # Stage 1: builder — produce a frozen venv from pyproject.toml + uv.lock
 # ---------------------------------------------------------------------------
-FROM python:${PYTHON_VERSION}-slim AS builder
+FROM python:${PYTHON_VERSION}-slim-bullseye AS builder
 
 # uv is shipped as a static binary. Pin the version for reproducibility.
 COPY --from=ghcr.io/astral-sh/uv:0.4.27 /uv /usr/local/bin/uv
@@ -80,7 +80,7 @@ RUN uv sync --frozen --no-dev
 # ---------------------------------------------------------------------------
 # Stage 2: runtime-base — common slim runtime, non-root, /opt/venv on PATH
 # ---------------------------------------------------------------------------
-FROM python:${PYTHON_VERSION}-slim AS runtime-base
+FROM python:${PYTHON_VERSION}-slim-bullseye AS runtime-base
 
 ARG APP_UID
 ARG APP_GID
