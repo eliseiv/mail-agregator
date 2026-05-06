@@ -117,17 +117,27 @@ async def inbox_page(
     request: Request,
     db: DbSession,
     user: CurrentUser,
-    account_id: Annotated[int | None, Query(ge=1)] = None,
+    # ``account_id`` is accepted as a string so the empty value submitted by
+    # the "All accounts" option of the filter form (account_id=) doesn't blow
+    # up FastAPI's int parser. Same for ``unread``.
+    account_id: Annotated[str | None, Query()] = None,
     cursor: Annotated[str | None, Query(max_length=200)] = None,
-    unread: Annotated[bool | None, Query()] = None,
+    unread: Annotated[str | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
 ) -> Response:
     sess = request.state.session
+    parsed_account_id: int | None = None
+    if account_id and account_id.isdigit():
+        parsed_account_id = int(account_id)
+    parsed_unread: bool | None = None
+    if unread:
+        parsed_unread = unread.lower() in ("1", "true", "on", "yes")
+
     accounts = await MailAccountsRepo(db).list_for_user(user.id)
     listing = await MessageService(db).list_for_user(
         user_id=user.id,
-        account_id=account_id,
-        unread=unread,
+        account_id=parsed_account_id,
+        unread=parsed_unread,
         cursor=cursor,
         limit=limit,
     )
@@ -139,8 +149,8 @@ async def inbox_page(
             "items": listing.items,
             "next_cursor": listing.next_cursor,
             "accounts": accounts,
-            "selected_account_id": account_id,
-            "unread_only": bool(unread),
+            "selected_account_id": parsed_account_id,
+            "unread_only": bool(parsed_unread),
             "unread_count": unread_count,
             "csrf_token": sess.csrf_token,
             "session": sess,

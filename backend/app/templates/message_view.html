@@ -36,13 +36,13 @@
       <div class="message__meta-row">
         <dt>To</dt>
         <dd>
-          {% if message.to_addrs %}{{ message.to_addrs | join(', ') | e }}{% else %}&mdash;{% endif %}
+          {% if message.to_addrs %}{{ message.to_addrs | e }}{% else %}&mdash;{% endif %}
         </dd>
       </div>
       {% if message.cc_addrs %}
         <div class="message__meta-row">
           <dt>Cc</dt>
-          <dd>{{ message.cc_addrs | join(', ') | e }}</dd>
+          <dd>{{ message.cc_addrs | e }}</dd>
         </div>
       {% endif %}
       <div class="message__meta-row">

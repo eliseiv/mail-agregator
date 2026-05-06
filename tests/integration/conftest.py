@@ -125,9 +125,7 @@ async def client(app: Any) -> AsyncIterator[httpx.AsyncClient]:
 # ---------------------------------------------------------------------------
 
 
-async def two_step_login(
-    client: httpx.AsyncClient, username: str, password: str
-) -> httpx.Response:
+async def two_step_login(client: httpx.AsyncClient, username: str, password: str) -> httpx.Response:
     """Drive the two-step login flow (ADR-0016) on ``client``.
 
     Returns the step-2 response so callers can grab cookies (``mas_session``,
@@ -143,12 +141,11 @@ async def two_step_login(
         302,
         303,
     ), f"step1 expected redirect, got {r1.status_code}: {r1.text[:200]}"
-    r2 = await client.post(
+    return await client.post(
         "/login/password",
         data={"password": password},
         headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
-    return r2
 
 
 @pytest_asyncio.fixture
