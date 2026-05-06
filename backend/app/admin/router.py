@@ -346,6 +346,16 @@ async def admin_audit_page(
         page=page,
         limit=limit,
     )
+    # Build query string for pagination links (preserves active filters).
+    qs_parts = []
+    if action:
+        qs_parts.append(f"action={action}")
+    if target_user_id is not None:
+        qs_parts.append(f"target_user_id={target_user_id}")
+    if limit != 50:
+        qs_parts.append(f"limit={limit}")
+    query_qs = "&".join(qs_parts) + ("&" if qs_parts else "")
+
     return await render(
         request,
         "admin/audit.html",
@@ -354,7 +364,22 @@ async def admin_audit_page(
             "total": listing.total,
             "page": listing.page,
             "limit": listing.limit,
-            "action_filter": action or "",
+            "filter": {
+                "action": action or "",
+                "target_user_id": target_user_id,
+                "from": "",
+                "to": "",
+            },
+            "available_actions": [
+                "user_create",
+                "user_delete",
+                "password_reset",
+                "admin_login",
+                "admin_logout",
+                "lockout_triggered",
+                "account_auto_disabled",
+            ],
+            "query_qs": query_qs,
             "csrf_token": sess.csrf_token,
             "session": sess,
         },
