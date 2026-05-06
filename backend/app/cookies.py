@@ -7,7 +7,7 @@ short-lived state cookie carrying the username between step-1 and step-2 of
 the two-step login flow — ADR-0016).
 
 Per ``docs/06-security.md`` sec. 5: ``Secure`` flag only in prod (TLS is
-terminated upstream by Caddy in dev there is no TLS).
+terminated upstream by the nginx reverse proxy; in dev there is no TLS).
 """
 
 from __future__ import annotations

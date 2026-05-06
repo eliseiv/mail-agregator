@@ -217,11 +217,11 @@ CSP запрещает inline JS — все скрипты только из `/s
 
 ## 9. TLS / в проде
 
-- Reverse proxy (Caddy/nginx) обязателен в проде.
-- Caddy автоматически получает Let's Encrypt-сертификат.
+- Reverse proxy (nginx 1.27) обязателен в проде.
+- Сертификат Let's Encrypt получается через certbot/webroot (см. `07-deployment.md` sec. 6).
 - Backend `api` слушает только на internal docker network, не публикуется наружу.
-- Минимальная версия TLS — 1.2 (Caddy default), желательно 1.3.
-- HSTS включается только когда подтверждено, что весь traffic — HTTPS (см. `07-deployment.md`).
+- Минимальная версия TLS — 1.2 (nginx 1.27 default — см. `deploy/nginx/nginx.conf`), включён 1.3.
+- HSTS (`max-age=63072000; includeSubDomains; preload`) выставляется на nginx-уровне в server-блоке `:443` — единая точка ответственности; backend такой header не дублирует.
 
 ---
 

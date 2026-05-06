@@ -391,7 +391,7 @@ flowchart LR
             rd[redis]
             mn[minio]
         end
-        rev[reverse proxy<br/>Caddy/nginx<br/>:443]
+        rev[reverse proxy<br/>nginx + certbot<br/>:80, :443]
     end
 
     Browser((Browser))
@@ -400,7 +400,7 @@ flowchart LR
     worker1 --> pg & rd & mn
 ```
 
-- TLS terminates на reverse proxy (Caddy с автоматическим Let's Encrypt — рекомендация).
+- TLS terminates на reverse proxy (nginx 1.27 + certbot/Let's Encrypt — см. `07-deployment.md` sec. 6).
 - Все backend-контейнеры в общей docker-сети, не публикуют порты наружу.
 - Только `:443` (proxy) и опционально `:9001` (MinIO console, ограничен по IP) выставляются.
 

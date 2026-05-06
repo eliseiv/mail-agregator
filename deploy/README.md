@@ -10,7 +10,11 @@ README is operational — what to run, in what order, with what flags.
 | --- | --- |
 | `Dockerfile` | Multi-stage build, two final targets: `api` and `worker`. |
 | `minio-bootstrap.sh` | Idempotent script run by the `minio-bootstrap` init container — creates the bucket, the `mas-app` policy, and the `MINIO_APP_*` service account. |
-| `caddy/Caddyfile` | Reverse-proxy + TLS termination config (prod profile only). |
+| `nginx/nginx.conf` | Main nginx config (mounted read-only at `/etc/nginx/nginx.conf`). |
+| `nginx/templates/default.conf.template` | Per-host server block; rendered at container start by the alpine entrypoint, which `envsubst`'s `${SERVER_DOMAIN}`. |
+
+For the operator-side bootstrap (DNS, firewall, first cert, GH secrets), see
+`docs/SERVER-SETUP.md` — it's the canonical first-run runbook.
 
 The compose file lives at the repo root (`/docker-compose.yml`) so
 `docker compose up` works without `-f`.
@@ -59,8 +63,10 @@ docker compose ps           # every service should show "(healthy)"
 curl http://localhost:8080/healthz   # only works if you publish api port (we don't by default)
 ```
 
-In dev the api port is **not** published to the host. To hit it without
-caddy, either:
+In dev the api port is **not** published to the host (the bundled
+`docker-compose.override.yml` re-publishes `127.0.0.1:8080:8080`). To hit
+it without the nginx front (which only runs under `--profile prod`),
+either:
 
 - exec into the network: `docker compose exec api curl localhost:8080/healthz`
 - or temporarily add `ports: ["8080:8080"]` under `services.api` in a
@@ -144,4 +150,6 @@ of the prod-shipped file entirely.
 | `api` stuck "starting" forever | DB migrations failing | `docker compose logs api` — look for alembic stack trace. |
 | `worker` healthcheck flaps | `/tmp/worker_alive` not written | Check worker process logs — APScheduler keep-alive job may have crashed. |
 | 503 from any endpoint | postgres or redis unhealthy | `docker compose ps`; restart the unhealthy service. |
-| TLS cert renewal failed | Caddy can't reach LE / port 80 blocked | `docker compose logs caddy`; check firewall on 80. |
+| TLS cert renewal failed | certbot can't reach LE / port 80 blocked | `docker compose logs certbot`; check UFW on 80; verify DNS A record matches host IP. |
+| nginx serves stale TLS cert after renewal | nginx not reloaded since cert rotated | `docker compose exec nginx nginx -s reload` (or rely on the weekly host cron — see `docs/SERVER-SETUP.md` Part D). |
+| `502 Bad Gateway` from nginx | api unhealthy | `docker logs mas-api`. |

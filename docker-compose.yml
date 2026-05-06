@@ -5,18 +5,19 @@
 # bootstrap order) and docs/06-security.md sec.12 (MinIO least-privilege).
 #
 # Layout:
-#   - api       : FastAPI (HTTP, internal :8080, fronted by caddy)
+#   - api       : FastAPI (HTTP, internal :8080, fronted by nginx in prod)
 #   - worker    : APScheduler sync_cycle + cleanup
 #   - postgres  : metadata + audit
 #   - redis     : sessions, rate-limit, force_sync flags
 #   - minio     : object storage for attachments
 #   - minio-bootstrap : one-shot init container (creates bucket, policy,
 #                      service account from MINIO_APP_*). Idempotent.
-#   - caddy     : TLS + reverse proxy (only in prod profile, see profiles)
+#   - nginx     : TLS + reverse proxy (only in prod profile, see profiles)
+#   - certbot   : Let's Encrypt cert renewal loop (only in prod profile)
 #
 # All services live on a single user-defined bridge network so DNS resolves
 # by service name (postgres / redis / minio / api). No host-port mapping
-# for postgres/redis/minio — only caddy publishes 80/443.
+# for postgres/redis/minio — only nginx publishes 80/443.
 #
 # Local dev:  docker compose up -d
 # Prod:       docker compose --profile prod up -d
@@ -179,7 +180,10 @@ services:
   # api — by then tables exist.
   # -------------------------------------------------------------------------
   mas-migrations:
-    image: mail-aggregator/api:${IMAGE_TAG:-local}
+    # IMAGE_REGISTRY is empty for local builds (resolves to "mail-aggregator/api:..."),
+    # set to e.g. ghcr.io/<owner>/<repo> on the prod host so `docker compose pull`
+    # fetches the CI-published image instead of rebuilding locally.
+    image: ${IMAGE_REGISTRY:-mail-aggregator}/api:${IMAGE_TAG:-local}
     container_name: mas-migrations
     build:
       context: .
@@ -208,7 +212,10 @@ services:
   # API — FastAPI behind gunicorn+uvicorn workers
   # -------------------------------------------------------------------------
   api:
-    image: mail-aggregator/api:${IMAGE_TAG:-local}
+    # IMAGE_REGISTRY is empty for local builds (resolves to "mail-aggregator/api:..."),
+    # set to e.g. ghcr.io/<owner>/<repo> on the prod host so `docker compose pull`
+    # fetches the CI-published image instead of rebuilding locally.
+    image: ${IMAGE_REGISTRY:-mail-aggregator}/api:${IMAGE_TAG:-local}
     container_name: mas-api
     <<: [*restart_default, *logging_default]
     build:
@@ -270,7 +277,7 @@ services:
   # Worker — APScheduler sync_cycle + cleanup
   # -------------------------------------------------------------------------
   worker:
-    image: mail-aggregator/worker:${IMAGE_TAG:-local}
+    image: ${IMAGE_REGISTRY:-mail-aggregator}/worker:${IMAGE_TAG:-local}
     container_name: mas-worker
     <<: [*restart_default, *logging_default]
     build:
@@ -330,24 +337,32 @@ services:
       start_period: 30s
 
   # -------------------------------------------------------------------------
-  # Caddy — TLS + reverse proxy. Prod-only (profile: prod).
-  # In dev, hit api directly: `docker compose port api 8080`.
+  # Nginx — TLS termination + reverse proxy. Prod-only (profile: prod).
+  # In dev, hit api directly via docker-compose.override.yml (publishes
+  # 127.0.0.1:8080) — nginx is never started.
+  #
+  # First-run requires a TLS cert: bring up the rest of the stack first,
+  # run certbot in standalone mode (Part B of docs/SERVER-SETUP.md), then
+  # `docker compose --profile prod up -d nginx certbot`.
   # -------------------------------------------------------------------------
-  caddy:
-    image: caddy:2.8-alpine
-    container_name: mas-caddy
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: mas-nginx
     <<: [*restart_default, *logging_default]
     profiles: ["prod"]
     depends_on:
       api:
         condition: service_healthy
     environment:
-      CADDY_DOMAIN: ${CADDY_DOMAIN:?CADDY_DOMAIN must be set in prod profile}
-      CADDY_ACME_EMAIL: ${CADDY_ACME_EMAIL:?CADDY_ACME_EMAIL must be set in prod profile}
+      # Substituted into /etc/nginx/templates/*.template at startup.
+      SERVER_DOMAIN: ${SERVER_DOMAIN:?SERVER_DOMAIN must be set in prod profile}
     volumes:
-      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
-      - mas_caddy_data:/data
-      - mas_caddy_config:/config
+      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./deploy/nginx/templates:/etc/nginx/templates:ro
+      # TLS certs and the ACME http-01 webroot are shared with certbot.
+      # Read-only here — only certbot writes.
+      - mas_certbot_certs:/etc/letsencrypt:ro
+      - mas_certbot_webroot:/var/www/certbot:ro
     ports:
       - "80:80"
       - "443:443"
@@ -356,11 +371,49 @@ services:
     security_opt:
       - no-new-privileges:true
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:2019/config/"]
+      # Loopback HTTP probe — listens on the same :80 server block where
+      # /_health_nginx returns 200. Intentionally HTTP (not HTTPS) so the
+      # check works even if the TLS cert is missing/expired.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/_health_nginx"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 10s
+      start_period: 5s
+
+  # -------------------------------------------------------------------------
+  # Certbot — Let's Encrypt cert renewal loop. Prod-only.
+  #
+  # Initial cert acquisition is a manual one-shot (see docs/SERVER-SETUP.md
+  # Part B). After that, this container loops every 12h running
+  # `certbot renew` against the webroot shared with nginx. If certs change,
+  # renewal succeeds; nginx must be reloaded out-of-band — we document a
+  # weekly host cron `docker compose exec nginx nginx -s reload` because
+  # certbot has no docker socket and the alternatives are all fragile.
+  # -------------------------------------------------------------------------
+  certbot:
+    image: certbot/certbot:v2.11.0
+    container_name: mas-certbot
+    <<: *logging_default
+    profiles: ["prod"]
+    volumes:
+      - mas_certbot_certs:/etc/letsencrypt
+      - mas_certbot_webroot:/var/www/certbot
+    # Loop forever: try renewal every 12h. --webroot uses the shared
+    # /var/www/certbot path that nginx serves under /.well-known/acme-challenge/.
+    # The --deploy-hook fires once per actual renewal — we just log; nginx
+    # reload is handled by an external host cron (see docs/SERVER-SETUP.md
+    # Part D / G), because certbot has no way to signal nginx without the
+    # docker socket.
+    entrypoint: >-
+      sh -c 'trap exit TERM; while :; do certbot renew
+      --webroot -w /var/www/certbot --quiet
+      --deploy-hook "echo $$(date -Iseconds) cert renewed; touch /etc/letsencrypt/.reload-needed";
+      sleep 12h & wait $${!}; done'
+    networks:
+      - mas-net
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
 
 # ---------------------------------------------------------------------------
 # Volumes — all named, all on default driver. Backup policy in
@@ -373,14 +426,17 @@ volumes:
     name: mas_redis_data
   mas_minio_data:
     name: mas_minio_data
-  mas_caddy_data:
-    name: mas_caddy_data
-  mas_caddy_config:
-    name: mas_caddy_config
+  # Let's Encrypt store: account keys + /live/<domain>/{fullchain,privkey,chain}.pem
+  mas_certbot_certs:
+    name: mas_certbot_certs
+  # Webroot used by certbot --webroot for http-01 challenges; mounted
+  # read-only into nginx, read-write into certbot.
+  mas_certbot_webroot:
+    name: mas_certbot_webroot
 
 # ---------------------------------------------------------------------------
 # Network — single user-defined bridge. Service-to-service traffic stays
-# inside this network; only caddy publishes ports to the host.
+# inside this network; only nginx publishes ports to the host (80/443).
 # ---------------------------------------------------------------------------
 networks:
   mas-net:

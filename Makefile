@@ -40,7 +40,7 @@ up: env ## Start full stack in background (dev profile)
 	$(COMPOSE) up -d
 
 .PHONY: up-prod
-up-prod: env ## Start full stack incl. caddy (prod profile)
+up-prod: env ## Start full stack incl. nginx + certbot (prod profile)
 	$(COMPOSE_PROD) up -d
 
 .PHONY: down

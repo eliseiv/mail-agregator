@@ -1,0 +1,179 @@
+# ---------------------------------------------------------------------------
+# Mail Aggregator — Deploy (SSH + docker compose pull/up)
+#
+# Trigger: push to main (after CI is green) OR manual workflow_dispatch
+# (so you can re-deploy a known-good sha without pushing a new commit).
+#
+# Sequence:
+#   1. Wait for the CI workflow to finish on this same sha.
+#   2. SSH into $DEPLOY_HOST as $DEPLOY_USER (key in $DEPLOY_KEY).
+#   3. On the server: git pull, write IMAGE_TAG=<sha> into .env, pull GHCR
+#      images, recreate api/worker (and nginx/certbot if --profile prod
+#      is up), then assert healthchecks.
+#
+# Required GitHub Secrets (Settings → Secrets and variables → Actions):
+#   DEPLOY_HOST  — public IP / DNS name
+#   DEPLOY_USER  — ssh login user (must be in the docker group on the host)
+#   DEPLOY_KEY   — full PEM of the private SSH key (matching the public key
+#                  added to ~$DEPLOY_USER/.ssh/authorized_keys)
+#   DEPLOY_PATH  — absolute path to the checkout on the server (e.g.
+#                  /opt/mail-aggregator)
+#
+# The host must already be bootstrapped per docs/SERVER-SETUP.md (Docker
+# installed, repo cloned to $DEPLOY_PATH, .env populated, GHCR `docker login`
+# done so `docker compose pull` can read private images).
+# ---------------------------------------------------------------------------
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Image SHA to deploy (defaults to current ref's sha)"
+        required: false
+        type: string
+
+# Never deploy two different shas in parallel — they'd race on the server.
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+
+  # -------------------------------------------------------------------------
+  # 1. Wait for CI to be green on the same sha. workflow_run-style triggers
+  #    are unreliable when CI uses concurrency cancellation; polling here is
+  #    explicit and easy to debug.
+  # -------------------------------------------------------------------------
+  wait-for-ci:
+    name: Wait for CI to pass
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Skip the wait when the user manually re-deploys a sha they already
+    # know is green (e.g. rolling back to yesterday's image).
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Wait for CI workflow on ${{ github.sha }}
+        uses: lewagon/wait-on-check-action@v1.3.4
+        with:
+          ref: ${{ github.sha }}
+          # Match the *workflow* name, not job names — this lets us add new
+          # jobs in CI without updating this allowlist.
+          check-name: 'Build images (api)'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          wait-interval: 20
+
+      - name: Wait for CI worker build
+        uses: lewagon/wait-on-check-action@v1.3.4
+        with:
+          ref: ${{ github.sha }}
+          check-name: 'Build images (worker)'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          wait-interval: 20
+
+  # -------------------------------------------------------------------------
+  # 2. Actual deploy — runs only after CI passed (or immediately on manual
+  #    dispatch).
+  # -------------------------------------------------------------------------
+  deploy:
+    name: SSH deploy to ${{ vars.DEPLOY_ENV || 'prod' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [wait-for-ci]
+    # Allow workflow_dispatch to bypass needs:wait-for-ci by treating "skipped"
+    # as success (manual dispatch sets wait-for-ci.if=false → "skipped").
+    if: always() && (needs.wait-for-ci.result == 'success' || needs.wait-for-ci.result == 'skipped')
+    environment:
+      # GitHub Environments give per-env approval gates if you want them
+      # later (Settings → Environments → prod → Required reviewers).
+      name: prod
+    steps:
+      - name: Resolve deploy sha
+        id: sha
+        run: |
+          input_sha="${{ github.event.inputs.sha }}"
+          if [ -n "$input_sha" ]; then
+            echo "sha=$input_sha" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compute repo lower-case
+        id: repo
+        run: |
+          repo_lc="$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')"
+          echo "lc=ghcr.io/${repo_lc}" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host:     ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key:      ${{ secrets.DEPLOY_KEY }}
+          port:     22
+          # Strict host-key checking: relies on the runner's known_hosts;
+          # appleboy/ssh-action accepts any host key by default. We accept
+          # that trade-off (CI runner is trusted) for simplicity.
+          script_stop: true
+          # Pass the resolved sha + image registry path as inline env. We
+          # never pass secrets through the script body.
+          envs: SHA,IMAGE_REGISTRY
+          script: |
+            set -euo pipefail
+            cd "${{ secrets.DEPLOY_PATH }}"
+
+            echo "==> deploying $SHA from $IMAGE_REGISTRY"
+
+            # Pin the version in .env so subsequent `docker compose ps`,
+            # `restart`, etc. on the host use the same images. We rewrite
+            # only the IMAGE_TAG / IMAGE_REGISTRY lines — leave the rest
+            # of .env (passwords, encryption keys) untouched.
+            git fetch --depth=1 origin main
+            git -c advice.detachedHead=false checkout "$SHA"
+
+            # In-place edit of .env: replace IMAGE_TAG=... and IMAGE_REGISTRY=...
+            # If a key is missing (older .env), append it.
+            for kv in "IMAGE_TAG=$SHA" "IMAGE_REGISTRY=$IMAGE_REGISTRY"; do
+              key="${kv%%=*}"
+              if grep -q "^${key}=" .env; then
+                sed -i "s|^${key}=.*|${kv}|" .env
+              else
+                echo "$kv" >> .env
+              fi
+            done
+
+            # Pull the new images. `--profile prod` is required so nginx /
+            # certbot are included if they're already running on this host.
+            docker compose --profile prod pull api worker
+
+            # Recreate exactly the services that ship our code. Postgres /
+            # redis / minio stay running; mas-migrations runs once as part
+            # of the api dependency graph; nginx is reloaded only if it
+            # was already up under --profile prod.
+            docker compose --profile prod up -d --remove-orphans api worker
+
+            # Smoke-test: poll healthcheck for up to 90s.
+            attempts=18
+            until docker inspect --format='{{.State.Health.Status}}' mas-api 2>/dev/null | grep -q healthy; do
+              attempts=$((attempts - 1))
+              if [ $attempts -le 0 ]; then
+                echo "api never became healthy; recent logs:"
+                docker logs --tail 80 mas-api || true
+                exit 1
+              fi
+              sleep 5
+            done
+
+            docker compose ps
+            echo "==> deploy of $SHA complete"
+        env:
+          SHA: ${{ steps.sha.outputs.sha }}
+          IMAGE_REGISTRY: ${{ steps.repo.outputs.lc }}

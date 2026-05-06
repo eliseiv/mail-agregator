@@ -41,7 +41,7 @@ log = get_logger(__name__)
 
 
 def client_ip(request: Request) -> str:
-    """Best-effort client IP. Trusts ``X-Forwarded-For`` from Caddy."""
+    """Best-effort client IP. Trusts ``X-Forwarded-For`` from the nginx reverse proxy."""
     xff = request.headers.get("x-forwarded-for")
     if xff:
         return xff.split(",")[0].strip()

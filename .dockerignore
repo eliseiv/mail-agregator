@@ -55,7 +55,7 @@ shared/tests/
 
 # Docker / compose self-references (avoid recursive context bloat)
 deploy/docker-compose.yml
-deploy/caddy/
+deploy/nginx/
 deploy/minio-bootstrap.sh
 
 # OS junk

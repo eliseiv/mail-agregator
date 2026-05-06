@@ -14,24 +14,29 @@ flowchart LR
         pg[postgres<br/>:5432 internal]
         rd[redis<br/>:6379 internal]
         mn[minio<br/>:9000 internal<br/>:9001 console]
-        cd[caddy<br/>:80, :443]
+        ng[nginx<br/>:80, :443]
+        cb[certbot<br/>renewal loop]
     end
 
-    cd --> api
+    ng --> api
     api --> pg & rd & mn
     worker --> pg & rd & mn
+    cb -. webroot+certs .- ng
 ```
 
 | Сервис | Image | Restart | Ports (host:container) | Зависит от (depends_on healthy) |
 | --- | --- | --- | --- | --- |
-| `caddy` | `caddy:2.8-alpine` | always | `80:80, 443:443` | api |
-| `api` | local build (`api.Dockerfile`) | always | (только internal) | postgres, redis, minio |
-| `worker` | local build (`worker.Dockerfile`) | always | (нет) | postgres, redis, minio |
-| `postgres` | `postgres:16-alpine` | always | (только internal) | — |
-| `redis` | `redis:7.2-alpine` | always | (только internal) | — |
-| `minio` | `minio/minio:RELEASE.2024-08-29T01-40-52Z` (или новее latest stable) | always | `9001:9001` (console, только если нужно; обычно за VPN) | — |
+| `nginx` | `nginx:1.27-alpine` | unless-stopped | `80:80, 443:443` | api |
+| `certbot` | `certbot/certbot:v2.11.0` | unless-stopped | (нет) | — (shares two volumes with nginx) |
+| `api` | local build / GHCR (`deploy/Dockerfile` target `api`) | unless-stopped | (только internal) | postgres, redis, minio, minio-bootstrap, mas-migrations |
+| `worker` | local build / GHCR (`deploy/Dockerfile` target `worker`) | unless-stopped | (нет) | postgres, redis, minio, minio-bootstrap, mas-migrations |
+| `postgres` | `postgres:16-alpine` | unless-stopped | (только internal) | — |
+| `redis` | `redis:7.2-alpine` | unless-stopped | (только internal) | — |
+| `minio` | `minio/minio:RELEASE.2024-08-29T01-40-52Z` | unless-stopped | `127.0.0.1:9001:9001` (console, dev; в prod закрыт за firewall/VPN) | — |
 
 Все internal-порты в общей docker network `mas-net` (default bridge). Никаких host-port mapping для api/postgres/redis/minio:9000.
+
+`nginx` и `certbot` запускаются только под `--profile prod` — в dev их нет, api публикуется на `127.0.0.1:8080` через `docker-compose.override.yml`.
 
 ---
 
@@ -42,8 +47,8 @@ flowchart LR
 | `mas_pg_data` | postgres | `/var/lib/postgresql/data` | **Critical** — основные данные |
 | `mas_minio_data` | minio | `/data` | **Critical** — вложения |
 | `mas_redis_data` | redis | `/data` (если включить AOF) | Low — можно потерять (sessions релогинятся) |
-| `mas_caddy_data` | caddy | `/data` (TLS certs) | Medium — рестор Let's Encrypt автоматически, но избегаем rate-limit |
-| `mas_caddy_config` | caddy | `/config` | Low |
+| `mas_certbot_certs` | certbot (RW), nginx (RO) | `/etc/letsencrypt` (account keys + `live/<domain>/{fullchain,privkey,chain}.pem`) | Medium — рестор Let's Encrypt автоматически, но избегаем rate-limit (5 fails/час, 50 certs/нед на домен) |
+| `mas_certbot_webroot` | certbot (RW), nginx (RO) | `/var/www/certbot` (HTTP-01 challenge files) | Low — пересоздаётся при каждом renewal |
 
 Все volumes — named volumes Docker.
 
@@ -101,8 +106,19 @@ healthcheck:
   retries: 5
 ```
 
-### `caddy`
-По умолчанию (process supervisor); опционально `caddy --pingback`.
+### `nginx`
+```yaml
+healthcheck:
+  test: ["CMD", "wget", "-qO-", "http://127.0.0.1/_health_nginx"]
+  interval: 30s
+  timeout: 5s
+  retries: 3
+  start_period: 5s
+```
+Server-блок отвечает `200 ok\n` на `/_health_nginx` (HTTP, не HTTPS — чтобы не зависеть от наличия cert).
+
+### `certbot`
+Healthcheck не настроен — это бесконечный sleep-цикл renewal. Достаточно `restart: unless-stopped`. Логи: `docker logs mas-certbot`.
 
 ---
 
@@ -187,11 +203,19 @@ healthcheck:
 | `SETUP_SESSION_TTL_SECONDS` | `900` | no | 15 минут. |
 | `COOKIE_DOMAIN` | (none) | no | Если задан — кладётся в Set-Cookie domain. |
 
-### Caddy
+### Reverse proxy + TLS (nginx + certbot)
 
 | Переменная | Default | Required | Описание |
 | --- | --- | --- | --- |
-| `CADDY_DOMAIN` | (none) | yes (prod) | FQDN для TLS (например, `mail.example.com`). |
+| `SERVER_DOMAIN` | (none) | yes (prod) | FQDN для TLS (например, `mail.example.com`). nginx envsubst-ит в `default.conf`; certbot использует для запроса cert. |
+| `ACME_EMAIL` | `admin@example.com` | yes (prod) | Контакт для Let's Encrypt — приходят уведомления о истечении сертификата + reset-ссылки для аккаунта LE. |
+
+### CI / Build
+
+| Переменная | Default | Required | Описание |
+| --- | --- | --- | --- |
+| `IMAGE_REGISTRY` | (empty → `mail-aggregator`) | no | Префикс образа. На prod-сервере выставить `ghcr.io/<owner>/<repo>` чтобы compose pull тянул published-образы. |
+| `IMAGE_TAG` | `local` | no | Тег образа. CI выставляет `${{ github.sha }}`; deploy.yml перезаписывает `IMAGE_TAG` в `.env` на сервере. |
 
 ---
 
@@ -209,34 +233,54 @@ healthcheck:
 
 ---
 
-## 6. Caddy — пример Caddyfile
+## 6. Reverse proxy: nginx + certbot
 
+TLS терминируется на nginx; cert получаем у Let's Encrypt через certbot. Нужны открытые на firewall'е порты `80` (HTTP-01 challenge + 301 redirect) и `443` (HTTPS).
+
+### Файлы
+
+- `deploy/nginx/nginx.conf` — main config (worker процессы, gzip, log_format, общие SSL defaults).
+- `deploy/nginx/templates/default.conf.template` — server-блок для `${SERVER_DOMAIN}`. nginx alpine-образ автоматически рендерит шаблоны из `/etc/nginx/templates/` через envsubst при старте контейнера.
+
+### Поведение server-блока
+
+- Listen `80` — HTTP→HTTPS 301 redirect, **кроме** `/.well-known/acme-challenge/*` (раздаётся из webroot для cert challenge) и `/_health_nginx` (healthcheck).
+- Listen `443 ssl http2` — proxy_pass на `http://api:8080`. Cert из `mas_certbot_certs` volume (`/etc/letsencrypt/live/${SERVER_DOMAIN}/`).
+- Headers вверх: `Host`, `X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Proto: https`, `X-Forwarded-Host`, `X-Request-ID`. Backend полагается на эти headers для cookie Secure + audit IP + Message-ID URL-build.
+- HSTS: `Strict-Transport-Security: max-age=63072000; includeSubDomains; preload`.
+- gzip on для text/css, application/json, application/javascript, application/xml+rss, atom, image/svg+xml. text/html включается gzip-модулем по умолчанию — добавлять его в `gzip_types` нельзя (warning duplicate MIME type).
+- `client_max_body_size 30m` (под MAX_ATTACHMENT_BYTES=25 MiB + MIME overhead).
+- `proxy_read_timeout 60s` / `proxy_send_timeout 60s` / `proxy_connect_timeout 5s` — выровнено с gunicorn `--timeout=60` в api Dockerfile.
+
+### Первое получение cert (standalone)
+
+В первый запуск nginx падает (нет cert). Bootstrap:
+
+```bash
+# поднимаем всё КРОМЕ nginx
+docker compose up -d postgres redis minio minio-bootstrap mas-migrations api worker
+
+# certbot standalone — занимает порт 80 на время challenge
+docker compose run --rm -p 80:80 certbot certonly --standalone \
+  -d "$SERVER_DOMAIN" --email "$ACME_EMAIL" --agree-tos --no-eff-email
+
+# теперь поднимаем nginx + renewal-loop
+docker compose --profile prod up -d nginx certbot
 ```
-{$CADDY_DOMAIN} {
-    encode zstd gzip
 
-    @static path /static/*
-    handle @static {
-        reverse_proxy api:8080
-        header Cache-Control "public, max-age=86400"
-    }
+### Renewal
 
-    handle {
-        reverse_proxy api:8080 {
-            header_up X-Forwarded-Proto {scheme}
-            header_up X-Forwarded-For {remote_host}
-        }
-    }
+`certbot` контейнер — бесконечный цикл `certbot renew --webroot -w /var/www/certbot --quiet` каждые 12 часов. При успешном renewal:
 
-    header {
-        Strict-Transport-Security "max-age=31536000; includeSubDomains"
-    }
-}
-```
+1. Cert файлы в `mas_certbot_certs` обновляются.
+2. `--deploy-hook` создаёт маркер `/etc/letsencrypt/.reload-needed` (виден в обоих контейнерах через volume).
+3. **Nginx нужно перезагрузить вручную** — certbot не имеет docker socket, и signal-механизмы между контейнерами хрупкие. Способ: внешний host-cron, например еженедельно:
+   ```cron
+   0 4 * * 1 cd /opt/mail-aggregator && docker compose --profile prod exec -T nginx nginx -s reload
+   ```
+   `nginx -s reload` graceful — без потерь активных соединений. Cert меняется раз в 60 дней, так что недельный cron безопасно покрывает rotation window.
 
-Caddy сам берёт TLS у Let's Encrypt; нужен открытый порт 80 (для challenge) и 443.
-
-В dev — заменить блок `{$CADDY_DOMAIN}` на `:8080` (без TLS) и опустить HSTS.
+В dev TLS не терминируется на nginx — его просто нет под `--profile prod`. API публикуется на `127.0.0.1:8080` через `docker-compose.override.yml`.
 
 ---
 
@@ -250,7 +294,7 @@ cd mail-aggregator
 cp .env.example .env
 # Отредактировать .env: MAIL_ENCRYPTION_KEY, ADMIN_PASSWORD, POSTGRES_PASSWORD,
 #   MINIO_ROOT_USER, MINIO_ROOT_PASSWORD, MINIO_APP_ACCESS_KEY, MINIO_APP_SECRET_KEY,
-#   CADDY_DOMAIN, APP_BASE_URL
+#   SERVER_DOMAIN, ACME_EMAIL, APP_BASE_URL
 docker compose up -d --build
 docker compose logs -f api worker
 ```
@@ -264,21 +308,35 @@ docker compose logs -f api worker
    - `Storage.ensure_bucket` — defensive проверка `head_bucket`; bucket уже создан init-контейнером, шаг возвращается мгновенно.
 4. `worker` стартует с теми же зависимостями.
 
-UI доступен на `https://{CADDY_DOMAIN}/login`.
+UI доступен на `https://${SERVER_DOMAIN}/login`. Полный operator-runbook по подъёму свежего prod-сервера (DNS, firewall, GH secrets, GHCR auth, бэкапы) — `docs/SERVER-SETUP.md`.
 
 ### Обновление (deploy)
 
+Автоматический путь — push в `main`, CI собирает и пушит образы в GHCR, `deploy.yml` забирает их на сервер. См. `docs/SERVER-SETUP.md` Часть E.
+
+Ручной путь (если CI/workflow недоступны):
+
 ```bash
-git pull
-docker compose build api worker
-docker compose up -d api worker  # без рестарта postgres/redis/minio
+cd /opt/mail-aggregator
+git pull origin main
+docker compose --profile prod pull api worker
+docker compose --profile prod up -d --remove-orphans api worker
+docker compose ps
 ```
 
-Migrations применяются автоматически. **Важно**: писать migrations совместимо снизу-вверх (online schema changes; не блокирующие). Если миграция требует downtime — devops согласовывает окно.
+Migrations применяются автоматически (init-контейнер `mas-migrations`). **Важно**: писать migrations совместимо снизу-вверх (online schema changes; не блокирующие). Если миграция требует downtime — devops согласовывает окно.
 
 ### Откат
 
-- При ошибке запуска новой версии: `docker compose tag api:previous && docker compose up -d api`. (Нюансы — ответственность devops; на первой итерации просто `git checkout <tag> && docker compose up -d --build`.)
+- Через workflow_dispatch на `Deploy`: запустить вручную, передать sha из known-good коммита.
+- Вручную на сервере:
+  ```bash
+  cd /opt/mail-aggregator
+  git checkout <previous-tag-or-sha>
+  sed -i "s|^IMAGE_TAG=.*|IMAGE_TAG=<previous-sha>|" .env
+  docker compose --profile prod pull api worker
+  docker compose --profile prod up -d api worker
+  ```
 - Откат migrations: Alembic поддерживает `downgrade`, но в проде применять с осторожностью; preferred — write-forward fix (новая миграция).
 
 ---
@@ -334,16 +392,19 @@ docker run --rm -v mas_minio_data:/data -v /backups/minio:/out alpine tar czf /o
 - Upload coverage report (artifact).
 
 #### 3. `build`
-- Только при push в `main` или ручном trigger.
-- `docker build -f deploy/api.Dockerfile -t api:${{ github.sha }} .`
-- `docker build -f deploy/worker.Dockerfile -t worker:${{ github.sha }} .`
-- (опционально) `trivy image` — security scan.
+- На PR: `docker buildx build target=api|worker` без push (sanity check Dockerfile).
+- На push в `main`: тот же build + push в **GHCR** (`ghcr.io/<owner>/<repo>/api:<sha>` и `:latest`, аналогично для `worker`).
+- Аутентификация: `docker/login-action@v3` с `username=${{ github.actor }}` и `password=${{ secrets.GITHUB_TOKEN }}` (GH автоматически выдаёт). Опт-ин `permissions: packages: write` только в этой job (не workflow-wide).
+- Trivy security-scan — отдельный workflow (`security.yml`).
 
-#### 4. `deploy` (опционально, в первой итерации — manual)
-- Push images в registry (GHCR / Docker Hub).
-- SSH на сервер, `docker compose pull && up -d`.
-
-Конкретные YAML-файлы — ответственность devops.
+#### 4. `deploy` (`.github/workflows/deploy.yml`)
+- Триггер: push в `main` после CI green ИЛИ ручной `workflow_dispatch` (можно передать sha для отката на known-good).
+- Шаги:
+  1. `wait-for-ci` job дожидается зелёного `Build images (api)` и `Build images (worker)` на этой sha (через `lewagon/wait-on-check-action`).
+  2. `deploy` job: `appleboy/ssh-action` SSH'ится на `$DEPLOY_HOST` под `$DEPLOY_USER`, на сервере: `git checkout <sha>`, перезаписывает `IMAGE_TAG`/`IMAGE_REGISTRY` в `.env`, `docker compose --profile prod pull api worker`, `docker compose --profile prod up -d api worker`, ждёт healthy 90s.
+- Required GH Secrets: `DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_KEY` (full PEM private key), `DEPLOY_PATH` (обычно `/opt/mail-aggregator`).
+- На сервере должен быть выполнен `docker login ghcr.io` под пользователем `$DEPLOY_USER` (одноразово, см. `docs/SERVER-SETUP.md` Часть A шаг 9).
+- Concurrency lock `deploy-prod` запрещает параллельные deploy'и разных sha.
 
 ### Quality gates
 
@@ -414,7 +475,7 @@ docker run --rm -v mas_minio_data:/data -v /backups/minio:/out alpine tar czf /o
 
 ### 11.2 Безопасность сервера
 
-- Только SSH (key-based) и 80/443 (Caddy) открыты наружу.
+- Только SSH (key-based) и 80/443 (nginx) открыты наружу.
 - MinIO console (`:9001`) — закрыт firewall'ом, доступ только через VPN или SSH-tunnel.
 - Регулярные обновления базовых образов (`docker compose pull` раз в неделю/месяц).
 - `MAIL_ENCRYPTION_KEY` хранится в password manager / sealed env (не в git, не в shared чатах).

@@ -118,7 +118,8 @@ deploy/
   docker-compose.yml
   api.Dockerfile
   worker.Dockerfile
-  caddy/Caddyfile
+  nginx/nginx.conf
+  nginx/templates/default.conf.template
   postgres/init.sql        # роль/БД (или через docker env)
 .github/workflows/ci.yml
 .env.example

@@ -77,7 +77,8 @@
 | Docker Engine | 24+ | Контейнеризация |
 | docker compose | v2 | Локальный и prod-оркестратор |
 | GitHub Actions | n/a | CI/CD pipeline |
-| Caddy (reverse proxy) | 2.8+ | TLS termination, reverse proxy в проде (рекомендация — может быть заменена на nginx, ответственность devops) |
+| Nginx (reverse proxy) | 1.27 alpine | TLS termination, reverse proxy в проде (см. `docs/07-deployment.md` sec. 6) |
+| Certbot (Let's Encrypt) | 2.11.0 | Получение и auto-renewal TLS-сертификата (см. `docs/07-deployment.md` sec. 6) |
 
 ---
 
