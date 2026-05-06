@@ -26,8 +26,12 @@
 
 name: Deploy
 
+# Trigger from CI workflow completion (more reliable than polling for jobs
+# that may not exist yet), or manually via workflow_dispatch.
 on:
-  push:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
     branches: [main]
   workflow_dispatch:
     inputs:
@@ -46,51 +50,14 @@ permissions:
 
 jobs:
 
-  # -------------------------------------------------------------------------
-  # 1. Wait for CI to be green on the same sha. workflow_run-style triggers
-  #    are unreliable when CI uses concurrency cancellation; polling here is
-  #    explicit and easy to debug.
-  # -------------------------------------------------------------------------
-  wait-for-ci:
-    name: Wait for CI to pass
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    # Skip the wait when the user manually re-deploys a sha they already
-    # know is green (e.g. rolling back to yesterday's image).
-    if: github.event_name == 'push'
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Wait for CI workflow on ${{ github.sha }}
-        uses: lewagon/wait-on-check-action@v1.3.4
-        with:
-          ref: ${{ github.sha }}
-          # Match the *workflow* name, not job names — this lets us add new
-          # jobs in CI without updating this allowlist.
-          check-name: 'Build images (api)'
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-          wait-interval: 20
-
-      - name: Wait for CI worker build
-        uses: lewagon/wait-on-check-action@v1.3.4
-        with:
-          ref: ${{ github.sha }}
-          check-name: 'Build images (worker)'
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-          wait-interval: 20
-
-  # -------------------------------------------------------------------------
-  # 2. Actual deploy — runs only after CI passed (or immediately on manual
-  #    dispatch).
-  # -------------------------------------------------------------------------
   deploy:
     name: SSH deploy to ${{ vars.DEPLOY_ENV || 'prod' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: [wait-for-ci]
-    # Allow workflow_dispatch to bypass needs:wait-for-ci by treating "skipped"
-    # as success (manual dispatch sets wait-for-ci.if=false → "skipped").
-    if: always() && (needs.wait-for-ci.result == 'success' || needs.wait-for-ci.result == 'skipped')
+    # Run only when CI passed (workflow_run path) or on manual dispatch.
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     environment:
       # GitHub Environments give per-env approval gates if you want them
       # later (Settings → Environments → prod → Required reviewers).
@@ -102,6 +69,8 @@ jobs:
           input_sha="${{ github.event.inputs.sha }}"
           if [ -n "$input_sha" ]; then
             echo "sha=$input_sha" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "sha=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
           else
             echo "sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
           fi
