@@ -133,20 +133,20 @@ jobs:
           --health-retries 10
 
       minio:
-        image: minio/minio:RELEASE.2024-08-29T01-40-52Z
+        # Bitnami's image auto-starts `minio server /bitnami/minio/data` without
+        # needing an explicit `command:` (which GH Actions services don't support).
+        image: bitnami/minio:2024
         env:
           MINIO_ROOT_USER: ci_root_user
           MINIO_ROOT_PASSWORD: ci_root_password_change_in_real_envs
+          MINIO_DEFAULT_BUCKETS: mail-attachments-ci
         ports:
           - 9000:9000
-        # GitHub services don't accept `command:` directly, but the minio
-        # image's default entrypoint runs `minio server /data` — for CI
-        # the data dir is the in-container default and that's fine.
         options: >-
           --health-cmd "curl -fsS http://localhost:9000/minio/health/live"
           --health-interval 10s
           --health-timeout 5s
-          --health-retries 10
+          --health-retries 20
 
     env:
       # Test config — local-host endpoints because services map to the runner host.
@@ -183,13 +183,13 @@ jobs:
         run: uv sync --frozen --all-extras --dev
 
       - name: Bootstrap MinIO bucket for tests
-        # CI uses root creds straight (no separate svcacct) — simpler and
-        # acceptable because the bucket is wiped each run.
+        # bitnami/minio already auto-creates MINIO_DEFAULT_BUCKETS, but run mc
+        # belt-and-braces in case the env var is ignored on a future image bump.
         run: |
           docker run --rm --network host \
             -e MC_HOST_local=http://ci_root_user:ci_root_password_change_in_real_envs@localhost:9000 \
-            minio/mc:RELEASE.2024-08-26T15-33-30Z \
-            mb --ignore-existing local/mail-attachments-ci
+            minio/mc:latest \
+            mb --ignore-existing local/mail-attachments-ci || true
 
       - name: Apply migrations
         run: uv run alembic upgrade head
