@@ -29,16 +29,37 @@ pytestmark = pytest.mark.integration
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers — drive the two-step login flow (ADR-0016).
 # ---------------------------------------------------------------------------
 
 
-async def _post_login(client: httpx.AsyncClient, *, username: str, password: str) -> httpx.Response:
+async def _post_step1(client: httpx.AsyncClient, *, username: str) -> httpx.Response:
+    """Step-1: submit only the username; sets ``mas_login`` cookie on success."""
     return await client.post(
         "/login",
-        data={"username": username, "password": password},
+        data={"username": username},
         headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
+
+
+async def _post_step2(client: httpx.AsyncClient, *, password: str) -> httpx.Response:
+    """Step-2: submit only the password; reads username from ``mas_login`` cookie."""
+    return await client.post(
+        "/login/password",
+        data={"password": password},
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+
+
+async def _post_login(client: httpx.AsyncClient, *, username: str, password: str) -> httpx.Response:
+    """Drive both steps and return the step-2 response.
+
+    Convenience: the username step always returns the same redirect for
+    valid/invalid usernames (anti-enumeration), so we can ignore step-1's
+    response and surface step-2's outcome to the caller.
+    """
+    await _post_step1(client, username=username)
+    return await _post_step2(client, password=password)
 
 
 # ---------------------------------------------------------------------------
@@ -50,7 +71,8 @@ class TestLogin:
     async def test_admin_login_form_redirects_with_cookies(self, client: httpx.AsyncClient) -> None:
         s = get_settings()
         resp = await _post_login(client, username=s.ADMIN_LOGIN, password=s.ADMIN_PASSWORD)
-        assert resp.status_code == 302
+        # Step-2 redirects with 303 (See Other) per RFC 7231.
+        assert resp.status_code == 303
         assert resp.cookies.get("mas_session") is not None
         assert resp.cookies.get("mas_csrf") is not None
         assert resp.headers["location"] == "/"
@@ -59,17 +81,28 @@ class TestLogin:
         self, client: httpx.AsyncClient
     ) -> None:
         s = get_settings()
-        resp = await client.post(
+        # JSON two-step: step-1 with username, step-2 with password.
+        r1 = await client.post(
             "/login",
-            json={"username": s.ADMIN_LOGIN, "password": s.ADMIN_PASSWORD},
+            json={"username": s.ADMIN_LOGIN},
             headers={"Accept": "application/json"},
         )
-        assert resp.status_code == 200
-        body = resp.json()
+        assert r1.status_code == 200, r1.text
+        b1 = r1.json()
+        assert b1["kind"] == "needs_password"
+        assert b1["redirect"] == "/login/password"
+
+        r2 = await client.post(
+            "/login/password",
+            json={"password": s.ADMIN_PASSWORD},
+            headers={"Accept": "application/json"},
+        )
+        assert r2.status_code == 200
+        body = r2.json()
         assert body["kind"] == "session_created"
         assert body["redirect"] == "/"
-        assert resp.cookies.get("mas_session") is not None
-        assert resp.cookies.get("mas_csrf") is not None
+        assert r2.cookies.get("mas_session") is not None
+        assert r2.cookies.get("mas_csrf") is not None
 
     async def test_wrong_password_returns_401(self, client: httpx.AsyncClient) -> None:
         s = get_settings()
@@ -109,16 +142,18 @@ class TestLockout:
         # 5 wrong attempts. Use distinct password values so rate-limit allows
         # us to actually hit the lockout (ADR-0009 limits to 5/15min by
         # username+IP — we exhaust on the 5th attempt).
+        # Step-1 happens once; step-2 is what counts against LIMIT_LOGIN.
+        await _post_step1(client, username=s.ADMIN_LOGIN)
         last: httpx.Response | None = None
         for i in range(s.LOGIN_FAILURE_THRESHOLD):
-            last = await _post_login(client, username=s.ADMIN_LOGIN, password=f"wrong{i}")
+            last = await _post_step2(client, password=f"wrong{i}")
         assert last is not None
         # The 5th *failure* triggers the lockout, which returns 423 to the
         # caller per the API contract.
         assert last.status_code in (401, 423), last.text
 
         # 6th attempt: rate-limit OR lockout. Either way NOT 200.
-        sixth = await _post_login(client, username=s.ADMIN_LOGIN, password="wrong-final")
+        sixth = await _post_step2(client, password="wrong-final")
         assert sixth.status_code in (401, 423, 429)
 
         # Audit row should mention lockout.
@@ -142,10 +177,11 @@ class TestLockout:
     ) -> None:
         s = get_settings()
         # Burn through threshold first.
+        await _post_step1(client, username=s.ADMIN_LOGIN)
         for i in range(s.LOGIN_FAILURE_THRESHOLD):
-            await _post_login(client, username=s.ADMIN_LOGIN, password=f"wrong{i}")
+            await _post_step2(client, password=f"wrong{i}")
         # Now even the right password is rejected.
-        resp = await _post_login(client, username=s.ADMIN_LOGIN, password=s.ADMIN_PASSWORD)
+        resp = await _post_step2(client, password=s.ADMIN_PASSWORD)
         assert resp.status_code in (423, 429)
         if resp.status_code == 423:
             # 423 must come with Retry-After.
@@ -160,7 +196,8 @@ class TestLockout:
 class TestAntiTiming:
     async def test_unknown_user_still_takes_time(self, client: httpx.AsyncClient) -> None:
         # A purely "user does not exist" path should not short-circuit.
-        # We just check the response is 401 (not e.g. 404).
+        # Both branches at step-1 redirect to /login/password (anti-enumeration);
+        # step-2 with a wrong password yields the same generic 401.
         resp = await _post_login(client, username="nonexistent_user", password="x")
         assert resp.status_code == 401
 
@@ -205,7 +242,8 @@ class TestLogout:
     async def test_logout_clears_session(self, client: httpx.AsyncClient) -> None:
         s = get_settings()
         login = await _post_login(client, username=s.ADMIN_LOGIN, password=s.ADMIN_PASSWORD)
-        assert login.status_code == 302
+        # Step-2 redirect is 303 (See Other) after the two-step refactor.
+        assert login.status_code == 303
         csrf = login.cookies.get("mas_csrf")
         assert csrf is not None
 

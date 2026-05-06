@@ -52,13 +52,10 @@ def _mock_smtp_and_imap(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 @pytest.fixture
 async def admin_account(client: httpx.AsyncClient, db_engine: AsyncEngine) -> dict[str, Any]:
     s = get_settings()
-    resp = await client.post(
-        "/login",
-        data={"username": s.ADMIN_LOGIN, "password": s.ADMIN_PASSWORD},
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
-    assert resp.status_code == 302
-    csrf = resp.cookies["mas_csrf"]
+    # Two-step login flow (ADR-0016).
+    from tests.integration.conftest import login_as_admin
+
+    csrf = await login_as_admin(client)
 
     factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
     async with factory() as ses, ses.begin():

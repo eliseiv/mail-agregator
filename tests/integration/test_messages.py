@@ -45,14 +45,10 @@ async def seeded(
     ``att_key``.
     """
     s = get_settings()
-    # Login.
-    resp = await client.post(
-        "/login",
-        data={"username": s.ADMIN_LOGIN, "password": s.ADMIN_PASSWORD},
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
-    assert resp.status_code == 302
-    csrf = resp.cookies["mas_csrf"]
+    # Login (two-step flow per ADR-0016).
+    from tests.integration.conftest import login_as_admin
+
+    csrf = await login_as_admin(client)
 
     factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
     message_ids: list[int] = []

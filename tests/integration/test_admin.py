@@ -20,14 +20,10 @@ pytestmark = pytest.mark.integration
 
 
 async def _login_admin(client: httpx.AsyncClient) -> str:
-    s = get_settings()
-    resp = await client.post(
-        "/login",
-        data={"username": s.ADMIN_LOGIN, "password": s.ADMIN_PASSWORD},
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
-    assert resp.status_code == 302
-    return resp.cookies["mas_csrf"]
+    """Log in as the seeded super-admin via the two-step flow (ADR-0016)."""
+    from tests.integration.conftest import login_as_admin
+
+    return await login_as_admin(client)
 
 
 class TestCreateUser:

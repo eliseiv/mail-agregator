@@ -125,19 +125,69 @@ async def client(app: Any) -> AsyncIterator[httpx.AsyncClient]:
 # ---------------------------------------------------------------------------
 
 
+async def two_step_login(
+    client: httpx.AsyncClient, username: str, password: str
+) -> httpx.Response:
+    """Drive the two-step login flow (ADR-0016) on ``client``.
+
+    Returns the step-2 response so callers can grab cookies (``mas_session``,
+    ``mas_csrf``) or assert on status. On the success path the response is a
+    303 redirect to ``/`` with the session cookies set.
+    """
+    r1 = await client.post(
+        "/login",
+        data={"username": username},
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    assert r1.status_code in (
+        302,
+        303,
+    ), f"step1 expected redirect, got {r1.status_code}: {r1.text[:200]}"
+    r2 = await client.post(
+        "/login/password",
+        data={"password": password},
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    return r2
+
+
+@pytest_asyncio.fixture
+async def login_as(client: httpx.AsyncClient):
+    """Login helper fixture that drives the two-step flow.
+
+    Usage in a test::
+
+        async def test_x(client, login_as):
+            csrf = await login_as("admin", "secret")
+            # client now has mas_session + mas_csrf cookies set.
+
+    Returns the CSRF token on success. Asserts the success path; tests that
+    need to inspect failure responses should call :func:`two_step_login`
+    directly.
+    """
+
+    async def _login(username: str, password: str) -> str:
+        resp = await two_step_login(client, username, password)
+        assert resp.status_code in (
+            302,
+            303,
+        ), f"step2 expected redirect, got {resp.status_code}: {resp.text[:200]}"
+        csrf = resp.cookies.get("mas_csrf")
+        assert csrf, "csrf cookie not set on login redirect"
+        return csrf
+
+    return _login
+
+
 async def login_as_admin(client: httpx.AsyncClient) -> str:
-    """Log in as the seeded super-admin. Returns the CSRF token."""
+    """Log in as the seeded super-admin. Returns the CSRF token.
+
+    Drives the two-step login flow (ADR-0016).
+    """
     from shared.config import get_settings
 
     s = get_settings()
-    resp = await client.post(
-        "/login",
-        data={
-            "username": s.ADMIN_LOGIN,
-            "password": s.ADMIN_PASSWORD,
-        },
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
+    resp = await two_step_login(client, s.ADMIN_LOGIN, s.ADMIN_PASSWORD)
     assert resp.status_code in (302, 303), resp.text
     csrf = resp.cookies.get("mas_csrf")
     assert csrf, "csrf cookie not set on login redirect"
