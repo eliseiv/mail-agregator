@@ -102,7 +102,7 @@ jobs:
   #    Coverage gate enforced via --cov-fail-under in pytest itself.
   # -------------------------------------------------------------------------
   test:
-    name: Test (pytest + coverage ≥ ${{ env.COVERAGE_MIN }}%)
+    name: Test (pytest + coverage)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: [lint]
