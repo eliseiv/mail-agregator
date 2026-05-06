@@ -284,8 +284,6 @@ jobs:
           tags: |
             ${{ steps.imgpath.outputs.base }}:${{ github.sha }}
             ${{ steps.imgpath.outputs.base }}:latest
-            mail-aggregator/${{ matrix.target }}:${{ github.sha }}
-            mail-aggregator/${{ matrix.target }}:ci
           cache-from: type=gha,scope=${{ matrix.target }}
           cache-to: type=gha,scope=${{ matrix.target }},mode=max
           provenance: false
@@ -298,6 +296,6 @@ jobs:
         run: |
           docker run --rm \
             --entrypoint python \
-            mail-aggregator/${{ matrix.target }}:${{ github.sha }} \
+            ${{ steps.imgpath.outputs.base }}:${{ github.sha }} \
             -c "import sys; print('python', sys.version); import structlog, fastapi" \
           || exit 1
