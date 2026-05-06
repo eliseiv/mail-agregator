@@ -110,8 +110,16 @@ services:
       start_period: 5s
     security_opt:
       - no-new-privileges:true
+    # Alpine redis init script setpriv-drops to the redis user — needs SETUID/SETGID.
+    # Other caps are needed by docker-entrypoint for chown/chmod of /data.
     cap_drop:
       - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+      - CHOWN
+      - FOWNER
 
   # -------------------------------------------------------------------------
   # MinIO — object storage. Boots with ROOT credentials only used by
