@@ -152,8 +152,8 @@ services:
   # See docs/07-deployment.md sec.12 + docs/06-security.md sec.12.
   # -------------------------------------------------------------------------
   minio-bootstrap:
-    # Older mc release matching the older MinIO server (avoids x86-64-v2 requirement).
-    image: minio/mc:RELEASE.2024-01-31T15-13-08Z
+    # mc is a static Go binary (no glibc dependency); digest-pinned for reproducibility.
+    image: minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
     container_name: mas-minio-bootstrap
     depends_on:
       minio:
