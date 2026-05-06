@@ -44,8 +44,7 @@ services:
   # PostgreSQL 16 — metadata + audit log
   # -------------------------------------------------------------------------
   postgres:
-    # Bullseye-based image (glibc 2.31) — works on CPUs without x86-64-v2.
-    image: postgres:16-bullseye
+    image: postgres:16-alpine
     container_name: mas-postgres
     <<: [*restart_default, *logging_default]
     environment:
@@ -84,9 +83,7 @@ services:
   # Redis 7.2 — sessions, rate-limit, force_sync flags
   # -------------------------------------------------------------------------
   redis:
-    # Bullseye-based image (glibc 2.31) — works on CPUs without x86-64-v2.
-    # 7.2 was never bullseye-tagged on Docker Hub; use 7.0-bullseye.
-    image: redis:7.0-bullseye
+    image: redis:7.2-alpine
     container_name: mas-redis
     <<: [*restart_default, *logging_default]
     # AOF off by default — sessions are recoverable by re-login (TD says
@@ -121,8 +118,7 @@ services:
   # itself and the bootstrap init container; api/worker NEVER see them.
   # -------------------------------------------------------------------------
   minio:
-    # Pre-2023 release built before glibc started requiring x86-64-v2.
-    image: minio/minio:RELEASE.2022-12-12T19-27-27Z
+    image: minio/minio:RELEASE.2024-08-29T01-40-52Z
     container_name: mas-minio
     <<: [*restart_default, *logging_default]
     command: server /data --console-address ":9001"
