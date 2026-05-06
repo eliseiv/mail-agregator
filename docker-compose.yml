@@ -368,10 +368,12 @@ services:
     volumes:
       - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./deploy/nginx/templates:/etc/nginx/templates:ro
-      # TLS certs and the ACME http-01 webroot are shared with certbot.
-      # Read-only here — only certbot writes.
-      - mas_certbot_certs:/etc/letsencrypt:ro
-      - mas_certbot_webroot:/var/www/certbot:ro
+      # Host-installed certbot writes certs to /etc/letsencrypt and serves
+      # ACME http-01 challenges from /var/www/certbot during webroot-renewal.
+      # nginx reads both via bind mounts. systemd-timer on the host
+      # handles renewal — no in-cluster certbot container needed.
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      - /var/www/certbot:/var/www/certbot:ro
     ports:
       - "80:80"
       - "443:443"
@@ -389,41 +391,6 @@ services:
       retries: 3
       start_period: 5s
 
-  # -------------------------------------------------------------------------
-  # Certbot — Let's Encrypt cert renewal loop. Prod-only.
-  #
-  # Initial cert acquisition is a manual one-shot (see docs/SERVER-SETUP.md
-  # Part B). After that, this container loops every 12h running
-  # `certbot renew` against the webroot shared with nginx. If certs change,
-  # renewal succeeds; nginx must be reloaded out-of-band — we document a
-  # weekly host cron `docker compose exec nginx nginx -s reload` because
-  # certbot has no docker socket and the alternatives are all fragile.
-  # -------------------------------------------------------------------------
-  certbot:
-    image: certbot/certbot:v2.11.0
-    container_name: mas-certbot
-    <<: *logging_default
-    profiles: ["prod"]
-    volumes:
-      - mas_certbot_certs:/etc/letsencrypt
-      - mas_certbot_webroot:/var/www/certbot
-    # Loop forever: try renewal every 12h. --webroot uses the shared
-    # /var/www/certbot path that nginx serves under /.well-known/acme-challenge/.
-    # The --deploy-hook fires once per actual renewal — we just log; nginx
-    # reload is handled by an external host cron (see docs/SERVER-SETUP.md
-    # Part D / G), because certbot has no way to signal nginx without the
-    # docker socket.
-    entrypoint: >-
-      sh -c 'trap exit TERM; while :; do certbot renew
-      --webroot -w /var/www/certbot --quiet
-      --deploy-hook "echo $$(date -Iseconds) cert renewed; touch /etc/letsencrypt/.reload-needed";
-      sleep 12h & wait $${!}; done'
-    networks:
-      - mas-net
-    restart: unless-stopped
-    security_opt:
-      - no-new-privileges:true
-
 # ---------------------------------------------------------------------------
 # Volumes — all named, all on default driver. Backup policy in
 # docs/07-deployment.md sec.8.
@@ -435,13 +402,6 @@ volumes:
     name: mas_redis_data
   mas_minio_data:
     name: mas_minio_data
-  # Let's Encrypt store: account keys + /live/<domain>/{fullchain,privkey,chain}.pem
-  mas_certbot_certs:
-    name: mas_certbot_certs
-  # Webroot used by certbot --webroot for http-01 challenges; mounted
-  # read-only into nginx, read-write into certbot.
-  mas_certbot_webroot:
-    name: mas_certbot_webroot
 
 # ---------------------------------------------------------------------------
 # Network — single user-defined bridge. Service-to-service traffic stays
