@@ -157,6 +157,8 @@ async def message_view_page(
 ) -> Response:
     sess = request.state.session
     detail = await MessageService(db).get(user_id=user.id, message_id=message_id)
+    # Close the autobegun read-tx so the explicit begin() below does not collide.
+    await db.commit()
     # Mark as read on first view (idempotent).
     async with db.begin():
         await MessageService(db).mark_read(
