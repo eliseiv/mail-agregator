@@ -135,7 +135,7 @@ jobs:
       minio:
         # Bitnami's image auto-starts `minio server /bitnami/minio/data` without
         # needing an explicit `command:` (which GH Actions services don't support).
-        image: bitnami/minio:2024
+        image: bitnami/minio:latest
         env:
           MINIO_ROOT_USER: ci_root_user
           MINIO_ROOT_PASSWORD: ci_root_password_change_in_real_envs
