@@ -61,6 +61,42 @@
     <small>Mail Aggregator</small>
   </footer>
 
+  {# Bottom navigation: shown on mobile (≤640px) and inside Telegram WebApp.
+     CSS-only visibility: .bottom-nav is `display:none` by default, opens to
+     flex inside `body.tg-app` and at narrow viewports. CSP-friendly — no
+     inline styles or scripts. The Admin item is server-rendered conditionally
+     so non-admin sessions never receive markup that links to /admin. #}
+  {% if request is defined and request.state is defined and request.state.session %}
+    <nav class="bottom-nav" aria-label="App navigation">
+      <a href="/"
+         class="bottom-nav__item{% if request.url.path == '/' %} bottom-nav__item--active{% endif %}"
+         {% if request.url.path == '/' %}aria-current="page"{% endif %}>
+        <span class="bottom-nav__icon" aria-hidden="true">&#128229;</span>
+        <span class="bottom-nav__label">Inbox</span>
+      </a>
+      <a href="/accounts"
+         class="bottom-nav__item{% if request.url.path.startswith('/accounts') %} bottom-nav__item--active{% endif %}"
+         {% if request.url.path.startswith('/accounts') %}aria-current="page"{% endif %}>
+        <span class="bottom-nav__icon" aria-hidden="true">&#128231;</span>
+        <span class="bottom-nav__label">Accounts</span>
+      </a>
+      <a href="/tags"
+         class="bottom-nav__item{% if request.url.path.startswith('/tags') %} bottom-nav__item--active{% endif %}"
+         {% if request.url.path.startswith('/tags') %}aria-current="page"{% endif %}>
+        <span class="bottom-nav__icon" aria-hidden="true">&#127991;&#65039;</span>
+        <span class="bottom-nav__label">Tags</span>
+      </a>
+      {% if request.state.session.role == 'admin' %}
+      <a href="/admin"
+         class="bottom-nav__item{% if request.url.path.startswith('/admin') %} bottom-nav__item--active{% endif %}"
+         {% if request.url.path.startswith('/admin') %}aria-current="page"{% endif %}>
+        <span class="bottom-nav__icon" aria-hidden="true">&#9881;&#65039;</span>
+        <span class="bottom-nav__label">Admin</span>
+      </a>
+      {% endif %}
+    </nav>
+  {% endif %}
+
   <script src="/static/js/csrf.js"></script>
   {% block extra_js %}{% endblock %}
 </body>
