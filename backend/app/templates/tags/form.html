@@ -133,10 +133,10 @@
                 id="rule-type-pre-{{ loop.index }}"
                 name="rule_type[]">
                 <option value="">— тип —</option>
-                <option value="subject_contains" {% if r.type == 'subject_contains' %}selected{% endif %}>Подстрока в subject</option>
-                <option value="body_contains" {% if r.type == 'body_contains' %}selected{% endif %}>Подстрока в теле</option>
-                <option value="sender_contains" {% if r.type == 'sender_contains' %}selected{% endif %}>Подстрока в sender</option>
-                <option value="sender_exact" {% if r.type == 'sender_exact' %}selected{% endif %}>Точное совпадение sender</option>
+                <option value="subject_contains" {% if r.type == 'subject_contains' %}selected{% endif %}>Совпадение в теме</option>
+                <option value="body_contains" {% if r.type == 'body_contains' %}selected{% endif %}>Совпадение в письме</option>
+                <option value="sender_contains" {% if r.type == 'sender_contains' %}selected{% endif %}>Совпадение Отправителя</option>
+                <option value="sender_exact" {% if r.type == 'sender_exact' %}selected{% endif %}>Точное совпадение Отправителя</option>
               </select>
               <label class="visually-hidden" for="rule-pattern-pre-{{ loop.index }}">Шаблон</label>
               <input
@@ -163,10 +163,10 @@
                 id="rule-type-empty-{{ i }}"
                 name="rule_type[]">
                 <option value="">— тип —</option>
-                <option value="subject_contains">Подстрока в subject</option>
-                <option value="body_contains">Подстрока в теле</option>
-                <option value="sender_contains">Подстрока в sender</option>
-                <option value="sender_exact">Точное совпадение sender</option>
+                <option value="subject_contains">Совпадение в теме</option>
+                <option value="body_contains">Совпадение в письме</option>
+                <option value="sender_contains">Совпадение Отправителя</option>
+                <option value="sender_exact">Точное совпадение Отправителя</option>
               </select>
               <label class="visually-hidden" for="rule-pattern-empty-{{ i }}">Шаблон</label>
               <input
@@ -230,10 +230,10 @@
           {% for rule in tag.rules %}
             <li class="tag-rule-item">
               <span class="tag-rule-item__type" title="Тип условия">
-                {% if rule.type == 'subject_contains' %}Подстрока в subject
-                {% elif rule.type == 'body_contains' %}Подстрока в теле
-                {% elif rule.type == 'sender_contains' %}Подстрока в sender
-                {% elif rule.type == 'sender_exact' %}Точное совпадение sender
+                {% if rule.type == 'subject_contains' %}Совпадение в теме
+                {% elif rule.type == 'body_contains' %}Совпадение в письме
+                {% elif rule.type == 'sender_contains' %}Совпадение Отправителя
+                {% elif rule.type == 'sender_exact' %}Точное совпадение Отправителя
                 {% else %}{{ rule.type | e }}{% endif %}
               </span>
               <span class="tag-rule-item__pattern">
@@ -278,10 +278,10 @@
             name="type"
             required>
             <option value="">— тип —</option>
-            <option value="subject_contains">Подстрока в subject</option>
-            <option value="body_contains">Подстрока в теле</option>
-            <option value="sender_contains">Подстрока в sender</option>
-            <option value="sender_exact">Точное совпадение sender</option>
+            <option value="subject_contains">Совпадение в теме</option>
+            <option value="body_contains">Совпадение в письме</option>
+            <option value="sender_contains">Совпадение Отправителя</option>
+            <option value="sender_exact">Точное совпадение Отправителя</option>
           </select>
           <label class="visually-hidden" for="rule-add-pattern">Шаблон</label>
           <input
