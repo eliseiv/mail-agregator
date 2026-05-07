@@ -81,68 +81,72 @@ jobs:
           repo_lc="$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')"
           echo "lc=ghcr.io/${repo_lc}" >> "$GITHUB_OUTPUT"
 
-      - name: Deploy over SSH
-        uses: appleboy/ssh-action@v1.2.0
+      # webfactory/ssh-agent is more tolerant of whitespace / trailing
+      # newline issues in DEPLOY_KEY than appleboy/ssh-action — it loads
+      # the key into ssh-agent and the rest is a plain `ssh` invocation.
+      - name: Set up SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
         with:
-          host:     ${{ secrets.DEPLOY_HOST }}
-          username: ${{ secrets.DEPLOY_USER }}
-          key:      ${{ secrets.DEPLOY_KEY }}
-          port:     22
-          # Strict host-key checking: relies on the runner's known_hosts;
-          # appleboy/ssh-action accepts any host key by default. We accept
-          # that trade-off (CI runner is trusted) for simplicity.
-          script_stop: true
-          # Pass the resolved sha + image registry path as inline env. We
-          # never pass secrets through the script body.
-          envs: SHA,IMAGE_REGISTRY
-          script: |
-            set -euo pipefail
-            cd "${{ secrets.DEPLOY_PATH }}"
+          ssh-private-key: ${{ secrets.DEPLOY_KEY }}
 
-            echo "==> deploying $SHA from $IMAGE_REGISTRY"
+      - name: Trust the deploy host
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
 
-            # Pin the version in .env so subsequent `docker compose ps`,
-            # `restart`, etc. on the host use the same images. We rewrite
-            # only the IMAGE_TAG / IMAGE_REGISTRY lines — leave the rest
-            # of .env (passwords, encryption keys) untouched.
-            git fetch --depth=1 origin main
-            git -c advice.detachedHead=false checkout "$SHA"
-
-            # In-place edit of .env: replace IMAGE_TAG=... and IMAGE_REGISTRY=...
-            # If a key is missing (older .env), append it.
-            for kv in "IMAGE_TAG=$SHA" "IMAGE_REGISTRY=$IMAGE_REGISTRY"; do
-              key="${kv%%=*}"
-              if grep -q "^${key}=" .env; then
-                sed -i "s|^${key}=.*|${kv}|" .env
-              else
-                echo "$kv" >> .env
-              fi
-            done
-
-            # Pull the new images. `--profile prod` is required so nginx /
-            # certbot are included if they're already running on this host.
-            docker compose --profile prod pull api worker
-
-            # Recreate exactly the services that ship our code. Postgres /
-            # redis / minio stay running; mas-migrations runs once as part
-            # of the api dependency graph; nginx is reloaded only if it
-            # was already up under --profile prod.
-            docker compose --profile prod up -d --remove-orphans api worker
-
-            # Smoke-test: poll healthcheck for up to 90s.
-            attempts=18
-            until docker inspect --format='{{.State.Health.Status}}' mas-api 2>/dev/null | grep -q healthy; do
-              attempts=$((attempts - 1))
-              if [ $attempts -le 0 ]; then
-                echo "api never became healthy; recent logs:"
-                docker logs --tail 80 mas-api || true
-                exit 1
-              fi
-              sleep 5
-            done
-
-            docker compose ps
-            echo "==> deploy of $SHA complete"
+      - name: Deploy over SSH
         env:
           SHA: ${{ steps.sha.outputs.sha }}
           IMAGE_REGISTRY: ${{ steps.repo.outputs.lc }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" \
+            SHA="$SHA" IMAGE_REGISTRY="$IMAGE_REGISTRY" DEPLOY_PATH="$DEPLOY_PATH" \
+            bash -s <<'REMOTE_SCRIPT'
+          set -euo pipefail
+          cd "$DEPLOY_PATH"
+
+          echo "==> deploying $SHA from $IMAGE_REGISTRY"
+
+          # Pin the version in .env so subsequent `docker compose ps`,
+          # `restart`, etc. on the host use the same images. We rewrite
+          # only the IMAGE_TAG / IMAGE_REGISTRY lines — leave the rest
+          # of .env (passwords, encryption keys) untouched.
+          git fetch --depth=1 origin main
+          git -c advice.detachedHead=false checkout "$SHA"
+
+          # In-place edit of .env: replace IMAGE_TAG=... and IMAGE_REGISTRY=...
+          # If a key is missing (older .env), append it.
+          for kv in "IMAGE_TAG=$SHA" "IMAGE_REGISTRY=$IMAGE_REGISTRY"; do
+            key="${kv%%=*}"
+            if grep -q "^${key}=" .env; then
+              sed -i "s|^${key}=.*|${kv}|" .env
+            else
+              echo "$kv" >> .env
+            fi
+          done
+
+          # Pull the new images. `--profile prod` is required so nginx /
+          # certbot are included if they're already running on this host.
+          docker compose --profile prod pull api worker
+
+          # Recreate exactly the services that ship our code.
+          docker compose --profile prod up -d --remove-orphans api worker
+
+          # Smoke-test: poll healthcheck for up to 90s.
+          attempts=18
+          until docker inspect --format='{{.State.Health.Status}}' mas-api 2>/dev/null | grep -q healthy; do
+            attempts=$((attempts - 1))
+            if [ $attempts -le 0 ]; then
+              echo "api never became healthy; recent logs:"
+              docker logs --tail 80 mas-api || true
+              exit 1
+            fi
+            sleep 5
+          done
+
+          docker compose ps
+          echo "==> deploy of $SHA complete"
+          REMOTE_SCRIPT
