@@ -143,6 +143,23 @@ class CannotDeleteAdminError(DomainError):
     code = "cannot_delete_admin"
 
 
+class CannotDeleteBuiltinTagError(DomainError):
+    """User tried to ``DELETE /api/tags/{id}`` for a builtin tag (ADR-0017)."""
+
+    status_code = 400
+    code = "cannot_delete_builtin_tag"
+
+
+class TagApplyTooManyError(DomainError):
+    """``apply_to_existing=true`` rejected: user has > 100k messages.
+
+    See ADR-0017 §7. Surfaced as 422 with code ``tag_apply_too_many``.
+    """
+
+    status_code = 422
+    code = "tag_apply_too_many"
+
+
 # --- Helpers ----------------------------------------------------------------
 
 

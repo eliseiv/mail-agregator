@@ -25,8 +25,10 @@ from backend.app.messages.schemas import (
 )
 from backend.app.repositories.mail_accounts import MailAccountsRepo
 from backend.app.repositories.messages import MessagesRepo
+from backend.app.repositories.tags import MessageTagsRepo
+from backend.app.tags.schemas import TagBriefDTO
 from shared.logging import get_logger
-from shared.models import Attachment
+from shared.models import Attachment, Tag
 from shared.storage import Storage, get_storage
 
 log = get_logger(__name__)
@@ -50,11 +52,16 @@ def _decode_cursor(cursor: str) -> tuple[datetime, int]:
         raise ValidationError("Invalid pagination cursor", field="cursor") from exc
 
 
+def _to_tag_brief(tag: Tag) -> TagBriefDTO:
+    return TagBriefDTO(id=tag.id, name=tag.name, color=tag.color)
+
+
 class MessageService:
     def __init__(self, session: AsyncSession) -> None:
         self._db = session
         self._repo = MessagesRepo(session)
         self._accounts = MailAccountsRepo(session)
+        self._tags = MessageTagsRepo(session)
         self._storage: Storage = get_storage()
 
     async def list_for_user(
@@ -65,16 +72,23 @@ class MessageService:
         unread: bool | None,
         cursor: str | None,
         limit: int,
+        tag_id: int | None = None,
     ) -> MessageListResponse:
         cursor_date: datetime | None = None
         cursor_id: int | None = None
         if cursor:
             cursor_date, cursor_id = _decode_cursor(cursor)
 
+        # Validate tag ownership before any heavy SELECT — leaks nothing
+        # about other users' tags (ADR-0017 §9 — 404 on foreign tag_id).
+        if tag_id is not None and not await self._repo.is_tag_owned(tag_id=tag_id, user_id=user_id):
+            raise NotFoundError()
+
         # Fetch one extra row so we know whether to emit ``next_cursor``.
         rows = await self._repo.list_for_user(
             user_id=user_id,
             account_id=account_id,
+            tag_id=tag_id,
             unread=unread,
             cursor_internal_date=cursor_date,
             cursor_id=cursor_id,
@@ -89,6 +103,7 @@ class MessageService:
 
         ids = [m.id for m, _ in rows]
         att_map = await self._repo.has_attachments_bulk(ids)
+        tags_map = await self._tags.list_for_messages_bulk(ids)
 
         items = [
             MessageListItem(
@@ -101,6 +116,7 @@ class MessageService:
                 internal_date=m.internal_date,
                 is_read=m.is_read,
                 has_attachments=att_map.get(m.id, False),
+                tags=[_to_tag_brief(t) for t in tags_map.get(m.id, [])],
             )
             for m, email in rows
         ]
@@ -116,6 +132,7 @@ class MessageService:
         assert acc is not None  # FK guarantees this
         atts_map = await self._repo.list_attachments_bulk([msg.id])
         atts: list[Attachment] = atts_map.get(msg.id, [])
+        tags = await self._tags.list_for_message(msg.id)
 
         return MessageDetail(
             id=msg.id,
@@ -142,6 +159,7 @@ class MessageService:
                 )
                 for a in atts
             ],
+            tags=[_to_tag_brief(t) for t in tags],
         )
 
     async def mark_read(

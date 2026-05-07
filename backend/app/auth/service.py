@@ -25,6 +25,7 @@ from backend.app.exceptions import (
 )
 from backend.app.repositories.users import UsersRepo
 from backend.app.sessions import SessionStore, SetupSessionStore
+from backend.app.tags.service import TagsService
 from shared.config import get_settings
 from shared.logging import get_logger
 
@@ -198,6 +199,15 @@ class AuthService:
             await self._users.set_password_hash(user.id, new_hash)
 
         await self._users.record_login_success(user.id)
+
+        # Builtin tags post-login hook (ADR-0017 §6). Idempotent — no-op
+        # for users who already have any builtin row. Run inside the same
+        # transaction as the login bookkeeping so a tag-write failure
+        # rolls everything back: builtin tags are a functional must-have
+        # and silently skipping them would leave users with empty
+        # "/tags" pages until next login.
+        await TagsService(self._db).ensure_builtin_tags(user_id=user.id)
+
         role = "admin" if user.is_admin else "user"
         token, csrf = await self._sessions.create(user.id, role, ip, user_agent)
 
@@ -242,6 +252,11 @@ class AuthService:
         new_hash = self._ph.hash(password)
         await self._users.set_password_hash(user.id, new_hash)
         await self._setup.revoke(setup_token)
+
+        # Builtin tags post-login hook (ADR-0017 §6) — fired here too so
+        # that the user-after-set-password-flow lands on /tags with the
+        # four builtin rows already present. Idempotent.
+        await TagsService(self._db).ensure_builtin_tags(user_id=user.id)
 
         role = "admin" if user.is_admin else "user"
         session_token, csrf = await self._sessions.create(user.id, role, ip, user_agent)

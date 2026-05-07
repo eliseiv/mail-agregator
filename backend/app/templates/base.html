@@ -24,6 +24,7 @@
         <nav class="topnav" aria-label="Primary">
           <a class="topnav__link" href="/">Inbox</a>
           <a class="topnav__link" href="/accounts">Accounts</a>
+          <a class="topnav__link" href="/tags">Теги</a>
           {% if request.state.session.role == 'admin' %}
             <a class="topnav__link" href="/admin">Admin</a>
           {% endif %}

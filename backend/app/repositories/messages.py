@@ -14,7 +14,7 @@ from sqlalchemy import and_, delete, exists, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from shared.models import Attachment, MailAccount, Message
+from shared.models import Attachment, MailAccount, Message, MessageTag, Tag
 
 
 class MessagesRepo:
@@ -37,6 +37,7 @@ class MessagesRepo:
         *,
         user_id: int,
         account_id: int | None,
+        tag_id: int | None = None,
         unread: bool | None,
         cursor_internal_date: datetime | None,
         cursor_id: int | None,
@@ -46,6 +47,10 @@ class MessagesRepo:
 
         Returns ``[(Message, mail_account_email), ...]`` ordered by
         ``(internal_date DESC, id DESC)``.
+
+        ``tag_id`` (ADR-0017) — when set, restricts results to messages
+        linked to that tag. Caller is responsible for verifying the tag
+        belongs to ``user_id`` (404 mismatch leaks otherwise).
         """
         stmt = (
             select(Message, MailAccount.email)
@@ -54,6 +59,14 @@ class MessagesRepo:
         )
         if account_id is not None:
             stmt = stmt.where(Message.mail_account_id == account_id)
+        if tag_id is not None:
+            stmt = stmt.join(
+                MessageTag,
+                and_(
+                    MessageTag.message_id == Message.id,
+                    MessageTag.tag_id == tag_id,
+                ),
+            )
         if unread is True:
             stmt = stmt.where(Message.is_read.is_(False))
         elif unread is False:
@@ -72,6 +85,15 @@ class MessagesRepo:
         stmt = stmt.order_by(Message.internal_date.desc(), Message.id.desc()).limit(limit)
         rows = (await self._s.execute(stmt)).all()
         return [(row[0], row[1]) for row in rows]
+
+    async def is_tag_owned(self, *, tag_id: int, user_id: int) -> bool:
+        """Return True iff the tag exists and belongs to ``user_id``.
+
+        Used to gate ``GET /api/messages?tag_id=X``: foreign / unknown
+        tags must surface as 404 (per ADR-0017 §9 — never leak existence).
+        """
+        stmt = select(exists().where(Tag.id == tag_id, Tag.user_id == user_id))
+        return bool((await self._s.execute(stmt)).scalar_one())
 
     async def list_attachments_bulk(self, message_ids: list[int]) -> dict[int, list[Attachment]]:
         if not message_ids:
@@ -320,12 +342,18 @@ class MessagesRepo:
         return int((await self._s.execute(stmt)).scalar_one())
 
     async def list_for_user_html(
-        self, *, user_id: int, account_id: int | None, limit: int
+        self,
+        *,
+        user_id: int,
+        account_id: int | None,
+        limit: int,
+        tag_id: int | None = None,
     ) -> list[dict[str, Any]]:
         """Convenience for HTML inbox: list with ``has_attachments`` precomputed."""
         rows = await self.list_for_user(
             user_id=user_id,
             account_id=account_id,
+            tag_id=tag_id,
             unread=None,
             cursor_internal_date=None,
             cursor_id=None,

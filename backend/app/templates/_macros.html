@@ -83,3 +83,39 @@
 <time datetime="{{ iso_value | e }}">{{ (human_value if human_value else iso_value) | e }}</time>
 {%- endif -%}
 {%- endmacro -%}
+
+{# ---------------------------------------------------------------------------
+   Tag chip (ADR-0017 / 08-frontend.md §5.1).
+
+   Renders a colored badge for a tag. The backend persists ``tags.color`` as a
+   lowercase hex (#rrggbb) constrained to a fixed 8-color palette; we map each
+   hex to a CSS class slot ``c1`` ... ``c8`` so the rendered HTML never carries
+   an inline ``style`` attribute (CSP ``style-src 'self'``, ADR-0008).
+
+   ``tag`` is anything with ``.name`` (str) and ``.color`` (lowercase hex str)
+   attributes — works for both ``TagDTO`` and ``TagBriefDTO``.
+
+   Unknown / out-of-palette colors fall back to ``c8`` (slate) rather than
+   raising — defence in depth so a corrupted tag never breaks rendering.
+   --------------------------------------------------------------------------- #}
+{%- set TAG_PALETTE_MAP = {
+  '#2563eb': 'c1',
+  '#dc2626': 'c2',
+  '#f59e0b': 'c3',
+  '#16a34a': 'c4',
+  '#7c3aed': 'c5',
+  '#0891b2': 'c6',
+  '#db2777': 'c7',
+  '#475569': 'c8'
+} -%}
+
+{%- macro tag_color_class(color) -%}
+{%- set normalised = (color | default('') | string | lower) -%}
+{{ TAG_PALETTE_MAP.get(normalised, 'c8') }}
+{%- endmacro -%}
+
+{%- macro tag_chip(tag) -%}
+{%- set raw_color = (tag.color if tag.color is defined else '') | default('') | string | lower -%}
+{%- set cls = TAG_PALETTE_MAP.get(raw_color, 'c8') -%}
+<span class="tag-chip tag-color-{{ cls }}" title="{{ tag.name | e }}">{{ tag.name | e }}</span>
+{%- endmacro -%}

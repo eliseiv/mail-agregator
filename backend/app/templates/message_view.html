@@ -24,6 +24,12 @@
       {% if message.subject %}{{ message.subject | e }}{% else %}<em>(no subject)</em>{% endif %}
     </h1>
 
+    {% if message.tags %}
+      <div class="message__tags" aria-label="Tags">
+        {% for t in message.tags %}{{ m.tag_chip(t) }}{% endfor %}
+      </div>
+    {% endif %}
+
     <dl class="message__meta">
       <div class="message__meta-row">
         <dt>From</dt>

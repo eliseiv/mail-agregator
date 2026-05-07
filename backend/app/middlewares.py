@@ -136,6 +136,7 @@ _OVERRIDE_EXACT_PATHS: frozenset[str] = frozenset(
         "/api/messages/send",
         "/api/mail-accounts",
         "/api/admin/users",
+        "/api/tags",
     }
 )
 _OVERRIDE_REGEX_PATHS: tuple[re.Pattern[str], ...] = (
@@ -144,6 +145,12 @@ _OVERRIDE_REGEX_PATHS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^/api/mail-accounts/\d+/sync-now$"),
     re.compile(r"^/api/admin/users/\d+/reset$"),
     re.compile(r"^/api/admin/users/\d+/delete$"),  # DELETE sibling
+    # Tags (ADR-0017)
+    re.compile(r"^/api/tags/\d+$"),  # PATCH (override)
+    re.compile(r"^/api/tags/\d+/delete$"),  # DELETE sibling
+    re.compile(r"^/api/tags/\d+/rules$"),  # POST add rule (no override)
+    re.compile(r"^/api/tags/\d+/rules/\d+/delete$"),  # DELETE sibling for rule
+    re.compile(r"^/api/tags/\d+/apply-to-existing$"),
 )
 
 _ALLOWED_OVERRIDE_METHODS: frozenset[str] = frozenset({"DELETE", "PATCH", "PUT"})

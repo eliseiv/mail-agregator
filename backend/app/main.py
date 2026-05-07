@@ -47,6 +47,7 @@ from backend.app.middlewares import (
 )
 from backend.app.rate_limit import install_rate_limiter
 from backend.app.send.router import router as send_router
+from backend.app.tags.router import router as tags_router
 from shared.config import get_settings
 from shared.db import dispose_engine, init_engine, make_session
 from shared.logging import configure_logging, get_logger
@@ -156,6 +157,7 @@ def create_app() -> FastAPI:
     app.include_router(accounts_router)
     app.include_router(messages_router)
     app.include_router(send_router)
+    app.include_router(tags_router)
     app.include_router(admin_router)
     app.include_router(health_router)
 

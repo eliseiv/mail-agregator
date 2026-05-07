@@ -1,0 +1,319 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m with context %}
+
+{# Tag create / edit form (ADR-0017, 08-frontend.md §4.11).
+
+   Backend contract — context expected from
+     - ``GET /tags/new``           : tag=None,            is_edit=False
+     - ``GET /tags/{id}/edit``     : tag=TagDTO,          is_edit=True
+
+   Always present:
+     - ``form``       : dict with keys ``name``, ``color``, ``rules``
+                        (list of {type, pattern}), ``apply_to_existing`` (bool).
+                        Used to re-render with previously submitted values
+                        on validation errors.
+     - ``palette``    : iterable of 8 hex strings — exact 8 colours from
+                        backend.app.tags.schemas.PALETTE_COLORS, server-sorted.
+     - ``csrf_token`` : str
+     - ``session``    : SessionData
+     - ``flashes``    : iterable, rendered by base.html
+     - ``is_edit``    : bool
+
+   Without JS:
+     - 5 empty rule rows are pre-rendered on the create form (and, for edit,
+       a single empty rule row inside the "Add rule" sub-form). Backend skips
+       rule pairs where both type and pattern are empty.
+     - The 8 colour swatches are real <input type="radio">; selection works
+       without JS. Default checked = first palette colour.
+#}
+
+{% block title %}{% if is_edit %}Редактировать тег{% else %}Новый тег{% endif %} &middot; Mail Aggregator{% endblock %}
+{% block body_class %}tags-form{% endblock %}
+
+{% block content %}
+<section class="tags" aria-labelledby="tag-form-heading">
+  <nav class="tags__nav" aria-label="Tags navigation">
+    <a class="btn btn--secondary" href="/tags">&larr; К тегам</a>
+  </nav>
+
+  <h1 id="tag-form-heading" class="tags__title">
+    {% if is_edit %}
+      Редактировать тег{% if tag and tag.name %} «{{ tag.name | e }}»{% endif %}
+    {% else %}
+      Новый тег
+    {% endif %}
+  </h1>
+
+  {# ====================================================================
+     Main form: create OR update name+colour.
+
+     - Create  : POST /api/tags
+                 + (optional) initial rules via rule_type[]/rule_pattern[]
+                 + (optional) apply_to_existing checkbox
+     - Edit    : POST /api/tags/{id} + _method=PATCH (name + colour only)
+                 Rule add/remove + apply-to-existing live in separate forms
+                 below.
+     ==================================================================== #}
+  <form
+    method="POST"
+    action="{% if is_edit %}/api/tags/{{ tag.id }}{% else %}/api/tags{% endif %}"
+    class="form tags__form"
+    enctype="application/x-www-form-urlencoded"
+    novalidate
+    data-tag-form>
+    {{ m.csrf_input() }}
+
+    {% if is_edit %}
+      <input type="hidden" name="_method" value="PATCH">
+    {% endif %}
+
+    <div class="field">
+      <label class="field__label" for="tag-name">Имя</label>
+      <input
+        class="field__input"
+        type="text"
+        id="tag-name"
+        name="name"
+        required
+        minlength="1"
+        maxlength="64"
+        autocomplete="off"
+        value="{{ form.name | default('') | e }}">
+      <p class="field__hint">От 1 до 64 символов.</p>
+    </div>
+
+    <fieldset class="form-section tag-color-fieldset">
+      <legend class="form-section__legend">Цвет</legend>
+      <div class="color-swatches" role="radiogroup" aria-label="Цвет тега">
+        {% set selected_color = (form.color | default('') | string | lower) %}
+        {% for hex in palette %}
+          {% set hex_lower = hex | lower %}
+          {% set slot = m.tag_color_class(hex_lower) | trim %}
+          {% set radio_id = 'tag-color-' ~ slot %}
+          {% set is_checked = (selected_color == hex_lower) or (not selected_color and loop.first) %}
+          <label class="color-swatch-label" for="{{ radio_id }}">
+            <input
+              class="visually-hidden color-swatch-input"
+              type="radio"
+              id="{{ radio_id }}"
+              name="color"
+              value="{{ hex_lower | e }}"
+              required
+              {% if is_checked %}checked{% endif %}
+              data-tag-color-input>
+            <span class="color-swatch tag-color-{{ slot }}"
+                  aria-hidden="true"
+                  title="{{ hex_lower | e }}"></span>
+            <span class="visually-hidden">Цвет {{ hex_lower | e }}</span>
+          </label>
+        {% endfor %}
+      </div>
+    </fieldset>
+
+    {% if not is_edit %}
+      {# Initial rules (only on create form). 5 pre-rendered rows for no-JS
+         users; JS lets you add/remove. Backend skips rows where both type
+         and pattern are empty. #}
+      <fieldset class="form-section tag-rules-fieldset">
+        <legend class="form-section__legend">Условия (срабатывает любое)</legend>
+
+        <div class="tag-rules" data-rules-container>
+          {# Render submitted rules first (after a validation error round-trip),
+             then top up to at least 5 empty rows for usability without JS. #}
+          {% set submitted = form.rules | default([]) %}
+          {% set min_rows = 5 %}
+          {% set empty_needed = (min_rows - (submitted | length)) %}
+          {% if empty_needed < 0 %}{% set empty_needed = 0 %}{% endif %}
+
+          {% for r in submitted %}
+            <div class="rule-row">
+              <label class="visually-hidden" for="rule-type-pre-{{ loop.index }}">Тип условия</label>
+              <select
+                class="field__input field__input--compact"
+                id="rule-type-pre-{{ loop.index }}"
+                name="rule_type[]">
+                <option value="">— тип —</option>
+                <option value="subject_contains" {% if r.type == 'subject_contains' %}selected{% endif %}>Подстрока в subject</option>
+                <option value="body_contains" {% if r.type == 'body_contains' %}selected{% endif %}>Подстрока в теле</option>
+                <option value="sender_contains" {% if r.type == 'sender_contains' %}selected{% endif %}>Подстрока в sender</option>
+                <option value="sender_exact" {% if r.type == 'sender_exact' %}selected{% endif %}>Точное совпадение sender</option>
+              </select>
+              <label class="visually-hidden" for="rule-pattern-pre-{{ loop.index }}">Шаблон</label>
+              <input
+                class="field__input"
+                type="text"
+                id="rule-pattern-pre-{{ loop.index }}"
+                name="rule_pattern[]"
+                maxlength="256"
+                placeholder="Шаблон"
+                value="{{ r.pattern | default('') | e }}">
+              <button
+                type="button"
+                class="rule-row__remove"
+                data-remove-rule
+                aria-label="Удалить условие">&times;</button>
+            </div>
+          {% endfor %}
+
+          {% for i in range(empty_needed) %}
+            <div class="rule-row">
+              <label class="visually-hidden" for="rule-type-empty-{{ i }}">Тип условия</label>
+              <select
+                class="field__input field__input--compact"
+                id="rule-type-empty-{{ i }}"
+                name="rule_type[]">
+                <option value="">— тип —</option>
+                <option value="subject_contains">Подстрока в subject</option>
+                <option value="body_contains">Подстрока в теле</option>
+                <option value="sender_contains">Подстрока в sender</option>
+                <option value="sender_exact">Точное совпадение sender</option>
+              </select>
+              <label class="visually-hidden" for="rule-pattern-empty-{{ i }}">Шаблон</label>
+              <input
+                class="field__input"
+                type="text"
+                id="rule-pattern-empty-{{ i }}"
+                name="rule_pattern[]"
+                maxlength="256"
+                placeholder="Шаблон">
+              <button
+                type="button"
+                class="rule-row__remove"
+                data-remove-rule
+                aria-label="Удалить условие">&times;</button>
+            </div>
+          {% endfor %}
+        </div>
+
+        {# JS-only "+ Add condition" button. The container above already has
+           5 working rows so no-JS users are not blocked. #}
+        <div class="tag-rules__actions">
+          <button
+            type="button"
+            class="btn btn--secondary btn--small"
+            data-add-rule
+            hidden
+            aria-label="Добавить условие">+ Условие</button>
+          <p class="field__hint">Пустые строки игнорируются. До 32 условий на тег.</p>
+        </div>
+
+        <label class="checkbox">
+          <input
+            type="checkbox"
+            name="apply_to_existing"
+            value="1"
+            {% if form.apply_to_existing %}checked{% endif %}>
+          <span>Применить к существующим письмам</span>
+        </label>
+      </fieldset>
+    {% endif %}
+
+    <div class="form-actions">
+      <button type="submit" class="btn btn--primary">
+        {% if is_edit %}Сохранить изменения{% else %}Создать тег{% endif %}
+      </button>
+      <a class="btn btn--secondary" href="/tags">Отмена</a>
+    </div>
+  </form>
+
+  {# ====================================================================
+     EDIT-only sections below: existing rules list + "Add rule" form +
+     "Apply to existing" form. Each is its own <form> so no-JS users get
+     a working button per action.
+     ==================================================================== #}
+  {% if is_edit and tag %}
+    <section class="tag-rules-manage" aria-labelledby="tag-rules-heading">
+      <h2 id="tag-rules-heading" class="tag-rules-manage__title">Управление правилами</h2>
+
+      {% if tag.rules %}
+        <ul class="tag-rules-manage__list">
+          {% for rule in tag.rules %}
+            <li class="tag-rule-item">
+              <span class="tag-rule-item__type" title="Тип условия">
+                {% if rule.type == 'subject_contains' %}Подстрока в subject
+                {% elif rule.type == 'body_contains' %}Подстрока в теле
+                {% elif rule.type == 'sender_contains' %}Подстрока в sender
+                {% elif rule.type == 'sender_exact' %}Точное совпадение sender
+                {% else %}{{ rule.type | e }}{% endif %}
+              </span>
+              <span class="tag-rule-item__pattern">
+                <code>{{ rule.pattern | e }}</code>
+              </span>
+              <form
+                method="POST"
+                action="/api/tags/{{ tag.id }}/rules/{{ rule.id }}/delete"
+                class="inline-form"
+                data-rule-delete-form
+                data-confirm="Удалить правило?">
+                {{ m.csrf_input() }}
+                <input type="hidden" name="_method" value="DELETE">
+                <button type="submit"
+                        class="btn btn--danger btn--small"
+                        aria-label="Удалить правило {{ rule.pattern | e }}">
+                  Удалить правило
+                </button>
+              </form>
+            </li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p class="tag-rules-manage__empty">У этого тега пока нет правил. Добавьте первое ниже.</p>
+      {% endif %}
+
+      <form
+        method="POST"
+        action="/api/tags/{{ tag.id }}/rules"
+        class="form tag-rules-manage__add"
+        enctype="application/x-www-form-urlencoded"
+        data-rule-add-form>
+        {{ m.csrf_input() }}
+
+        <h3 class="tag-rules-manage__sub">Добавить правило</h3>
+
+        <div class="rule-row">
+          <label class="visually-hidden" for="rule-add-type">Тип условия</label>
+          <select
+            class="field__input field__input--compact"
+            id="rule-add-type"
+            name="type"
+            required>
+            <option value="">— тип —</option>
+            <option value="subject_contains">Подстрока в subject</option>
+            <option value="body_contains">Подстрока в теле</option>
+            <option value="sender_contains">Подстрока в sender</option>
+            <option value="sender_exact">Точное совпадение sender</option>
+          </select>
+          <label class="visually-hidden" for="rule-add-pattern">Шаблон</label>
+          <input
+            class="field__input"
+            type="text"
+            id="rule-add-pattern"
+            name="pattern"
+            required
+            maxlength="256"
+            placeholder="Шаблон">
+          <button type="submit" class="btn btn--secondary btn--small">Добавить правило</button>
+        </div>
+        <p class="field__hint">Удаление правила не снимает уже прикреплённые теги.</p>
+      </form>
+
+      <form
+        method="POST"
+        action="/api/tags/{{ tag.id }}/apply-to-existing"
+        class="form tag-rules-manage__apply"
+        enctype="application/x-www-form-urlencoded"
+        data-tag-apply-form
+        data-confirm="Применить тег ко всем уже скачанным письмам? Может занять время.">
+        {{ m.csrf_input() }}
+        <button type="submit" class="btn btn--secondary">
+          Применить тег к существующим письмам
+        </button>
+      </form>
+    </section>
+  {% endif %}
+</section>
+{% endblock %}
+
+{% block extra_js %}
+<script src="/static/js/tags.js"></script>
+{% endblock %}

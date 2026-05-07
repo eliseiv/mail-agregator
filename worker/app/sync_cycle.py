@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from dataclasses import dataclass
 
 import structlog
 from cryptography.exceptions import InvalidTag
@@ -38,6 +39,7 @@ from backend.app.repositories.mail_accounts import MailAccountsRepo
 from backend.app.repositories.messages import MessagesRepo
 from backend.app.repositories.users import UsersRepo
 from backend.app.security import assert_public_host
+from backend.app.tags.service import TagsService
 from shared.config import get_settings
 from shared.crypto import decrypt_mail_password
 from shared.db import make_session
@@ -52,6 +54,23 @@ log = get_logger(__name__)
 # Tag for invalid auth — gets ``is_active=false`` immediately (per ADR-0008).
 _AUTH_FAIL_PREFIX = "auth_failed"
 _DISABLE_AFTER_FAILS = 3
+
+
+@dataclass(slots=True)
+class _TagInputMessage:
+    """Minimal message-shaped tuple passed to ``TagsService.apply_tags_to_message``.
+
+    The service expects a ``Message``-shaped object with ``id``, ``subject``,
+    ``body_text`` and ``from_addr``. Constructing a real ORM ``Message`` here
+    would require extra round-trips (we already have the values from
+    ``FetchedMessage`` + ``inserted_id``); a tiny dataclass keeps the call
+    clean and avoids a SELECT round-trip.
+    """
+
+    id: int
+    subject: str | None
+    body_text: str
+    from_addr: str
 
 
 # ---------------------------------------------------------------------------
@@ -185,8 +204,10 @@ async def sync_one_account(
     # Save messages + attachments.
     new_count = 0
     conflict_count = 0
+    tags_applied_total = 0
     async with make_session() as s, s.begin():
         repo = MessagesRepo(s)
+        tags_service = TagsService(s)
         for fmsg in box.new_messages:
             inserted_id = await repo.insert_message_idempotent(
                 mail_account_id=account.id,
@@ -240,6 +261,35 @@ async def sync_one_account(
                     skipped_too_large=skipped,
                 )
 
+            # Apply tags (ADR-0017 §5). Best-effort within the same
+            # transaction: a SQL fault here would abort all messages in
+            # this batch, so we catch broadly and log a warning. The
+            # ``ON CONFLICT DO NOTHING`` in the underlying SQL keeps it
+            # idempotent against retries — no tag duplication risk.
+            try:
+                applied = await tags_service.apply_tags_to_message(
+                    message=_TagInputMessage(
+                        id=inserted_id,
+                        subject=fmsg.subject,
+                        body_text=fmsg.body_text,
+                        from_addr=fmsg.from_addr,
+                    ),
+                    user_id=account.user_id,
+                )
+                tags_applied_total += applied
+            except Exception as exc:
+                # Don't lose the message; just record that we couldn't
+                # tag it. Subsequent ingest of the same UID is impossible
+                # (UNIQUE constraint), so unlike the message itself the
+                # tag application has no automatic retry path. That's
+                # acceptable — operators can re-run apply-to-existing
+                # from /tags/{id}/edit if a rule was misconfigured.
+                cycle_log.warning(
+                    "apply_tags_failed",
+                    message_id=inserted_id,
+                    detail=str(exc)[:200],
+                )
+
     # Mark sync success.
     async with make_session() as s, s.begin():
         await MailAccountsRepo(s).mark_sync_success(
@@ -252,6 +302,7 @@ async def sync_one_account(
         "sync_account_finish",
         new_messages=new_count,
         conflicts=conflict_count,
+        tags_applied=tags_applied_total,
     )
     return new_count, conflict_count
 

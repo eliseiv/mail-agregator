@@ -21,6 +21,7 @@ from backend.app.messages.schemas import (
 from backend.app.messages.service import MessageService
 from backend.app.repositories.mail_accounts import MailAccountsRepo
 from backend.app.repositories.messages import MessagesRepo
+from backend.app.tags.service import TagsService
 from backend.app.templates import render
 
 api = APIRouter(prefix="/api/messages", tags=["messages"])
@@ -37,6 +38,7 @@ async def list_messages(
     db: DbSession,
     user: CurrentUser,
     account_id: Annotated[int | None, Query(ge=1)] = None,
+    tag_id: Annotated[int | None, Query(ge=1)] = None,
     unread: Annotated[bool | None, Query()] = None,
     cursor: Annotated[str | None, Query(max_length=200)] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
@@ -44,6 +46,7 @@ async def list_messages(
     return await MessageService(db).list_for_user(
         user_id=user.id,
         account_id=account_id,
+        tag_id=tag_id,
         unread=unread,
         cursor=cursor,
         limit=limit,
@@ -119,8 +122,9 @@ async def inbox_page(
     user: CurrentUser,
     # ``account_id`` is accepted as a string so the empty value submitted by
     # the "All accounts" option of the filter form (account_id=) doesn't blow
-    # up FastAPI's int parser. Same for ``unread``.
+    # up FastAPI's int parser. Same for ``unread`` and ``tag_id`` (ADR-0017).
     account_id: Annotated[str | None, Query()] = None,
+    tag_id: Annotated[str | None, Query()] = None,
     cursor: Annotated[str | None, Query(max_length=200)] = None,
     unread: Annotated[str | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
@@ -129,14 +133,20 @@ async def inbox_page(
     parsed_account_id: int | None = None
     if account_id and account_id.isdigit():
         parsed_account_id = int(account_id)
+    parsed_tag_id: int | None = None
+    if tag_id and tag_id.isdigit():
+        parsed_tag_id = int(tag_id)
     parsed_unread: bool | None = None
     if unread:
         parsed_unread = unread.lower() in ("1", "true", "on", "yes")
 
     accounts = await MailAccountsRepo(db).list_for_user(user.id)
+    # Server-render dropdown of user's tags so the filter renders without JS.
+    tags = await TagsService(db).list_for_user(user.id)
     listing = await MessageService(db).list_for_user(
         user_id=user.id,
         account_id=parsed_account_id,
+        tag_id=parsed_tag_id,
         unread=parsed_unread,
         cursor=cursor,
         limit=limit,
@@ -149,7 +159,9 @@ async def inbox_page(
             "items": listing.items,
             "next_cursor": listing.next_cursor,
             "accounts": accounts,
+            "tags": tags,
             "selected_account_id": parsed_account_id,
+            "selected_tag_id": parsed_tag_id,
             "unread_only": bool(parsed_unread),
             "unread_count": unread_count,
             "csrf_token": sess.csrf_token,

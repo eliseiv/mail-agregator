@@ -77,6 +77,10 @@ LIMIT_ACCOUNT_WRITE = Limit(name="acc_write", capacity=10, window_seconds=60 * 6
 LIMIT_ACCOUNT_SYNC = Limit(name="acc_sync", capacity=5, window_seconds=60 * 60)
 LIMIT_MESSAGE_SEND = Limit(name="msg_send", capacity=30, window_seconds=60 * 60)
 LIMIT_ADMIN_WRITE = Limit(name="admin_write", capacity=50, window_seconds=60 * 60)
+# Tags (ADR-0017): writes (create/edit/delete tag, add/remove rule) — 30/h.
+# ``apply_to_existing`` is a heavier path and gets its own 5/h limit per user.
+LIMIT_TAGS_WRITE = Limit(name="tags_write", capacity=30, window_seconds=60 * 60)
+LIMIT_TAGS_APPLY = Limit(name="tags_apply", capacity=5, window_seconds=60 * 60)
 
 
 async def consume(limit: Limit, key: str) -> None:

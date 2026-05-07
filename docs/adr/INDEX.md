@@ -20,3 +20,4 @@
 | [ADR-0014](./ADR-0014-logging.md) | Логирование — structlog, JSON в stdout, request_id correlation | accepted | 2026-05-05 |
 | [ADR-0015](./ADR-0015-no-js-fallback.md) | No-JS fallback — `_method` override + form-encoded acceptance + content negotiation | accepted | 2026-05-05 |
 | [ADR-0016](./ADR-0016-two-step-login.md) | Two-step login (username then password, ADR-style flow as Google) | accepted | 2026-05-06 |
+| [ADR-0017](./ADR-0017-tags.md) | Теги для писем — rule-based авто-классификация и пользовательские правила | accepted | 2026-05-07 |

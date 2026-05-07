@@ -10,6 +10,7 @@ from shared.models.mail_account import MailAccount
 from shared.models.message import Message
 from shared.models.sent_attachment import SentAttachment
 from shared.models.sent_message import SentMessage
+from shared.models.tag import MessageTag, Tag, TagRule
 from shared.models.user import User
 
 __all__ = [
@@ -17,7 +18,10 @@ __all__ = [
     "Attachment",
     "MailAccount",
     "Message",
+    "MessageTag",
     "SentAttachment",
     "SentMessage",
+    "Tag",
+    "TagRule",
     "User",
 ]

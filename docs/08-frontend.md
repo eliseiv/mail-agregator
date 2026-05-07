@@ -22,6 +22,11 @@ flowchart LR
     Accounts -- "Edit" --> AccEdit[/accounts/{id}/edit/]
     AccNew --> Accounts
     AccEdit --> Accounts
+    Inbox -- nav --> Tags[/tags/]
+    Tags -- "+ Добавить тег" --> TagNew[/tags/new/]
+    Tags -- "Edit" --> TagEdit[/tags/{id}/edit/]
+    TagNew --> Tags
+    TagEdit --> Tags
     Inbox -- nav (admin only) --> AdminUsers[/admin/]
     AdminUsers --> AdminAudit[/admin/audit/]
 ```
@@ -43,6 +48,8 @@ flowchart LR
 | `accounts/form.html` | Add / edit account | `GET /accounts/new`, `GET /accounts/{id}/edit` |
 | `admin/users.html` | Admin users | `GET /admin` |
 | `admin/audit.html` | Admin audit log | `GET /admin/audit` |
+| `tags/list.html` | Tags list page | `GET /tags` |
+| `tags/form.html` | Create / edit tag form | `GET /tags/new`, `GET /tags/{id}/edit` |
 | `errors/4xx.html` | Generic 4xx error | error handlers |
 | `errors/5xx.html` | Generic 5xx error | error handlers |
 
@@ -64,6 +71,7 @@ flowchart LR
       <nav>
         <a href="/">Inbox</a>
         <a href="/accounts">Accounts</a>
+        <a href="/tags">Tags</a>
         {% if request.state.session.role == 'admin' %}<a href="/admin">Admin</a>{% endif %}
         <form method="POST" action="/logout" class="inline">
           {{ csrf_input() }}
@@ -93,6 +101,7 @@ flowchart LR
 | `compose.js` | Compose: подсветка некорректных email-адресов; счётчик символов subject; клиентская проверка длины body. |
 | `account_form.js` | Add/edit account: при вводе email — auto-fill IMAP/SMTP defaults для известных доменов (хардкод-таблица в JS, см. ниже; backend-эндпоинта provider-suggest нет, чтобы не плодить лишних round-trip'ов); кнопка "Test connection" — POST `/api/mail-accounts/test`, показывает inline-результат. |
 | `admin_users.js` | Admin: раскрытие/сворачивание списка mail-аккаунтов внутри строки пользователя; confirm-диалоги для reset/delete. |
+| `tags.js` | Tags form (create / edit): динамическое добавление/удаление строк condition (rule_type[] + rule_pattern[]); валидация (тип выбран, pattern непустой) перед submit; color-picker swatches (см. секцию 5.1); confirm-диалог при DELETE тега и DELETE rule. **Важно:** без JS форма всё равно работает — template рендерит фиксированное число пустых rule-row (например, 5); пользователь заполняет столько, сколько нужно; backend пропускает empty pairs. |
 
 **Provider auto-suggest**: хардкод-таблица в `account_form.js` (короткий объект, дублирующий `accounts/providers.py`). Минимальный набор — `gmail.com`, `yandex.ru`, `mail.ru`, `outlook.com`; backend-агент при необходимости расширяет JS-таблицу до полного списка из `providers.py` (см. `05-modules.md` секция 9). Backend остаётся источником истины — он ре-валидирует всё при POST/test.
 
@@ -176,7 +185,7 @@ flowchart LR
 ┌──────────────────────────────────────────────────────┐
 │  [< Inbox]   [Reply]   [Mark as unread]              │
 ├──────────────────────────────────────────────────────┤
-│  Subject: {{ subject }}                              │
+│  Subject: {{ subject }}  [● Important] [● Диспут]    │
 │  From: {{ from_name }} <{{ from_addr }}>             │
 │  To: {{ to_addrs }}                                  │
 │  Cc: {{ cc_addrs }}                                  │
@@ -311,7 +320,112 @@ flowchart LR
 - "Delete" — confirm-диалог с явным "Type username to confirm" (защита от misclick).
 - Super-admin строка — без кнопок.
 
-### 4.9 Admin audit (`admin/audit.html`)
+### 4.10 Tags list (`tags/list.html`)
+
+Источник истины — [ADR-0017](./adr/ADR-0017-tags.md).
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  Ваши теги                                    [+ Добавить тег]   │
+├──────────────────────────────────────────────────────────────────┤
+│  ● DPLA.PLA              builtin   4 правила      [Изменить]     │
+│  ● Диспут                builtin   2 правила      [Изменить]     │
+│  ● Отменить подписку     builtin   2 правила      [Изменить]     │
+│  ● Продление аккаунта    builtin   1 правило      [Изменить]     │
+│  ● Important             custom    3 правила      [Изменить][×]  │
+│  ● Newsletters           custom    1 правило      [Изменить][×]  │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+- "●" — circle SVG в цвете тега (16×16 px); рядом — `name`.
+- "builtin" — бледный badge серого цвета (для встроенных тегов; `is_builtin=true`).
+- Число правил — из `tags[i].rules.length`.
+- "[×]" — кнопка delete; видна **только** для custom тегов; для builtin — отсутствует / disabled.
+  - Реализация delete: `<form method="POST" action="/api/tags/{id}/delete" class="inline">` + `_method=DELETE` + csrf_input + confirm-диалог через JS.
+- "[+ Добавить тег]" — `<a href="/tags/new">`.
+
+### 4.11 Tag form (`tags/form.html`) — create/edit
+
+```
+┌────────────────────────────────────────────────────┐
+│   Новый тег                                        │
+│                                                    │
+│   Имя:    [ Apple disputes                       ] │
+│   Цвет:   [●][●][●][●][●][●][●][●]   ← swatches    │
+│                                                    │
+│   ── Условия (срабатывает любое) ──                │
+│   ┌──────────────────────────────────────────┐     │
+│   │ Тип: [ subject contains    ▼]            │     │
+│   │ Шаблон: [ Apple Inc                    ] │ [×] │
+│   └──────────────────────────────────────────┘     │
+│   ┌──────────────────────────────────────────┐     │
+│   │ Тип: [ sender exact        ▼]            │     │
+│   │ Шаблон: [ AppStoreNotices@apple.com    ] │ [×] │
+│   └──────────────────────────────────────────┘     │
+│   [ + Добавить условие ]                           │
+│                                                    │
+│   ☐ Применить к существующим письмам               │
+│                                                    │
+│   [ Сохранить ]   [ Отмена ]                       │
+└────────────────────────────────────────────────────┘
+```
+
+- "Имя" — `<input name="name" maxlength="64" required>`.
+- "Цвет" — 8 swatch-вариантов из палитры (см. секцию 5.1). Реализация: `<input type="radio" name="color" value="#2563eb" id="color-c1" required>` для каждого слота палитры; `<label for="color-c1" class="color-swatch tag-color-c1">` (CSS-класс задаёт визуал из main.css — без inline-style, CSP-friendly). По умолчанию выбран первый цвет. Работает без JS как чистая radio-группа.
+- Список условий — повторяющиеся блоки с парами `<select name="rule_type[]">` и `<input name="rule_pattern[]">`. Каждый блок имеет кнопку "[×]" для удаления (JS); без JS — пользователь оставляет поля пустыми, backend пропускает empty pairs.
+- "[+ Добавить условие]" — JS добавляет новый rule-row. Без JS — template рендерит **5 пустых rule-row сразу** (явно: 5 — компромисс между «много для maxlength rules» и «не загромождает форму»; пользователь заполняет нужные).
+- Типы условия (dropdown):
+  - `subject_contains` — "Подстрока в subject"
+  - `body_contains` — "Подстрока в теле"
+  - `sender_contains` — "Подстрока в sender"
+  - `sender_exact` — "Точное совпадение sender"
+- Чекбокс "Применить к существующим письмам" — присутствует только в **create**-форме (в edit-форме — отдельная кнопка "Применить к существующим" вне формы, см. ниже).
+- "[Сохранить]" → `<button type="submit">` → POST на `/api/tags` (create) или `POST /api/tags/{id}` + `_method=PATCH` (edit).
+- "[Отмена]" → `<a href="/tags">`.
+
+В edit-форме дополнительно:
+
+```
+┌────────────────────────────────────────────────────┐
+│   Редактировать тег "Important"                    │
+│   ...                                              │
+│                                                    │
+│   [ Сохранить имя/цвет ]                           │
+│                                                    │
+│   ── Управление правилами ──                       │
+│   • subject_contains "TODO"     [Удалить правило]  │
+│   • body_contains "ASAP"        [Удалить правило]  │
+│                                                    │
+│   ┌──────────────────────────────────────────┐     │
+│   │ Тип: [ ▼]   Шаблон: [           ]        │     │
+│   └──────────────────────────────────────────┘     │
+│   [ Добавить правило ]                             │
+│                                                    │
+│   [ Применить тег к существующим письмам ]         │
+└────────────────────────────────────────────────────┘
+```
+
+- В edit разделены 3 операции: `PATCH /api/tags/{id}` (имя+цвет), `POST /api/tags/{id}/rules` (add rule, отдельная форма), `DELETE /api/tags/{id}/rules/{rule_id}` (sibling-роут `.../delete` с `_method=DELETE`), `POST /api/tags/{id}/apply-to-existing` (отдельная кнопка-форма).
+- Каждая `<form>` содержит свой `csrf_input()`.
+
+### 4.12 Inbox с tag-фильтром и tag-badges
+
+Дополняет 4.3 (Inbox). Изменения:
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  [Compose]   Filter: [All accounts ▼]  [Tag: All ▼]  ☐ unread only   │
+├──────────────────────────────────────────────────────────────────────┤
+│  ● [acc:gmail]  John Doe        Subject of message  [● Important]    │
+│  ○ [acc:yandex] Newsletter      Some news subject   [● News]         │
+│  ● [acc:gmail]  Apple Inc       Receipt #1234       [● Диспут]       │
+│  ...                                                                 │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+- Filter "Tag" — `<select name="tag_id">` с `<option value="">All</option>` + список тегов пользователя (рендерится server-side).
+- Tag-badges возле subject — небольшие chips: `<span class="tag-chip tag-color-{slot}">● Name</span>`.
+- **Цветовое решение (CSP-friendly).** Колонка `tags.color` хранит hex `#RRGGBB`, но UI принуждённо выбирает значение строго из фиксированной палитры из 8 цветов (см. секцию 5.1). В `main.css` 8 предкомпилированных классов `.tag-color-c1` ... `.tag-color-c8` с фиксированными `background-color`. Helper в Jinja2-template маппит hex → имя класса (8 элементов в `dict`). Это исключает inline-`style` атрибут и не требует ослабления CSP `style-src 'self'`. Pure custom RGB — отдельный ADR, не в этом scope.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -342,6 +456,25 @@ flowchart LR
 - Layout: max-width 960px на основном content, full-width topbar.
 - Mobile: одна колонка; табличные строки inbox адаптируются под flex.
 - Без иконочных шрифтов; SVG inline в шаблонах (опционально).
+
+### 5.1 Палитра тегов
+
+8 фиксированных цветов для тегов (выбор делается на форме `/tags/new`/`/tags/{id}/edit`; `tags.color` хранит выбранный hex):
+
+| Slot | CSS-class | Hex | Семантика |
+| --- | --- | --- | --- |
+| c1 | `.tag-color-c1` | `#2563eb` | blue (default; общий) |
+| c2 | `.tag-color-c2` | `#dc2626` | red (срочно / диспут) |
+| c3 | `.tag-color-c3` | `#f59e0b` | amber (напоминание / подписка) |
+| c4 | `.tag-color-c4` | `#16a34a` | green (готово / продление) |
+| c5 | `.tag-color-c5` | `#7c3aed` | purple (важное) |
+| c6 | `.tag-color-c6` | `#0891b2` | cyan (ссылка / интеграция) |
+| c7 | `.tag-color-c7` | `#db2777` | pink (личное) |
+| c8 | `.tag-color-c8` | `#475569` | slate (архив / шум) |
+
+CSS-классы `.tag-color-cN` имеют `background-color: <hex>; color: white;` (с проверкой контраста для каждого hex). Класс `.tag-chip` задаёт padding, border-radius, font-size. Helper в Jinja2 (`_macros.html`) — `{{ tag_chip(tag) }}` — рендерит `<span class="tag-chip tag-color-{slot}">{{ tag.name }}</span>`.
+
+Backend-валидация `color`: regex `^#[0-9A-Fa-f]{6}$` + проверка `IN (palette)` (8 hex-значений), на случай прямого API-вызова в обход формы. Если значение не из палитры — 400 `validation_error`.
 
 ---
 
@@ -374,6 +507,7 @@ i18n-инфраструктура не поднимается. Если потр
 - Compose + send (form-POST на `/api/messages/send` form-encoded; backend поддерживает form-encoded POST как альтернативу JSON; multi-value `to`/`cc`/`bcc` — одна строка с разделителем `,`/`;`).
 - Add/edit/delete account (form-POST; для PATCH/DELETE используется `_method=PATCH`/`_method=DELETE` поверх POST; "Test connection" недоступен — Save сам делает тест на сервере).
 - Admin: create user, reset, delete (form-POST; для DELETE — `_method=DELETE` на sibling-роуте `.../delete`; confirm через `<button onclick>` отвалится при no-JS — допустимо, страховка на стороне сервера через сами actions достаточна).
+- Tags: list / create / edit / delete тегов (form-POST; для PATCH/DELETE — `_method=PATCH`/`_method=DELETE` на whitelist'е; rules add/remove работают через отдельные `<form>` элементы; "Применить к существующим" — отдельная form-POST кнопка; форма rule-row рендерит 5 пустых строк по умолчанию, JS дополнительно позволяет добавить/удалить, но без JS все 5 строк рабочие).
 
 JS только улучшает UX, но не блокирует базовую функциональность.
 
@@ -394,3 +528,6 @@ JS только улучшает UX, но не блокирует базовую
 - [ ] Flash-сообщения после redirect рендерятся через `flash_messages()` macro в `base.html`.
 - [ ] Адаптивная вёрстка (mobile-first).
 - [ ] Базовая a11y соблюдена.
+- [ ] Шаблоны `tags/list.html`, `tags/form.html` созданы; `tags.js` подключается только на этих страницах через `{% block extra_js %}`. Без JS — форма с 5 пустыми rule-rows работает; цвет выбирается radio-buttons.
+- [ ] Tag-chips на inbox и message_view используют `_macros.html → tag_chip(tag)` с CSS-классом `.tag-color-cN` из палитры (секция 5.1) — без inline-style.
+- [ ] Tag-фильтр на inbox: `<select name="tag_id">` с list пользовательских тегов; query-param пробрасывается.

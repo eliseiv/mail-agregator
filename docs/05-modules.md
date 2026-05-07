@@ -55,6 +55,12 @@ backend/
       service.py
       schemas.py
       mime.py
+    tags/
+      router.py            # API + HTML routes для /tags, /api/tags
+      service.py           # TagsService (create, update, delete, apply_to_existing, ensure_builtin_tags, apply_tags_to_message)
+      schemas.py           # Pydantic для request/response
+      builtin.py           # Список 4 builtin-тегов + правил (статичный)
+      sql.py               # Готовые SQL для apply (используются service'ом и worker'ом)
     audit/
       service.py
     models/                # SQLAlchemy ORM
@@ -66,12 +72,14 @@ backend/
       sent_message.py
       sent_attachment.py
       admin_audit.py
+      tag.py                # Tag, TagRule, MessageTag ORM
     repositories/
       users.py
       mail_accounts.py
       messages.py
       sent_messages.py
       audit.py
+      tags.py               # TagsRepo, TagRulesRepo, MessageTagsRepo
     templates/             # Jinja2
       base.html
       login.html
@@ -83,16 +91,20 @@ backend/
       accounts/form.html
       admin/users.html
       admin/audit.html
+      tags/list.html
+      tags/form.html
     static/
       css/main.css
       js/app.js
       js/csrf.js
       js/inbox.js
       js/compose.js
+      js/tags.js
   migrations/              # alembic
     env.py
     versions/
       001_initial.py
+      002_add_tags.py        # ADR-0017
   tests/
     unit/
     integration/
@@ -332,6 +344,18 @@ Login, logout, set-password, super-admin seed, lockout-логика.
 - Никакие данные из cookie/payload клиента на это значение не влияют.
 - При успешном login для `is_admin=true` пользователя auth-модуль дополнительно вызывает `AuditWriter.log(action="admin_login", actor_user_id=user.id, ip, ua)`.
 - При `POST /logout`, если у текущей сессии `role == "admin"`, auth-модуль перед удалением сессии вызывает `AuditWriter.log(action="admin_logout", ...)`.
+
+### Post-login hook: builtin-теги (ADR-0017)
+
+После успешного создания сессии (в обоих flow — `complete_set_password` и `login`) и **до** возврата `LoginResult` auth-модуль вызывает:
+
+```python
+await tags_service.ensure_builtin_tags(user_id=user.id)
+```
+
+Метод идемпотентен (см. `03-data-model.md` секция "Заполнение builtin-тегов" и модуль 18 ниже). Ошибка вызова — пробрасывается (это безопасно: builtin-теги — функциональный must-have; если БД отвалилась — login не удался по тем же причинам).
+
+Логирование: `event=builtin_tags_created` (новые) или `event=builtin_tags_unchanged` (уже были).
 
 ### Публичный API
 - HTTP routes: см. `04-api-contracts.md` секция Public Auth (two-step login per ADR-0016).
@@ -586,11 +610,16 @@ Redirect targets и flash-тексты — из таблицы в ADR-0015 (serv
 - Service:
 ```python
 class MessageService:
-    async def list_for_user(user_id: int, account_id: int|None, unread: bool|None, cursor: str|None, limit: int) -> tuple[list[MessageListDTO], next_cursor: str|None]
+    async def list_for_user(user_id: int, account_id: int|None, tag_id: int|None, unread: bool|None, cursor: str|None, limit: int) -> tuple[list[MessageListDTO], next_cursor: str|None]
     async def get(user_id: int, message_id: int) -> MessageDetailDTO
     async def mark_read(user_id: int, message_id: int, is_read: bool) -> None
     async def stream_attachment(user_id: int, message_id: int, attachment_id: int) -> tuple[Attachment, AsyncIterator[bytes]]
 ```
+
+#### Tag-aware fields в DTO (ADR-0017)
+- `MessageListDTO` дополнен `tags: list[TagBriefDTO]` (`{id, name, color}`). Один query: leftjoin `message_tags mt` → `tags t` GROUP BY message с `array_agg`/`json_agg` (или один доп-SELECT на batch — на усмотрение реализации).
+- `MessageDetailDTO` дополнен таким же `tags: list[TagBriefDTO]`.
+- `tag_id`-фильтр в `list_for_user`: добавляет `JOIN message_tags mt ON mt.message_id = m.id AND mt.tag_id = :tag_id`. Ownership tag'а валидируется отдельно (`SELECT 1 FROM tags WHERE id=:tag_id AND user_id=:user_id`); если `tag_id` чужой/невалиден — `404 not_found` (не молча игнорировать).
 
 ### Зависимости
 - repositories.messages, storage.
@@ -747,6 +776,13 @@ class MethodOverrideMiddleware:
         "/api/admin/users",
         r"^/api/admin/users/\d+/reset$",
         r"^/api/admin/users/\d+/delete$",     # DELETE (sibling-роут)
+        # Tags (ADR-0017)
+        "/api/tags",
+        r"^/api/tags/\d+$",                       # PATCH
+        r"^/api/tags/\d+/delete$",                # DELETE (sibling-роут)
+        r"^/api/tags/\d+/rules$",                 # POST add rule
+        r"^/api/tags/\d+/rules/\d+/delete$",      # DELETE rule (sibling-роут)
+        r"^/api/tags/\d+/apply-to-existing$",
     ]
     ALLOWED_OVERRIDES = {"DELETE", "PATCH", "PUT"}
 ```
@@ -862,6 +898,7 @@ async def sync_one_account(account: MailAccount) -> AccountSyncResult
 - Attachments: для каждого `att`: если `size <= 25 MiB` — PUT в MinIO (key из storage.build_key); иначе записать с `skipped_too_large=true`.
 - INSERT messages + attachments в одной транзакции.
 - ON CONFLICT (`mail_account_id`, `uidvalidity`, `uid`) DO NOTHING.
+- **Apply tags (ADR-0017):** если INSERT messages вернул `RETURNING id` (т.е. это была новая запись, не дубль), в той же транзакции выполняется `tags_service.apply_tags_to_message(message_id, user_id)` (использует SQL `APPLY_TAGS_TO_MESSAGE` из `app/tags/sql.py`). Все условия — один SQL-запрос, ON CONFLICT DO NOTHING. Падение apply откатывает всю транзакцию (включая INSERT messages) → message будет пере-обработан при следующем sync. `user_id` берётся из `mail_accounts.user_id` (resolve один раз перед циклом save_message). При ON CONFLICT (письмо уже было) apply пропускается — повторно теги не применяются.
 
 ### Обработка ошибок (per-account)
 | Ошибка | Действие |
@@ -945,7 +982,155 @@ SSR HTML-страницы и минимальный vanilla JS.
 
 ---
 
-## 17. QA / тесты — обязательный набор для backend/worker
+## 17. tags (модуль)
+
+### Назначение
+Управление пользовательскими и встроенными тегами писем (см. ADR-0017). Применяет теги к новым письмам в worker'е и предоставляет user-facing API/HTML для CRUD тегов и rules. Per-user изоляция.
+
+### Публичный API
+- HTTP routes: см. `04-api-contracts.md` секция Tags + HTML-страницы `/tags`, `/tags/new`, `/tags/{id}/edit`.
+- Service:
+```python
+class TagsService:
+    async def list_for_user(user_id: int) -> list[TagDTO]
+    async def get(user_id: int, tag_id: int) -> TagDTO
+    async def create(user_id: int, name: str, color: str, rules: list[RuleSpec], apply_to_existing: bool) -> tuple[TagDTO, applied_count: int]
+    async def update(user_id: int, tag_id: int, name: str | None, color: str | None) -> TagDTO
+    async def delete(user_id: int, tag_id: int) -> None  # raises CannotDeleteBuiltinTagError
+    async def add_rule(user_id: int, tag_id: int, type_: str, pattern: str) -> RuleDTO
+    async def delete_rule(user_id: int, tag_id: int, rule_id: int) -> None
+    async def apply_to_existing(user_id: int, tag_id: int) -> int          # returns applied_count
+    async def ensure_builtin_tags(user_id: int) -> None                    # idempotent; called from auth post-login hook
+    async def apply_tags_to_message(message_id: int, user_id: int) -> int  # called from worker.save_message
+```
+
+- Repository (в `repositories/tags.py`):
+```python
+class TagsRepo:
+    async def list_for_user(user_id: int) -> list[Tag]
+    async def get_owned(user_id: int, tag_id: int) -> Tag | None
+    async def create(user_id: int, name: str, color: str, is_builtin: bool) -> Tag
+    async def update_meta(tag_id: int, name: str | None, color: str | None) -> Tag
+    async def delete(tag_id: int) -> None
+    async def has_any_builtin(user_id: int) -> bool
+
+class TagRulesRepo:
+    async def list_for_tag(tag_id: int) -> list[TagRule]
+    async def add(tag_id: int, type_: str, pattern: str) -> TagRule
+    async def delete(rule_id: int) -> None
+
+class MessageTagsRepo:
+    async def link(message_id: int, tag_id: int) -> None  # idempotent (ON CONFLICT)
+    async def list_for_message(message_id: int) -> list[Tag]
+    async def list_messages_with_tag(user_id: int, tag_id: int, cursor: str | None, limit: int) -> list[Message]
+    async def count_messages_for_user(user_id: int) -> int  # для tag_apply_too_many guard
+```
+
+### Зависимости
+- repositories.tags, repositories.users (для ownership), repositories.messages (для apply_to_existing count guard).
+- Не зависит от Redis / MinIO.
+- Используется из `auth.AuthService` (ensure_builtin_tags), `messages.MessageService` (получение tags при list/get), `worker.sync_cycle.save_message` (apply_tags_to_message).
+
+### Состояния
+- Таг не имеет lifecycle-FSM. `is_builtin=true` — флаг защиты от DELETE (выставляется только из `ensure_builtin_tags`); user не может включить его через API.
+
+### SQL-helpers (`backend/app/tags/sql.py`)
+
+Готовый текст параметризованных запросов; используется service'ом и worker'ом без дублирования. Источник истины — ADR-0017 §5/§7.
+
+```python
+APPLY_TAGS_TO_MESSAGE = """
+INSERT INTO message_tags (message_id, tag_id)
+SELECT :message_id, t.id
+FROM tags t
+WHERE t.user_id = :user_id
+  AND EXISTS (
+    SELECT 1 FROM tag_rules r WHERE r.tag_id = t.id AND (
+        (r.type = 'subject_contains' AND :subject  ILIKE '%' || r.pattern || '%') OR
+        (r.type = 'body_contains'    AND :body     ILIKE '%' || r.pattern || '%') OR
+        (r.type = 'sender_contains'  AND :sender   ILIKE '%' || r.pattern || '%') OR
+        (r.type = 'sender_exact'     AND LOWER(:sender) = LOWER(r.pattern))
+    )
+  )
+ON CONFLICT (message_id, tag_id) DO NOTHING
+"""
+
+APPLY_TAG_TO_EXISTING = """
+INSERT INTO message_tags (message_id, tag_id)
+SELECT m.id, :tag_id
+FROM messages m
+JOIN mail_accounts ma ON ma.id = m.mail_account_id
+WHERE ma.user_id = :user_id
+  AND EXISTS (
+    SELECT 1 FROM tag_rules r WHERE r.tag_id = :tag_id AND (
+        (r.type = 'subject_contains' AND m.subject   ILIKE '%' || r.pattern || '%') OR
+        (r.type = 'body_contains'    AND m.body_text ILIKE '%' || r.pattern || '%') OR
+        (r.type = 'sender_contains'  AND m.from_addr ILIKE '%' || r.pattern || '%') OR
+        (r.type = 'sender_exact'     AND LOWER(m.from_addr) = LOWER(r.pattern))
+    )
+  )
+ON CONFLICT (message_id, tag_id) DO NOTHING
+"""
+```
+
+В `apply_tags_to_message` параметры `:subject`, `:body`, `:sender`, `:user_id`, `:message_id` — backend передаёт значениями из объекта `Message` (вытащить можно как из переданного объекта, так и SELECT'ом по message_id). Альтернатива — внутри SQL JOIN'нуть `messages m ON m.id = :message_id` (одинаково по производительности).
+
+### Edge cases
+- Создание тега: race с другим запросом того же пользователя (две одновременные POST /api/tags с одинаковым name) → один из POST вернёт 409 (UNIQUE constraint).
+- `apply_to_existing` при пустом массиве rules — INSERT не вернёт строк, `applied_count=0`. Это валидное состояние (пользователь хочет создать пустой тег и потом добавить rules).
+- DELETE rule после того как rule сработал → существующие `message_tags` остаются (см. note в `04-api-contracts.md`).
+- Pattern с `%` или `_` — рабочие как ILIKE-wildcards; намеренно (см. ADR-0017 §4).
+- `apply_to_existing=true` при число messages > 100 000 → `tag_apply_too_many` (422). Перед heavy SQL делаем `count_messages_for_user(user_id)`; см. ADR-0017 §7.
+- `ensure_builtin_tags` race (одновременно два login одного user'а): первый создаст builtin, второй увидит `has_any_builtin=true` и сделает return. Если ровно одновременно оба прошли проверку и пытаются INSERT — UNIQUE `(user_id, name)` гарантирует, что второй получит IntegrityError; ловим его и treat as success (idempotent retry-safe).
+
+### Тестируемые инварианты
+- `list_for_user(user_id)` возвращает **только** теги этого пользователя.
+- `get_owned(user_id, tag_id)` возвращает None, если tag не пользователя (используется для 404 в API).
+- DELETE builtin → `CannotDeleteBuiltinTagError` (преобразуется в 400 `cannot_delete_builtin_tag`).
+- `ensure_builtin_tags` вызванный дважды → только 4 builtin тега (idempotent).
+- `apply_tags_to_message` для сообщения, у которого subject="DPLA report" и user имеет builtin "DPLA.PLA" → `message_tags` содержит link.
+- `apply_tags_to_message` для message чужого пользователя (manual SQL test) → нет линков (защита через `t.user_id = :user_id`).
+- Pattern с `'` (одинарная кавычка) → корректно параметризован (нет SQL injection); тест: pattern=`O'Brien` сработает на subject `Hello, O'Brien!`.
+- ILIKE case-insensitive: pattern `Apple Inc`, subject `notification from APPLE INC.` → match.
+
+### Content negotiation (no-JS fallback)
+
+Whitelist endpoints для tags-роутера (см. `04-api-contracts.md` секция "Form-encoded fallback" + ADR-0015):
+- `POST /api/tags` (create);
+- `PATCH /api/tags/{id}` (edit) — также `POST /api/tags/{id}` + `_method=PATCH`;
+- `DELETE /api/tags/{id}` (canonical) — также `POST /api/tags/{id}/delete` + `_method=DELETE`;
+- `POST /api/tags/{id}/rules` (add rule);
+- `DELETE /api/tags/{id}/rules/{rule_id}` — также `POST /api/tags/{id}/rules/{rule_id}/delete` + `_method=DELETE`;
+- `POST /api/tags/{id}/apply-to-existing`.
+
+Также этот whitelist должен быть зарегистрирован в `MethodOverrideMiddleware.WHITELIST_PATHS` (см. модуль 13):
+```python
+WHITELIST_PATHS = [
+    # ... существующие ...
+    r"^/api/tags/\d+$",                            # PATCH
+    r"^/api/tags/\d+/delete$",                     # DELETE form-fallback
+    r"^/api/tags/\d+/rules/\d+/delete$",           # DELETE rule form-fallback
+]
+```
+
+Парсинг form-полей:
+- `name`, `color` — строки (`color` валидируется regex `^#[0-9A-Fa-f]{6}$`).
+- `apply_to_existing` — чекбокс (`on`/`true`/`1` → true; отсутствует → false).
+- `rule_type[]` и `rule_pattern[]` — массивы (`form.getlist('rule_type')` / `form.getlist('rule_pattern')`); парные по индексу. Пары, где оба поля пустые, пропускаются. Несовпадение длин → `validation_error`.
+- `type`, `pattern` (для add-rule) — строки.
+
+Особый момент с rules: при создании тега по UI пользователь может добавлять/удалять строки condition динамически (JS). Без JS он вводит фиксированное число пар (template рендерит, например, 5 пустых строк, лишние оставляет пустыми; backend пропускает empty pairs). Это работает без JS.
+
+Помимо whitelist — все остальные tags-роуты (`GET /api/tags`, `GET /api/tags/{id}`, `GET /api/tags/{id}/rules`) используют только JSON и не требуют form-encoded acceptance.
+
+### Пагинация / объёмы
+- `list_for_user`: возвращает все теги пользователя одним запросом, без pagination (≤ 20 тегов realistic max).
+- `list_for_message`: возвращает все теги одного письма (≤ 5–10 realistic max).
+- `list_messages_with_tag`: использует ту же keyset-пагинацию, что и `messages.list_for_user`. Endpoint: `GET /api/messages?tag_id=X&cursor=...`.
+
+---
+
+## 18. QA / тесты — обязательный набор для backend/worker
 
 Это не отдельный модуль кода, а сводный список тестов, которые QA-агент обязан реализовать. Backend-агент покрывает unit-тестами доменные функции, QA-агент — integration/e2e.
 
@@ -957,6 +1142,7 @@ SSR HTML-страницы и минимальный vanilla JS.
 - rate-limit: 6-я попытка login -> 429.
 - mime builder: text/plain charset=utf-8; In-Reply-To/References корректны; BCC отсутствует в headers.
 - providers.suggest_provider_defaults: правильные дефолты для всех 11 доменов.
+- tags (ADR-0017): `ensure_builtin_tags` идемпотентен; per-user изоляция (cross-user — нет утечек); DELETE builtin → `CannotDeleteBuiltinTagError`; UNIQUE `(user_id, name)` — race на create возвращает 409.
 
 ### Integration (с реальными Postgres/Redis/MinIO в test-compose)
 - POST mail-account с замоканным IMAP/SMTP (через mock-server) — успех/fail; шифрование сохраняется/расшифровывается.
@@ -965,10 +1151,11 @@ SSR HTML-страницы и минимальный vanilla JS.
 - Admin reset password — все сессии user'а удалены.
 - Admin delete user — каскад до MinIO (объекты удалены).
 - Force sync — маркер обработан в течение следующего тика.
+- Tags: первый login создаёт 4 builtin-тега; повторный login не дублирует. Sync с письмом subject="DPLA report" → автоматически прицепляется builtin "DPLA.PLA". Создание custom тега с `apply_to_existing=true` — новые linkы появились в `message_tags`. DELETE message → CASCADE удаляет `message_tags` (нет orphan). DELETE user → CASCADE удаляет `tags`/`tag_rules`/`message_tags`.
 
 ### E2E (через httpx + Browser-less)
 - Полный flow: admin создаёт user -> user logs in -> set password -> add account -> sync (триггер вручную) -> читает inbox -> отвечает -> sent_messages инкрементится.
 
 ### Coverage
-- Минимум 75% по модулям 1–11, 14, 15.
+- Минимум 75% по модулям 1–11, 14, 15, 17.
 - Никаких `# pragma: no cover` без обоснования в комментарии.

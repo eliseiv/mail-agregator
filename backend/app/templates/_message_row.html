@@ -1,10 +1,13 @@
 {# Partial. Expects loop variable `msg` with fields:
      id, mail_account_id, mail_account_email, from_addr, from_name,
      subject, internal_date (ISO str), internal_date_human (str|optional),
-     is_read (bool), has_attachments (bool).
+     is_read (bool), has_attachments (bool),
+     tags (list[TagBriefDTO] — id, name, color).  Optional / may be empty.
    Used by inbox.html (server-render) and inbox.js (client-side replace
    would re-fetch HTML; on this iteration we keep the snippet for
-   server-side reuse only). #}
+   server-side reuse only).
+   Macros: relies on the parent template's ``m`` import (Jinja2 includes
+   inherit context by default, see _macros.html). #}
 <li class="msg-row {% if not msg.is_read %}msg-row--unread{% endif %}" data-message-id="{{ msg.id }}">
   <a class="msg-row__link" href="/messages/{{ msg.id }}">
     <span class="msg-row__indicator" aria-hidden="true">{% if msg.is_read %}&#9675;{% else %}&#9679;{% endif %}</span>
@@ -20,6 +23,11 @@
       {% if msg.subject %}{{ msg.subject | e }}{% else %}<em>(no subject)</em>{% endif %}
       {% if msg.has_attachments %}
         <span class="msg-row__attach" aria-label="Has attachments" title="Has attachments">&#128206;</span>
+      {% endif %}
+      {% if msg.tags %}
+        <span class="msg-row__tags" aria-label="Tags">
+          {% for t in msg.tags %}{{ m.tag_chip(t) }}{% endfor %}
+        </span>
       {% endif %}
     </span>
 

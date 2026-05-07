@@ -30,6 +30,22 @@
           {% endfor %}
         </select>
 
+        <label class="visually-hidden" for="filter-tag">Filter by tag</label>
+        <select
+          class="field__input field__input--compact"
+          id="filter-tag"
+          name="tag_id"
+          data-inbox-filter>
+          <option value="">Все теги</option>
+          {% for tag in tags | default([]) %}
+            <option
+              value="{{ tag.id }}"
+              {% if selected_tag_id is defined and selected_tag_id and selected_tag_id == tag.id %}selected{% endif %}>
+              {{ tag.name | e }}
+            </option>
+          {% endfor %}
+        </select>
+
         <label class="checkbox">
           <input
             type="checkbox"
@@ -59,7 +75,7 @@
     {# Has accounts, no messages match the current filter. #}
     <div class="inbox__empty" role="status">
       <p>
-        {% if unread_only or selected_account_id %}
+        {% if unread_only or selected_account_id or selected_tag_id %}
           No messages match this filter.
         {% else %}
           No messages yet. Sync runs automatically every few minutes.
@@ -80,6 +96,7 @@
     {% if next_cursor %}
       {% set next_qs = "?cursor=" ~ next_cursor %}
       {% if selected_account_id %}{% set next_qs = next_qs ~ "&account_id=" ~ selected_account_id %}{% endif %}
+      {% if selected_tag_id %}{% set next_qs = next_qs ~ "&tag_id=" ~ selected_tag_id %}{% endif %}
       {% if unread_only %}{% set next_qs = next_qs ~ "&unread=1" %}{% endif %}
       {{ m.pagination_links(prev_url=None, next_url=next_qs) }}
     {% endif %}

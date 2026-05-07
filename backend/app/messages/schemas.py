@@ -6,6 +6,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
+from backend.app.tags.schemas import TagBriefDTO
+
 
 class AttachmentDTO(BaseModel):
     id: int
@@ -25,6 +27,8 @@ class MessageListItem(BaseModel):
     internal_date: datetime
     is_read: bool
     has_attachments: bool
+    # ADR-0017: list of tags applied to this message (compact form).
+    tags: list[TagBriefDTO] = Field(default_factory=list)
 
 
 class MessageListResponse(BaseModel):
@@ -48,6 +52,8 @@ class MessageDetail(BaseModel):
     in_reply_to: str | None
     is_read: bool
     attachments: list[AttachmentDTO]
+    # ADR-0017: list of tags applied to this message (compact form).
+    tags: list[TagBriefDTO] = Field(default_factory=list)
 
 
 class MarkReadRequest(BaseModel):

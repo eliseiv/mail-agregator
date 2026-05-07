@@ -1,0 +1,180 @@
+"""Repositories for ``tags``, ``tag_rules`` and ``message_tags`` (ADR-0017).
+
+Per ``docs/05-modules.md`` sec. 17 — three classes, thin wrappers over
+SQLAlchemy. Service-layer enforces ownership; repos only do the SQL.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+
+from sqlalchemy import delete, exists, func, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from shared.models import MailAccount, Message, MessageTag, Tag, TagRule
+
+
+class TagsRepo:
+    """CRUD for the ``tags`` table."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._s = session
+
+    # --- Reads -------------------------------------------------------------
+
+    async def list_for_user(self, user_id: int) -> list[Tag]:
+        stmt = select(Tag).where(Tag.user_id == user_id).order_by(Tag.is_builtin.desc(), Tag.name)
+        return list((await self._s.execute(stmt)).scalars().all())
+
+    async def get_owned(self, user_id: int, tag_id: int) -> Tag | None:
+        """Return the tag iff it belongs to ``user_id`` (404-on-mismatch)."""
+        stmt = select(Tag).where(Tag.id == tag_id, Tag.user_id == user_id)
+        return (await self._s.execute(stmt)).scalar_one_or_none()
+
+    async def find_by_user_name(self, user_id: int, name: str) -> Tag | None:
+        stmt = select(Tag).where(Tag.user_id == user_id, Tag.name == name)
+        return (await self._s.execute(stmt)).scalar_one_or_none()
+
+    async def has_any_builtin(self, user_id: int) -> bool:
+        stmt = select(exists().where(Tag.user_id == user_id, Tag.is_builtin.is_(True)))
+        return bool((await self._s.execute(stmt)).scalar_one())
+
+    # --- Writes ------------------------------------------------------------
+
+    async def create(self, *, user_id: int, name: str, color: str, is_builtin: bool) -> Tag:
+        tag = Tag(user_id=user_id, name=name, color=color, is_builtin=is_builtin)
+        self._s.add(tag)
+        await self._s.flush()
+        await self._s.refresh(tag)
+        return tag
+
+    async def update_meta(self, *, tag_id: int, name: str | None, color: str | None) -> None:
+        values: dict[str, object] = {}
+        if name is not None:
+            values["name"] = name
+        if color is not None:
+            values["color"] = color
+        if not values:
+            return
+        # Touch updated_at explicitly so the trigger isn't relied upon when the
+        # only changed column is name/color (the trigger does run, but being
+        # explicit makes the intent visible in the SQL and lets us assert in
+        # tests).
+        values["updated_at"] = datetime.now().astimezone()
+        await self._s.execute(update(Tag).where(Tag.id == tag_id).values(**values))
+
+    async def delete(self, tag_id: int) -> None:
+        await self._s.execute(delete(Tag).where(Tag.id == tag_id))
+
+
+class TagRulesRepo:
+    """CRUD for the ``tag_rules`` table."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._s = session
+
+    # --- Reads -------------------------------------------------------------
+
+    async def list_for_tag(self, tag_id: int) -> list[TagRule]:
+        stmt = select(TagRule).where(TagRule.tag_id == tag_id).order_by(TagRule.id)
+        return list((await self._s.execute(stmt)).scalars().all())
+
+    async def list_for_tags_bulk(self, tag_ids: list[int]) -> dict[int, list[TagRule]]:
+        if not tag_ids:
+            return {}
+        stmt = (
+            select(TagRule).where(TagRule.tag_id.in_(tag_ids)).order_by(TagRule.tag_id, TagRule.id)
+        )
+        out: dict[int, list[TagRule]] = {tid: [] for tid in tag_ids}
+        for rule in (await self._s.execute(stmt)).scalars():
+            out[rule.tag_id].append(rule)
+        return out
+
+    async def get_owned(self, tag_id: int, rule_id: int) -> TagRule | None:
+        stmt = select(TagRule).where(TagRule.id == rule_id, TagRule.tag_id == tag_id)
+        return (await self._s.execute(stmt)).scalar_one_or_none()
+
+    # --- Writes ------------------------------------------------------------
+
+    async def add(self, *, tag_id: int, type_: str, pattern: str) -> TagRule:
+        rule = TagRule(tag_id=tag_id, type=type_, pattern=pattern)
+        self._s.add(rule)
+        await self._s.flush()
+        await self._s.refresh(rule)
+        return rule
+
+    async def add_many(self, *, tag_id: int, rules: list[tuple[str, str]]) -> list[TagRule]:
+        if not rules:
+            return []
+        objs = [TagRule(tag_id=tag_id, type=t, pattern=p) for t, p in rules]
+        self._s.add_all(objs)
+        await self._s.flush()
+        for o in objs:
+            await self._s.refresh(o)
+        return objs
+
+    async def delete(self, rule_id: int) -> None:
+        await self._s.execute(delete(TagRule).where(TagRule.id == rule_id))
+
+
+class MessageTagsRepo:
+    """CRUD for the ``message_tags`` link table."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._s = session
+
+    # --- Reads -------------------------------------------------------------
+
+    async def list_for_message(self, message_id: int) -> list[Tag]:
+        """Return all tags linked to a single message, joined with ``tags``."""
+        stmt = (
+            select(Tag)
+            .join(MessageTag, MessageTag.tag_id == Tag.id)
+            .where(MessageTag.message_id == message_id)
+            .order_by(Tag.is_builtin.desc(), Tag.name)
+        )
+        return list((await self._s.execute(stmt)).scalars().all())
+
+    async def list_for_messages_bulk(self, message_ids: list[int]) -> dict[int, list[Tag]]:
+        """Return ``{message_id: [Tag, ...]}`` for the given ids in one query.
+
+        Used by ``MessageService.list_for_user`` to avoid N+1 when rendering
+        tag-chips on the inbox.
+        """
+        if not message_ids:
+            return {}
+        stmt = (
+            select(MessageTag.message_id, Tag)
+            .join(Tag, Tag.id == MessageTag.tag_id)
+            .where(MessageTag.message_id.in_(message_ids))
+            .order_by(Tag.is_builtin.desc(), Tag.name)
+        )
+        out: dict[int, list[Tag]] = {mid: [] for mid in message_ids}
+        for mid, tag in (await self._s.execute(stmt)).all():
+            out[int(mid)].append(tag)
+        return out
+
+    async def count_messages_for_user(self, user_id: int) -> int:
+        """Total number of messages owned by ``user_id`` (across accounts).
+
+        Used by the ``apply_to_existing`` path to enforce the 100k limit
+        guard documented in ADR-0017 §7.
+        """
+        stmt = (
+            select(func.count(Message.id))
+            .join(MailAccount, MailAccount.id == Message.mail_account_id)
+            .where(MailAccount.user_id == user_id)
+        )
+        return int((await self._s.execute(stmt)).scalar_one())
+
+    # --- Writes ------------------------------------------------------------
+
+    async def link(self, *, message_id: int, tag_id: int) -> None:
+        """Idempotent INSERT (``ON CONFLICT DO NOTHING``)."""
+        stmt = (
+            pg_insert(MessageTag)
+            .values(message_id=message_id, tag_id=tag_id)
+            .on_conflict_do_nothing(index_elements=["message_id", "tag_id"])
+        )
+        await self._s.execute(stmt)

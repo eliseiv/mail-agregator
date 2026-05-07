@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m with context %}
+
+{# Tags list page (ADR-0017, 08-frontend.md §4.10).
+
+   Backend contract — context expected from ``GET /tags`` handler:
+     - ``tags``       : list[TagDTO]   (TagDTO has id, name, color, is_builtin,
+                                        rules, created_at, updated_at)
+     - ``csrf_token`` : str            (required for inline DELETE forms)
+     - ``session``    : SessionData    (used by base.html topnav)
+     - ``flashes``    : optional iterable rendered by ``base.html``
+#}
+
+{% block title %}Теги &middot; Mail Aggregator{% endblock %}
+{% block body_class %}tags-list{% endblock %}
+
+{% block content %}
+<section class="tags" aria-labelledby="tags-heading">
+  <header class="tags__toolbar">
+    <h1 id="tags-heading" class="tags__title">Ваши теги</h1>
+    <a class="btn btn--primary" href="/tags/new">+ Добавить тег</a>
+  </header>
+
+  {% if not tags %}
+    <div class="tags__empty" role="status">
+      <p>У вас ещё нет тегов. Создайте первый, чтобы автоматически помечать письма по правилам.</p>
+      <a class="btn btn--primary" href="/tags/new">+ Добавить тег</a>
+    </div>
+  {% else %}
+    <div class="table-wrapper">
+      <table class="tags-list" aria-describedby="tags-heading">
+        <thead>
+          <tr>
+            <th scope="col">Имя</th>
+            <th scope="col">Тип</th>
+            <th scope="col">Правил</th>
+            <th scope="col" class="tags-list__actions-col">Действия</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for tag in tags %}
+            <tr class="tags-list__row {% if tag.is_builtin %}tags-list__row--builtin{% endif %}">
+              <td class="tags-list__name">
+                {{ m.tag_chip(tag) }}
+              </td>
+              <td class="tags-list__kind">
+                {% if tag.is_builtin %}
+                  <span class="tag-kind tag-kind--builtin" title="Встроенный тег">builtin</span>
+                {% else %}
+                  <span class="tag-kind tag-kind--custom">custom</span>
+                {% endif %}
+              </td>
+              <td class="tags-list__count">
+                {{ tag.rules | length }}
+              </td>
+              <td class="tags-list__actions">
+                <a class="btn btn--secondary btn--small"
+                   href="/tags/{{ tag.id }}/edit"
+                   aria-label="Изменить тег {{ tag.name | e }}">
+                  Изменить
+                </a>
+
+                {% if not tag.is_builtin %}
+                  <form
+                    method="POST"
+                    action="/api/tags/{{ tag.id }}/delete"
+                    class="inline-form"
+                    data-tag-delete-form
+                    data-confirm="Удалить тег «{{ tag.name | e }}»? Все привязки к письмам будут удалены.">
+                    {{ m.csrf_input() }}
+                    <input type="hidden" name="_method" value="DELETE">
+                    <button type="submit"
+                            class="btn btn--danger btn--small"
+                            aria-label="Удалить тег {{ tag.name | e }}">
+                      Удалить
+                    </button>
+                  </form>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+</section>
+{% endblock %}
+
+{% block extra_js %}
+<script src="/static/js/tags.js"></script>
+{% endblock %}

@@ -14,8 +14,12 @@ erDiagram
     users ||--o{ sent_messages : sends
     users ||--o{ admin_audit : "subject_user (nullable, no FK)"
     users ||--o{ admin_audit : "performed (super-admin only, no FK)"
+    users ||--o{ tags : owns
     mail_accounts ||--o{ messages : "stores"
     messages ||--o{ attachments : "has"
+    messages ||--o{ message_tags : "tagged_with"
+    tags ||--o{ tag_rules : "matches_via"
+    tags ||--o{ message_tags : "applied_to"
     sent_messages ||--o{ sent_attachments : "has"
     mail_accounts ||--o{ sent_messages : "from"
 
@@ -125,6 +129,30 @@ erDiagram
         jsonb details "nullable"
         text ip
         text user_agent "nullable"
+        timestamptz created_at
+    }
+
+    tags {
+        bigint id PK
+        bigint user_id FK
+        text name
+        text color "hex #RRGGBB"
+        boolean is_builtin
+        timestamptz created_at
+        timestamptz updated_at
+    }
+
+    tag_rules {
+        bigint id PK
+        bigint tag_id FK
+        text type "subject_contains|body_contains|sender_contains|sender_exact"
+        text pattern
+        timestamptz created_at
+    }
+
+    message_tags {
+        bigint message_id FK
+        bigint tag_id FK
         timestamptz created_at
     }
 ```
@@ -310,13 +338,125 @@ erDiagram
 
 ---
 
+### `tags`
+
+Источник истины — [ADR-0017](./adr/ADR-0017-tags.md). Per-user классификационные метки, прикладываемые к `messages` через rule-based матчинг.
+
+| Колонка | Тип | Constraints | Описание |
+| --- | --- | --- | --- |
+| `id` | BIGSERIAL | PK | |
+| `user_id` | BIGINT | NOT NULL, FK → `users(id)` ON DELETE CASCADE | Владелец тега. Tag всегда per-user. |
+| `name` | TEXT | NOT NULL | Видимое имя тега (1..64 символа; UI-валидация). Произвольная строка, в т.ч. кириллица. |
+| `color` | TEXT | NOT NULL | Hex `#RRGGBB`. Backend валидирует: (а) regex `^#[0-9A-Fa-f]{6}$`; (б) значение принадлежит whitelist из 8 цветов палитры (см. `08-frontend.md` сек. 5.1). UI выбирает radio-кнопкой из палитры. |
+| `is_builtin` | BOOLEAN | NOT NULL DEFAULT false | true для 4 системных тегов (`DPLA.PLA`, `Диспут`, `Отменить подписку`, `Продление аккаунта`). Запрет на DELETE; rules/name/color редактируемы. |
+| `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | |
+| `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | Обновляется триггером `BEFORE UPDATE ON tags`. |
+
+**Constraints:**
+- UNIQUE `(user_id, name)` — у одного пользователя не может быть двух тегов с одним именем.
+- CHECK `char_length(name) BETWEEN 1 AND 64`.
+- CHECK `color ~ '^#[0-9A-Fa-f]{6}$'`.
+
+**Индексы:**
+- `INDEX (user_id)` — list-tags-for-user (часто, при каждом рендере inbox для filter dropdown).
+
+**Триггер:** `BEFORE UPDATE ON tags` — `NEW.updated_at = now()`.
+
+**Объём:** ≤ 5 пользователей × ~20 тегов = ≤ 100 строк.
+
+---
+
+### `tag_rules`
+
+Правила, по которым тег прикладывается к письмам. Несколько rules для одного тега — соединяются логическим **OR** (см. ADR-0017 §3).
+
+| Колонка | Тип | Constraints | Описание |
+| --- | --- | --- | --- |
+| `id` | BIGSERIAL | PK | |
+| `tag_id` | BIGINT | NOT NULL, FK → `tags(id)` ON DELETE CASCADE | |
+| `type` | TEXT | NOT NULL | Enum-string: `subject_contains` \| `body_contains` \| `sender_contains` \| `sender_exact`. CHECK constraint. |
+| `pattern` | TEXT | NOT NULL | Подстрока (для `*_contains`) или полный email (для `sender_exact`). 1..256 символов. |
+| `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | |
+
+**Constraints:**
+- CHECK `type IN ('subject_contains','body_contains','sender_contains','sender_exact')`.
+- CHECK `char_length(pattern) BETWEEN 1 AND 256`.
+
+**Индексы:**
+- `INDEX (tag_id)` — load-rules-for-tag.
+
+**Не делается:**
+- Нет UNIQUE `(tag_id, type, pattern)` — пользователь сознательно может продублировать; приложение может предупредить, но не блокирует. Дубль не ломает SQL (`INSERT message_tags ... ON CONFLICT DO NOTHING`).
+
+**Объём:** ≤ 100 тегов × ~5 rules = ≤ 500 строк.
+
+---
+
+### `message_tags`
+
+Many-to-many линки тегов и сообщений. Создаются worker'ом при синке (см. `05-modules.md` модуль `tags`) и synchronous'но при `apply_to_existing` через API.
+
+| Колонка | Тип | Constraints | Описание |
+| --- | --- | --- | --- |
+| `message_id` | BIGINT | NOT NULL, FK → `messages(id)` ON DELETE CASCADE | |
+| `tag_id` | BIGINT | NOT NULL, FK → `tags(id)` ON DELETE CASCADE | |
+| `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | |
+
+**Constraints:**
+- PRIMARY KEY `(message_id, tag_id)` — идемпотентность, один линк на пару.
+
+**Индексы:**
+- PK `(message_id, tag_id)` — также служит как индекс для list-tags-for-message.
+- `INDEX (tag_id, message_id)` — обратная сортировка для list-messages-with-tag (inbox filter `tag_id`).
+
+**Объём (верхняя граница):** 750 000 messages × среднее 3 tags/message = ~2.25M строк ≈ 110 MB. Постоянно очищается через CASCADE при retention cleanup `messages`.
+
+---
+
+### Заполнение builtin-тегов
+
+Builtin-теги создаются **не через миграцию**, а через **post-login hook** в `auth.AuthService` — при первом успешном login пользователя или завершении set-password flow (см. ADR-0017 §6 и `05-modules.md` модуль `auth`). Реализация — в `backend/app/tags/builtin.py` (статичный список из 4 объектов).
+
+Псевдокод (для исполнителя — это всё в коде, не в DDL):
+
+```python
+BUILTIN_TAGS = [
+    {"name": "DPLA.PLA", "color": "#2563eb", "rules": [
+        {"type": "subject_contains", "pattern": "DPLA"},
+        {"type": "subject_contains", "pattern": "PLA"},
+        {"type": "body_contains",    "pattern": "DPLA"},
+        {"type": "body_contains",    "pattern": "PLA"},
+    ]},
+    {"name": "Диспут", "color": "#dc2626", "rules": [
+        {"type": "subject_contains", "pattern": "Apple Inc"},
+        {"type": "sender_exact",     "pattern": "AppStoreNotices@apple.com"},
+    ]},
+    {"name": "Отменить подписку", "color": "#f59e0b", "rules": [
+        {"type": "body_contains", "pattern": "cancel"},
+        {"type": "body_contains", "pattern": "subscription"},
+    ]},
+    {"name": "Продление аккаунта", "color": "#16a34a", "rules": [
+        {"type": "body_contains", "pattern": "Your Distribution Certificate will no longer be valid in 30 days"},
+    ]},
+]
+```
+
+`TagsService.ensure_builtin_tags(user_id)`:
+1. `SELECT 1 FROM tags WHERE user_id=:uid AND is_builtin=true LIMIT 1` — если есть, return.
+2. Иначе — в одной транзакции INSERT всех 4 tags + tag_rules.
+
+Идемпотентен: повторный вызов NoOp.
+
+---
+
 ## Каскады удаления — сводная таблица
 
 | Удаление чего | Что каскадно удаляется (Postgres ON DELETE CASCADE) | Что чистится приложением |
 | --- | --- | --- |
-| `users(id)` | `mail_accounts`, `sent_messages`, `sent_attachments`, `messages` (через `mail_accounts → messages → attachments`), `attachments` | Объекты MinIO по префиксу `{user_id}/`; все session keys (Redis); запись в `admin_audit` (action=delete_user) |
-| `mail_accounts(id)` | `messages`, `attachments`, `sent_messages` (FK from_account_id) | Объекты MinIO по префиксу `{user_id}/{mail_account_id}/` |
-| `messages(id)` (retention) | `attachments` | Объекты MinIO по prefix `{user_id}/{mail_account_id}/{uid}/` |
+| `users(id)` | `mail_accounts`, `sent_messages`, `sent_attachments`, `messages` (через `mail_accounts → messages → attachments`), `attachments`, `tags`, `tag_rules` (через `tags`), `message_tags` (через `tags` и `messages`) | Объекты MinIO по префиксу `{user_id}/`; все session keys (Redis); запись в `admin_audit` (action=delete_user) |
+| `mail_accounts(id)` | `messages`, `attachments`, `sent_messages` (FK from_account_id), `message_tags` (через `messages`) | Объекты MinIO по префиксу `{user_id}/{mail_account_id}/` |
+| `messages(id)` (retention) | `attachments`, `message_tags` | Объекты MinIO по prefix `{user_id}/{mail_account_id}/{uid}/` |
+| `tags(id)` (user delete tag) | `tag_rules`, `message_tags` | — |
 
 Приложение перед каждым DELETE собирает список s3_key заранее (одним SELECT) и удаляет объекты MinIO, потом DELETE из БД. Транзакционности между MinIO и Postgres нет; в случае сбоя возможны "осиротевшие" объекты — это допустимо (cleanup `orphan_scan` в backlog).
 
@@ -328,11 +468,13 @@ erDiagram
 - 500 ящиков × ~50 писем/день × 30 дней = **750 000 max** строк `messages`.
 - При среднем размере 50 KiB и 0.3 attachments/письмо: ~200 000 объектов в MinIO, ~10–15 GiB.
 - Размер БД (без TOAST вне `body_text`): ~5–10 GiB на пике.
+- `tags`: ≤ 100 строк; `tag_rules`: ≤ 500 строк; `message_tags`: ≤ 2.25M строк ≈ 110 MB (см. ADR-0017).
 
 ---
 
 ## Миграции
 
 - Используем Alembic (см. `02-tech-stack.md`). Каждая миграция — отдельный файл в `backend/migrations/versions/`.
-- **Первая миграция (V001_initial)** создаёт всю схему выше + триггеры `updated_at`.
+- **Первая миграция (V001_initial)** создаёт всю схему выше + триггеры `updated_at` (за исключением tags-таблиц — см. ниже).
 - Seed супер-админа — отдельная init-фаза приложения (не миграция; см. `05-modules.md → admin module → seed flow`).
+- **Миграция `add_tags`** (ADR-0017) создаёт `tags`, `tag_rules`, `message_tags` + триггер `updated_at` на `tags`. Builtin-теги в эту миграцию **не попадают** — они создаются post-login hook'ом (см. ADR-0017 §6).
