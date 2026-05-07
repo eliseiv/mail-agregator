@@ -98,6 +98,17 @@ jobs:
         run: |
           ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
 
+      - name: Diagnose SSH (verbose, no script)
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          # IdentitiesOnly=yes prevents ssh from trying any default keys
+          # (e.g. id_rsa) before our deploy_key, which can trip sshd's
+          # MaxAuthTries=3 limit.
+          ssh -v -o IdentitiesOnly=yes -i ~/.ssh/deploy_key \
+            "$DEPLOY_USER@$DEPLOY_HOST" "echo SSH_OK"
+
       - name: Deploy over SSH
         env:
           SHA: ${{ steps.sha.outputs.sha }}
@@ -106,7 +117,7 @@ jobs:
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
         run: |
-          ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" \
+          ssh -o IdentitiesOnly=yes -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" \
             SHA="$SHA" IMAGE_REGISTRY="$IMAGE_REGISTRY" DEPLOY_PATH="$DEPLOY_PATH" \
             bash -s <<'REMOTE_SCRIPT'
           set -euo pipefail
