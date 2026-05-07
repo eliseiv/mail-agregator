@@ -41,6 +41,14 @@ REDACT_KEYS: frozenset[str] = frozenset(
         "ADMIN_PASSWORD",
         "S3_SECRET_KEY",
         "POSTGRES_PASSWORD",
+        # Telegram launcher (ADR-0018, docs/06-security.md §1.8): bot token
+        # leak lets attacker impersonate the bot. Operator env var is
+        # ``BOT_TOKEN`` (see shared/config.py for naming note); legacy
+        # ``TELEGRAM_BOT_TOKEN`` covers any place still using the docs name.
+        "BOT_TOKEN",
+        "TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_WEBHOOK_SECRET",
+        "X-Telegram-Bot-Api-Secret-Token",
     }
 )
 
@@ -73,6 +81,16 @@ def configure_logging(level: str = "INFO", service: str = "api") -> None:
     # Quiet down noisy libraries that double-log at DEBUG.
     for noisy in ("uvicorn.access", "asyncio"):
         logging.getLogger(noisy).setLevel(max(log_level, logging.INFO))
+
+    # ``httpx`` logs the full request URL at INFO via its internal logger,
+    # which would leak the Telegram Bot token embedded in the api.telegram.org
+    # URL (`bot<TOKEN>/<method>`) — see ADR-0018 §6 / docs/06-security.md
+    # §1.8. Silence it to WARNING; we still see real failures (4xx/5xx)
+    # via our own ``telegram_send_message_api_error`` event in
+    # ``backend/app/telegram/bot.py`` and via the redacted-aware
+    # ``_redact_processor`` for any structlog event we emit ourselves.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     structlog.configure(
         processors=[

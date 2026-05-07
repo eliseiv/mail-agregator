@@ -12,6 +12,13 @@
   <title>{% block title %}Mail Aggregator{% endblock %}</title>
   <link rel="stylesheet" href="/static/css/main.css">
   <link rel="icon" href="data:," >
+  {# Telegram WebApp adaptation (ADR-0018, 08-frontend.md §10).
+     SDK is fetched from telegram.org (CSP script-src whitelists this origin
+     in 06-security.md §6); tg.js is a no-op in a regular browser. Both use
+     `defer`, which guarantees execution order: SDK first, glue script after,
+     and both run after DOMContentLoaded. #}
+  <script src="https://telegram.org/js/telegram-web-app.js" defer></script>
+  <script src="/static/js/tg.js" defer></script>
 </head>
 <body class="page page--{% block body_class %}default{% endblock %}">
   <a class="skip-link" href="#main">Skip to main content</a>

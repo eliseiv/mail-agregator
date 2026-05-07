@@ -83,6 +83,22 @@
 | D | Brute admin password | Тот же rate-limit + lockout |
 | E | Self-delete admin | Endpoint отказывает (`cannot_delete_admin`) |
 
+### 1.8 Telegram webhook (ADR-0018)
+
+| Угроза | Описание | Митигация |
+| --- | --- | --- |
+| S | Поддельный webhook от чужого процесса | Двойная проверка `TELEGRAM_WEBHOOK_SECRET`: (1) в URL-path `/api/telegram/webhook/{secret}`, (2) в header `X-Telegram-Bot-Api-Secret-Token` (выставляется Telegram'ом из аргумента `setWebhook?secret_token=`). Несовпадение любого — 403, без обработки body |
+| T | Подмена body update'а | Telegram гарантирует целостность через TLS до своего edge; secret-проверка отсекает не-Telegram отправителя |
+| R | Логирование Bot-token | `TELEGRAM_BOT_TOKEN` в structlog redact-list рядом с `MAIL_ENCRYPTION_KEY`/`password`/`session_token` (см. ADR-0014); webhook-handler НЕ логирует path-segment `{secret}` (только хэш / маркер `present|absent`) — иначе secret попадёт в access-log nginx |
+| I | Утечка Bot-token | env-only, `chmod 600`; компрометация позволяет атакующему слать сообщения от имени бота, но НЕ даёт доступа к user-данным сервиса (нет линковки telegram_user_id ↔ user_id) |
+| D | Шквал spoofed webhook'ов | Rate-limit `60/min per IP` на webhook-роуте (см. `04-api-contracts.md` секция 4a); 403 на secret fail возвращается после rate-limit checks |
+| E | Получение auth/session через Telegram | Намеренно отсутствует. Бот — только launcher; пользователь, открывший WebApp, проходит обычный two-step login (ADR-0016). Telegram не может создать session без знания username+password |
+
+Дополнительно (общая позиция по WebApp):
+- WebApp открывается на основном URL сервиса. Telegram WebView shares cookies with system WebView; auth-cookies (`mas_session`, `mas_csrf`) работают штатно с `SameSite=Lax` + `Secure` поверх HTTPS.
+- В WebView невозможна attack `frame-ancestors` (Telegram не вкладывает наш URL в iframe — он открывает в native WebView), CSP `frame-ancestors 'none'` сохраняется.
+- Никаких новых таблиц/полей в БД — нет surface area для атак на персональные данные через бот-канал.
+
 ---
 
 ## 2. Шифрование почтовых паролей (схема)
@@ -181,7 +197,7 @@ CSRF: см. ADR-0010. `mas_csrf` cookie + `X-CSRF-Token` header / `csrf_token` f
 
 | Заголовок | Значение | Зачем |
 | --- | --- | --- |
-| `Content-Security-Policy` | `default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'self'` | XSS, clickjacking, data exfiltration |
+| `Content-Security-Policy` | `default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self' https://telegram.org; form-action 'self'; frame-ancestors 'none'; base-uri 'self'` | XSS, clickjacking, data exfiltration. `script-src` включает `https://telegram.org` для официального Telegram WebApp SDK (`telegram-web-app.js`) — см. ADR-0018; CDN отдаёт только этот один файл |
 | `X-Content-Type-Options` | `nosniff` | MIME confusion |
 | `X-Frame-Options` | `DENY` | Clickjacking (legacy, дополнение к CSP frame-ancestors) |
 | `Referrer-Policy` | `same-origin` | Минимизация утечек |
@@ -189,7 +205,7 @@ CSRF: см. ADR-0010. `mas_csrf` cookie + `X-CSRF-Token` header / `csrf_token` f
 | `Cache-Control` | `no-store` (HTML под auth) | Sensitive data cache |
 | `Permissions-Policy` | `geolocation=(), camera=(), microphone=()` | Default-deny |
 
-CSP запрещает inline JS — все скрипты только из `/static/js/`. Inline-данные в шаблоны — через `data-*` атрибуты, не `<script>`.
+CSP запрещает inline JS — все скрипты только из `/static/js/` и единственного external `https://telegram.org/js/telegram-web-app.js` (см. ADR-0018). Inline-данные в шаблоны — через `data-*` атрибуты, не `<script>`. CSP `style-src` остаётся строгим (`'self'`) — Telegram SDK не подгружает CSS.
 
 ---
 

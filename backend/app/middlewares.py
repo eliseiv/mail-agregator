@@ -65,11 +65,15 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     JSON responses get the minimal subset (``X-Content-Type-Options``).
     """
 
+    # `script-src` whitelists https://telegram.org for the official Telegram
+    # WebApp SDK (`telegram-web-app.js`) loaded from base.html — see ADR-0018
+    # and docs/06-security.md §6. CDN serves only this single file; no styles,
+    # no images. All other directives stay strict (no 'unsafe-inline' / 'unsafe-eval').
     _CSP = (
         "default-src 'self'; "
         "img-src 'self' data:; "
         "style-src 'self'; "
-        "script-src 'self'; "
+        "script-src 'self' https://telegram.org; "
         "form-action 'self'; "
         "frame-ancestors 'none'; "
         "base-uri 'self'"

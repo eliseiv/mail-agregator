@@ -61,6 +61,11 @@ backend/
       schemas.py           # Pydantic для request/response
       builtin.py           # Список 4 builtin-тегов + правил (статичный)
       sql.py               # Готовые SQL для apply (используются service'ом и worker'ом)
+    telegram/              # ADR-0018; bot launcher only (no DB tables, no auth changes)
+      __init__.py
+      router.py            # POST /api/telegram/webhook/{secret}
+      bot.py               # send_message_with_webapp_button(chat_id, text), handle_update(update); httpx async к api.telegram.org
+      schemas.py           # Pydantic минимально: TelegramUpdate с message.chat.id, message.text, message.from.id
     audit/
       service.py
     models/                # SQLAlchemy ORM
@@ -100,6 +105,7 @@ backend/
       js/inbox.js
       js/compose.js
       js/tags.js
+      js/tg.js               # ADR-0018: Telegram WebApp adaptation (theme vars + body.tg-app)
   migrations/              # alembic
     env.py
     versions/
@@ -1130,7 +1136,101 @@ WHITELIST_PATHS = [
 
 ---
 
-## 18. QA / тесты — обязательный набор для backend/worker
+## 18. telegram (модуль)
+
+### Назначение
+Webhook-приёмник Telegram Bot API; bot выступает **исключительно** launcher'ом — отдаёт WebApp-кнопку, ведущую на основной URL сервиса (`TELEGRAM_WEBAPP_URL`). Источник истины — [ADR-0018](./adr/ADR-0018-telegram-launcher.md).
+
+**Никаких** изменений в auth/session/CSRF/БД. **Никакой** линковки telegram_user_id ↔ user_id. **Никакой** initData-аутентификации. Пользователь, открывший WebApp из бота, видит обычную login-форму (two-step, ADR-0016) и логинится cookie-сессией так же, как в браузере.
+
+### Публичный API
+- HTTP route: `POST /api/telegram/webhook/{secret}` — см. `04-api-contracts.md` секция 4a.
+- Bot helpers (`backend/app/telegram/bot.py`):
+```python
+async def send_message_with_webapp_button(chat_id: int, text: str) -> None
+    # POST https://api.telegram.org/bot{token}/sendMessage
+    # body: {chat_id, text, reply_markup: {inline_keyboard: [[{text: "Open Mail Aggregator", web_app: {url: TELEGRAM_WEBAPP_URL}}]]}}
+
+async def handle_update(update: TelegramUpdate) -> None
+    # message.text starts with "/start" → send_message_with_webapp_button
+    # message.text starts with "/help"  → send plain "Send /start to open the app"
+    # all other updates                 → no-op
+```
+- Schemas (`backend/app/telegram/schemas.py`) — Pydantic `TelegramUpdate` с минимальными полями:
+```python
+class TelegramFrom(BaseModel):
+    id: int
+
+class TelegramChat(BaseModel):
+    id: int
+
+class TelegramMessage(BaseModel):
+    chat: TelegramChat
+    text: str | None = None
+    from_: TelegramFrom | None = Field(default=None, alias="from")
+
+class TelegramUpdate(BaseModel):
+    update_id: int
+    message: TelegramMessage | None = None
+    # extra fields (callback_query, edited_message, ...) — Pydantic игнорирует через model_config = ConfigDict(extra="ignore")
+```
+
+### Зависимости
+- `httpx` (async) — уже в зависимостях для IMAP/SMTP-связанных задач не используется, но добавлен в `pyproject.toml` для других целей; реиспользуется. Если по факту ещё не подключён — devops добавляет одной строкой.
+- `Settings.TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `TELEGRAM_WEBAPP_URL`, `TELEGRAM_BOT_ENABLED` — см. `07-deployment.md` секция 4.
+- structlog redact-list дополнен `TELEGRAM_BOT_TOKEN` (см. `06-security.md` §1.8 + ADR-0014).
+
+### Состояния
+- Модуль stateless — нет persisted state; апдейты обрабатываются и забываются.
+
+### Алгоритм webhook handler
+```text
+1. Path-secret check: if path-segment {secret} != settings.TELEGRAM_WEBHOOK_SECRET → 403
+2. Header check: if request.headers["X-Telegram-Bot-Api-Secret-Token"] != settings.TELEGRAM_WEBHOOK_SECRET → 403
+3. Если settings.TELEGRAM_BOT_ENABLED is False → return 200 (валидируем secret, но не дёргаем Bot API)
+4. Pydantic-парсинг body как TelegramUpdate; ValidationError → log warn → return 200 (Telegram не любит ретраи)
+5. await handle_update(update)
+6. return 200 (всегда; HTTPException только для secret-fail)
+```
+
+### Edge cases
+- Bot API временно недоступен (timeout/5xx от api.telegram.org) — `send_message_with_webapp_button` логирует warn и возвращает None; webhook возвращает 200 (Telegram не должен ретраить — пользователь и так увидит, что бот молчит, и отправит /start ещё раз).
+- Произвольный текст без `/start` — игнорируется молча. Допустимо: бот не диалоговый.
+- Forwarded-update от Telegram (re-delivery) — обрабатываем как новый: `/start` снова отдаст кнопку, никаких side-effects не возникает (нет dedup по `update_id`, idempotent by design).
+- Несовпадение `update_id` контракта — ловится Pydantic.
+
+### Тестируемые инварианты
+- `POST /api/telegram/webhook/<wrong>` → `403`, нет вызова `send_message`.
+- `POST /api/telegram/webhook/<correct>` без header `X-Telegram-Bot-Api-Secret-Token` → `403`.
+- `POST /api/telegram/webhook/<correct>` с правильным header и body `{"update_id": 1, "message": {"chat": {"id": 100}, "text": "/start", "from": {"id": 200}}}` → `200`, Bot API получил `sendMessage` с inline-keyboard, в keyboard ровно одна кнопка с `web_app.url == TELEGRAM_WEBAPP_URL`.
+- То же body с `text="hello"` → `200`, Bot API не дёргался.
+- Body без `message` (например, `callback_query`) → `200`, Bot API не дёргался.
+- `TELEGRAM_BOT_ENABLED=false` + правильный secret + body `/start` → `200`, Bot API не дёргался.
+- `TELEGRAM_BOT_TOKEN` не появляется в логах ни на одном уровне (включая DEBUG) — проверяется отдельным redact-тестом (см. модуль 6 logging).
+
+### Frontend (тонкий клиент)
+- `backend/app/static/js/tg.js` — на DOMContentLoaded:
+  - Если нет `window.Telegram?.WebApp` → no-op (страница открыта в обычном браузере).
+  - Иначе: `Telegram.WebApp.ready()`; читать `Telegram.WebApp.themeParams`; для каждого ключа `bg_color`/`text_color`/`hint_color`/`link_color`/`button_color`/`button_text_color`/`secondary_bg_color` — `document.documentElement.style.setProperty('--tg-' + name.replace(/_color$/, '').replace('_', '-'), value)`.
+  - `document.body.classList.add('tg-app')`.
+  - Подписка `Telegram.WebApp.onEvent('themeChanged', applyTheme)` для повторного применения при смене темы пользователем.
+- В `base.html` подключение скриптов (DEFER):
+  ```html
+  <script src="https://telegram.org/js/telegram-web-app.js" defer></script>
+  <script src="/static/js/tg.js" defer></script>
+  ```
+- CSP `script-src` расширяется на `https://telegram.org` (см. `06-security.md` §6 — таблица обновлена).
+- CSS-правила для `body.tg-app` — в `static/css/main.css` (см. `08-frontend.md` §10): скрытие `header.topbar nav`, переопределение `--bg`/`--text`/`--primary` из `--tg-*` с fallback.
+
+### Интеграция с другими модулями
+- **auth** — не изменяется. Cookies `mas_session`/`mas_csrf` ставятся при обычном login независимо от того, открыт ли клиент через бот или браузер. Telegram WebView shares cookies with system WebView (на iOS WKWebView, на Android system WebView), `SameSite=Lax` + `Secure` поверх HTTPS работают.
+- **redis** — не изменяется (нет новых ключей).
+- **БД** — не изменяется (нет новых таблиц, нет новых колонок).
+- **middlewares** — webhook-роут не подпадает под `SessionMiddleware`/`CSRFMiddleware` через path-prefix `/api/telegram/webhook/*` (явный exempt в стеке middleware рядом с `/healthz`/`/readyz`/`/login`).
+
+---
+
+## 19. QA / тесты — обязательный набор для backend/worker
 
 Это не отдельный модуль кода, а сводный список тестов, которые QA-агент обязан реализовать. Backend-агент покрывает unit-тестами доменные функции, QA-агент — integration/e2e.
 
@@ -1143,6 +1243,7 @@ WHITELIST_PATHS = [
 - mime builder: text/plain charset=utf-8; In-Reply-To/References корректны; BCC отсутствует в headers.
 - providers.suggest_provider_defaults: правильные дефолты для всех 11 доменов.
 - tags (ADR-0017): `ensure_builtin_tags` идемпотентен; per-user изоляция (cross-user — нет утечек); DELETE builtin → `CannotDeleteBuiltinTagError`; UNIQUE `(user_id, name)` — race на create возвращает 409.
+- telegram (ADR-0018): `POST /api/telegram/webhook/<wrong>` → 403; правильный secret + `/start` → 200 и Bot API получил `sendMessage` с inline-keyboard и web_app.url; правильный secret + `/help` или произвольный текст или body без `message` → 200 без вызова Bot API; `TELEGRAM_BOT_TOKEN` отсутствует во всех логах (redact-test).
 
 ### Integration (с реальными Postgres/Redis/MinIO в test-compose)
 - POST mail-account с замоканным IMAP/SMTP (через mock-server) — успех/fail; шифрование сохраняется/расшифровывается.
@@ -1157,5 +1258,5 @@ WHITELIST_PATHS = [
 - Полный flow: admin создаёт user -> user logs in -> set password -> add account -> sync (триггер вручную) -> читает inbox -> отвечает -> sent_messages инкрементится.
 
 ### Coverage
-- Минимум 75% по модулям 1–11, 14, 15, 17.
+- Минимум 75% по модулям 1–11, 14, 15, 17, 18.
 - Никаких `# pragma: no cover` без обоснования в комментарии.

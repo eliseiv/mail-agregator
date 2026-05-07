@@ -85,10 +85,15 @@ flowchart LR
     {% block content %}{% endblock %}
   </main>
   <script src="/static/js/csrf.js"></script>
+  <!-- Telegram WebApp adaptation (ADR-0018); no-op в обычном браузере -->
+  <script src="https://telegram.org/js/telegram-web-app.js" defer></script>
+  <script src="/static/js/tg.js" defer></script>
   {% block extra_js %}{% endblock %}
 </body>
 </html>
 ```
+
+**Topbar nav** в шаблоне дополнительно скрывается, когда `<body>` имеет класс `tg-app` (Telegram WebApp предоставляет свой back-button — дублирование избыточно). Скрытие через CSS-правило `body.tg-app header.topbar nav { display: none; }` в `main.css` (см. секцию 10).
 
 ---
 
@@ -102,6 +107,7 @@ flowchart LR
 | `account_form.js` | Add/edit account: при вводе email — auto-fill IMAP/SMTP defaults для известных доменов (хардкод-таблица в JS, см. ниже; backend-эндпоинта provider-suggest нет, чтобы не плодить лишних round-trip'ов); кнопка "Test connection" — POST `/api/mail-accounts/test`, показывает inline-результат. |
 | `admin_users.js` | Admin: раскрытие/сворачивание списка mail-аккаунтов внутри строки пользователя; confirm-диалоги для reset/delete. |
 | `tags.js` | Tags form (create / edit): динамическое добавление/удаление строк condition (rule_type[] + rule_pattern[]); валидация (тип выбран, pattern непустой) перед submit; color-picker swatches (см. секцию 5.1); confirm-диалог при DELETE тега и DELETE rule. **Важно:** без JS форма всё равно работает — template рендерит фиксированное число пустых rule-row (например, 5); пользователь заполняет столько, сколько нужно; backend пропускает empty pairs. |
+| `tg.js` | Telegram WebApp adaptation (ADR-0018). На DOMContentLoaded: если `window.Telegram?.WebApp` существует — `Telegram.WebApp.ready()`, читает `themeParams` и применяет как CSS-vars (`--tg-bg`, `--tg-text`, `--tg-hint`, `--tg-link`, `--tg-button`, `--tg-button-text`, `--tg-secondary-bg`) на `document.documentElement`; добавляет класс `tg-app` на `<body>`; подписывается на `themeChanged`. Если SDK не загружен (открыто в браузере) — no-op. Подключается на каждой странице (в `base.html`) с `defer`. |
 
 **Provider auto-suggest**: хардкод-таблица в `account_form.js` (короткий объект, дублирующий `accounts/providers.py`). Минимальный набор — `gmail.com`, `yandex.ru`, `mail.ru`, `outlook.com`; backend-агент при необходимости расширяет JS-таблицу до полного списка из `providers.py` (см. `05-modules.md` секция 9). Backend остаётся источником истины — он ре-валидирует всё при POST/test.
 
@@ -511,6 +517,8 @@ i18n-инфраструктура не поднимается. Если потр
 
 JS только улучшает UX, но не блокирует базовую функциональность.
 
+Telegram WebApp adaptation — см. секцию 10 ниже.
+
 ---
 
 ## 9. Сводный чек-лист для frontend-исполнителя
@@ -518,7 +526,7 @@ JS только улучшает UX, но не блокирует базовую
 - [ ] Все шаблоны из секции 2 созданы.
 - [ ] Все JS-файлы из секции 3 созданы.
 - [ ] CSS из секции 5 написан.
-- [ ] CSP-совместимо: нет inline `<script>`, нет inline `<style>`. CSP — строгий, `style-src 'self'` (без `'unsafe-inline'`); все стили только из `static/css/main.css`. Любые "стили в шаблонах" недопустимы.
+- [ ] CSP-совместимо: нет inline `<script>`, нет inline `<style>`. CSP — строгий, `style-src 'self' https://telegram.org` (без `'unsafe-inline'`); все стили только из `static/css/main.css`. Любые "стили в шаблонах" недопустимы. Единственный external script — `https://telegram.org/js/telegram-web-app.js` (см. секцию 10).
 - [ ] CSRF-input вставлен во все form-POST.
 - [ ] Email-адреса HTML-escape'ятся (Jinja2 `|e` default).
 - [ ] Тела писем в `<pre>` с белым пробелом сохранением.
@@ -531,3 +539,80 @@ JS только улучшает UX, но не блокирует базовую
 - [ ] Шаблоны `tags/list.html`, `tags/form.html` созданы; `tags.js` подключается только на этих страницах через `{% block extra_js %}`. Без JS — форма с 5 пустыми rule-rows работает; цвет выбирается radio-buttons.
 - [ ] Tag-chips на inbox и message_view используют `_macros.html → tag_chip(tag)` с CSS-классом `.tag-color-cN` из палитры (секция 5.1) — без inline-style.
 - [ ] Tag-фильтр на inbox: `<select name="tag_id">` с list пользовательских тегов; query-param пробрасывается.
+- [ ] `tg.js` подключён в `base.html` (defer); открытие в обычном браузере — no-op; открытие через Telegram-бот — применяется тема и `body.tg-app` (см. секцию 10).
+- [ ] CSS-правила `body.tg-app` добавлены в `main.css` (секция 10.3).
+
+---
+
+## 10. Telegram WebApp adaptation
+
+Источник истины — [ADR-0018](./adr/ADR-0018-telegram-launcher.md). Web интерфейс — единственный фронт; никакой отдельной "telegram-версии". Когда страница открыта внутри Telegram WebApp (через бот-launcher), мы лишь применяем тему Telegram и скрываем дублирующую навигацию. Auth-flow остаётся ровно тем же (two-step login, ADR-0016).
+
+### 10.1 Подключение SDK
+
+В `base.html` (см. секцию 2):
+
+```html
+<script src="https://telegram.org/js/telegram-web-app.js" defer></script>
+<script src="/static/js/tg.js" defer></script>
+```
+
+CSP `script-src` расширен на `https://telegram.org` (см. `06-security.md` §6 — таблица обновлена). CDN отдаёт ровно один файл (`telegram-web-app.js`), без styles/img.
+
+### 10.2 `tg.js` — поведение
+
+```text
+on DOMContentLoaded:
+  if (!window.Telegram || !window.Telegram.WebApp) return;     // обычный браузер
+  const tg = window.Telegram.WebApp;
+  tg.ready();
+  function applyTheme() {
+    const p = tg.themeParams || {};
+    const map = {
+      bg_color: '--tg-bg', text_color: '--tg-text',
+      hint_color: '--tg-hint', link_color: '--tg-link',
+      button_color: '--tg-button', button_text_color: '--tg-button-text',
+      secondary_bg_color: '--tg-secondary-bg',
+    };
+    for (const [k, v] of Object.entries(map)) {
+      if (p[k]) document.documentElement.style.setProperty(v, p[k]);
+    }
+  }
+  applyTheme();
+  document.body.classList.add('tg-app');
+  tg.onEvent('themeChanged', applyTheme);
+```
+
+Никаких side-effects в обычном браузере (early return).
+
+### 10.3 CSS-правила
+
+В `main.css` добавляются:
+
+```css
+/* Telegram WebApp: применяются только когда запущено через бот */
+body.tg-app {
+  background-color: var(--tg-bg, #ffffff);
+  color: var(--tg-text, #1a1a1a);
+}
+body.tg-app a { color: var(--tg-link, #2563eb); }
+body.tg-app .btn-primary {
+  background-color: var(--tg-button, #2563eb);
+  color: var(--tg-button-text, #ffffff);
+}
+body.tg-app header.topbar nav { display: none; }   /* back-button даёт сам Telegram */
+```
+
+Mobile-CSS уже описан секцией 5 (`@media (max-width: 640px)`) — отдельной адаптации под Telegram WebApp не требуется (WebView отрисовывает страницу с шириной устройства).
+
+### 10.4 Что НЕ меняется
+
+- Auth-flow: пользователь видит обычную login-форму на `/login`. Никакого initData, никакой автоматической сессии (см. ADR-0018 §1, §5).
+- Шаблоны страниц: ни один существующий шаблон (login, inbox, compose и т.д.) **не меняется** — Telegram-адаптация полностью на уровне `base.html` + `tg.js` + CSS.
+- CSRF, cookies, SameSite, mark-read, compose-send — поведение идентично браузерному.
+
+### 10.5 Тестирование
+
+- Открыть страницу в обычном браузере: `body` не имеет класса `tg-app`, CSS-vars `--tg-*` не выставлены, всё рендерится по светлой теме.
+- Открыть через бот в Telegram: `body.tg-app` присутствует, цвета соответствуют теме Telegram (light/dark в зависимости от системы), top-bar nav скрыт.
+- Переключение темы Telegram (light ↔ dark) на лету — UI обновляется без перезагрузки (через подписку `themeChanged`).

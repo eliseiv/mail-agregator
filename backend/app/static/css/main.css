@@ -1255,3 +1255,47 @@ a:hover { color: var(--color-primary-hover); }
   .rule-row input.field__input { width: 100%; min-width: 0; }
   .rule-row__remove { width: 100%; }
 }
+
+/* ---------- 19. Telegram WebApp adaptation (ADR-0018, 08-frontend.md §10) ----
+   Activated only when tg.js detects window.Telegram.WebApp and adds the
+   `tg-app` class to <body>. In a regular browser these rules never match.
+   The --tg-* custom properties are populated by tg.js from Telegram's
+   themeParams; each one falls back to the equivalent default-light token
+   so the layout stays sensible if a particular param is absent.
+   ---------------------------------------------------------------------- */
+
+body.tg-app {
+  /* Re-bind the design tokens used across the stylesheet to Telegram's
+     theme. Components keep referencing --color-bg / --color-text / etc. —
+     no per-component overrides required. */
+  --color-bg:         var(--tg-bg, #ffffff);
+  --color-bg-subtle:  var(--tg-secondary-bg, #f8fafc);
+  --color-bg-hover:   var(--tg-secondary-bg, #f1f5f9);
+  --color-text:       var(--tg-text, #1a1a1a);
+  --color-text-muted: var(--tg-hint, #64748b);
+  --color-primary:    var(--tg-button, #2563eb);
+  --color-primary-fg: var(--tg-button-text, #ffffff);
+}
+
+/* Telegram WebView already shows its own back-button + close-button at the
+   top of the screen; duplicating our nav and the user/logout block would
+   only clutter the view. The brand title stays visible as page identifier. */
+body.tg-app .topnav,
+body.tg-app .topbar__user {
+  display: none;
+}
+body.tg-app .topbar__inner {
+  padding: var(--space-2) var(--space-4);
+  min-height: auto;
+}
+
+/* Tighter padding around the main content on the WebView (typically a
+   smaller viewport). On wide screens the .main max-width still applies. */
+body.tg-app .main {
+  padding: var(--space-3) var(--space-4);
+}
+
+/* The footer with brand name is also redundant inside Telegram. */
+body.tg-app .footer {
+  display: none;
+}

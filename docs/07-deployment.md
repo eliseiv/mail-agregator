@@ -210,6 +210,17 @@ Healthcheck не настроен — это бесконечный sleep-цик
 | `SERVER_DOMAIN` | (none) | yes (prod) | FQDN для TLS (например, `mail.example.com`). nginx envsubst-ит в `default.conf`; certbot использует для запроса cert. |
 | `ACME_EMAIL` | `admin@example.com` | yes (prod) | Контакт для Let's Encrypt — приходят уведомления о истечении сертификата + reset-ссылки для аккаунта LE. |
 
+### Telegram bot (ADR-0018)
+
+| Переменная | Default | Required | Описание |
+| --- | --- | --- | --- |
+| `TELEGRAM_BOT_ENABLED` | `false` | no | Если `false` — webhook-роут регистрируется и валидирует secret, но не вызывает Bot API. Включается одноразово после deploy + `setWebhook`. |
+| `TELEGRAM_BOT_TOKEN` | (none) | yes (если enabled) | Bot-token от BotFather. Маскируется в structlog redact-list рядом с `MAIL_ENCRYPTION_KEY` (см. ADR-0014, `06-security.md` §1.8). |
+| `TELEGRAM_WEBHOOK_SECRET` | (none) | yes (если enabled) | 32 hex-символа, генерация: `openssl rand -hex 16`. Используется и в URL-path webhook'а, и в header `X-Telegram-Bot-Api-Secret-Token` (двойная проверка). |
+| `TELEGRAM_WEBAPP_URL` | (none) | yes (если enabled) | URL, который бот вкладывает в `web_app.url` inline-кнопки. Prod: `https://postapp.store`. Dev: ngrok URL (Telegram требует HTTPS). |
+
+`TELEGRAM_BOT_TOKEN` хранится в `.env` (`chmod 600`). Никогда не передаётся в worker (он не использует Telegram API). Маскировка в логах гарантируется redact-list'ом structlog.
+
 ### CI / Build
 
 | Переменная | Default | Required | Описание |
@@ -600,5 +611,85 @@ services:
 - UI отправки не поддерживает аттачи (TD-005).
 - Нет CAPTCHA на login (TD-008).
 - Нет обратной IMAP-синхронизации флагов read/seen (TD-010).
+- Telegram бот — только launcher (открывает обычную login-страницу), нет push-уведомлений о новых письмах (TD-013, требует линковки telegram_user_id ↔ user_id; см. ADR-0018).
+
+---
+
+## 14. Telegram bot setup (ADR-0018)
+
+Бот создаётся одноразово через BotFather и подключается к prod-серверу webhook'ом. Никаких background-процессов — webhook обслуживает существующий `api` контейнер.
+
+### 14.1 Создание бота в BotFather
+
+1. В Telegram: `@BotFather` → `/newbot` → выбрать имя и username (например, `mail_aggregator_postapp_bot`).
+2. Получить `bot_token` (формат `123456789:ABC-DEF...`). Сохранить в password manager и в `.env` сервера как `TELEGRAM_BOT_TOKEN`.
+3. (Опционально) `/setdescription`, `/setabouttext`, `/setuserpic` — косметика.
+4. **Важно**: настроить домен WebApp в BotFather: `/mybots → <bot> → Bot Settings → Configure Mini App → enable + URL = https://postapp.store`. Без этого Telegram отказывается открывать WebApp.
+
+### 14.2 Генерация webhook secret
+
+```bash
+openssl rand -hex 16
+```
+
+Положить в `.env`:
+```
+TELEGRAM_BOT_TOKEN=<bot_token_от_botfather>
+TELEGRAM_WEBHOOK_SECRET=<32_hex_chars>
+TELEGRAM_WEBAPP_URL=https://postapp.store
+TELEGRAM_BOT_ENABLED=true
+```
+
+`chmod 600 .env`. Перезапустить `api`:
+```bash
+docker compose restart api
+```
+
+### 14.3 Регистрация webhook у Telegram
+
+Из любого хоста с доступом в Internet (можно с самого сервера):
+
+```bash
+source /opt/mail-aggregator/.env
+curl -F "url=https://postapp.store/api/telegram/webhook/${TELEGRAM_WEBHOOK_SECRET}" \
+     -F "secret_token=${TELEGRAM_WEBHOOK_SECRET}" \
+     "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook"
+```
+
+Ожидаемый ответ:
+```json
+{"ok":true,"result":true,"description":"Webhook was set"}
+```
+
+Проверка:
+```bash
+curl "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo"
+```
+
+Поля `url` (без secret_token — Telegram его не показывает) и `pending_update_count: 0` — webhook работает.
+
+### 14.4 Smoke-test
+
+1. В Telegram открыть бота → `/start` → должна появиться кнопка `Open Mail Aggregator`.
+2. Нажать — открывается WebApp с обычной login-страницей.
+3. Логин под существующим пользователем (созданным админом) — попадает в inbox.
+4. Логи `api` должны содержать `event=telegram_webhook_received` (level INFO) и НЕ должны содержать значение `TELEGRAM_BOT_TOKEN` ни на одном уровне.
+
+### 14.5 Ротация secret / token
+
+- **Webhook secret**: сгенерировать новый, обновить `.env`, перезапустить `api`, повторить `setWebhook` (см. 14.3) с новым значением. Старый сразу перестаёт работать.
+- **Bot token**: в BotFather `/revoke` → новый token, повторить шаги 14.1–14.3. Старый token немедленно невалиден.
+
+### 14.6 Отключение бота
+
+```
+TELEGRAM_BOT_ENABLED=false
+```
+
+Перезапустить `api`. Webhook продолжит принимать запросы (валидируя secret), но не будет вызывать Bot API. Чтобы Telegram перестал слать апдейты:
+
+```bash
+curl "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/deleteWebhook"
+```
 
 ---

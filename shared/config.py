@@ -88,6 +88,17 @@ class Settings(BaseSettings):
     SAFE_REDIRECT_AFTER_LOGIN: str = "/"
     LOGIN_PATH: str = "/login"
 
+    # --- Telegram launcher bot (ADR-0018) ---
+    # NOTE: ADR-0018 + docs/05-modules.md sec. 18 reference the env name
+    # ``TELEGRAM_BOT_TOKEN``. Operator deployment uses ``BOT_TOKEN`` (it is
+    # what BotFather copy-paste UX surfaces and what is already provisioned
+    # in the prod ``.env``); rename in docs is tracked separately as a
+    # documentation-consistency item — code here uses ``BOT_TOKEN`` as the
+    # source of truth. Marked redact in ``shared/logging.py``.
+    BOT_TOKEN: str = ""
+    TELEGRAM_WEBHOOK_SECRET: str = ""
+    TELEGRAM_WEBAPP_URL: str = ""
+
     @field_validator("MAIL_ENCRYPTION_KEY")
     @classmethod
     def _validate_master_key(cls, v: str) -> str:
@@ -143,6 +154,17 @@ class Settings(BaseSettings):
     def cookie_secure(self) -> bool:
         """Set-Cookie ``Secure`` flag — only in prod (TLS terminated upstream)."""
         return self.is_prod
+
+    @property
+    def telegram_bot_enabled(self) -> bool:
+        """True only when *all* required Telegram env vars are populated.
+
+        Per ADR-0018 §6: webhook route is always registered, but if any of
+        the three required values is empty it returns 200 OK without
+        contacting the Bot API. Lets us wire the route in dev/CI without
+        BotFather setup.
+        """
+        return bool(self.BOT_TOKEN and self.TELEGRAM_WEBHOOK_SECRET and self.TELEGRAM_WEBAPP_URL)
 
     def mail_master_key_bytes(self) -> bytes:
         """Decoded current key — never logged, never cached on disk."""

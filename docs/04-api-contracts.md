@@ -606,6 +606,41 @@ _method=DELETE&csrf_token=...
 
 ---
 
+## 4a. Telegram webhook
+
+Источник истины — [ADR-0018](./adr/ADR-0018-telegram-launcher.md). Бот используется **только** как launcher: одна команда `/start` отдаёт inline-keyboard с WebApp-кнопкой на основной URL сервиса. Никакой линковки Telegram ↔ user, никакой initData-аутентификации, никакого нового способа login. Auth-flow для пользователя, открывшего WebApp, — обычный two-step login (ADR-0016).
+
+### `POST /api/telegram/webhook/{secret}`
+
+| | |
+| --- | --- |
+| Доступ | публичный, но защищён двойной проверкой secret. |
+| Авторизация | (1) `{secret}` в URL-path должен совпадать с env `TELEGRAM_WEBHOOK_SECRET`; (2) header `X-Telegram-Bot-Api-Secret-Token` должен совпадать с тем же значением. Несовпадение любого — `403 forbidden`, лог `event=telegram_webhook_invalid_secret`, без обработки body. |
+| Запрос | `application/json`, тело — Telegram [`Update`](https://core.telegram.org/bots/api#update). Обрабатываются только поля `message.chat.id`, `message.text`, `message.from.id`. Остальные поля игнорируются (forward-совместимость). |
+| Поведение | Если `message.text` начинается с `/start` — backend асинхронно отправляет `sendMessage` в Bot API с inline-keyboard `[[{text: "Open Mail Aggregator", web_app: {url: TELEGRAM_WEBAPP_URL}}]]`. Если с `/help` — отправляет краткое "Send /start to open the app". Все остальные апдейты (произвольный текст, callback_query, edited_message и т.п.) — игнорируются. |
+| CSRF | exempt (нет user-сессии и невозможно — Telegram не шлёт cookies). |
+| Rate-limit | 60/min per IP (защита от шквала forwarded-update'ов; нормальная нагрузка — десятки апдейтов в день). |
+| 200 | пустое тело (Telegram игнорирует body, важен только статус-код). Возвращается **всегда** при валидном secret — даже если апдейт не распознан, чтобы Telegram не ретраил. |
+| 403 | `forbidden` (secret invalid). |
+| 429 | `rate_limited` (превышен лимит). |
+| 503 | `dependency_unavailable` (если бот включён, но `httpx`-вызов на api.telegram.org упал — возвращаем 503, чтобы Telegram повторил позже; обычно это transient). |
+
+Если env `TELEGRAM_BOT_ENABLED=false`, endpoint регистрируется и валидирует secret, но `sendMessage` не отправляет — просто 200 OK. Это упрощает запуск окружений без bot-настройки (CI, dev без BotFather).
+
+### Setup webhook (one-shot)
+
+После каждого изменения secret или URL — выполнить (на хост-машине, разово):
+
+```bash
+curl -F "url=https://postapp.store/api/telegram/webhook/${TELEGRAM_WEBHOOK_SECRET}" \
+     -F "secret_token=${TELEGRAM_WEBHOOK_SECRET}" \
+     "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook"
+```
+
+Подробнее — `07-deployment.md` секция 14 "Telegram bot setup".
+
+---
+
 ## 5. Health & ops
 
 ### `GET /healthz`
@@ -696,5 +731,6 @@ FastAPI автогенерит OpenAPI 3.1. UI:
 | DELETE | `/api/admin/users/{id}` | admin | yes | 50/h | yes | delete user (canonical) |
 | POST | `/api/admin/users/{id}/delete` | admin | yes | 50/h | yes | form-fallback delete (`_method=DELETE`) |
 | GET | `/api/admin/audit` | admin | — | — | — | audit log |
+| POST | `/api/telegram/webhook/{secret}` | secret in URL + header | exempt | 60/min per IP | — | Telegram bot webhook (launcher only — `/start` отдаёт WebApp button); см. ADR-0018 |
 | GET | `/healthz` | none | — | — | — | liveness |
 | GET | `/readyz` | none | — | — | — | readiness |
