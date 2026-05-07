@@ -81,20 +81,21 @@ jobs:
           repo_lc="$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')"
           echo "lc=ghcr.io/${repo_lc}" >> "$GITHUB_OUTPUT"
 
-      # webfactory/ssh-agent is more tolerant of whitespace / trailing
-      # newline issues in DEPLOY_KEY than appleboy/ssh-action — it loads
-      # the key into ssh-agent and the rest is a plain `ssh` invocation.
-      - name: Set up SSH agent
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.DEPLOY_KEY }}
-
-      - name: Show loaded key fingerprint (debug)
-        run: ssh-add -l
+      # The private key is stored base64-encoded in DEPLOY_KEY_B64. This is
+      # the most reliable way to ship a PEM through GitHub's Secret UI:
+      # base64 is a single line with no newlines/whitespace to mangle, and
+      # `base64 -d` always reproduces the original bytes exactly.
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "${{ secrets.DEPLOY_KEY_B64 }}" | base64 -d > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          # Fail fast with a clear message if the secret is invalid.
+          ssh-keygen -lf ~/.ssh/deploy_key
 
       - name: Trust the deploy host
         run: |
-          mkdir -p ~/.ssh
           ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
 
       - name: Deploy over SSH
@@ -105,7 +106,7 @@ jobs:
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
         run: |
-          ssh "$DEPLOY_USER@$DEPLOY_HOST" \
+          ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" \
             SHA="$SHA" IMAGE_REGISTRY="$IMAGE_REGISTRY" DEPLOY_PATH="$DEPLOY_PATH" \
             bash -s <<'REMOTE_SCRIPT'
           set -euo pipefail
