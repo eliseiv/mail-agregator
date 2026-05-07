@@ -16,14 +16,13 @@
 
   // ---- 1. Inbox filter auto-submit -----------------------------------------
 
-  const filterSelect = document.querySelector('[data-inbox-filter]');
-  if (filterSelect) {
-    filterSelect.addEventListener('change', function () {
-      // The form is the closest ancestor <form>.
-      const form = filterSelect.closest('form');
+  // Multiple filter selects (account_id, tag_id, ...) — wire each up.
+  document.querySelectorAll('[data-inbox-filter]').forEach(function (sel) {
+    sel.addEventListener('change', function () {
+      const form = sel.closest('form');
       if (form) form.submit();
     });
-  }
+  });
 
   const unreadCheckbox = document.querySelector('[data-inbox-unread]');
   if (unreadCheckbox) {
