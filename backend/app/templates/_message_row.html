@@ -19,15 +19,16 @@
       {% if msg.from_name %}{{ msg.from_name | e }}{% else %}{{ msg.from_addr | e }}{% endif %}
     </span>
 
+    {# Always emit the tags slot so the grid columns line up between rows.
+       Empty span has zero intrinsic width and is collapsed by the grid gap. #}
+    <span class="msg-row__tags" aria-label="Tags">
+      {% for t in msg.tags | default([]) %}{{ m.tag_chip(t) }}{% endfor %}
+    </span>
+
     <span class="msg-row__subject">
       {% if msg.subject %}{{ msg.subject | e }}{% else %}<em>(no subject)</em>{% endif %}
       {% if msg.has_attachments %}
         <span class="msg-row__attach" aria-label="Has attachments" title="Has attachments">&#128206;</span>
-      {% endif %}
-      {% if msg.tags %}
-        <span class="msg-row__tags" aria-label="Tags">
-          {% for t in msg.tags %}{{ m.tag_chip(t) }}{% endfor %}
-        </span>
       {% endif %}
     </span>
 

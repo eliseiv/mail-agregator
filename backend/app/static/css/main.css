@@ -490,7 +490,8 @@ a:hover { color: var(--color-primary-hover); }
 
 .msg-row__link {
   display: grid;
-  grid-template-columns: 16px auto minmax(120px, 1fr) minmax(180px, 2fr) auto;
+  /* indicator | account | from | tags | subject | date */
+  grid-template-columns: 16px auto minmax(120px, 1fr) auto minmax(180px, 2fr) auto;
   align-items: center;
   gap: var(--space-3);
   padding: var(--space-3) var(--space-4);
@@ -847,12 +848,14 @@ a:hover { color: var(--color-primary-hover); }
     grid-template-areas:
       "ind tag date"
       "from from from"
+      "tags tags tags"
       "subj subj subj";
     row-gap: var(--space-1);
   }
   .msg-row__indicator { grid-area: ind; }
   .msg-row__account-tag { grid-area: tag; max-width: none; }
   .msg-row__from { grid-area: from; }
+  .msg-row__tags { grid-area: tags; max-width: none; flex-wrap: wrap; }
   .msg-row__subject { grid-area: subj; white-space: normal; }
   .msg-row__date { grid-area: date; justify-self: end; }
 
@@ -1203,13 +1206,18 @@ a:hover { color: var(--color-primary-hover); }
   margin: 0;
 }
 
-/* Inline tag chips inside inbox row + message header */
+/* Tag chips column inside the inbox row + message header.
+   Sits between the "from" column and the subject so a long subject
+   never pushes tags out of view. Truncation happens in the subject
+   column (white-space:nowrap + ellipsis), not here. */
 .msg-row__tags {
-  display: inline-flex;
+  display: flex;
   gap: 0.3em;
-  margin-left: var(--space-2);
-  vertical-align: middle;
+  flex-wrap: nowrap;
+  max-width: 14rem;
+  overflow: hidden;
 }
+.msg-row__tags:empty { display: none; }
 .message__tags {
   display: flex;
   flex-wrap: wrap;
