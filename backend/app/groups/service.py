@@ -17,6 +17,8 @@ from backend.app.exceptions import (
     ValidationError,
 )
 from backend.app.groups.schemas import (
+    EligibleUserDTO,
+    EligibleUsersResponse,
     GroupDetailDTO,
     GroupDTO,
     GroupsListResponse,
@@ -192,11 +194,37 @@ class GroupsService:
         actor: VisibilityScope,
         name: str,
         leader_user_id: int,
+        member_ids: list[int] | None = None,
         ip: str | None,
         user_agent: str | None,
     ) -> GroupDetailDTO:
+        """Create a group with the given leader and optional initial members.
+
+        Atomic: all writes (insert group, promote leader, demote/add
+        members, audit rows, session revocations) happen inside the
+        caller's open transaction. If any validation fails the whole
+        request rolls back.
+
+        ``member_ids`` (optional, default empty) is a list of additional
+        user ids that will become ``group_member`` of the new group.
+        Constraints (validated up-front to surface readable errors):
+
+        - leader and members must all exist and not be ``super_admin``;
+        - ``leader_user_id`` must not appear in ``member_ids``;
+        - ``leader_user_id`` must not already lead a different group;
+        - members must not currently lead any group (a leader can't be
+          demoted in this flow — super-admin must dismantle the old group
+          first).
+        """
         if not actor.is_super_admin:
             raise NotFoundError("group_not_found")  # hide endpoint existence
+
+        member_ids = list(member_ids or [])
+        if leader_user_id in member_ids:
+            raise ValidationError(
+                "leader_user_id must not appear in member_ids",
+                field="member_ids",
+            )
 
         target = await self._users.get_by_id(leader_user_id)
         if target is None:
@@ -213,6 +241,50 @@ class GroupsService:
                 field="leader_user_id",
             )
 
+        # Pre-validate every member id before mutating state. Doing the
+        # whole check first means failures surface as clean 400s instead
+        # of triggering a partial-write rollback.
+        members: list[User] = []
+        if member_ids:
+            members_map = await self._users.get_many_by_ids(member_ids)
+            missing = [mid for mid in member_ids if mid not in members_map]
+            if missing:
+                raise ValidationError(
+                    "One or more member_ids do not exist",
+                    field="member_ids",
+                    details={"missing": missing},
+                )
+            for mid in member_ids:
+                m = members_map[mid]
+                if m.role == ROLE_SUPER_ADMIN:
+                    raise ValidationError(
+                        "Super admin cannot be a group member",
+                        field="member_ids",
+                        details={"user_id": mid},
+                    )
+                # If the user is currently leader of some other group,
+                # the FK ON DELETE RESTRICT and our own invariants make
+                # the demotion ambiguous (their old group becomes
+                # leaderless). Reject up-front; super-admin must delete
+                # the old group first.
+                led = await self._repo.get_by_leader(mid)
+                if led is not None:
+                    raise ValidationError(
+                        "Cannot add an existing leader as member; " "delete their group first",
+                        field="member_ids",
+                        details={"user_id": mid, "led_group_id": led.id},
+                    )
+                members.append(m)
+
+        # Capture the pre-mutation snapshot before any UPDATE — the same
+        # SQLAlchemy session is used by ``create_for_leader``, which expires
+        # ``target`` after its UPDATE so subsequent ``target.role`` reads
+        # would actually re-fetch the post-UPDATE values.
+        leader_username_before = target.username
+        leader_role_before = target.role
+        leader_group_before = target.group_id
+
+        # 1. Create the group + promote the leader.
         group = await self.create_for_leader(
             leader_user_id=leader_user_id,
             name=name,
@@ -227,17 +299,108 @@ class GroupsService:
             actor_user_id=actor.user_id,
             action="user_role_change",
             target_user_id=leader_user_id,
-            target_username=target.username,
+            target_username=leader_username_before,
             details={
-                "from_role": target.role,
+                "from_role": leader_role_before,
                 "to_role": ROLE_GROUP_LEADER,
-                "group_id_before": target.group_id,
+                "group_id_before": leader_group_before,
                 "group_id_after": group.id,
             },
             ip=ip,
             user_agent=user_agent,
         )
+
+        # 2. For each member: set role=group_member + group_id=<new>.
+        for m in members:
+            # Snapshot before mutation (see leader-side comment above).
+            member_id = m.id
+            member_username = m.username
+            old_role = m.role
+            old_group = m.group_id
+            await self._users.update_fields(
+                member_id,
+                role=ROLE_GROUP_MEMBER,
+                group_id=group.id,
+            )
+            await self._sessions.revoke_all_for_user(member_id)
+            # Use ``user_role_change`` if the role actually changed; else
+            # ``user_group_change``. Both are existing audit actions
+            # (see ADR-0019 §9 + 04-api-contracts.md).
+            if old_role != ROLE_GROUP_MEMBER:
+                await self._audit.log(
+                    actor_user_id=actor.user_id,
+                    action="user_role_change",
+                    target_user_id=member_id,
+                    target_username=member_username,
+                    details={
+                        "from_role": old_role,
+                        "to_role": ROLE_GROUP_MEMBER,
+                        "group_id_before": old_group,
+                        "group_id_after": group.id,
+                    },
+                    ip=ip,
+                    user_agent=user_agent,
+                )
+            elif old_group != group.id:
+                await self._audit.log(
+                    actor_user_id=actor.user_id,
+                    action="user_group_change",
+                    target_user_id=member_id,
+                    target_username=member_username,
+                    details={
+                        "from_group_id": old_group,
+                        "to_group_id": group.id,
+                    },
+                    ip=ip,
+                    user_agent=user_agent,
+                )
+
         return await self.get_detail(actor, group.id)
+
+    async def list_eligible_users(
+        self,
+        actor: VisibilityScope,
+    ) -> EligibleUsersResponse:
+        """Return users that may be picked as leader / member in a new group.
+
+        Excludes the super-admin (they can never be a group member or
+        leader; ADR-0019 §6 invariants). Result is intentionally small —
+        the project caps total users at ≤ 5 — so a single SELECT without
+        pagination is fine.
+        """
+        if not actor.is_super_admin:
+            raise NotFoundError("group_not_found")  # hide endpoint existence
+
+        users, _total = await self._users.list_paged(
+            q=None,
+            page=1,
+            limit=200,
+        )
+        # Bulk-load the groups referenced by these users so we can embed
+        # ``{id, name}`` without an N+1 lookup.
+        gids = sorted({u.group_id for u in users if u.group_id is not None})
+        groups = await self._repo.list_by_ids(gids)
+        group_by_id: dict[int, Group] = {g.id: g for g in groups}
+
+        items: list[EligibleUserDTO] = []
+        for u in users:
+            if u.role == ROLE_SUPER_ADMIN:
+                continue
+            grp_payload: dict[str, str | int] | None = None
+            if u.group_id is not None:
+                g = group_by_id.get(u.group_id)
+                if g is not None:
+                    grp_payload = {"id": g.id, "name": g.name}
+            items.append(
+                EligibleUserDTO(
+                    id=u.id,
+                    username=u.username,
+                    display_name=u.display_name,
+                    role=u.role,
+                    group=grp_payload,
+                )
+            )
+        return EligibleUsersResponse(items=items)
 
     async def rename(
         self,

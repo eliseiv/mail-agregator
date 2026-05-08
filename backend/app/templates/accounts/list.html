@@ -38,7 +38,7 @@
 
             <span class="account-list__sync">
               {% if acc.last_synced_at %}
-                Синхронизация: {{ m.time_tag(acc.last_synced_at, acc.last_synced_at_human if acc.last_synced_at_human is defined else None) }}
+                Синхронизация: {{ m.time_tag_short(acc.last_synced_at) }}
               {% else %}
                 Ни разу не синхронизировано
               {% endif %}

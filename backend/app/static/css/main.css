@@ -420,7 +420,11 @@ a:hover { color: var(--color-primary-hover); text-decoration: underline; }
   font-family: inherit;
   font-size: var(--font-size-base);
   padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--color-border-strong);
+  /* Default state must be unmistakably visible as a rectangle even on
+     subtle/Telegram-themed backgrounds (FE-FIX 1). Use the muted text colour
+     for the idle border — it is darker than --color-border-strong and works
+     for both light and dark schemes via tokens. */
+  border: 1px solid var(--color-text-muted);
   border-radius: var(--radius-md);
   background: var(--color-bg);
   color: var(--color-text);
@@ -994,13 +998,20 @@ a:hover { color: var(--color-primary-hover); text-decoration: underline; }
 .admin-user__email { color: var(--color-text-muted); font-size: var(--font-size-sm); }
 .admin-user__meta { color: var(--color-text-muted); font-size: var(--font-size-sm); }
 .admin-user__badge {
+  display: inline-block;
   background: var(--color-primary-soft);
   color: var(--color-primary);
   border: 1px solid var(--color-primary);
-  padding: 2px var(--space-3);
+  /* FE-FIX 5: Russian role labels (Супер-админ, Лидер группы, Участник
+     группы) need horizontal padding without fixed widths, and must stay on
+     one line. */
+  padding: 0.15em 0.7em;
   border-radius: var(--radius-full);
   font-size: var(--font-size-xs);
   font-weight: 500;
+  line-height: 1.5;
+  white-space: nowrap;
+  vertical-align: middle;
 }
 .admin-user__warn {
   color: var(--color-warning);
@@ -1097,10 +1108,25 @@ a:hover { color: var(--color-primary-hover); text-decoration: underline; }
   gap: var(--space-3);
 }
 
-/* Role badge variants */
-.admin-user__badge--super_admin { background: var(--color-bg-subtle); color: var(--color-text-muted); }
-.admin-user__badge--group_leader { background: rgba(124, 58, 237, 0.12); color: #6d28d9; }
-.admin-user__badge--group_member { background: rgba(37, 99, 235, 0.12); color: var(--color-primary); }
+/* Role badge variants (FE-FIX 5: per-role colours, per spec).
+   - super_admin: blue
+   - group_leader: green
+   - group_member: gray */
+.admin-user__badge--super_admin {
+  background: var(--color-primary-soft);
+  color: var(--color-primary);
+  border-color: var(--color-primary);
+}
+.admin-user__badge--group_leader {
+  background: var(--color-success-soft);
+  color: var(--color-success);
+  border-color: var(--color-success);
+}
+.admin-user__badge--group_member {
+  background: var(--color-bg-subtle);
+  color: var(--color-text-muted);
+  border-color: var(--color-border-strong);
+}
 
 .admin-groups-table__name strong { font-weight: 600; }
 .admin__hint {
@@ -1263,17 +1289,20 @@ a:hover { color: var(--color-primary-hover); text-decoration: underline; }
   display: none;
 }
 
+/* Bottom-nav items are text-only navigation links (FE-FIX 3); no icons,
+   no logout — Logout lives only in the topbar (FE-FIX 2). */
 .bottom-nav__item {
   flex: 1 1 0;
   display: flex;
-  flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 2px;
-  padding: var(--space-1) var(--space-2);
+  text-align: center;
+  padding: var(--space-2) var(--space-2);
   text-decoration: none;
   color: var(--color-text-muted);
-  font-size: var(--font-size-xs);
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  letter-spacing: 0;
   border-radius: var(--radius-md);
   transition: color var(--transition), background-color var(--transition);
   min-height: 48px;
@@ -1289,51 +1318,11 @@ a:hover { color: var(--color-primary-hover); text-decoration: underline; }
 .bottom-nav__item--active:hover {
   color: var(--color-primary-hover);
 }
-.bottom-nav__icon {
-  font-size: 1.4em;
-  line-height: 1;
-  display: inline-block;
-}
 .bottom-nav__label {
-  font-weight: 500;
+  font-weight: inherit;
   letter-spacing: 0;
-  font-size: 0.7rem;
-}
-
-/* Logout in bottom-nav: <form> styled identically to <a class="bottom-nav__item">
-   so the 5-th icon-button looks like the four nav links. POST + CSRF (no GET
-   logout, see ADR-0019 §10). The <form> itself is the flex item; its <button>
-   fills the slot with a transparent background and inherits colour. */
-.bottom-nav__form {
-  margin: 0;
-  padding: 0;
-  display: flex;
-}
-.bottom-nav__button {
-  flex: 1 1 auto;
-  background: transparent;
-  border: 0;
-  cursor: pointer;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 2px;
-  padding: var(--space-1) var(--space-2);
-  color: var(--color-text-muted);
-  font: inherit;
-  font-size: var(--font-size-xs);
-  font-family: inherit;
-  border-radius: var(--radius-md);
-  transition: color var(--transition), background-color var(--transition);
-  min-height: 48px;
-  width: 100%;
-  -webkit-tap-highlight-color: transparent;
-}
-.bottom-nav__button:hover,
-.bottom-nav__button:focus-visible {
-  color: var(--color-primary);
-  background: var(--color-bg-hover);
+  font-size: inherit;
+  line-height: 1.2;
 }
 
 /* Show bottom nav on mobile (<=640px) and override main padding so the

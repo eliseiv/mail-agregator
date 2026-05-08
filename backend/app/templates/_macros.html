@@ -84,6 +84,42 @@
 {%- endif -%}
 {%- endmacro -%}
 
+{# Compact date-time formatter (FE-FIX 4). Renders ``YYYY-MM-DD HH:MM`` —
+   no seconds, no microseconds, no timezone — and falls back to an
+   em-dash when the value is empty/None. Accepts both ISO strings and
+   Python datetime objects. #}
+{%- macro format_dt(value) -%}
+{%- if value -%}
+  {%- if value.strftime is defined -%}
+    {{- value.strftime('%Y-%m-%d %H:%M') | e -}}
+  {%- elif value is string -%}
+    {%- set s = value | replace('T', ' ') -%}
+    {{- s[:16] | e -}}
+  {%- else -%}
+    {%- set s = value | string | replace('T', ' ') -%}
+    {{- s[:16] | e -}}
+  {%- endif -%}
+{%- else -%}&mdash;
+{%- endif -%}
+{%- endmacro -%}
+
+{# Compact date-time wrapped in a <time> element with ISO datetime kept in
+   the ``datetime`` attribute for a11y / machine reading. Renders the
+   shortened ``YYYY-MM-DD HH:MM`` for humans (FE-FIX 4). #}
+{%- macro time_tag_short(value) -%}
+{%- if value -%}
+{%- if value.strftime is defined -%}
+{%- set iso = value.isoformat() -%}
+{%- set short = value.strftime('%Y-%m-%d %H:%M') -%}
+{%- else -%}
+{%- set iso = value | string -%}
+{%- set s = iso | replace('T', ' ') -%}
+{%- set short = s[:16] -%}
+{%- endif -%}
+<time datetime="{{ iso | e }}">{{ short | e }}</time>
+{%- endif -%}
+{%- endmacro -%}
+
 {# ---------------------------------------------------------------------------
    Tag chip (ADR-0017 / 08-frontend.md §5.1).
 

@@ -257,32 +257,54 @@ class MailAccountService:
         if new_smtp_ssl and new_smtp_starttls:
             raise ConflictError("smtp_ssl and smtp_starttls are mutually exclusive")
 
-        if payload.password:
-            imap_pwd = payload.password
-        else:
-            imap_pwd = decrypt_mail_password(acc.encrypted_password, acc.id)
-
-        if payload.smtp_password:
-            smtp_pwd = payload.smtp_password
-        elif acc.smtp_encrypted_password is not None:
-            smtp_pwd = decrypt_mail_password(acc.smtp_encrypted_password, acc.id)
-        else:
-            smtp_pwd = imap_pwd
-
-        test_payload = MailAccountTestRequest(
-            email=new_email,
-            password=imap_pwd,
-            imap_host=new_imap_host,
-            imap_port=new_imap_port,
-            imap_ssl=new_imap_ssl,
-            smtp_host=new_smtp_host,
-            smtp_port=new_smtp_port,
-            smtp_ssl=new_smtp_ssl,
-            smtp_starttls=new_smtp_starttls,
-            smtp_username=new_smtp_username,
-            smtp_password=smtp_pwd,
+        # Decide whether IMAP/SMTP credentials actually changed. A PATCH that
+        # only touches non-credential fields (e.g. ``display_name``) must NOT
+        # re-validate connectivity — re-running the IMAP/SMTP login on every
+        # nickname edit can break for providers (Gmail/Yandex) that have
+        # since invalidated the stored app-password, even though the user
+        # never asked us to verify it. Empty ``password=""`` / ``smtp_password=""``
+        # is interpreted as "do not change" — also no re-test.
+        creds_changed = bool(
+            payload.password
+            or payload.smtp_password
+            or (payload.imap_host is not None and payload.imap_host != acc.imap_host)
+            or (payload.imap_port is not None and payload.imap_port != acc.imap_port)
+            or (payload.imap_ssl is not None and payload.imap_ssl != acc.imap_ssl)
+            or (payload.smtp_host is not None and payload.smtp_host != acc.smtp_host)
+            or (payload.smtp_port is not None and payload.smtp_port != acc.smtp_port)
+            or (payload.smtp_ssl is not None and payload.smtp_ssl != acc.smtp_ssl)
+            or (payload.smtp_starttls is not None and payload.smtp_starttls != acc.smtp_starttls)
+            or (payload.smtp_username is not None and payload.smtp_username != acc.smtp_username)
+            or (payload.email is not None and payload.email != acc.email)
         )
-        await self.test(test_payload)
+
+        if creds_changed:
+            if payload.password:
+                imap_pwd = payload.password
+            else:
+                imap_pwd = decrypt_mail_password(acc.encrypted_password, acc.id)
+
+            if payload.smtp_password:
+                smtp_pwd = payload.smtp_password
+            elif acc.smtp_encrypted_password is not None:
+                smtp_pwd = decrypt_mail_password(acc.smtp_encrypted_password, acc.id)
+            else:
+                smtp_pwd = imap_pwd
+
+            test_payload = MailAccountTestRequest(
+                email=new_email,
+                password=imap_pwd,
+                imap_host=new_imap_host,
+                imap_port=new_imap_port,
+                imap_ssl=new_imap_ssl,
+                smtp_host=new_smtp_host,
+                smtp_port=new_smtp_port,
+                smtp_ssl=new_smtp_ssl,
+                smtp_starttls=new_smtp_starttls,
+                smtp_username=new_smtp_username,
+                smtp_password=smtp_pwd,
+            )
+            await self.test(test_payload)
 
         update_fields: dict[str, object] = {
             "email": new_email,
@@ -305,9 +327,14 @@ class MailAccountService:
             update_fields["display_name"] = None
         elif payload.display_name is not None:
             update_fields["display_name"] = payload.display_name
-        update_fields["is_active"] = True
-        update_fields["last_sync_error"] = None
-        update_fields["consecutive_failures"] = 0
+        # Only flip ``is_active`` / clear sync-error state when we actually
+        # re-validated credentials. A bare display_name edit must not reset
+        # ``consecutive_failures`` — the account's IMAP/SMTP health hasn't
+        # been re-verified, so leave the status unchanged.
+        if creds_changed:
+            update_fields["is_active"] = True
+            update_fields["last_sync_error"] = None
+            update_fields["consecutive_failures"] = 0
 
         await self._repo.update_fields(account_id, **update_fields)
         refreshed = await self._repo.get_by_id(account_id)

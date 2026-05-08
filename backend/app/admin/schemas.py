@@ -57,8 +57,15 @@ def _trim_or_none(v: str | None) -> str | None:
 
 
 class CreateUserRequest(BaseModel):
+    """Body of ``POST /api/admin/users``.
+
+    Note: the ``email`` column on ``users`` is preserved at the DB layer for
+    backwards compatibility but is no longer accepted as input — newly
+    created users always have ``email = NULL``. The field was removed from
+    the public API at the user's request (UX feedback: it was never used).
+    """
+
     username: str = Field(min_length=3, max_length=64)
-    email: str | None = Field(default=None, max_length=254)
     display_name: str | None = Field(default=None, max_length=100)
     role: str = Field(default="group_member")
     group_id: int | None = Field(default=None, ge=1)
@@ -71,7 +78,7 @@ class CreateUserRequest(BaseModel):
             raise ValueError("username may only contain A-Z, 0-9, _ . -")
         return v
 
-    @field_validator("email", "display_name")
+    @field_validator("display_name")
     @classmethod
     def _trim(cls, v: str | None) -> str | None:
         return _trim_or_none(v)

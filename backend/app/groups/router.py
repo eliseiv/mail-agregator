@@ -57,6 +57,33 @@ def _form_str(form: object, name: str) -> str:
     return v if isinstance(v, str) else ""
 
 
+def _form_int_list(form: object, name: str) -> list[int]:
+    """Read a multi-valued form field (``name[]`` or repeated ``name``) as ints.
+
+    Empty or missing field → empty list. Non-integer entries raise a
+    ``ValidationError`` with field=name.
+    """
+    if not hasattr(form, "getlist"):
+        return []
+    raw_items: list[str] = []
+    # Starlette's FormData supports both ``name`` and ``name[]`` keys.
+    raw_items.extend([v for v in form.getlist(name) if isinstance(v, str)])
+    raw_items.extend([v for v in form.getlist(f"{name}[]") if isinstance(v, str)])
+    out: list[int] = []
+    for raw in raw_items:
+        s = raw.strip()
+        if not s:
+            continue
+        try:
+            out.append(int(s))
+        except ValueError as exc:
+            raise ValidationError(
+                f"{name} must contain integers only",
+                field=name,
+            ) from exc
+    return out
+
+
 async def _parse_create_form(request: Request) -> GroupCreateRequest:
     form = await request.form()
     raw_leader = _form_str(form, "leader_user_id").strip()
@@ -67,9 +94,14 @@ async def _parse_create_form(request: Request) -> GroupCreateRequest:
             "leader_user_id must be an integer",
             field="leader_user_id",
         ) from exc
+    member_ids = _form_int_list(form, "member_ids")
     try:
         return GroupCreateRequest.model_validate(
-            {"name": _form_str(form, "name"), "leader_user_id": leader_id}
+            {
+                "name": _form_str(form, "name"),
+                "leader_user_id": leader_id,
+                "member_ids": member_ids,
+            }
         )
     except PydanticValidationError as exc:
         raise ValidationError("Invalid form payload") from exc
@@ -143,6 +175,7 @@ async def create_group(
                 actor=scope,
                 name=payload.name,
                 leader_user_id=payload.leader_user_id,
+                member_ids=payload.member_ids,
                 ip=ip,
                 user_agent=ua,
             )
@@ -156,6 +189,7 @@ async def create_group(
                 form_values={
                     "name": payload.name,
                     "leader_user_id": payload.leader_user_id,
+                    "member_ids": payload.member_ids,
                 },
                 status_code=exc.status_code,
             )

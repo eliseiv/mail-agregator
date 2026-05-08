@@ -41,6 +41,8 @@ from backend.app.exceptions import (
     ValidationError,
 )
 from backend.app.flash import flash
+from backend.app.groups.schemas import EligibleUsersResponse
+from backend.app.groups.service import GroupsService
 from backend.app.rate_limit import LIMIT_ADMIN_WRITE, client_ip, consume
 from backend.app.repositories.groups import GroupsRepo
 from backend.app.templates import render
@@ -73,9 +75,11 @@ def _form_int_or_none(form: object, name: str) -> int | None:
 
 async def _parse_create_user_form(request: Request) -> CreateUserRequest:
     form = await request.form()
+    # ``email`` is intentionally NOT parsed: the field was removed from the
+    # public API. Form-encoded clients that still submit ``email=...`` will
+    # have it silently ignored (forward-compat for old HTML caches).
     payload: dict[str, object] = {
         "username": _form_str(form, "username"),
-        "email": _form_str(form, "email").strip() or None,
         "display_name": _form_str(form, "display_name").strip() or None,
         "role": _form_str(form, "role").strip() or "group_member",
         "group_id": _form_int_or_none(form, "group_id"),
@@ -178,6 +182,20 @@ async def list_users(
     )
 
 
+@api.get("/users/eligible", response_model=EligibleUsersResponse)
+async def list_eligible_users(
+    db: DbSession,
+    actor: SuperAdminScope,
+) -> EligibleUsersResponse:
+    """Users that may be picked as leader / member in a new group.
+
+    Excludes the super-admin (cannot be a member or leader by ADR-0019
+    invariants). The frontend uses this to populate the multi-select
+    dropdowns on the "create group" / "create user" forms.
+    """
+    return await GroupsService(db).list_eligible_users(actor)
+
+
 @api.post(
     "/users",
     response_model=None,
@@ -221,7 +239,6 @@ async def create_user(
                 error_message=exc.message,
                 create_form={
                     "username": payload.username,
-                    "email": payload.email or "",
                     "display_name": payload.display_name or "",
                     "role": payload.role,
                     "group_id": payload.group_id,

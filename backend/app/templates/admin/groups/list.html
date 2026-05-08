@@ -70,7 +70,7 @@
               </td>
               <td class="admin-groups-table__date">
                 {% if grp.created_at %}
-                  {{ m.time_tag(grp.created_at, grp.created_at_human if grp.created_at_human is defined else None) }}
+                  {{ m.time_tag_short(grp.created_at) }}
                 {% else %}
                   <span class="admin-users-table__muted">&mdash;</span>
                 {% endif %}

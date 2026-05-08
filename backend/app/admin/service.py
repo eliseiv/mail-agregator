@@ -193,9 +193,14 @@ class AdminService:
         role, group_id = await self._resolve_create_role_and_group(actor, payload)
 
         try:
+            # ``email`` is no longer accepted in the request payload (the
+            # field was removed from the public API). New users are created
+            # with ``email = NULL``; the DB column itself is kept for
+            # backwards compatibility with the seeded super-admin and old
+            # rows. See ``CreateUserRequest`` docstring.
             user = await self._users.create(
                 username=payload.username,
-                email=payload.email,
+                email=None,
                 role=role,
                 group_id=group_id,
                 display_name=payload.display_name,

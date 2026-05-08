@@ -21,6 +21,7 @@
       <a class="topnav__link" href="/admin/groups">Группы &rarr;</a>
       <a class="topnav__link" href="/admin/audit">Журнал действий &rarr;</a>
       <button type="button" class="btn btn--primary" data-admin-create-user>+ Создать пользователя</button>
+      <button type="button" class="btn btn--secondary" data-admin-create-group>+ Создать группу</button>
     </div>
   </header>
 
@@ -85,11 +86,11 @@
                 {% endif %}
               </td>
               <td class="admin-users-table__date">
-                {{ m.time_tag(u.created_at, u.created_at_human if u.created_at_human is defined else None) }}
+                {{ m.time_tag_short(u.created_at) }}
               </td>
               <td class="admin-users-table__date">
                 {% if u.last_login_at %}
-                  {{ m.time_tag(u.last_login_at, u.last_login_at_human if u.last_login_at_human is defined else None) }}
+                  {{ m.time_tag_short(u.last_login_at) }}
                 {% else %}
                   <span class="admin-users-table__muted">никогда</span>
                 {% endif %}
@@ -116,7 +117,7 @@
                               </span>
                               <span class="admin-user__account-meta">
                                 {% if ma.last_synced_at %}
-                                  синхр. {{ m.time_tag(ma.last_synced_at, ma.last_synced_at_human if ma.last_synced_at_human is defined else None) }}
+                                  синхр. {{ m.time_tag_short(ma.last_synced_at) }}
                                 {% else %}
                                   ни разу
                                 {% endif %}
@@ -189,17 +190,9 @@
           autocomplete="off">
         <p class="field__hint">3–64 символа: латиница, цифры, символы <code>_ . -</code>.</p>
       </div>
+      {# FE-FIX 6: email field removed — backend больше не требует его. #}
       <div class="field">
-        <label class="field__label" for="new-user-email">Email <span class="field__optional">(необязательно)</span></label>
-        <input
-          class="field__input"
-          type="email"
-          id="new-user-email"
-          name="email"
-          autocomplete="off">
-      </div>
-      <div class="field">
-        <label class="field__label" for="new-user-display-name">Имя для отображения <span class="field__optional">(необязательно)</span></label>
+        <label class="field__label" for="new-user-display-name">Имя <span class="field__optional">(необязательно)</span></label>
         <input
           class="field__input"
           type="text"
@@ -208,7 +201,7 @@
           maxlength="100"
           autocomplete="off"
           placeholder="Например: Иван Иванов">
-        <p class="field__hint">Если пусто — будет показываться логин.</p>
+        <p class="field__hint">Если пусто — будет показываться логин. От 1 до 100 символов.</p>
       </div>
 
       <fieldset class="form-section">
@@ -265,6 +258,71 @@
 
       <div class="form-actions">
         <button type="submit" class="btn btn--primary">Создать</button>
+      </div>
+    </form>
+  </dialog>
+
+  {# Create-group dialog (FE-FIX 7). Two select-like controls populated via
+     fetch /api/admin/users/eligible on first open. The "Лидер группы" select
+     is required; "Участники" is a multi-select (optional). On submit we POST
+     JSON {name, leader_user_id, member_ids:[...]} to /api/admin/groups. #}
+  <dialog class="dialog" id="dialog-create-group" data-admin-create-group-dialog>
+    <form method="dialog" class="dialog__form-cancel">
+      <button type="submit" class="btn btn--link" aria-label="Закрыть">&times;</button>
+    </form>
+    <h2 class="dialog__title">Создать группу</h2>
+
+    <p class="form-error" role="alert" data-admin-create-group-error hidden></p>
+
+    <form
+      method="POST"
+      action="/api/admin/groups"
+      class="form"
+      data-admin-create-group-form>
+      {{ m.csrf_input() }}
+
+      <div class="field">
+        <label class="field__label" for="new-group-name">Название группы</label>
+        <input
+          class="field__input"
+          type="text"
+          id="new-group-name"
+          name="name"
+          required
+          minlength="1"
+          maxlength="100"
+          autocomplete="off">
+        <p class="field__hint">От 1 до 100 символов.</p>
+      </div>
+
+      <div class="field">
+        <label class="field__label" for="new-group-leader">Лидер группы</label>
+        <select
+          class="field__input"
+          id="new-group-leader"
+          name="leader_user_id"
+          required
+          data-admin-group-leader-select>
+          <option value="">— загрузка списка пользователей… —</option>
+        </select>
+        <p class="field__hint">Обязательное поле.</p>
+      </div>
+
+      <div class="field">
+        <label class="field__label" for="new-group-members">Участники <span class="field__optional">(необязательно)</span></label>
+        <select
+          class="field__input"
+          id="new-group-members"
+          name="member_ids"
+          multiple
+          size="6"
+          data-admin-group-members-select>
+        </select>
+        <p class="field__hint">Удерживайте Ctrl (⌘ на macOS) для выбора нескольких. Лидер исключается из участников автоматически.</p>
+      </div>
+
+      <div class="form-actions">
+        <button type="submit" class="btn btn--primary" data-admin-create-group-submit>Создать</button>
       </div>
     </form>
   </dialog>

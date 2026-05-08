@@ -67,7 +67,7 @@
         <tbody>
           {% for row in items %}
             <tr>
-              <td>{{ m.time_tag(row.created_at, row.created_at_human if row.created_at_human is defined else None) }}</td>
+              <td>{{ m.time_tag_short(row.created_at) }}</td>
               <td>{{ row.actor_username | default('система') | e }}</td>
               <td><code>{{ row.action | e }}</code></td>
               <td>

@@ -71,44 +71,32 @@
      inline styles or scripts. The Admin item is server-rendered conditionally
      so non-admin sessions never receive markup that links to /admin.
 
-     Logout is the 5-th nav item — implemented as <form method="POST"> so
-     it carries CSRF protection (GET-logout is forbidden by ADR-0019 §10). #}
+     Logout lives in the topbar only (ADR-0019 UI-1) — bottom-nav is
+     navigation-only and shows text labels without icons. #}
   {% if request is defined and request.state is defined and request.state.session %}
-    {% import "_macros.html" as m with context %}
     <nav class="bottom-nav" aria-label="Нижняя навигация">
       <a href="/"
          class="bottom-nav__item{% if request.url.path == '/' %} bottom-nav__item--active{% endif %}"
          {% if request.url.path == '/' %}aria-current="page"{% endif %}>
-        <span class="bottom-nav__icon" aria-hidden="true">&#128229;</span>
         <span class="bottom-nav__label">Входящие</span>
       </a>
       <a href="/accounts"
          class="bottom-nav__item{% if request.url.path.startswith('/accounts') %} bottom-nav__item--active{% endif %}"
          {% if request.url.path.startswith('/accounts') %}aria-current="page"{% endif %}>
-        <span class="bottom-nav__icon" aria-hidden="true">&#128231;</span>
         <span class="bottom-nav__label">Почты</span>
       </a>
       <a href="/tags"
          class="bottom-nav__item{% if request.url.path.startswith('/tags') %} bottom-nav__item--active{% endif %}"
          {% if request.url.path.startswith('/tags') %}aria-current="page"{% endif %}>
-        <span class="bottom-nav__icon" aria-hidden="true">&#127991;&#65039;</span>
         <span class="bottom-nav__label">Теги</span>
       </a>
       {% if request.state.session.role == 'super_admin' %}
       <a href="/admin"
          class="bottom-nav__item{% if request.url.path.startswith('/admin') %} bottom-nav__item--active{% endif %}"
          {% if request.url.path.startswith('/admin') %}aria-current="page"{% endif %}>
-        <span class="bottom-nav__icon" aria-hidden="true">&#9881;&#65039;</span>
         <span class="bottom-nav__label">Админ</span>
       </a>
       {% endif %}
-      <form method="POST" action="/logout" class="bottom-nav__item bottom-nav__form" aria-label="Выйти из аккаунта">
-        {{ m.csrf_input() }}
-        <button type="submit" class="bottom-nav__button" aria-label="Выйти из аккаунта">
-          <span class="bottom-nav__icon" aria-hidden="true">&#128682;</span>
-          <span class="bottom-nav__label">Выйти</span>
-        </button>
-      </form>
     </nav>
   {% endif %}
 
