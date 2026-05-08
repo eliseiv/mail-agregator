@@ -31,6 +31,7 @@ from backend.app.admin.schemas import (
 )
 from backend.app.admin.service import AdminService
 from backend.app.deps import (
+    AdminOrLeaderScope,
     DbSession,
     SuperAdminScope,
     VisibilityScope,
@@ -49,6 +50,7 @@ from backend.app.templates import render
 
 api = APIRouter(prefix="/api/admin", tags=["admin"])
 html = APIRouter(prefix="/admin", tags=["admin-html"])
+leader_html = APIRouter(prefix="/my", tags=["leader-html"])
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +223,7 @@ async def list_eligible_users(
 async def create_user(
     request: Request,
     db: DbSession,
-    actor: SuperAdminScope,
+    actor: AdminOrLeaderScope,
 ) -> Response:
     actor_id = actor.user_id
     await consume(LIMIT_ADMIN_WRITE, str(actor_id))
@@ -276,7 +278,7 @@ async def create_user(
 async def _patch_user_impl(
     request: Request,
     db: DbSession,
-    actor: SuperAdminScope,
+    actor: AdminOrLeaderScope,
     user_id: int,
 ) -> Response:
     actor_id = actor.user_id
@@ -319,7 +321,7 @@ async def _patch_user_impl(
 async def patch_user(
     request: Request,
     db: DbSession,
-    actor: SuperAdminScope,
+    actor: AdminOrLeaderScope,
     user_id: int = Path(..., ge=1),
 ) -> Response:
     return await _patch_user_impl(request, db, actor, user_id)
@@ -333,7 +335,7 @@ async def patch_user(
 async def patch_user_sibling(
     request: Request,
     db: DbSession,
-    actor: SuperAdminScope,
+    actor: AdminOrLeaderScope,
     user_id: int = Path(..., ge=1),
 ) -> Response:
     """Form-fallback to PATCH (POST + ``_method=PATCH``)."""
@@ -344,7 +346,7 @@ async def patch_user_sibling(
 async def reset_password(
     request: Request,
     db: DbSession,
-    actor: SuperAdminScope,
+    actor: AdminOrLeaderScope,
     user_id: int = Path(..., ge=1),
 ) -> Response:
     await consume(LIMIT_ADMIN_WRITE, str(actor.user_id))
@@ -374,7 +376,7 @@ async def reset_password(
 async def _delete_user_impl(
     request: Request,
     db: DbSession,
-    actor: SuperAdminScope,
+    actor: AdminOrLeaderScope,
     user_id: int,
 ) -> Response:
     await consume(LIMIT_ADMIN_WRITE, str(actor.user_id))
@@ -405,7 +407,7 @@ async def _delete_user_impl(
 async def delete_user(
     request: Request,
     db: DbSession,
-    actor: SuperAdminScope,
+    actor: AdminOrLeaderScope,
     user_id: int = Path(..., ge=1),
 ) -> Response:
     return await _delete_user_impl(request, db, actor, user_id)
@@ -419,7 +421,7 @@ async def delete_user(
 async def delete_user_sibling(
     request: Request,
     db: DbSession,
-    actor: SuperAdminScope,
+    actor: AdminOrLeaderScope,
     user_id: int = Path(..., ge=1),
 ) -> Response:
     """Sibling endpoint reachable from a plain HTML form via method override."""
@@ -574,6 +576,40 @@ async def admin_audit_page(
     )
 
 
+@leader_html.get("/members", response_class=HTMLResponse)
+async def leader_members_page(
+    request: Request,
+    db: DbSession,
+    actor: AdminOrLeaderScope,
+) -> Response:
+    """Group leader's "Участники" page (FE-FIX round-9 #1).
+
+    Lists members of the leader's own group (incl. the leader). Provides a
+    "+ Добавить участника" dialog (POST /api/admin/users with role auto-set
+    to ``group_member`` and group_id forced to the leader's own — service
+    layer handles this in :meth:`AdminService._resolve_create_role_and_group`).
+    Reset / delete reuse the existing /api/admin/users endpoints, which
+    accept group_leader callers and enforce same-group / non-leader
+    invariants in the service layer.
+    """
+    sess = request.state.session
+    listing = await AdminService(db).list_users(actor, q=None, page=1, limit=200)
+    return await render(
+        request,
+        "admin/members.html",
+        {
+            "users": listing.items,
+            "total": listing.total,
+            "current_user_id": actor.user_id,
+            "current_group_id": actor.group_id,
+            "is_super_admin": actor.is_super_admin,
+            "csrf_token": sess.csrf_token,
+            "session": sess,
+        },
+    )
+
+
 router = APIRouter()
 router.include_router(api)
 router.include_router(html)
+router.include_router(leader_html)

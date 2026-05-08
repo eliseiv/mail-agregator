@@ -37,6 +37,7 @@
             <a class="topnav__link" href="/admin">Пользователи</a>
             <a class="topnav__link" href="/admin/groups">Группы</a>
           {% elif request.state.session.role == 'group_leader' %}
+            <a class="topnav__link" href="/my/members">Участники</a>
             <a class="topnav__link" href="/admin/groups">Моя группа</a>
           {% endif %}
         </nav>
@@ -97,6 +98,12 @@
          class="bottom-nav__item{% if request.url.path.startswith('/admin') %} bottom-nav__item--active{% endif %}"
          {% if request.url.path.startswith('/admin') %}aria-current="page"{% endif %}>
         <span class="bottom-nav__label">Админ</span>
+      </a>
+      {% elif request.state.session.role == 'group_leader' %}
+      <a href="/my/members"
+         class="bottom-nav__item{% if request.url.path.startswith('/my/members') or request.url.path.startswith('/admin/groups') %} bottom-nav__item--active{% endif %}"
+         {% if request.url.path.startswith('/my/members') or request.url.path.startswith('/admin/groups') %}aria-current="page"{% endif %}>
+        <span class="bottom-nav__label">Группа</span>
       </a>
       {% endif %}
     </nav>
