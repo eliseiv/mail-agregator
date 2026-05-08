@@ -1087,21 +1087,24 @@ a:hover { color: var(--color-primary-hover); text-decoration: underline; }
 .admin-users-table__name { font-weight: 600; }
 .admin-users-table__muted { color: var(--color-text-muted); font-size: var(--font-size-xs); }
 
-/* Group banding (FE-FIX round-5 #2): each group is its own <tbody> with a
-   thick contoured border, rounded corners and a real vertical gap between
-   groups. Implementation:
-     - <table border-collapse: separate; border-spacing: 0 var(--space-3)>
-       inserts real space between <tbody>s without extra DOM.
-     - per-group accent tint alternates between groups so adjacent ones
-       stay visually distinct even when borders touch.
-     - first/last row of each tbody round their corners; the border is
-       drawn on the outer <td>s. */
+/* Group banding (FE-FIX round-6 #1+#2): each group is its own <tbody> with
+   a thick contoured border. Internal members of the same group are flush
+   (no gap); the visible gap appears ONLY between groups via a transparent
+   spacer <tbody> the template renders between adjacent buckets.
+
+   Implementation notes:
+     - ``border-collapse: separate`` + ``border-spacing: 0`` keeps cells
+       flush so members read as one block while still allowing rounded
+       corners / per-side borders on cells.
+     - Selectors qualify ``.admin-users-table tbody.user-group ...`` to
+       beat the global ``tbody tr:last-child td { border-bottom: none }``
+       rule that would otherwise hide the group's bottom contour. */
 .admin-users-table {
   border-collapse: separate;
-  border-spacing: 0 var(--space-3);
+  border-spacing: 0;
 }
 .admin-users-table tbody.user-group tr td {
-  border-bottom: none; /* override the global last-row rule */
+  border-bottom: none; /* default: no inner row separator */
 }
 
 .user-group {
@@ -1130,10 +1133,14 @@ a:hover { color: var(--color-primary-hover); text-decoration: underline; }
 .user-group tr td:last-child {
   border-right: 2px solid var(--user-group-accent);
 }
-.user-group tr:first-child td {
+/* Top of the first row + bottom of the last row carry the group contour.
+   Selectors are qualified with ``.admin-users-table tbody.user-group`` so
+   they outrank the global ``tbody tr:last-child td { border-bottom: none }``
+   and the override above. */
+.admin-users-table tbody.user-group tr:first-child td {
   border-top:    2px solid var(--user-group-accent);
 }
-.user-group tr:last-child td {
+.admin-users-table tbody.user-group tr:last-child td {
   border-bottom: 2px solid var(--user-group-accent);
 }
 .user-group tr:first-child td:first-child { border-top-left-radius:     8px; }
@@ -1141,14 +1148,22 @@ a:hover { color: var(--color-primary-hover); text-decoration: underline; }
 .user-group tr:last-child  td:first-child { border-bottom-left-radius:  8px; }
 .user-group tr:last-child  td:last-child  { border-bottom-right-radius: 8px; }
 
-/* Soft hairline between members of the same group. */
-.user-group tr + tr td {
-  border-top: 1px dashed rgba(0, 0, 0, 0.1);
-}
-
 .admin-users-table tbody.user-group tr:hover {
   background: var(--user-group-tint);
   filter: brightness(0.95);
+}
+
+/* Spacer tbody between adjacent groups — purely visual gap, no border
+   so the next group's top contour stays clean. */
+.admin-users-table tbody.user-group__spacer td {
+  background: transparent;
+  border: none;
+  padding: 0;
+  height: var(--space-4);
+}
+.admin-users-table tbody.user-group__spacer tr:hover {
+  background: transparent;
+  filter: none;
 }
 
 /* Inline "+" button next to the user's name — opens the move-to-group

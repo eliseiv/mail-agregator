@@ -71,6 +71,14 @@
             {% set _band_class = 'user-group--band-' ~ ('a' if band_idx.value == 0 else 'b') %}
             {% set band_idx.value = 1 - band_idx.value %}
           {% endif %}
+          {# Visual gap BETWEEN groups (FE-FIX round-6 #1). Inserted as a
+             standalone <tbody> so it never picks up the group's hover /
+             border styling. Inside one group the rows stay flush. #}
+          {% if not loop.first %}
+            <tbody class="user-group__spacer" aria-hidden="true">
+              <tr><td colspan="6"></td></tr>
+            </tbody>
+          {% endif %}
           <tbody class="user-group {{ _band_class }}" data-group-id="{{ _gid }}">
             {% for u in bucket.users %}
               {% set _is_super = u.role == 'super_admin' or u.is_admin %}
