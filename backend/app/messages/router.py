@@ -14,6 +14,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 
 from backend.app.accounts.service import MailAccountService
 from backend.app.deps import CurrentScope, DbSession
+from backend.app.groups.service import GroupsService
 from backend.app.messages.schemas import (
     MarkReadRequest,
     MessageDetail,
@@ -122,6 +123,7 @@ async def inbox_page(
     scope: CurrentScope,
     account_id: Annotated[str | None, Query()] = None,
     tag_id: Annotated[str | None, Query()] = None,
+    group_id: Annotated[str | None, Query()] = None,
     cursor: Annotated[str | None, Query(max_length=200)] = None,
     unread: Annotated[str | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
@@ -133,6 +135,9 @@ async def inbox_page(
     parsed_tag_id: int | None = None
     if tag_id and tag_id.isdigit():
         parsed_tag_id = int(tag_id)
+    parsed_group_id: int | None = None
+    if group_id and group_id.isdigit():
+        parsed_group_id = int(group_id)
     parsed_unread: bool | None = None
     if unread:
         parsed_unread = unread.lower() in ("1", "true", "on", "yes")
@@ -140,10 +145,20 @@ async def inbox_page(
     accounts = await MailAccountService(db).list_for_scope(scope)
     # Server-render dropdown of user's tags so the filter renders without JS.
     tags = await TagsService(db).list_for_user(scope.user_id)
+    # FE-FIX round-7 #2: super_admin gets a third filter — by group. We
+    # always include the dropdown options when the caller is super_admin;
+    # the template hides the <select> when ``groups`` is empty.
+    groups: list = []
+    if scope.is_super_admin:
+        groups_resp = await GroupsService(db).list_for_scope(
+            scope, q=None, page=1, limit=200
+        )
+        groups = groups_resp.items
     listing = await MessageService(db).list_for_scope(
         scope,
         account_id=parsed_account_id,
         tag_id=parsed_tag_id,
+        group_id=parsed_group_id if scope.is_super_admin else None,
         unread=parsed_unread,
         cursor=cursor,
         limit=limit,
@@ -157,8 +172,10 @@ async def inbox_page(
             "next_cursor": listing.next_cursor,
             "accounts": accounts,
             "tags": tags,
+            "groups": groups,
             "selected_account_id": parsed_account_id,
             "selected_tag_id": parsed_tag_id,
+            "selected_group_id": parsed_group_id if scope.is_super_admin else None,
             "unread_only": bool(parsed_unread),
             "unread_count": unread_count,
             "scope": scope,

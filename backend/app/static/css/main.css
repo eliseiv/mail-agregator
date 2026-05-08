@@ -1758,9 +1758,11 @@ body.tg-app .main {
 .tags-list__count { color: var(--color-text-muted); font-variant-numeric: tabular-nums; }
 .tags-list__actions {
   display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
   gap: var(--space-2);
-  flex-wrap: wrap;
   justify-content: flex-end;
+  align-items: center;
 }
 .tags-list__actions-col { text-align: right; width: 1%; white-space: nowrap; }
 .tags-list__row--builtin .tags-list__actions {
@@ -1882,13 +1884,14 @@ body.tg-app .main {
 }
 .tag-rule-item {
   display: grid;
-  grid-template-columns: minmax(160px, auto) 1fr auto;
+  grid-template-columns: minmax(140px, auto) 1fr auto;
   align-items: center;
-  gap: var(--space-3);
-  padding: var(--space-3) var(--space-4);
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
   background: var(--color-bg-subtle);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
+  font-size: var(--font-size-sm);
 }
 .tag-rule-item__type {
   font-size: var(--font-size-sm);
@@ -1950,9 +1953,15 @@ body.tg-app .main {
     border-bottom: none;
     padding: var(--space-1) var(--space-3);
   }
-  .tags-list__actions { justify-content: flex-start; }
+  .tags-list__actions {
+    /* keep buttons side-by-side even on narrow screens (FE-FIX round-7 #2). */
+    justify-content: flex-start;
+    flex-wrap: nowrap;
+  }
   .tag-rule-item {
-    grid-template-columns: 1fr;
+    /* keep "type | pattern | delete" on one row instead of stacking,
+       which made each rule block taller than the actual content. */
+    grid-template-columns: minmax(110px, auto) 1fr auto;
     gap: var(--space-2);
   }
   .rule-row { flex-direction: column; align-items: stretch; }
