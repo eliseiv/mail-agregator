@@ -94,9 +94,6 @@
                 {% else %}
                   <span class="admin-users-table__muted">никогда</span>
                 {% endif %}
-                {% if u.password_reset_required %}
-                  <span class="admin-user__warn">пароль не задан</span>
-                {% endif %}
               </td>
               <td class="admin-users-table__actions">
                 {% if not _is_super %}
@@ -190,20 +187,8 @@
           autocomplete="off">
         <p class="field__hint">3–64 символа: латиница, цифры, символы <code>_ . -</code>.</p>
       </div>
-      {# FE-FIX 6: email field removed — backend больше не требует его. #}
-      <div class="field">
-        <label class="field__label" for="new-user-display-name">Имя <span class="field__optional">(необязательно)</span></label>
-        <input
-          class="field__input"
-          type="text"
-          id="new-user-display-name"
-          name="display_name"
-          maxlength="100"
-          autocomplete="off"
-          placeholder="Например: Иван Иванов">
-        <p class="field__hint">Если пусто — будет показываться логин. От 1 до 100 символов.</p>
-      </div>
-
+      {# FE-FIX 6: email field removed. FE-FIX (round-2) #4: display_name field
+         removed — only Логин is required. Group is optional. #}
       <fieldset class="form-section">
         <legend class="form-section__legend">Роль</legend>
         <div class="radio-group">
@@ -230,13 +215,13 @@
           </label>
         </div>
         <p class="field__hint">
-          Для лидера группа создаётся автоматически с именем «Группа &lt;имя для отображения|логин&gt;».
-          Для участника — выберите существующую группу из списка ниже.
+          Для лидера группа создаётся автоматически с именем «Группа &lt;логин&gt;».
+          Для участника группа необязательна — пользователя можно добавить в группу позже.
         </p>
       </fieldset>
 
       <div class="field" data-admin-group-field>
-        <label class="field__label" for="new-user-group-id">Группа</label>
+        <label class="field__label" for="new-user-group-id">Группа <span class="field__optional">(необязательно)</span></label>
         <select
           class="field__input"
           id="new-user-group-id"
@@ -296,16 +281,15 @@
       </div>
 
       <div class="field">
-        <label class="field__label" for="new-group-leader">Лидер группы</label>
+        <label class="field__label" for="new-group-leader">Лидер группы <span class="field__optional">(необязательно)</span></label>
         <select
           class="field__input"
           id="new-group-leader"
           name="leader_user_id"
-          required
           data-admin-group-leader-select>
-          <option value="">— загрузка списка пользователей… —</option>
+          <option value="">— без лидера —</option>
         </select>
-        <p class="field__hint">Обязательное поле.</p>
+        <p class="field__hint">Если не выбрать лидера — первый участник станет лидером автоматически. Группу можно создать и без участников.</p>
       </div>
 
       <div class="field">

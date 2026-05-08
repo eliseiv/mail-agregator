@@ -19,7 +19,7 @@ class UserBriefDTO(BaseModel):
 class GroupDTO(BaseModel):
     id: int
     name: str
-    leader: UserBriefDTO
+    leader: UserBriefDTO | None = None
     members_count: int
     created_at: datetime
 
@@ -27,7 +27,8 @@ class GroupDTO(BaseModel):
 class GroupDetailDTO(BaseModel):
     id: int
     name: str
-    leader: UserBriefDTO
+    # FE-FIX round-2 #3: leader is optional (orphan group).
+    leader: UserBriefDTO | None = None
     members: list[UserBriefDTO]
     created_at: datetime
 
@@ -57,7 +58,9 @@ class GroupCreateRequest(BaseModel):
     """
 
     name: str = Field(min_length=1, max_length=100)
-    leader_user_id: int = Field(ge=1)
+    # FE-FIX round-2 #3: leader_user_id is optional. If null, the group is
+    # created leader-less; the first member added later becomes the leader.
+    leader_user_id: int | None = Field(default=None, ge=1)
     member_ids: list[int] = Field(default_factory=list)
 
     @field_validator("name")

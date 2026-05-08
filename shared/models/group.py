@@ -31,10 +31,12 @@ class Group(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(Text, nullable=False)
-    leader_user_id: Mapped[int] = mapped_column(
+    # FE-FIX round-2 #3: nullable so a group can be created leaderless;
+    # the first member added later becomes the leader.
+    leader_user_id: Mapped[int | None] = mapped_column(
         BigInteger,
         ForeignKey("users.id", ondelete="RESTRICT"),
-        nullable=False,
+        nullable=True,
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("now()")

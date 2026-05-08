@@ -100,16 +100,12 @@ class GroupsService:
         items: list[GroupDTO] = []
         for g in groups:
             leader = leaders_map.get(g.id)
-            if leader is None:
-                # Defensive: leader vanished (FK RESTRICT prevents it, but
-                # surface as 500-equivalent rather than crash).
-                log.warning("group_without_leader", group_id=g.id)
-                continue
+            # FE-FIX round-2 #3: orphan groups (no leader yet) — leader brief is None.
             items.append(
                 GroupDTO(
                     id=g.id,
                     name=g.name,
-                    leader=_user_brief(leader),
+                    leader=_user_brief(leader) if leader is not None else None,
                     members_count=counts_map.get(g.id, 0),
                     created_at=g.created_at,
                 )
@@ -123,15 +119,17 @@ class GroupsService:
         if not scope.is_super_admin and scope.group_id != group_id:
             # Hide existence from non-members.
             raise NotFoundError("group_not_found")
-        leader = await self._users.get_by_id(group.leader_user_id)
-        if leader is None:
-            log.warning("group_without_leader", group_id=group.id)
-            raise NotFoundError("group_not_found")
+        # FE-FIX round-2 #3: orphan group (no leader yet) — leader brief is None.
+        leader = None
+        if group.leader_user_id is not None:
+            leader = await self._users.get_by_id(group.leader_user_id)
+            if leader is None:
+                log.warning("group_without_leader", group_id=group.id)
         members = await self._users.list_in_group(group.id)
         return GroupDetailDTO(
             id=group.id,
             name=group.name,
-            leader=_user_brief(leader),
+            leader=_user_brief(leader) if leader is not None else None,
             members=[_user_brief(m) for m in members],
             created_at=group.created_at,
         )
@@ -193,53 +191,56 @@ class GroupsService:
         *,
         actor: VisibilityScope,
         name: str,
-        leader_user_id: int,
+        leader_user_id: int | None,
         member_ids: list[int] | None = None,
         ip: str | None,
         user_agent: str | None,
     ) -> GroupDetailDTO:
         """Create a group with the given leader and optional initial members.
 
+        FE-FIX round-2 #3: ``leader_user_id`` is optional. If null, the
+        first user in ``member_ids`` (if any) becomes the leader; if both
+        are empty, the group is created leaderless. The first member
+        added later through a separate flow then becomes the leader.
+
         Atomic: all writes (insert group, promote leader, demote/add
         members, audit rows, session revocations) happen inside the
         caller's open transaction. If any validation fails the whole
         request rolls back.
-
-        ``member_ids`` (optional, default empty) is a list of additional
-        user ids that will become ``group_member`` of the new group.
-        Constraints (validated up-front to surface readable errors):
-
-        - leader and members must all exist and not be ``super_admin``;
-        - ``leader_user_id`` must not appear in ``member_ids``;
-        - ``leader_user_id`` must not already lead a different group;
-        - members must not currently lead any group (a leader can't be
-          demoted in this flow — super-admin must dismantle the old group
-          first).
         """
         if not actor.is_super_admin:
             raise NotFoundError("group_not_found")  # hide endpoint existence
 
         member_ids = list(member_ids or [])
-        if leader_user_id in member_ids:
+
+        # FE-FIX round-2 #3: if leader is omitted but members are given,
+        # promote the first member to leader (the rest stay as members).
+        if leader_user_id is None and member_ids:
+            leader_user_id = member_ids[0]
+            member_ids = member_ids[1:]
+
+        if leader_user_id is not None and leader_user_id in member_ids:
             raise ValidationError(
                 "leader_user_id must not appear in member_ids",
                 field="member_ids",
             )
 
-        target = await self._users.get_by_id(leader_user_id)
-        if target is None:
-            raise NotFoundError("user_not_found")
-        if target.role == ROLE_SUPER_ADMIN:
-            raise ValidationError(
-                "Super admin cannot lead a group",
-                field="leader_user_id",
-            )
-        existing_group = await self._repo.get_by_leader(leader_user_id)
-        if existing_group is not None:
-            raise ConflictError(
-                "User already leads another group",
-                field="leader_user_id",
-            )
+        target: User | None = None
+        if leader_user_id is not None:
+            target = await self._users.get_by_id(leader_user_id)
+            if target is None:
+                raise NotFoundError("user_not_found")
+            if target.role == ROLE_SUPER_ADMIN:
+                raise ValidationError(
+                    "Super admin cannot lead a group",
+                    field="leader_user_id",
+                )
+            existing_group = await self._repo.get_by_leader(leader_user_id)
+            if existing_group is not None:
+                raise ConflictError(
+                    "User already leads another group",
+                    field="leader_user_id",
+                )
 
         # Pre-validate every member id before mutating state. Doing the
         # whole check first means failures surface as clean 400s instead
@@ -276,10 +277,26 @@ class GroupsService:
                     )
                 members.append(m)
 
+        # FE-FIX round-2 #3: orphan group (no leader, no members) — just
+        # insert the row; admin can wire up the leader later.
+        if leader_user_id is None:
+            group = await self._repo.insert(name=name, leader_user_id=None)
+            await self._audit.log(
+                actor_user_id=actor.user_id,
+                action="group_create",
+                target_user_id=None,
+                target_username=None,
+                details={"group_id": group.id, "auto_created": False, "leaderless": True},
+                ip=ip,
+                user_agent=user_agent,
+            )
+            return await self.get_detail(actor, group.id)
+
         # Capture the pre-mutation snapshot before any UPDATE — the same
         # SQLAlchemy session is used by ``create_for_leader``, which expires
         # ``target`` after its UPDATE so subsequent ``target.role`` reads
         # would actually re-fetch the post-UPDATE values.
+        assert target is not None  # leader_user_id resolved above implies target is set
         leader_username_before = target.username
         leader_role_before = target.role
         leader_group_before = target.group_id

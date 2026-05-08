@@ -166,8 +166,10 @@ class AdminService:
             if payload.role == ROLE_GROUP_LEADER:
                 # Auto-create the group → group_id is None for now.
                 return ROLE_GROUP_LEADER, None
-            # group_member: schema guarantees group_id is not None.
-            assert payload.group_id is not None
+            # FE-FIX round-2 #4: group_id is optional for group_member —
+            # super-admin can create user без group и привязать позже.
+            if payload.group_id is None:
+                return ROLE_GROUP_MEMBER, None
             group = await self._groups.get_by_id(payload.group_id)
             if group is None:
                 raise ValidationError("group_not_found", field="group_id")

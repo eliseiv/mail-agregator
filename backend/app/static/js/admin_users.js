@@ -91,17 +91,13 @@
       const payload = {
         username: (fd.get('username') || '').toString().trim(),
       };
-      // FE-FIX 6: email field removed from the create-user form.
-      const displayName = (fd.get('display_name') || '').toString().trim();
-      if (displayName) payload.display_name = displayName;
+      // FE-FIX 6: email removed. FE-FIX round-2 #4: display_name removed too.
+      // Only username + role (+ optional group_id) are sent.
       const role = (fd.get('role') || '').toString().trim();
       if (role) payload.role = role;
       const groupIdRaw = (fd.get('group_id') || '').toString().trim();
-      if (role === 'group_member') {
-        if (!groupIdRaw) {
-          window.MAS.flash('Выберите группу для участника.', 'error');
-          return;
-        }
+      // group_id is optional even for group_member (FE-FIX round-2 #4).
+      if (role === 'group_member' && groupIdRaw) {
         const gid = parseInt(groupIdRaw, 10);
         if (Number.isFinite(gid) && gid > 0) {
           payload.group_id = gid;
@@ -288,10 +284,13 @@
         showGroupError('Укажите название группы.');
         return;
       }
-      const leaderId = parseInt(leaderRaw, 10);
-      if (!Number.isFinite(leaderId) || leaderId < 1) {
-        showGroupError('Выберите лидера группы.');
-        return;
+      // FE-FIX round-2 #3: leader is optional. If empty, the first
+      // member (if any) becomes the leader; otherwise the group is
+      // created leaderless.
+      let leaderId = null;
+      if (leaderRaw) {
+        const parsed = parseInt(leaderRaw, 10);
+        if (Number.isFinite(parsed) && parsed > 0) leaderId = parsed;
       }
       // FormData.getAll for the multi-select.
       const memberRaws = fd.getAll('member_ids');

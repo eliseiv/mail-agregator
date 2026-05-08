@@ -1828,12 +1828,12 @@ body.tg-app {
 }
 
 /* Telegram WebView already shows its own back-button + close-button at the
-   top of the screen; duplicating our top nav and the user/logout block would
-   only clutter the view. The brand title stays visible as page identifier.
+   top of the screen; duplicating our top nav would only clutter the view.
+   The brand title and the user/logout block stay visible (logout was
+   removed from bottom-nav and must remain reachable from the topbar).
    The bottom-nav (built into base.html, gated by request.state.session)
    takes over primary navigation inside the WebView. */
-body.tg-app .topnav,
-body.tg-app .topbar__user {
+body.tg-app .topnav {
   display: none;
 }
 body.tg-app .topbar__inner {

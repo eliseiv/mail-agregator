@@ -90,9 +90,10 @@ class GroupsRepo:
 
     # --- Writes ------------------------------------------------------------
 
-    async def insert(self, *, name: str, leader_user_id: int) -> Group:
+    async def insert(self, *, name: str, leader_user_id: int | None) -> Group:
         """Insert a row in ``groups``. Caller must satisfy the FK invariant
         (the user must exist) and the unique constraint on ``leader_user_id``.
+        ``leader_user_id`` may be ``None`` for orphan groups (FE-FIX #3).
         """
         group = Group(name=name, leader_user_id=leader_user_id)
         self._s.add(group)
