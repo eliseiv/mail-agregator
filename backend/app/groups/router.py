@@ -38,6 +38,7 @@ from backend.app.groups.schemas import (
 )
 from backend.app.groups.service import GroupsService
 from backend.app.rate_limit import LIMIT_ADMIN_WRITE, client_ip, consume
+from backend.app.repositories.mail_accounts import MailAccountsRepo
 from backend.app.repositories.users import UsersRepo
 from backend.app.templates import render
 from shared.models import ROLE_GROUP_MEMBER
@@ -384,12 +385,51 @@ async def groups_list_page(
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
 ) -> Response:
     listing = await GroupsService(db).list_for_scope(scope, q=q, page=page, limit=limit)
+
+    # FE-FIX round-7 #1: render mail accounts under each group. We bulk-load
+    # users in the visible groups, then bulk-load mail accounts for those
+    # users, and produce a per-group flat list of accounts annotated with
+    # the owner's username.
+    users_repo = UsersRepo(db)
+    accounts_repo = MailAccountsRepo(db)
+    accounts_by_group: dict[int, list[dict[str, object]]] = {g.id: [] for g in listing.items}
+    if listing.items:
+        all_user_ids: list[int] = []
+        users_by_group: dict[int, list[int]] = {}
+        for g in listing.items:
+            uids = await users_repo.list_user_ids_in_group(g.id)
+            users_by_group[g.id] = uids
+            all_user_ids.extend(uids)
+        accs_map = await accounts_repo.list_for_users(all_user_ids)
+        # Map user_id → user row (for username/display_name in the row).
+        user_rows = await users_repo.get_many_by_ids(all_user_ids)
+        for gid, uids in users_by_group.items():
+            flat: list[dict[str, object]] = []
+            for uid in uids:
+                u = user_rows.get(uid)
+                if u is None:
+                    continue
+                for acc in accs_map.get(uid, []):
+                    flat.append(
+                        {
+                            "id": acc.id,
+                            "email": acc.email,
+                            "display_name": acc.display_name,
+                            "is_active": acc.is_active,
+                            "last_synced_at": acc.last_synced_at,
+                            "owner_username": u.username,
+                            "owner_display_name": u.display_name,
+                        }
+                    )
+            accounts_by_group[gid] = flat
+
     sess = request.state.session
     return await render(
         request,
         "admin/groups/list.html",
         {
             "groups": listing.items,
+            "accounts_by_group": accounts_by_group,
             "total": listing.total,
             "page": listing.page,
             "limit": listing.limit,

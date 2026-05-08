@@ -49,8 +49,12 @@
             <th scope="col" class="admin-groups-table__actions-col">Действия</th>
           </tr>
         </thead>
-        <tbody>
-          {% for grp in groups %}
+        {% for grp in groups %}
+          {# One <tbody> per group: the group meta row + a second row that
+             expands across all columns to list the group's mail accounts.
+             Browsers parse <tbody> per-section so border-radius / spacing
+             can be applied per-group without extra wrappers. #}
+          <tbody class="admin-groups-table__group">
             <tr class="admin-groups-table__row" data-group-id="{{ grp.id }}">
               <td class="admin-groups-table__name">
                 <strong>{{ grp.name | e }}</strong>
@@ -58,7 +62,7 @@
               <td class="admin-groups-table__leader">
                 {% if grp.leader %}
                   {{ m.effective_user_name(grp.leader) }}
-                  {% if grp.leader.username and grp.leader.username != (grp.leader.display_name | default('')) %}
+                  {% if grp.leader.display_name and grp.leader.display_name != grp.leader.username %}
                     <span class="admin-users-table__muted">(@{{ grp.leader.username | e }})</span>
                   {% endif %}
                 {% else %}
@@ -82,9 +86,6 @@
                   Изменить
                 </a>
 
-                {# Delete is destructive and reserved for super_admin
-                   (FE-FIX round-5 #1): a leader may rename their own group
-                   but cannot dissolve it. #}
                 {% if is_super_admin %}
                   <form
                     method="POST"
@@ -103,8 +104,52 @@
                 {% endif %}
               </td>
             </tr>
-          {% endfor %}
-        </tbody>
+            <tr class="admin-groups-table__accounts-row">
+              <td colspan="5" class="admin-groups-table__accounts-cell">
+                {% set accs = (accounts_by_group.get(grp.id) if accounts_by_group is defined else None) or [] %}
+                <div class="group-accounts">
+                  <div class="group-accounts__title">
+                    Email-аккаунты группы
+                    <span class="group-accounts__count">({{ accs | length }})</span>
+                  </div>
+                  {% if accs %}
+                    <ul class="group-accounts__list">
+                      {% for a in accs %}
+                        <li class="group-accounts__item {% if not a.is_active %}group-accounts__item--disabled{% endif %}">
+                          <span class="group-accounts__email">
+                            {% if a.display_name %}
+                              {{ a.display_name | e }}
+                              <span class="admin-users-table__muted">&lt;{{ a.email | e }}&gt;</span>
+                            {% else %}
+                              {{ a.email | e }}
+                            {% endif %}
+                          </span>
+                          <span class="group-accounts__owner admin-users-table__muted">
+                            — {{ (a.owner_display_name or a.owner_username) | e }}
+                          </span>
+                          <span class="group-accounts__sync admin-users-table__muted">
+                            {% if a.last_synced_at %}
+                              синхр. {{ m.time_tag_short(a.last_synced_at) }}
+                            {% else %}
+                              ни разу не синхронизирован
+                            {% endif %}
+                          </span>
+                          {% if not a.is_active %}
+                            <span class="admin-user__warn">отключён</span>
+                          {% endif %}
+                        </li>
+                      {% endfor %}
+                    </ul>
+                  {% else %}
+                    <p class="group-accounts__empty admin-users-table__muted">
+                      Email-аккаунтов в группе пока нет.
+                    </p>
+                  {% endif %}
+                </div>
+              </td>
+            </tr>
+          </tbody>
+        {% endfor %}
       </table>
     </div>
   {% endif %}

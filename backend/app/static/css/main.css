@@ -1241,6 +1241,49 @@ a:hover { color: var(--color-primary-hover); text-decoration: underline; }
 }
 
 .admin-groups-table__name strong { font-weight: 600; }
+
+/* /admin/groups: each group's tbody now spans 2 rows — header + accounts.
+   We mark the second row visually so it reads as belonging to the group
+   above and add a soft gap before the next group. */
+.admin-groups-table tbody.admin-groups-table__group + tbody.admin-groups-table__group tr:first-child td {
+  border-top: 2px solid var(--color-border-strong);
+}
+.admin-groups-table__accounts-row td {
+  background: var(--color-bg-subtle);
+  padding: var(--space-3) var(--space-4) var(--space-4);
+  border-top: 1px dashed var(--color-border);
+}
+.group-accounts__title {
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--color-text-muted);
+  margin-bottom: var(--space-2);
+}
+.group-accounts__count { font-weight: 400; }
+.group-accounts__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.group-accounts__item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+  padding: var(--space-1) 0;
+  font-size: var(--font-size-sm);
+}
+.group-accounts__item--disabled .group-accounts__email {
+  text-decoration: line-through;
+  color: var(--color-text-muted);
+}
+.group-accounts__email { font-weight: 500; }
+.group-accounts__empty { margin: 0; font-style: italic; }
 .admin__hint {
   margin: 0 0 var(--space-4);
   color: var(--color-text-muted);
