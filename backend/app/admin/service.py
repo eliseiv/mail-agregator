@@ -388,6 +388,17 @@ class AdminService:
         refreshed = await self._users.get_by_id(target_id)
         assert refreshed is not None
 
+        # FE-FIX round-10: when the user goes from "no group" into a real
+        # group, attach their orphan mail accounts to the new group so the
+        # whole group can see them. Existing accounts that already have a
+        # ``group_id`` stay with their original group — that's the whole
+        # point of the round-10 model change.
+        if group_changed and old_group is None and refreshed.group_id is not None:
+            await self._accounts.attach_orphans_to_group(
+                user_id=refreshed.id,
+                group_id=refreshed.group_id,
+            )
+
         # If role or group changed → revoke sessions of the target.
         if role_changed or group_changed:
             await self._sessions.revoke_all_for_user(target_id)

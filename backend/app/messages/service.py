@@ -79,21 +79,29 @@ class MessageService:
     async def visible_user_ids(
         self, scope: VisibilityScope, *, group_id: int | None = None
     ) -> list[int] | None:
-        """Resolve the visibility filter as a list of mailbox-owner user_ids.
+        """Resolve the visibility filter as a list of ``mail_accounts.id``.
 
-        ``group_id`` (super-admin only) restricts the listing to one group.
-        Non-admin callers pass ``group_id=None`` and always see only their
-        own group.
+        FE-FIX round-10: the filter shifted from per-user (``users.group_id``)
+        to per-account (``mail_accounts.group_id``) so that moving a user
+        between groups no longer reassigns their messages along with them.
+
+        Returns:
+            ``None`` — no filter (super-admin path without ``group_id``);
+            ``[]``   — no accounts visible to the caller;
+            ``[id…]`` — the explicit list of visible ``mail_accounts.id``.
+
+        The method name is preserved to avoid a sweeping rename across
+        callers; the *meaning* now is "visible mail-account ids".
         """
         if scope.is_super_admin:
             if group_id is None:
                 return None
-            return await self._users.list_user_ids_in_group(group_id)
+            return await self._accounts.list_account_ids_in_group(group_id)
         if group_id is not None and group_id != scope.group_id:
             raise ForbiddenError("user_not_in_group_scope")
-        if scope.group_id is None:
-            return []
-        return await self._users.list_user_ids_in_group(scope.group_id)
+        return await self._accounts.list_account_ids_visible(
+            group_id=scope.group_id, owner_user_id=scope.user_id
+        )
 
     # --- List --------------------------------------------------------------
 
@@ -123,7 +131,7 @@ class MessageService:
         visible = await self.visible_user_ids(scope, group_id=group_id)
 
         rows = await self._repo.list_for_user_ids(
-            user_ids=visible,
+            mail_account_ids=visible,
             account_id=account_id,
             tag_id=tag_id,
             unread=unread,
@@ -173,7 +181,7 @@ class MessageService:
 
     async def get(self, *, scope: VisibilityScope, message_id: int) -> MessageDetail:
         visible = await self.visible_user_ids(scope)
-        msg = await self._repo.get_for_user_ids(message_id=message_id, user_ids=visible)
+        msg = await self._repo.get_for_user_ids(message_id=message_id, mail_account_ids=visible)
         if msg is None:
             raise NotFoundError()
         acc = await self._accounts.get_by_id(msg.mail_account_id)
@@ -223,7 +231,7 @@ class MessageService:
         payload: MarkReadRequest,
     ) -> None:
         visible = await self.visible_user_ids(scope)
-        msg = await self._repo.get_for_user_ids(message_id=message_id, user_ids=visible)
+        msg = await self._repo.get_for_user_ids(message_id=message_id, mail_account_ids=visible)
         if msg is None:
             raise NotFoundError()
         if msg.is_read == payload.is_read:
@@ -241,7 +249,7 @@ class MessageService:
         att = await self._repo.get_attachment_for_user_ids(
             attachment_id=attachment_id,
             message_id=message_id,
-            user_ids=visible,
+            mail_account_ids=visible,
         )
         if att is None or att.skipped_too_large:
             raise NotFoundError()

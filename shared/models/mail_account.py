@@ -36,6 +36,15 @@ class MailAccount(Base):
         ForeignKey("users.id", ondelete="CASCADE"),
         nullable=False,
     )
+    # FE-FIX round-10: group_id is the visibility key for non-super_admin
+    # callers. Set on insert from the owner's current ``users.group_id``;
+    # NULL means "personal" (visible to the owner + super_admin only).
+    # ON DELETE SET NULL keeps the account when its group is removed.
+    group_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("groups.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     email: Mapped[str] = mapped_column(Text, nullable=False)
     display_name: Mapped[str | None] = mapped_column(Text, nullable=True)
     encrypted_password: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)

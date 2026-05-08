@@ -105,11 +105,14 @@ class SendService:
         self._users = UsersRepo(session)
 
     async def _visible_user_ids(self, scope: VisibilityScope) -> list[int] | None:
+        """FE-FIX round-10: returns visible ``mail_accounts.id`` (semantic
+        change kept under the legacy method name to avoid renaming callers).
+        """
         if scope.is_super_admin:
             return None
-        if scope.group_id is None:
-            return []
-        return await self._users.list_user_ids_in_group(scope.group_id)
+        return await self._accounts.list_account_ids_visible(
+            group_id=scope.group_id, owner_user_id=scope.user_id
+        )
 
     async def send(
         self, *, scope: VisibilityScope, payload: SendMessageRequest
@@ -128,7 +131,7 @@ class SendService:
         if payload.in_reply_to_message_id is not None:
             original = await self._messages.get_for_user_ids(
                 message_id=payload.in_reply_to_message_id,
-                user_ids=visible,
+                mail_account_ids=visible,
             )
             if original is None:
                 raise NotFoundError("Original message not found")

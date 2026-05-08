@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import delete, func, select, text, update
+from sqlalchemy import and_, delete, func, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.models import MailAccount
@@ -31,19 +31,21 @@ class MailAccountsRepo:
         return (await self._s.execute(stmt)).scalar_one_or_none()
 
     async def get_for_user_ids(
-        self, user_ids: list[int] | None, account_id: int
+        self, mail_account_ids: list[int] | None, account_id: int
     ) -> MailAccount | None:
         """Visibility-aware get.
 
-        ``user_ids=None`` means "no scope filter" (super-admin path).
-        ``user_ids=[]`` means "no users visible" — always returns ``None``.
+        ``mail_account_ids=None`` means "no scope filter" (super-admin).
+        ``mail_account_ids=[]`` means nothing visible — returns ``None``.
+        FE-FIX round-10: the filter shifted from ``MailAccount.user_id``
+        to ``MailAccount.id`` so visibility follows ``mail_accounts.group_id``.
         """
-        if user_ids is None:
+        if mail_account_ids is None:
             return await self.get_by_id(account_id)
-        if not user_ids:
+        if not mail_account_ids:
             return None
         stmt = select(MailAccount).where(
-            MailAccount.id == account_id, MailAccount.user_id.in_(user_ids)
+            MailAccount.id == account_id, MailAccount.id.in_(mail_account_ids)
         )
         return (await self._s.execute(stmt)).scalar_one_or_none()
 
@@ -52,11 +54,13 @@ class MailAccountsRepo:
         return list((await self._s.execute(stmt)).scalars().all())
 
     async def list_for_user_ids(self, user_ids: list[int]) -> list[MailAccount]:
-        """Mail accounts for a set of users (visibility-scope aware).
+        """Mail accounts for a set of users (legacy helper).
 
-        Returns a flat list ordered by ``(user_id, id)``. Used by
-        :class:`backend.app.accounts.service.MailAccountService` to build
-        the list response for super-admin and group leaders/members.
+        Returns a flat list ordered by ``(user_id, id)``. Pre round-10 this
+        was the visibility helper for non-super_admin callers; today it
+        survives as a generic "by-owner" lookup (used by group-rendering
+        on the admin page when we want every account of every member of a
+        group, regardless of where the account currently belongs).
         """
         if not user_ids:
             return []
@@ -67,10 +71,91 @@ class MailAccountsRepo:
         )
         return list((await self._s.execute(stmt)).scalars().all())
 
+    async def list_by_ids(self, account_ids: list[int]) -> list[MailAccount]:
+        """Bulk-load accounts by their primary key. FE-FIX round-10."""
+        if not account_ids:
+            return []
+        stmt = (
+            select(MailAccount)
+            .where(MailAccount.id.in_(account_ids))
+            .order_by(MailAccount.user_id, MailAccount.id)
+        )
+        return list((await self._s.execute(stmt)).scalars().all())
+
     async def list_all(self) -> list[MailAccount]:
         """All mail accounts (super-admin only). No pagination — small Ns."""
         stmt = select(MailAccount).order_by(MailAccount.user_id, MailAccount.id)
         return list((await self._s.execute(stmt)).scalars().all())
+
+    async def list_for_group_or_owner(
+        self, *, group_id: int | None, owner_user_id: int
+    ) -> list[MailAccount]:
+        """Visibility query for a non-super_admin caller (FE-FIX round-10).
+
+        Returns accounts that satisfy ANY of the following:
+          - ``mail_accounts.group_id == group_id`` (group-shared accounts);
+          - ``mail_accounts.user_id == owner_user_id`` (the caller's personal
+            accounts — covers the case where the caller owns an account that
+            was created while they had no group, so its ``group_id`` is
+            still NULL or no longer matches their current group).
+
+        Pass ``group_id=None`` for callers without a group: only personal
+        accounts are returned.
+        """
+        cond = MailAccount.user_id == owner_user_id
+        if group_id is not None:
+            cond = or_(cond, MailAccount.group_id == group_id)
+        stmt = (
+            select(MailAccount)
+            .where(cond)
+            .order_by(MailAccount.user_id, MailAccount.id)
+        )
+        return list((await self._s.execute(stmt)).scalars().all())
+
+    async def get_for_group_or_owner(
+        self, *, group_id: int | None, owner_user_id: int, account_id: int
+    ) -> MailAccount | None:
+        cond = and_(
+            MailAccount.id == account_id,
+            or_(
+                MailAccount.user_id == owner_user_id,
+                MailAccount.group_id == group_id if group_id is not None else False,  # type: ignore[arg-type]
+            ),
+        )
+        stmt = select(MailAccount).where(cond)
+        return (await self._s.execute(stmt)).scalar_one_or_none()
+
+    async def list_account_ids_visible(
+        self, *, group_id: int | None, owner_user_id: int
+    ) -> list[int]:
+        """``mail_accounts.id`` visible to a non-super_admin caller."""
+        cond = MailAccount.user_id == owner_user_id
+        if group_id is not None:
+            cond = or_(cond, MailAccount.group_id == group_id)
+        stmt = select(MailAccount.id).where(cond)
+        return [int(r[0]) for r in (await self._s.execute(stmt)).all()]
+
+    async def list_account_ids_in_group(self, group_id: int) -> list[int]:
+        """``mail_accounts.id`` belonging to a group (super-admin filter)."""
+        stmt = select(MailAccount.id).where(MailAccount.group_id == group_id)
+        return [int(r[0]) for r in (await self._s.execute(stmt)).all()]
+
+    async def attach_orphans_to_group(self, *, user_id: int, group_id: int) -> None:
+        """Backfill ``mail_accounts.group_id`` for the user's orphan accounts.
+
+        Called by :meth:`AdminService.update_user` when a user is moved
+        from "no group" into a real group. Existing accounts that already
+        have a ``group_id`` are NOT touched — those stay with their
+        original group even when the owner changes group.
+        """
+        await self._s.execute(
+            update(MailAccount)
+            .where(
+                MailAccount.user_id == user_id,
+                MailAccount.group_id.is_(None),
+            )
+            .values(group_id=group_id, updated_at=datetime.now(UTC))
+        )
 
     async def list_for_users(self, user_ids: list[int]) -> dict[int, list[MailAccount]]:
         """Bulk-load mail accounts for many users to avoid N+1.
@@ -143,6 +228,7 @@ class MailAccountsRepo:
         *,
         account_id: int,
         user_id: int,
+        group_id: int | None,
         email: str,
         encrypted_password: bytes,
         imap_host: str,
@@ -159,6 +245,7 @@ class MailAccountsRepo:
         acc = MailAccount(
             id=account_id,
             user_id=user_id,
+            group_id=group_id,
             email=email,
             display_name=display_name,
             encrypted_password=encrypted_password,

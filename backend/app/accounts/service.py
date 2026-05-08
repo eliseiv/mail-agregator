@@ -77,42 +77,52 @@ class MailAccountService:
     # --- Visibility helpers ------------------------------------------------
 
     async def visible_user_ids(self, scope: VisibilityScope) -> list[int] | None:
-        """Compute the set of mailbox-owner user_ids visible to the caller.
+        """Compute the set of ``mail_accounts.id`` visible to the caller.
+
+        FE-FIX round-10: the filter shifted from per-user to per-account
+        — visibility is determined by ``mail_accounts.group_id`` (with a
+        personal exception for the owner). The legacy method name is
+        preserved to avoid renaming every caller.
 
         ``None`` = "no scope filter" (super-admin path).
-        Empty list = "no users visible" (a non-admin without a group).
-
-        Public so HTML route handlers can pre-load an account row using
-        the same visibility rules.
+        ``[]``   = nothing visible.
+        ``[id…]`` = the explicit list of visible ``mail_accounts.id``.
         """
         if scope.is_super_admin:
             return None
-        if scope.group_id is None:
-            return []
-        return await self._users.list_user_ids_in_group(scope.group_id)
+        return await self._repo.list_account_ids_visible(
+            group_id=scope.group_id, owner_user_id=scope.user_id
+        )
 
-    # Internal alias kept for the few service-internal call sites; do not
-    # introduce new external callers.
     async def _visible_user_ids(self, scope: VisibilityScope) -> list[int] | None:
         return await self.visible_user_ids(scope)
 
     # --- Reads -------------------------------------------------------------
 
     async def list_for_scope(self, scope: VisibilityScope) -> list[MailAccountDTO]:
-        visible = await self._visible_user_ids(scope)
-        if visible is None:
+        # FE-FIX round-10: visibility now keys off ``mail_accounts.group_id``
+        # (set on insert from the owner's then-current group, never moved
+        # automatically when the owner changes group). Personal accounts
+        # remain visible to their owner via the user_id condition.
+        if scope.is_super_admin:
             rows = await self._repo.list_all()
         else:
-            if not visible:
-                return []
-            rows = await self._repo.list_for_user_ids(visible)
+            rows = await self._repo.list_for_group_or_owner(
+                group_id=scope.group_id, owner_user_id=scope.user_id
+            )
         owner_ids = sorted({a.user_id for a in rows})
         owner_map = await self._users.get_many_by_ids(owner_ids)
         return [_to_dto(a, owner_map[a.user_id]) for a in rows if a.user_id in owner_map]
 
     async def get_for_scope(self, scope: VisibilityScope, account_id: int) -> MailAccountDTO:
-        visible = await self._visible_user_ids(scope)
-        acc = await self._repo.get_for_user_ids(visible, account_id)
+        if scope.is_super_admin:
+            acc = await self._repo.get_by_id(account_id)
+        else:
+            acc = await self._repo.get_for_group_or_owner(
+                group_id=scope.group_id,
+                owner_user_id=scope.user_id,
+                account_id=account_id,
+            )
         if acc is None:
             raise NotFoundError()
         owner = await self._users.get_by_id(acc.user_id)
@@ -196,6 +206,16 @@ class MailAccountService:
             raise ConflictError("Email already added", field="email")
         await self.test(payload)
 
+        # FE-FIX round-10: bind the new account to the owner's CURRENT
+        # group at insert time. Subsequent owner-group changes do NOT move
+        # the account (see ``MailAccountsRepo.attach_orphans_to_group`` for
+        # the orphan-attach exception when going from "no group" to a real
+        # group via PATCH /api/admin/users).
+        owner = await self._users.get_by_id(target_user_id)
+        if owner is None:
+            raise NotFoundError()
+        owner_group_id = owner.group_id
+
         new_id = await self._repo.next_account_id()
         encrypted = encrypt_mail_password(payload.password, new_id)
         smtp_encrypted: bytes | None = None
@@ -206,6 +226,7 @@ class MailAccountService:
             acc = await self._repo.insert_with_id(
                 account_id=new_id,
                 user_id=target_user_id,
+                group_id=owner_group_id,
                 email=payload.email,
                 encrypted_password=encrypted,
                 imap_host=payload.imap_host,
@@ -222,8 +243,6 @@ class MailAccountService:
         except IntegrityError as exc:
             raise ConflictError("Email already added", field="email") from exc
 
-        owner = await self._users.get_by_id(target_user_id)
-        assert owner is not None
         return _to_dto(acc, owner)
 
     # --- Update ------------------------------------------------------------

@@ -36,21 +36,26 @@ class MessagesRepo:
         self,
         *,
         message_id: int,
-        user_ids: list[int] | None,
+        mail_account_ids: list[int] | None,
     ) -> Message | None:
         """Visibility-aware get.
 
-        ``user_ids=None`` = "no scope filter" (super-admin path).
-        ``user_ids=[]`` = "no users visible" — returns ``None``.
+        ``mail_account_ids=None`` = "no scope filter" (super-admin path).
+        ``mail_account_ids=[]`` = "no accounts visible" — returns ``None``.
+        FE-FIX round-10: filter shifted from ``MailAccount.user_id`` to
+        ``MailAccount.id`` so visibility follows ``mail_accounts.group_id``
+        instead of ``users.group_id``.
         """
-        if user_ids is None:
+        if mail_account_ids is None:
             return await self._s.get(Message, message_id)
-        if not user_ids:
+        if not mail_account_ids:
             return None
         stmt = (
             select(Message)
-            .join(MailAccount, MailAccount.id == Message.mail_account_id)
-            .where(Message.id == message_id, MailAccount.user_id.in_(user_ids))
+            .where(
+                Message.id == message_id,
+                Message.mail_account_id.in_(mail_account_ids),
+            )
         )
         return (await self._s.execute(stmt)).scalar_one_or_none()
 
@@ -107,7 +112,7 @@ class MessagesRepo:
     async def list_for_user_ids(
         self,
         *,
-        user_ids: list[int] | None,
+        mail_account_ids: list[int] | None,
         account_id: int | None,
         tag_id: int | None = None,
         unread: bool | None,
@@ -117,18 +122,19 @@ class MessagesRepo:
     ) -> list[tuple[Message, MailAccount]]:
         """Visibility-aware listing.
 
-        ``user_ids=None`` = no filter (super-admin); ``user_ids=[]`` =
-        empty result. Returns ``[(Message, MailAccount)]`` so the caller
-        can build the per-row ``mail_account_display_name`` and ``owner``
-        without an extra round-trip.
+        ``mail_account_ids=None`` = no filter (super-admin);
+        ``mail_account_ids=[]`` = empty result. Returns
+        ``[(Message, MailAccount)]`` so the caller can build the per-row
+        ``mail_account_display_name`` / ``owner`` without an extra round-trip.
+        FE-FIX round-10.
         """
         stmt = select(Message, MailAccount).join(
             MailAccount, MailAccount.id == Message.mail_account_id
         )
-        if user_ids is not None:
-            if not user_ids:
+        if mail_account_ids is not None:
+            if not mail_account_ids:
                 return []
-            stmt = stmt.where(MailAccount.user_id.in_(user_ids))
+            stmt = stmt.where(Message.mail_account_id.in_(mail_account_ids))
         if account_id is not None:
             stmt = stmt.where(Message.mail_account_id == account_id)
         if tag_id is not None:
@@ -157,16 +163,12 @@ class MessagesRepo:
         rows = (await self._s.execute(stmt)).all()
         return [(row[0], row[1]) for row in rows]
 
-    async def count_unread_for_user_ids(self, user_ids: list[int] | None) -> int:
-        stmt = (
-            select(func.count(Message.id))
-            .join(MailAccount, MailAccount.id == Message.mail_account_id)
-            .where(Message.is_read.is_(False))
-        )
-        if user_ids is not None:
-            if not user_ids:
+    async def count_unread_for_user_ids(self, mail_account_ids: list[int] | None) -> int:
+        stmt = select(func.count(Message.id)).where(Message.is_read.is_(False))
+        if mail_account_ids is not None:
+            if not mail_account_ids:
                 return 0
-            stmt = stmt.where(MailAccount.user_id.in_(user_ids))
+            stmt = stmt.where(Message.mail_account_id.in_(mail_account_ids))
         return int((await self._s.execute(stmt)).scalar_one())
 
     async def is_tag_owned(self, *, tag_id: int, user_id: int) -> bool:
@@ -227,14 +229,14 @@ class MessagesRepo:
         *,
         attachment_id: int,
         message_id: int,
-        user_ids: list[int] | None,
+        mail_account_ids: list[int] | None,
     ) -> Attachment | None:
         """Visibility-aware get for ``GET /api/messages/{id}/attachments/{aid}``.
 
-        ``user_ids=None`` = super-admin (no filter); ``user_ids=[]`` =
-        empty result.
+        ``mail_account_ids=None`` = super-admin (no filter);
+        ``mail_account_ids=[]`` = empty result. FE-FIX round-10.
         """
-        if user_ids is None:
+        if mail_account_ids is None:
             stmt = (
                 select(Attachment)
                 .join(Message, Message.id == Attachment.message_id)
@@ -244,16 +246,15 @@ class MessagesRepo:
                 )
             )
             return (await self._s.execute(stmt)).scalar_one_or_none()
-        if not user_ids:
+        if not mail_account_ids:
             return None
         stmt = (
             select(Attachment)
             .join(Message, Message.id == Attachment.message_id)
-            .join(MailAccount, MailAccount.id == Message.mail_account_id)
             .where(
                 Attachment.id == attachment_id,
                 Attachment.message_id == message_id,
-                MailAccount.user_id.in_(user_ids),
+                Message.mail_account_id.in_(mail_account_ids),
             )
         )
         return (await self._s.execute(stmt)).scalar_one_or_none()

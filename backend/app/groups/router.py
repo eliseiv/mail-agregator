@@ -386,42 +386,39 @@ async def groups_list_page(
 ) -> Response:
     listing = await GroupsService(db).list_for_scope(scope, q=q, page=page, limit=limit)
 
-    # FE-FIX round-7 #1: render mail accounts under each group. We bulk-load
-    # users in the visible groups, then bulk-load mail accounts for those
-    # users, and produce a per-group flat list of accounts annotated with
-    # the owner's username.
-    users_repo = UsersRepo(db)
+    # FE-FIX round-10: list mail accounts that BELONG to each group via
+    # ``mail_accounts.group_id`` directly. Pre round-10 we walked through
+    # ``users.group_id`` of each member, but now an account stays with its
+    # original group even when its owner is moved elsewhere — so going
+    # through users would show the wrong list right after a transfer.
     accounts_repo = MailAccountsRepo(db)
     accounts_by_group: dict[int, list[dict[str, object]]] = {g.id: [] for g in listing.items}
     if listing.items:
-        all_user_ids: list[int] = []
-        users_by_group: dict[int, list[int]] = {}
+        users_repo = UsersRepo(db)
         for g in listing.items:
-            uids = await users_repo.list_user_ids_in_group(g.id)
-            users_by_group[g.id] = uids
-            all_user_ids.extend(uids)
-        accs_map = await accounts_repo.list_for_users(all_user_ids)
-        # Map user_id → user row (for username/display_name in the row).
-        user_rows = await users_repo.get_many_by_ids(all_user_ids)
-        for gid, uids in users_by_group.items():
+            ids = await accounts_repo.list_account_ids_in_group(g.id)
+            if not ids:
+                continue
+            rows = await accounts_repo.list_by_ids(ids)
+            owner_ids = sorted({a.user_id for a in rows})
+            owner_map = await users_repo.get_many_by_ids(owner_ids)
             flat: list[dict[str, object]] = []
-            for uid in uids:
-                u = user_rows.get(uid)
+            for acc in rows:
+                u = owner_map.get(acc.user_id)
                 if u is None:
                     continue
-                for acc in accs_map.get(uid, []):
-                    flat.append(
-                        {
-                            "id": acc.id,
-                            "email": acc.email,
-                            "display_name": acc.display_name,
-                            "is_active": acc.is_active,
-                            "last_synced_at": acc.last_synced_at,
-                            "owner_username": u.username,
-                            "owner_display_name": u.display_name,
-                        }
-                    )
-            accounts_by_group[gid] = flat
+                flat.append(
+                    {
+                        "id": acc.id,
+                        "email": acc.email,
+                        "display_name": acc.display_name,
+                        "is_active": acc.is_active,
+                        "last_synced_at": acc.last_synced_at,
+                        "owner_username": u.username,
+                        "owner_display_name": u.display_name,
+                    }
+                )
+            accounts_by_group[g.id] = flat
 
     sess = request.state.session
     return await render(

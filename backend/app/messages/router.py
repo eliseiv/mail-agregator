@@ -164,25 +164,22 @@ async def inbox_page(
         parsed_group_id if (scope.is_super_admin and parsed_group_id) else None
     )
     if effective_group_id is not None:
+        # FE-FIX round-10: account list comes from ``mail_accounts.group_id``
+        # directly, not the current memberships. Tag list still merges
+        # admin's own tags with the tags of users currently in the group.
+        ids = await MailAccountsRepo(db).list_account_ids_in_group(effective_group_id)
+        rows = await MailAccountsRepo(db).list_by_ids(ids) if ids else []
+        owner_ids = sorted({a.user_id for a in rows})
+        users_map = await UsersRepo(db).get_many_by_ids(owner_ids) if owner_ids else {}
+        accounts = [
+            _acc_to_dto(a, users_map[a.user_id]) for a in rows if a.user_id in users_map
+        ]
         member_ids = await UsersRepo(db).list_user_ids_in_group(effective_group_id)
-        if member_ids:
-            accs_map = await MailAccountsRepo(db).list_for_users(member_ids)
-            users_map = await UsersRepo(db).get_many_by_ids(member_ids)
-            accounts = [
-                _acc_to_dto(a, users_map[a.user_id])
-                for uid in member_ids
-                for a in accs_map.get(uid, [])
-                if a.user_id in users_map
-            ]
-            # Tags: members' tags ∪ caller's own tags. Dedupe by id.
-            tags_by_id: dict[int, object] = {}
-            for uid in member_ids + [scope.user_id]:
-                for t in await TagsService(db).list_for_user(uid):
-                    tags_by_id[t.id] = t
-            tags = sorted(tags_by_id.values(), key=lambda t: (not t.is_builtin, t.name))
-        else:
-            accounts = []
-            tags = await TagsService(db).list_for_user(scope.user_id)
+        tags_by_id: dict[int, object] = {}
+        for uid in [*member_ids, scope.user_id]:
+            for t in await TagsService(db).list_for_user(uid):
+                tags_by_id[t.id] = t
+        tags = sorted(tags_by_id.values(), key=lambda t: (not t.is_builtin, t.name))
     else:
         accounts = await MailAccountService(db).list_for_scope(scope)
         tags = await TagsService(db).list_for_user(scope.user_id)
