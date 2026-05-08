@@ -97,8 +97,10 @@ class CreateUserRequest(BaseModel):
         # ADR-0019 §5: new leader auto-creates the group → group_id must be null.
         if self.role == "group_leader" and self.group_id is not None:
             raise ValueError("group_id must be null when role='group_leader'")
-        # FE-FIX round-2 #4: group_id is optional for group_member —
-        # super-admin can create a user without group and assign later.
+        # FE-FIX round-4 #4: group_id is required for group_member at creation
+        # time. Super-admin must pick a group; reassignment is via PATCH later.
+        if self.role == "group_member" and self.group_id is None:
+            raise ValueError("group_id is required when role='group_member'")
         return self
 
 

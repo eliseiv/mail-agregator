@@ -53,13 +53,15 @@
     let role = 'group_member';
     roleInputs.forEach(function (r) { if (r.checked) role = r.value; });
     if (!groupField || !groupSelect) return;
-    // group_id is always optional; the field is just hidden for leaders.
-    groupSelect.required = false;
+    // FE-FIX round-4 #4: group_id is required for group_member, hidden for
+    // group_leader (auto-created on backend).
     if (role === 'group_leader') {
       groupField.hidden = true;
+      groupSelect.required = false;
       groupSelect.value = '';
     } else {
       groupField.hidden = false;
+      groupSelect.required = true;
     }
   }
 
@@ -429,6 +431,84 @@
         window.MAS.flash('Сетевая ошибка. Попробуйте ещё раз.', 'error');
       } finally {
         if (deleteGoBtn) deleteGoBtn.disabled = false;
+      }
+    });
+  }
+
+  // ---- Move-to-group (FE-FIX round-4 #3) -----------------------------------
+
+  const moveDialog       = document.querySelector('[data-admin-move-dialog]');
+  const moveForm         = document.querySelector('[data-admin-move-form]');
+  const moveSelect       = document.querySelector('[data-admin-move-select]');
+  const moveUsernameSpan = document.querySelector('[data-admin-move-username]');
+  const moveCancelBtn    = document.querySelector('[data-admin-move-cancel]');
+  const moveGoBtn        = document.querySelector('[data-admin-move-go]');
+  const moveError        = document.querySelector('[data-admin-move-error]');
+
+  let pendingMoveUserId = 0;
+
+  function showMoveError(text) {
+    if (!moveError) return;
+    moveError.textContent = text || '';
+    moveError.hidden = !text;
+  }
+
+  document.querySelectorAll('[data-admin-move-group]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      pendingMoveUserId = parseInt(btn.getAttribute('data-user-id') || '0', 10);
+      const username = btn.getAttribute('data-username') || '';
+      const currentGid = btn.getAttribute('data-current-gid') || '0';
+      if (!pendingMoveUserId || !moveDialog || !moveSelect) return;
+      if (moveUsernameSpan) moveUsernameSpan.textContent = '@' + username;
+      // Pre-select the current group (if any) so the admin sees current state.
+      if (currentGid && currentGid !== '0') {
+        moveSelect.value = currentGid;
+      } else {
+        moveSelect.selectedIndex = 0;
+      }
+      showMoveError('');
+      if (typeof moveDialog.showModal === 'function') {
+        moveDialog.showModal();
+      } else {
+        moveDialog.setAttribute('open', 'open');
+      }
+    });
+  });
+
+  if (moveCancelBtn && moveDialog) {
+    moveCancelBtn.addEventListener('click', function () {
+      if (typeof moveDialog.close === 'function') moveDialog.close();
+      else moveDialog.removeAttribute('open');
+    });
+  }
+
+  if (moveForm) {
+    moveForm.addEventListener('submit', async function (event) {
+      event.preventDefault();
+      if (!pendingMoveUserId || !moveSelect) return;
+      const gid = parseInt((moveSelect.value || '').toString(), 10);
+      if (!Number.isFinite(gid) || gid < 1) {
+        showMoveError('Выберите группу.');
+        return;
+      }
+      if (moveGoBtn) moveGoBtn.disabled = true;
+      try {
+        const resp = await window.MAS.csrfFetch('/api/admin/users/' + pendingMoveUserId, {
+          method: 'PATCH',
+          body: { group_id: gid },
+        });
+        if (resp.ok) {
+          window.MAS.flash('Пользователь перенесён в новую группу.', 'success');
+          if (typeof moveDialog.close === 'function') moveDialog.close();
+          window.location.reload();
+          return;
+        }
+        const err = await window.MAS.readJsonError(resp);
+        showMoveError(err.message || 'Не удалось перенести пользователя.');
+      } catch (_e) {
+        showMoveError('Сетевая ошибка. Попробуйте ещё раз.');
+      } finally {
+        if (moveGoBtn) moveGoBtn.disabled = false;
       }
     });
   }
