@@ -14,7 +14,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from shared.models import ROLE_GROUP_MEMBER, ROLE_SUPER_ADMIN, User
+from shared.models import ROLE_GROUP_LEADER, ROLE_GROUP_MEMBER, ROLE_SUPER_ADMIN, User
 
 
 class UsersRepo:
@@ -55,7 +55,19 @@ class UsersRepo:
         - ``in_group_ids`` — restrict to users whose ``group_id`` is in
           this list (used by group leaders to scope their visibility).
         """
-        stmt = select(User).order_by(User.id)
+        # Admin list ordering (FE-FIX round-3 #2):
+        #   1) ungrouped users first   (group_id IS NULL — NULLS FIRST)
+        #   2) within a group, leader before members
+        #   3) stable tiebreak by id
+        role_rank = case(
+            (User.role == ROLE_GROUP_LEADER, 0),
+            else_=1,
+        )
+        stmt = select(User).order_by(
+            User.group_id.asc().nullsfirst(),
+            role_rank,
+            User.id,
+        )
         count_stmt = select(func.count()).select_from(User)
         if q:
             pattern = f"%{q.lower()}%"

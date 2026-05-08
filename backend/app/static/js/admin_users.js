@@ -44,7 +44,7 @@
 
   // Toggle the group select visibility according to the selected role.
   // - role=group_leader  → group select hidden + cleared (auto-create on backend).
-  // - role=group_member  → group select visible + required.
+  // - role=group_member  → group select visible (optional — user can be created without a group).
   const roleInputs   = document.querySelectorAll('[data-admin-role-input]');
   const groupField   = document.querySelector('[data-admin-group-field]');
   const groupSelect  = document.querySelector('[data-admin-group-select]');
@@ -53,13 +53,13 @@
     let role = 'group_member';
     roleInputs.forEach(function (r) { if (r.checked) role = r.value; });
     if (!groupField || !groupSelect) return;
+    // group_id is always optional; the field is just hidden for leaders.
+    groupSelect.required = false;
     if (role === 'group_leader') {
       groupField.hidden = true;
-      groupSelect.required = false;
       groupSelect.value = '';
     } else {
       groupField.hidden = false;
-      groupSelect.required = true;
     }
   }
 
