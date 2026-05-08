@@ -10,7 +10,7 @@
     <meta name="csrf-token" content="{{ csrf_token | e }}">
   {% endif %}
   <title>{% block title %}Mail Aggregator{% endblock %}</title>
-  <link rel="stylesheet" href="/static/css/main.css">
+  <link rel="stylesheet" href="/static/css/main.css?v={{ static_v }}">
   <link rel="icon" href="data:," >
   {# Telegram WebApp adaptation (ADR-0018, 08-frontend.md §10).
      SDK is fetched from telegram.org (CSP script-src whitelists this origin
@@ -18,7 +18,7 @@
      `defer`, which guarantees execution order: SDK first, glue script after,
      and both run after DOMContentLoaded. #}
   <script src="https://telegram.org/js/telegram-web-app.js" defer></script>
-  <script src="/static/js/tg.js" defer></script>
+  <script src="/static/js/tg.js?v={{ static_v }}" defer></script>
 </head>
 <body class="page page--{% block body_class %}default{% endblock %}">
   <a class="skip-link" href="#main">Перейти к основному содержимому</a>
@@ -100,7 +100,7 @@
     </nav>
   {% endif %}
 
-  <script src="/static/js/csrf.js"></script>
+  <script src="/static/js/csrf.js?v={{ static_v }}"></script>
   {% block extra_js %}{% endblock %}
 </body>
 </html>

@@ -11,6 +11,7 @@ read-and-clear ``flash:{session_id}`` and pass them to the template as
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,10 @@ from backend.app.flash import consume_flashes
 _TEMPLATES_DIR = Path(__file__).parent / "templates"
 
 templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
+
+# Cache-busting token for static assets — refreshes on every process start so
+# we don't ship stale JS/CSS to clients that aggressively cache by URL.
+_STATIC_VERSION = str(int(time.time()))
 
 
 # --- Globals for templates --------------------------------------------------
@@ -66,6 +71,7 @@ def _format_bytes(n: int | None) -> str:
 # Register globals + filters on the underlying Jinja env.
 templates.env.globals["csrf_input"] = _csrf_input
 templates.env.globals["flash_messages"] = _flash_messages
+templates.env.globals["static_v"] = _STATIC_VERSION
 templates.env.filters["format_bytes"] = _format_bytes
 templates.env.autoescape = True
 
