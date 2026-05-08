@@ -19,6 +19,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import ValidationError as PydanticValidationError
 
 from backend.app.deps import (
+    AdminOrLeaderScope,
     CurrentScope,
     DbSession,
     SuperAdminScope,
@@ -207,7 +208,7 @@ async def create_group(
 async def _patch_group_impl(
     request: Request,
     db: DbSession,
-    scope: SuperAdminScope,
+    scope: AdminOrLeaderScope,
     group_id: int,
 ) -> Response:
     actor_id = scope.user_id
@@ -262,7 +263,7 @@ async def _patch_group_impl(
 async def patch_group(
     request: Request,
     db: DbSession,
-    scope: SuperAdminScope,
+    scope: AdminOrLeaderScope,
     group_id: int = Path(..., ge=1),
 ) -> Response:
     return await _patch_group_impl(request, db, scope, group_id)
@@ -276,7 +277,7 @@ async def patch_group(
 async def patch_group_sibling(
     request: Request,
     db: DbSession,
-    scope: SuperAdminScope,
+    scope: AdminOrLeaderScope,
     group_id: int = Path(..., ge=1),
 ) -> Response:
     """Form-fallback to PATCH (POST + ``_method=PATCH``)."""
@@ -414,9 +415,11 @@ async def groups_new_page(
 async def groups_edit_page(
     request: Request,
     db: DbSession,
-    scope: SuperAdminScope,
+    scope: AdminOrLeaderScope,
     group_id: int = Path(..., ge=1),
 ) -> Response:
+    # FE-FIX round-5 #1: leader can open the edit page only for their own
+    # group; ``get_detail`` enforces ownership for non-super_admin callers.
     detail = await GroupsService(db).get_detail(scope, group_id)
     sess = request.state.session
     return await render(
@@ -428,6 +431,7 @@ async def groups_edit_page(
             "csrf_token": sess.csrf_token,
             "session": sess,
             "form": {"name": detail.name},
+            "is_super_admin": scope.is_super_admin,
         },
     )
 

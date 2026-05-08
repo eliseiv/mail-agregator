@@ -82,20 +82,25 @@
                   Изменить
                 </a>
 
-                <form
-                  method="POST"
-                  action="/api/admin/groups/{{ grp.id }}/delete"
-                  class="inline-form"
-                  data-group-delete-form
-                  data-confirm="Удалить группу «{{ grp.name | e }}»?{% if grp.members_count and grp.members_count > 0 %} В группе ещё есть участники — операция будет отклонена сервером.{% endif %} Лидер останется в системе и потеряет статус.">
-                  {{ m.csrf_input() }}
-                  <input type="hidden" name="_method" value="DELETE">
-                  <button type="submit"
-                          class="btn btn--danger btn--small"
-                          aria-label="Удалить группу {{ grp.name | e }}">
-                    Удалить
-                  </button>
-                </form>
+                {# Delete is destructive and reserved for super_admin
+                   (FE-FIX round-5 #1): a leader may rename their own group
+                   but cannot dissolve it. #}
+                {% if is_super_admin %}
+                  <form
+                    method="POST"
+                    action="/api/admin/groups/{{ grp.id }}/delete"
+                    class="inline-form"
+                    data-group-delete-form
+                    data-confirm="Удалить группу «{{ grp.name | e }}»?{% if grp.members_count and grp.members_count > 0 %} В группе ещё есть участники — операция будет отклонена сервером.{% endif %} Лидер останется в системе и потеряет статус.">
+                    {{ m.csrf_input() }}
+                    <input type="hidden" name="_method" value="DELETE">
+                    <button type="submit"
+                            class="btn btn--danger btn--small"
+                            aria-label="Удалить группу {{ grp.name | e }}">
+                      Удалить
+                    </button>
+                  </form>
+                {% endif %}
               </td>
             </tr>
           {% endfor %}

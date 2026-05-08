@@ -1087,26 +1087,68 @@ a:hover { color: var(--color-primary-hover); text-decoration: underline; }
 .admin-users-table__name { font-weight: 600; }
 .admin-users-table__muted { color: var(--color-text-muted); font-size: var(--font-size-xs); }
 
-/* Group banding (FE-FIX round-4 #2): users come pre-sorted by group; we
-   alternate two soft tints between groups so members of the same group
-   read as a visual block, with a thicker top border marking each group's
-   first row. The "no-group" bucket has a neutral tint of its own. */
-.admin-users-table__row--no-group {
-  background: var(--color-bg-subtle);
+/* Group banding (FE-FIX round-5 #2): each group is its own <tbody> with a
+   thick contoured border, rounded corners and a real vertical gap between
+   groups. Implementation:
+     - <table border-collapse: separate; border-spacing: 0 var(--space-3)>
+       inserts real space between <tbody>s without extra DOM.
+     - per-group accent tint alternates between groups so adjacent ones
+       stay visually distinct even when borders touch.
+     - first/last row of each tbody round their corners; the border is
+       drawn on the outer <td>s. */
+.admin-users-table {
+  border-collapse: separate;
+  border-spacing: 0 var(--space-3);
 }
-.admin-users-table__row--band-a {
-  background: rgba(34, 197, 94, 0.06);  /* soft green */
+.admin-users-table tbody.user-group tr td {
+  border-bottom: none; /* override the global last-row rule */
 }
-.admin-users-table__row--band-b {
-  background: rgba(59, 130, 246, 0.06); /* soft blue */
+
+.user-group {
+  --user-group-accent: var(--color-border-strong);
+  --user-group-tint:   var(--color-bg-subtle);
 }
-.admin-users-table__row--band-start > td {
-  border-top: 2px solid var(--color-border-strong);
+.user-group--band-a {
+  --user-group-accent: rgb(34, 197, 94);    /* green */
+  --user-group-tint:   rgba(34, 197, 94, 0.08);
 }
-.admin-users-table tbody tr.admin-users-table__row--band-a:hover,
-.admin-users-table tbody tr.admin-users-table__row--band-b:hover,
-.admin-users-table tbody tr.admin-users-table__row--no-group:hover {
-  filter: brightness(0.97);
+.user-group--band-b {
+  --user-group-accent: rgb(59, 130, 246);   /* blue */
+  --user-group-tint:   rgba(59, 130, 246, 0.08);
+}
+.user-group--no-group {
+  --user-group-accent: var(--color-border-strong);
+  --user-group-tint:   var(--color-bg-subtle);
+}
+
+.user-group tr {
+  background: var(--user-group-tint);
+}
+.user-group tr td:first-child {
+  border-left:  2px solid var(--user-group-accent);
+}
+.user-group tr td:last-child {
+  border-right: 2px solid var(--user-group-accent);
+}
+.user-group tr:first-child td {
+  border-top:    2px solid var(--user-group-accent);
+}
+.user-group tr:last-child td {
+  border-bottom: 2px solid var(--user-group-accent);
+}
+.user-group tr:first-child td:first-child { border-top-left-radius:     8px; }
+.user-group tr:first-child td:last-child  { border-top-right-radius:    8px; }
+.user-group tr:last-child  td:first-child { border-bottom-left-radius:  8px; }
+.user-group tr:last-child  td:last-child  { border-bottom-right-radius: 8px; }
+
+/* Soft hairline between members of the same group. */
+.user-group tr + tr td {
+  border-top: 1px dashed rgba(0, 0, 0, 0.1);
+}
+
+.admin-users-table tbody.user-group tr:hover {
+  background: var(--user-group-tint);
+  filter: brightness(0.95);
 }
 
 /* Inline "+" button next to the user's name — opens the move-to-group

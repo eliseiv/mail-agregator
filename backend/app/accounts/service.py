@@ -257,26 +257,15 @@ class MailAccountService:
         if new_smtp_ssl and new_smtp_starttls:
             raise ConflictError("smtp_ssl and smtp_starttls are mutually exclusive")
 
-        # Decide whether IMAP/SMTP credentials actually changed. A PATCH that
-        # only touches non-credential fields (e.g. ``display_name``) must NOT
-        # re-validate connectivity — re-running the IMAP/SMTP login on every
-        # nickname edit can break for providers (Gmail/Yandex) that have
-        # since invalidated the stored app-password, even though the user
-        # never asked us to verify it. Empty ``password=""`` / ``smtp_password=""``
-        # is interpreted as "do not change" — also no re-test.
-        creds_changed = bool(
-            payload.password
-            or payload.smtp_password
-            or (payload.imap_host is not None and payload.imap_host != acc.imap_host)
-            or (payload.imap_port is not None and payload.imap_port != acc.imap_port)
-            or (payload.imap_ssl is not None and payload.imap_ssl != acc.imap_ssl)
-            or (payload.smtp_host is not None and payload.smtp_host != acc.smtp_host)
-            or (payload.smtp_port is not None and payload.smtp_port != acc.smtp_port)
-            or (payload.smtp_ssl is not None and payload.smtp_ssl != acc.smtp_ssl)
-            or (payload.smtp_starttls is not None and payload.smtp_starttls != acc.smtp_starttls)
-            or (payload.smtp_username is not None and payload.smtp_username != acc.smtp_username)
-            or (payload.email is not None and payload.email != acc.email)
-        )
+        # Decide whether to re-validate IMAP/SMTP credentials on this PATCH.
+        # FE-FIX round-5 #4: re-test only when the user actually submits a
+        # new IMAP or SMTP password. Editing a nickname (or even host/port)
+        # without re-entering the password must not trigger a login probe —
+        # the stored app-password may have expired, and a probe with a
+        # stale password fails with 535 even though the user only renamed
+        # the account. The next scheduled sync_cycle will surface real
+        # connectivity problems naturally.
+        creds_changed = bool(payload.password or payload.smtp_password)
 
         if creds_changed:
             if payload.password:

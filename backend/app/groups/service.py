@@ -428,11 +428,19 @@ class GroupsService:
         ip: str | None,
         user_agent: str | None,
     ) -> GroupDetailDTO:
-        if not actor.is_super_admin:
-            raise NotFoundError("group_not_found")
+        # FE-FIX round-5 #1: group_leader can rename their own group.
+        # super_admin can rename any group.
         group = await self._repo.get_by_id(group_id)
         if group is None:
             raise NotFoundError("group_not_found")
+        if not actor.is_super_admin:
+            is_own_leader = (
+                actor.role == ROLE_GROUP_LEADER
+                and actor.group_id == group_id
+                and group.leader_user_id == actor.user_id
+            )
+            if not is_own_leader:
+                raise NotFoundError("group_not_found")
         from_name = group.name
         await self._repo.rename(group_id=group_id, name=name)
         await self._audit.log(

@@ -136,11 +136,28 @@ async def _rerender_admin_users(
     listing = await AdminService(db).list_users(actor, q=None, page=1, limit=50)
     # Bring up the group dropdown choices for the create-user form.
     groups, _ = await GroupsRepo(db).list_all(q=None, page=1, limit=200)
+
+    grouped: list[dict[str, object]] = []
+    current_key: int | None = -1
+    for u in listing.items:
+        gid = u.group.id if u.group else None
+        if gid != current_key:
+            grouped.append(
+                {
+                    "group_id": gid,
+                    "group_name": (u.group.name if u.group else None),
+                    "users": [],
+                }
+            )
+            current_key = gid
+        grouped[-1]["users"].append(u)  # type: ignore[union-attr]
+
     return await render(
         request,
         "admin/users.html",
         {
             "users": listing.items,
+            "user_groups": grouped,
             "total": listing.total,
             "page": listing.page,
             "limit": listing.limit,
@@ -454,11 +471,32 @@ async def admin_users_page(
     sess = request.state.session
     listing = await AdminService(db).list_users(actor, q=q, page=page, limit=limit)
     groups, _ = await GroupsRepo(db).list_all(q=None, page=1, limit=200)
+
+    # FE-FIX round-5 #2: pre-group users by group_id so the template can
+    # render each group as a separate <tbody> with its own border + spacing.
+    # Listing comes pre-sorted (NULLS FIRST → group_id → leader → id), so a
+    # linear pass preserves the sort while bucketing.
+    grouped: list[dict[str, object]] = []
+    current_key: int | None = -1
+    for u in listing.items:
+        gid = u.group.id if u.group else None
+        if gid != current_key:
+            grouped.append(
+                {
+                    "group_id": gid,
+                    "group_name": (u.group.name if u.group else None),
+                    "users": [],
+                }
+            )
+            current_key = gid
+        grouped[-1]["users"].append(u)  # type: ignore[union-attr]
+
     return await render(
         request,
         "admin/users.html",
         {
             "users": listing.items,
+            "user_groups": grouped,
             "total": listing.total,
             "page": listing.page,
             "limit": listing.limit,

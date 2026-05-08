@@ -42,17 +42,15 @@
       <p>По вашему запросу пользователи не найдены.</p>
     </div>
   {% else %}
-    {# Group-banding (FE-FIX round-4 #2): users come pre-sorted by group_id
-       (NULLS FIRST) → leader-first → id. We toggle a band class on every
-       group transition so users of the same group share a background and
-       the boundary between groups is visible. The "ungrouped" bucket has
-       its own muted band.
-
-       Implementation note: Jinja's ``namespace`` is needed because regular
-       ``{% set %}`` inside a loop creates a new local scope each iteration
-       and the value won't carry over. #}
-    {% set band = namespace(prev_gid=None, idx=0, started=False) %}
-    <div class="table-wrapper">
+    {# Group banding (FE-FIX round-5 #2). Each group is rendered as its own
+       <tbody class="user-group ..."> with a thick border and visible gap to
+       the next group; the "no-group" bucket gets its own neutral colour.
+       The band class alternates between groups (--band-a / --band-b) so
+       neighbouring groups stay visually distinct even when their borders
+       happen to touch. Pre-grouping is done in Python (admin_users_page);
+       the template only walks the buckets. #}
+    {% set band_idx = namespace(value=0) %}
+    <div class="user-groups-list">
       <table class="admin-users-table">
         <thead>
           <tr>
@@ -61,72 +59,91 @@
             <th scope="col">Группа</th>
             <th scope="col">Создан</th>
             <th scope="col">Последний вход</th>
+            <th scope="col" class="admin-users-table__actions-col">Действия</th>
           </tr>
         </thead>
-        <tbody>
-          {% for u in users %}
-            {% set _is_super = u.role == 'super_admin' or u.is_admin %}
-            {% set _gid = u.group.id if u.group else 0 %}
-            {% set _gname = u.group.name if u.group else '' %}
-            {% if not band.started or _gid != band.prev_gid %}
-              {% set band.idx = 1 - band.idx %}
-              {% set band.prev_gid = _gid %}
-              {% set band.started = True %}
-              {% set _band_start = True %}
-            {% else %}
-              {% set _band_start = False %}
-            {% endif %}
-            <tr
-              class="admin-users-table__row
-                {% if _is_super %}admin-users-table__row--system{% endif %}
-                {% if _gid == 0 %}admin-users-table__row--no-group{% else %}admin-users-table__row--band-{{ 'a' if band.idx == 0 else 'b' }}{% endif %}
-                {% if _band_start %}admin-users-table__row--band-start{% endif %}"
-              data-group-id="{{ _gid }}">
-              <td class="admin-users-table__name">
-                <div class="admin-users-table__name-row">
-                  <span class="admin-users-table__name-text">{{ m.effective_user_name(u) }}</span>
-                  {% if not _is_super %}
-                    <button
-                      type="button"
-                      class="admin-users-table__add-group"
-                      title="Перенести в другую группу"
-                      aria-label="Перенести {{ u.username | e }} в другую группу"
-                      data-admin-move-group
-                      data-user-id="{{ u.id }}"
-                      data-username="{{ u.username | e }}"
-                      data-current-gid="{{ _gid }}">+</button>
+        {% for bucket in user_groups %}
+          {% set _gid = bucket.group_id or 0 %}
+          {% set _gname = bucket.group_name or '' %}
+          {% if _gid == 0 %}
+            {% set _band_class = 'user-group--no-group' %}
+          {% else %}
+            {% set _band_class = 'user-group--band-' ~ ('a' if band_idx.value == 0 else 'b') %}
+            {% set band_idx.value = 1 - band_idx.value %}
+          {% endif %}
+          <tbody class="user-group {{ _band_class }}" data-group-id="{{ _gid }}">
+            {% for u in bucket.users %}
+              {% set _is_super = u.role == 'super_admin' or u.is_admin %}
+              <tr class="admin-users-table__row {% if _is_super %}admin-users-table__row--system{% endif %}">
+                <td class="admin-users-table__name">
+                  <div class="admin-users-table__name-row">
+                    <span class="admin-users-table__name-text">{{ m.effective_user_name(u) }}</span>
+                    {% if not _is_super %}
+                      <button
+                        type="button"
+                        class="admin-users-table__add-group"
+                        title="Перенести в другую группу"
+                        aria-label="Перенести {{ u.username | e }} в другую группу"
+                        data-admin-move-group
+                        data-user-id="{{ u.id }}"
+                        data-username="{{ u.username | e }}"
+                        data-current-gid="{{ _gid }}">+</button>
+                    {% endif %}
+                  </div>
+                </td>
+                <td class="admin-users-table__role">
+                  {% if u.role %}
+                    <span class="admin-user__badge admin-user__badge--{{ u.role | e }}">{{ m.role_label(u.role) }}</span>
+                  {% elif u.is_admin %}
+                    <span class="admin-user__badge admin-user__badge--super_admin">{{ m.role_label('super_admin') }}</span>
+                  {% else %}
+                    <span class="admin-users-table__muted">&mdash;</span>
                   {% endif %}
-                </div>
-              </td>
-              <td class="admin-users-table__role">
-                {% if u.role %}
-                  <span class="admin-user__badge admin-user__badge--{{ u.role | e }}">{{ m.role_label(u.role) }}</span>
-                {% elif u.is_admin %}
-                  <span class="admin-user__badge admin-user__badge--super_admin">{{ m.role_label('super_admin') }}</span>
-                {% else %}
-                  <span class="admin-users-table__muted">&mdash;</span>
-                {% endif %}
-              </td>
-              <td class="admin-users-table__group">
-                {% if u.group %}
-                  {{ _gname | e }}
-                {% else %}
-                  <span class="admin-users-table__muted">без группы</span>
-                {% endif %}
-              </td>
-              <td class="admin-users-table__date">
-                {{ m.time_tag_short(u.created_at) }}
-              </td>
-              <td class="admin-users-table__date">
-                {% if u.last_login_at %}
-                  {{ m.time_tag_short(u.last_login_at) }}
-                {% else %}
-                  <span class="admin-users-table__muted">никогда</span>
-                {% endif %}
-              </td>
-            </tr>
-          {% endfor %}
-        </tbody>
+                </td>
+                <td class="admin-users-table__group">
+                  {% if u.group %}
+                    {{ _gname | e }}
+                  {% else %}
+                    <span class="admin-users-table__muted">без группы</span>
+                  {% endif %}
+                </td>
+                <td class="admin-users-table__date">
+                  {{ m.time_tag_short(u.created_at) }}
+                </td>
+                <td class="admin-users-table__date">
+                  {% if u.last_login_at %}
+                    {{ m.time_tag_short(u.last_login_at) }}
+                  {% else %}
+                    <span class="admin-users-table__muted">никогда</span>
+                  {% endif %}
+                </td>
+                <td class="admin-users-table__actions">
+                  {% if not _is_super %}
+                    {# Reset password and delete actions (FE-FIX round-5).
+                       Both confirm via JS dialogs (data-admin-reset-form
+                       sets a confirm message; data-admin-delete-form opens
+                       the type-the-username dialog already in this page). #}
+                    <form method="POST" action="/api/admin/users/{{ u.id }}/reset"
+                          class="inline-form" data-admin-reset-form
+                          data-confirm="Сбросить пароль пользователю @{{ u.username | e }}? При следующем входе он должен будет задать новый пароль.">
+                      {{ m.csrf_input() }}
+                      <button type="submit" class="btn btn--secondary btn--small">Сброс</button>
+                    </form>
+                    <form method="POST" action="/api/admin/users/{{ u.id }}/delete"
+                          class="inline-form" data-admin-delete-form
+                          data-username="{{ u.username | e }}">
+                      {{ m.csrf_input() }}
+                      <input type="hidden" name="_method" value="DELETE">
+                      <button type="submit" class="btn btn--danger btn--small">Удалить</button>
+                    </form>
+                  {% else %}
+                    <span class="admin-users-table__muted">системный</span>
+                  {% endif %}
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        {% endfor %}
       </table>
     </div>
 
