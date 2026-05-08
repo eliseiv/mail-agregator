@@ -12,9 +12,11 @@ from urllib.parse import quote
 from fastapi import APIRouter, Path, Query, Request, Response, status
 from fastapi.responses import HTMLResponse, StreamingResponse
 
-from backend.app.accounts.service import MailAccountService
+from backend.app.accounts.service import MailAccountService, _to_dto as _acc_to_dto
 from backend.app.deps import CurrentScope, DbSession
 from backend.app.groups.service import GroupsService
+from backend.app.repositories.mail_accounts import MailAccountsRepo
+from backend.app.repositories.users import UsersRepo
 from backend.app.messages.schemas import (
     MarkReadRequest,
     MessageDetail,
@@ -142,9 +144,6 @@ async def inbox_page(
     if unread:
         parsed_unread = unread.lower() in ("1", "true", "on", "yes")
 
-    accounts = await MailAccountService(db).list_for_scope(scope)
-    # Server-render dropdown of user's tags so the filter renders without JS.
-    tags = await TagsService(db).list_for_user(scope.user_id)
     # FE-FIX round-7 #2: super_admin gets a third filter — by group. We
     # always include the dropdown options when the caller is super_admin;
     # the template hides the <select> when ``groups`` is empty.
@@ -154,11 +153,45 @@ async def inbox_page(
             scope, q=None, page=1, limit=200
         )
         groups = groups_resp.items
+
+    # Account / tag dropdowns cascade off the selected group (FE-FIX round-8):
+    # when super_admin picks group N, "Все почты" narrows to mail accounts of
+    # that group's users, and "Все теги" narrows to tags owned by the group's
+    # members. The caller's own tags are merged in so the admin's personal
+    # tags stay reachable. For non-super_admin, ``parsed_group_id`` is None
+    # and the original behaviour is preserved.
+    effective_group_id: int | None = (
+        parsed_group_id if (scope.is_super_admin and parsed_group_id) else None
+    )
+    if effective_group_id is not None:
+        member_ids = await UsersRepo(db).list_user_ids_in_group(effective_group_id)
+        if member_ids:
+            accs_map = await MailAccountsRepo(db).list_for_users(member_ids)
+            users_map = await UsersRepo(db).get_many_by_ids(member_ids)
+            accounts = [
+                _acc_to_dto(a, users_map[a.user_id])
+                for uid in member_ids
+                for a in accs_map.get(uid, [])
+                if a.user_id in users_map
+            ]
+            # Tags: members' tags ∪ caller's own tags. Dedupe by id.
+            tags_by_id: dict[int, object] = {}
+            for uid in member_ids + [scope.user_id]:
+                for t in await TagsService(db).list_for_user(uid):
+                    tags_by_id[t.id] = t
+            tags = sorted(tags_by_id.values(), key=lambda t: (not t.is_builtin, t.name))
+        else:
+            accounts = []
+            tags = await TagsService(db).list_for_user(scope.user_id)
+    else:
+        accounts = await MailAccountService(db).list_for_scope(scope)
+        tags = await TagsService(db).list_for_user(scope.user_id)
+
     listing = await MessageService(db).list_for_scope(
         scope,
         account_id=parsed_account_id,
         tag_id=parsed_tag_id,
-        group_id=parsed_group_id if scope.is_super_admin else None,
+        group_id=effective_group_id,
         unread=parsed_unread,
         cursor=cursor,
         limit=limit,
