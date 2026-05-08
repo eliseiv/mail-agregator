@@ -1,4 +1,10 @@
-"""MailAccountService — CRUD + test-login + force-sync marker."""
+"""MailAccountService — CRUD + test-login + force-sync marker.
+
+Post-ADR-0019: visibility is governed by :class:`VisibilityScope`. The
+caller's user_id is no longer the only key — group leaders / members
+share the same view of every member's mailboxes (ADR-0019 §7.1) and a
+super-admin sees all.
+"""
 
 from __future__ import annotations
 
@@ -10,28 +16,40 @@ from backend.app.accounts.schemas import (
     MailAccountDTO,
     MailAccountTestRequest,
     MailAccountUpdateRequest,
+    OwnerBriefDTO,
     TestResult,
 )
 from backend.app.accounts.testers import imap_test_login, smtp_test_login
+from backend.app.deps import VisibilityScope
 from backend.app.exceptions import (
     ConflictError,
+    ForbiddenError,
     NotFoundError,
+    ValidationError,
 )
 from backend.app.repositories.mail_accounts import MailAccountsRepo
 from backend.app.repositories.messages import MessagesRepo
+from backend.app.repositories.users import UsersRepo
 from shared.crypto import decrypt_mail_password, encrypt_mail_password
 from shared.logging import get_logger
-from shared.models import MailAccount
+from shared.models import MailAccount, User
 from shared.redis_client import get_redis
 from shared.storage import get_storage
 
 log = get_logger(__name__)
 
 
-def _to_dto(acc: MailAccount) -> MailAccountDTO:
+def _to_dto(acc: MailAccount, owner: User) -> MailAccountDTO:
     return MailAccountDTO(
         id=acc.id,
+        user_id=acc.user_id,
+        owner=OwnerBriefDTO(
+            id=owner.id,
+            username=owner.username,
+            display_name=owner.display_name,
+        ),
         email=acc.email,
+        display_name=acc.display_name,
         imap_host=acc.imap_host,
         imap_port=acc.imap_port,
         imap_ssl=acc.imap_ssl,
@@ -53,24 +71,59 @@ class MailAccountService:
         self._db = session
         self._repo = MailAccountsRepo(session)
         self._messages = MessagesRepo(session)
+        self._users = UsersRepo(session)
         self._storage = get_storage()
+
+    # --- Visibility helpers ------------------------------------------------
+
+    async def visible_user_ids(self, scope: VisibilityScope) -> list[int] | None:
+        """Compute the set of mailbox-owner user_ids visible to the caller.
+
+        ``None`` = "no scope filter" (super-admin path).
+        Empty list = "no users visible" (a non-admin without a group).
+
+        Public so HTML route handlers can pre-load an account row using
+        the same visibility rules.
+        """
+        if scope.is_super_admin:
+            return None
+        if scope.group_id is None:
+            return []
+        return await self._users.list_user_ids_in_group(scope.group_id)
+
+    # Internal alias kept for the few service-internal call sites; do not
+    # introduce new external callers.
+    async def _visible_user_ids(self, scope: VisibilityScope) -> list[int] | None:
+        return await self.visible_user_ids(scope)
 
     # --- Reads -------------------------------------------------------------
 
-    async def list_for_user(self, user_id: int) -> list[MailAccountDTO]:
-        rows = await self._repo.list_for_user(user_id)
-        return [_to_dto(r) for r in rows]
+    async def list_for_scope(self, scope: VisibilityScope) -> list[MailAccountDTO]:
+        visible = await self._visible_user_ids(scope)
+        if visible is None:
+            rows = await self._repo.list_all()
+        else:
+            if not visible:
+                return []
+            rows = await self._repo.list_for_user_ids(visible)
+        owner_ids = sorted({a.user_id for a in rows})
+        owner_map = await self._users.get_many_by_ids(owner_ids)
+        return [_to_dto(a, owner_map[a.user_id]) for a in rows if a.user_id in owner_map]
 
-    async def get_for_user(self, user_id: int, account_id: int) -> MailAccountDTO:
-        acc = await self._repo.get_for_user(user_id, account_id)
+    async def get_for_scope(self, scope: VisibilityScope, account_id: int) -> MailAccountDTO:
+        visible = await self._visible_user_ids(scope)
+        acc = await self._repo.get_for_user_ids(visible, account_id)
         if acc is None:
             raise NotFoundError()
-        return _to_dto(acc)
+        owner = await self._users.get_by_id(acc.user_id)
+        if owner is None:
+            # FK should prevent this; surface 404 to avoid 500.
+            raise NotFoundError()
+        return _to_dto(acc, owner)
 
     # --- Test login --------------------------------------------------------
 
     async def test(self, payload: MailAccountTestRequest) -> TestResult:
-        # IMAP
         await imap_test_login(
             host=payload.imap_host,
             port=payload.imap_port,
@@ -78,7 +131,6 @@ class MailAccountService:
             username=payload.email,
             password=payload.password,
         )
-        # SMTP
         smtp_user = payload.smtp_username or payload.email
         smtp_pwd = payload.smtp_password or payload.password
         await smtp_test_login(
@@ -93,15 +145,57 @@ class MailAccountService:
 
     # --- Create ------------------------------------------------------------
 
-    async def create(self, *, user_id: int, payload: MailAccountCreateRequest) -> MailAccountDTO:
-        # 1. Conflict check (cheap, before any IMAP round-trip).
-        existing = await self._repo.find_by_user_email(user_id, payload.email)
+    async def _resolve_target_user_id(
+        self,
+        scope: VisibilityScope,
+        target_user_id: int | None,
+    ) -> int:
+        """Apply ADR-0019 §8 rules and return the row's owner user_id."""
+        # group_member: cannot create on someone else.
+        if scope.is_group_member:
+            if target_user_id is not None and target_user_id != scope.user_id:
+                raise ValidationError(
+                    "target_user_id must equal own user_id for group_member",
+                    field="target_user_id",
+                )
+            return scope.user_id
+
+        # group_leader: target must be in the same group; default = self.
+        if scope.is_group_leader:
+            if target_user_id is None:
+                return scope.user_id
+            target = await self._users.get_by_id(target_user_id)
+            if target is None:
+                raise NotFoundError()
+            if target.group_id != scope.group_id:
+                raise ForbiddenError("user_not_in_group_scope")
+            return target_user_id
+
+        # super_admin: target must exist (default = self).
+        if scope.is_super_admin:
+            if target_user_id is None:
+                return scope.user_id
+            target = await self._users.get_by_id(target_user_id)
+            if target is None:
+                raise NotFoundError()
+            return target_user_id
+
+        # Defensive — unknown role.
+        raise ForbiddenError()
+
+    async def create(
+        self,
+        *,
+        scope: VisibilityScope,
+        payload: MailAccountCreateRequest,
+    ) -> MailAccountDTO:
+        target_user_id = await self._resolve_target_user_id(scope, payload.target_user_id)
+
+        existing = await self._repo.find_by_user_email(target_user_id, payload.email)
         if existing is not None:
             raise ConflictError("Email already added", field="email")
-        # 2. Test IMAP + SMTP. Raises 422 on failure.
         await self.test(payload)
 
-        # 3. Reserve id, encrypt with that id in AAD, INSERT.
         new_id = await self._repo.next_account_id()
         encrypted = encrypt_mail_password(payload.password, new_id)
         smtp_encrypted: bytes | None = None
@@ -111,7 +205,7 @@ class MailAccountService:
         try:
             acc = await self._repo.insert_with_id(
                 account_id=new_id,
-                user_id=user_id,
+                user_id=target_user_id,
                 email=payload.email,
                 encrypted_password=encrypted,
                 imap_host=payload.imap_host,
@@ -123,28 +217,29 @@ class MailAccountService:
                 smtp_starttls=payload.smtp_starttls,
                 smtp_username=payload.smtp_username,
                 smtp_encrypted_password=smtp_encrypted,
+                display_name=payload.display_name,
             )
         except IntegrityError as exc:
-            # Race with another concurrent add — surface as 409.
             raise ConflictError("Email already added", field="email") from exc
-        return _to_dto(acc)
+
+        owner = await self._users.get_by_id(target_user_id)
+        assert owner is not None
+        return _to_dto(acc, owner)
 
     # --- Update ------------------------------------------------------------
 
     async def update(
         self,
         *,
-        user_id: int,
+        scope: VisibilityScope,
         account_id: int,
         payload: MailAccountUpdateRequest,
     ) -> MailAccountDTO:
-        acc = await self._repo.get_for_user(user_id, account_id)
+        visible = await self._visible_user_ids(scope)
+        acc = await self._repo.get_for_user_ids(visible, account_id)
         if acc is None:
             raise NotFoundError()
 
-        # Build the to-be-tested credentials. Apply incoming fields on top of
-        # current ones; we always re-test if any auth-relevant field changed.
-        # Determine effective credentials and connection params after patch.
         new_email = payload.email or acc.email
         new_imap_host = payload.imap_host or acc.imap_host
         new_imap_port = payload.imap_port or acc.imap_port
@@ -162,15 +257,11 @@ class MailAccountService:
         if new_smtp_ssl and new_smtp_starttls:
             raise ConflictError("smtp_ssl and smtp_starttls are mutually exclusive")
 
-        # IMAP password: if user supplied a new one, use it; else decrypt the
-        # stored blob.
         if payload.password:
             imap_pwd = payload.password
         else:
             imap_pwd = decrypt_mail_password(acc.encrypted_password, acc.id)
 
-        # SMTP password: if explicit smtp_password sent, use it; else stored
-        # smtp blob; else fall back to imap password.
         if payload.smtp_password:
             smtp_pwd = payload.smtp_password
         elif acc.smtp_encrypted_password is not None:
@@ -178,7 +269,6 @@ class MailAccountService:
         else:
             smtp_pwd = imap_pwd
 
-        # Always re-test on PATCH per ``docs/04-api-contracts.md``.
         test_payload = MailAccountTestRequest(
             email=new_email,
             password=imap_pwd,
@@ -194,7 +284,6 @@ class MailAccountService:
         )
         await self.test(test_payload)
 
-        # Build update fields.
         update_fields: dict[str, object] = {
             "email": new_email,
             "imap_host": new_imap_host,
@@ -212,45 +301,47 @@ class MailAccountService:
             update_fields["smtp_encrypted_password"] = encrypt_mail_password(
                 payload.smtp_password, acc.id
             )
-        # If account was disabled and it now passes test — re-enable.
+        if payload.clear_display_name:
+            update_fields["display_name"] = None
+        elif payload.display_name is not None:
+            update_fields["display_name"] = payload.display_name
         update_fields["is_active"] = True
         update_fields["last_sync_error"] = None
         update_fields["consecutive_failures"] = 0
 
         await self._repo.update_fields(account_id, **update_fields)
-        # Reload row.
-        refreshed = await self._repo.get_for_user(user_id, account_id)
+        refreshed = await self._repo.get_by_id(account_id)
         assert refreshed is not None
-        return _to_dto(refreshed)
+        owner = await self._users.get_by_id(refreshed.user_id)
+        assert owner is not None
+        return _to_dto(refreshed, owner)
 
     # --- Delete ------------------------------------------------------------
 
-    async def delete(self, *, user_id: int, account_id: int) -> None:
-        acc = await self._repo.get_for_user(user_id, account_id)
+    async def delete(self, *, scope: VisibilityScope, account_id: int) -> None:
+        visible = await self._visible_user_ids(scope)
+        acc = await self._repo.get_for_user_ids(visible, account_id)
         if acc is None:
             raise NotFoundError()
-        # Collect S3 keys for deletion BEFORE the cascade.
         keys = await self._messages.select_attachment_keys_for_account(account_id)
-        # Delete the row -> cascade removes messages + attachments.
         await self._repo.delete(account_id)
-        # Drop blobs (best-effort; orphan_scan = TD-004).
         if keys:
             await self._storage.delete_objects(keys)
-        # Also clean up any straggler objects under the account prefix.
-        prefix = f"{user_id}/{account_id}/"
+        prefix = f"{acc.user_id}/{account_id}/"
         await self._storage.delete_prefix(prefix)
 
     # --- Force sync marker -------------------------------------------------
 
-    async def force_sync(self, *, user_id: int, account_id: int) -> None:
-        acc = await self._repo.get_for_user(user_id, account_id)
+    async def force_sync(self, *, scope: VisibilityScope, account_id: int) -> None:
+        visible = await self._visible_user_ids(scope)
+        acc = await self._repo.get_for_user_ids(visible, account_id)
         if acc is None:
             raise NotFoundError()
         redis = get_redis()
-        # 60s TTL — worker will pick this up on its next 5-minute tick.
         await redis.set(f"force_sync:{account_id}", "1", ex=60)
         log.info(
             "force_sync_marked",
-            user_id=user_id,
+            actor_user_id=scope.user_id,
             mail_account_id=account_id,
+            owner_user_id=acc.user_id,
         )

@@ -5,6 +5,10 @@ HTML: ``/admin``, ``/admin/audit``.
 
 State-changing endpoints accept both ``application/json`` and
 ``application/x-www-form-urlencoded`` (no-JS fallback, ADR-0015).
+
+Post-ADR-0019: list_users / users-page render group + role information
+and the actor is a :class:`VisibilityScope` (not a raw User), so a future
+"leader manages own group" UI shares the same controllers.
 """
 
 from __future__ import annotations
@@ -21,16 +25,24 @@ from backend.app.admin.schemas import (
     CreateUserRequest,
     CreateUserResponse,
     DeleteUserResponse,
+    UpdateUserRequest,
+    UserDTO,
     UsersListResponse,
 )
 from backend.app.admin.service import AdminService
-from backend.app.deps import AdminUser, DbSession, is_form_request
+from backend.app.deps import (
+    DbSession,
+    SuperAdminScope,
+    VisibilityScope,
+    is_form_request,
+)
 from backend.app.exceptions import (
     DomainError,
     ValidationError,
 )
 from backend.app.flash import flash
 from backend.app.rate_limit import LIMIT_ADMIN_WRITE, client_ip, consume
+from backend.app.repositories.groups import GroupsRepo
 from backend.app.templates import render
 
 api = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -42,15 +54,67 @@ html = APIRouter(prefix="/admin", tags=["admin-html"])
 # ---------------------------------------------------------------------------
 
 
+def _form_str(form: object, name: str) -> str:
+    if not hasattr(form, "get"):
+        return ""
+    v = form.get(name)
+    return v if isinstance(v, str) else ""
+
+
+def _form_int_or_none(form: object, name: str) -> int | None:
+    raw = _form_str(form, name).strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValidationError(f"{name} must be an integer", field=name) from exc
+
+
 async def _parse_create_user_form(request: Request) -> CreateUserRequest:
     form = await request.form()
-    username_v = form.get("username", "")
-    email_v = form.get("email", "")
-    username = username_v if isinstance(username_v, str) else ""
-    email_raw = email_v if isinstance(email_v, str) else ""
-    email: str | None = email_raw.strip() or None
+    payload: dict[str, object] = {
+        "username": _form_str(form, "username"),
+        "email": _form_str(form, "email").strip() or None,
+        "display_name": _form_str(form, "display_name").strip() or None,
+        "role": _form_str(form, "role").strip() or "group_member",
+        "group_id": _form_int_or_none(form, "group_id"),
+    }
     try:
-        return CreateUserRequest.model_validate({"username": username, "email": email})
+        return CreateUserRequest.model_validate(payload)
+    except PydanticValidationError as exc:
+        raise ValidationError("Invalid form payload") from exc
+
+
+async def _parse_update_user_form(request: Request) -> UpdateUserRequest:
+    form = await request.form()
+    raw_dn = _form_str(form, "display_name")
+    raw_role = _form_str(form, "role").strip()
+    raw_gid = _form_str(form, "group_id").strip()
+
+    # Differentiate "field absent" from "field present and empty".
+    has_dn_field = "display_name" in {k for k, _ in form.multi_items()}
+    has_gid_field = "group_id" in {k for k, _ in form.multi_items()}
+
+    payload: dict[str, object] = {}
+    if has_dn_field:
+        s = raw_dn.strip()
+        if not s:
+            payload["clear_display_name"] = True
+        else:
+            payload["display_name"] = s
+    if raw_role:
+        payload["role"] = raw_role
+    if has_gid_field:
+        if not raw_gid:
+            payload["clear_group_id"] = True
+        else:
+            try:
+                payload["group_id"] = int(raw_gid)
+            except ValueError as exc:
+                raise ValidationError("group_id must be an integer", field="group_id") from exc
+    try:
+        return UpdateUserRequest.model_validate(payload)
     except PydanticValidationError as exc:
         raise ValidationError("Invalid form payload") from exc
 
@@ -59,22 +123,15 @@ async def _rerender_admin_users(
     request: Request,
     db: DbSession,
     *,
-    admin_id: int | None,
+    actor: VisibilityScope,
     error_message: str | None = None,
-    create_form: dict[str, str] | None = None,
+    create_form: dict[str, object] | None = None,
     status_code: int = 400,
 ) -> Response:
-    """Re-render the admin/users page with an error context.
-
-    Accepts ``admin_id`` as a primitive (not the ORM ``User``) because this
-    helper is invoked after a rolled-back ``async with db.begin():`` block —
-    at that point the ORM instance's attributes are expired, and reading
-    ``admin.id`` here would trigger a sync lazy-load that crashes the
-    asyncpg driver with ``MissingGreenlet`` (BUG-003). Callers must extract
-    primitives from the ORM ``User`` *before* opening the write transaction.
-    """
     sess = request.state.session
-    listing = await AdminService(db).list_users(q=None, page=1, limit=50)
+    listing = await AdminService(db).list_users(actor, q=None, page=1, limit=50)
+    # Bring up the group dropdown choices for the create-user form.
+    groups, _ = await GroupsRepo(db).list_all(q=None, page=1, limit=200)
     return await render(
         request,
         "admin/users.html",
@@ -84,9 +141,11 @@ async def _rerender_admin_users(
             "page": listing.page,
             "limit": listing.limit,
             "q": "",
-            "current_admin_id": admin_id,
+            "current_admin_id": actor.user_id,
             "csrf_token": sess.csrf_token,
             "session": sess,
+            "groups": groups,
+            "is_super_admin": actor.is_super_admin,
             "error_message": error_message,
             "create_form": create_form or {},
         },
@@ -102,13 +161,21 @@ async def _rerender_admin_users(
 @api.get("/users", response_model=UsersListResponse)
 async def list_users(
     db: DbSession,
-    admin: AdminUser,
+    actor: SuperAdminScope,
     q: Annotated[str | None, Query(max_length=64)] = None,
     page: Annotated[int, Query(ge=1)] = 1,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    group_id: Annotated[int | None, Query(ge=1)] = None,
+    role: Annotated[str | None, Query(max_length=32)] = None,
 ) -> UsersListResponse:
-    _ = admin  # auth
-    return await AdminService(db).list_users(q=q, page=page, limit=limit)
+    return await AdminService(db).list_users(
+        actor,
+        q=q,
+        page=page,
+        limit=limit,
+        group_id=group_id,
+        role=role,
+    )
 
 
 @api.post(
@@ -119,17 +186,10 @@ async def list_users(
 async def create_user(
     request: Request,
     db: DbSession,
-    admin: AdminUser,
+    actor: SuperAdminScope,
 ) -> Response:
-    """Create a user. Accepts JSON or form-encoded (ADR-0015)."""
-    # Snapshot ORM-bound primitives before the write transaction. After a
-    # rollback inside ``async with db.begin():`` the ``admin`` instance's
-    # attributes are expired; touching ``admin.id`` in the ``except`` branch
-    # would trigger a sync lazy-load and crash asyncpg with
-    # ``MissingGreenlet`` (BUG-003).
-    admin_id = admin.id
-
-    await consume(LIMIT_ADMIN_WRITE, str(admin_id))
+    actor_id = actor.user_id
+    await consume(LIMIT_ADMIN_WRITE, str(actor_id))
     ip = client_ip(request)
     ua = request.headers.get("user-agent", "")
     is_form = is_form_request(request)
@@ -146,8 +206,8 @@ async def create_user(
     try:
         async with db.begin():
             result: CreateUserResponse = await AdminService(db).create_user(
+                actor=actor,
                 payload=payload,
-                actor_id=admin_id,
                 ip=ip,
                 user_agent=ua,
             )
@@ -157,9 +217,15 @@ async def create_user(
             return await _rerender_admin_users(
                 request,
                 db,
-                admin_id=admin_id,
+                actor=actor,
                 error_message=exc.message,
-                create_form={"username": payload.username, "email": payload.email or ""},
+                create_form={
+                    "username": payload.username,
+                    "email": payload.email or "",
+                    "display_name": payload.display_name or "",
+                    "role": payload.role,
+                    "group_id": payload.group_id,
+                },
                 status_code=exc.status_code,
             )
         raise
@@ -173,22 +239,89 @@ async def create_user(
     )
 
 
+async def _patch_user_impl(
+    request: Request,
+    db: DbSession,
+    actor: SuperAdminScope,
+    user_id: int,
+) -> Response:
+    actor_id = actor.user_id
+    await consume(LIMIT_ADMIN_WRITE, str(actor_id))
+    ip = client_ip(request)
+    ua = request.headers.get("user-agent", "")
+    is_form = is_form_request(request)
+
+    if is_form:
+        payload = await _parse_update_user_form(request)
+    else:
+        body = await request.json()
+        try:
+            payload = UpdateUserRequest.model_validate(body)
+        except PydanticValidationError as exc:
+            raise ValidationError("Invalid JSON payload") from exc
+
+    try:
+        async with db.begin():
+            result: UserDTO = await AdminService(db).update_user(
+                actor=actor,
+                target_id=user_id,
+                payload=payload,
+                ip=ip,
+                user_agent=ua,
+            )
+    except DomainError as exc:
+        if is_form:
+            await flash(request, "error", exc.message)
+            return RedirectResponse(url="/admin", status_code=status.HTTP_303_SEE_OTHER)
+        raise
+
+    if is_form:
+        await flash(request, "success", "Пользователь обновлён")
+        return RedirectResponse(url="/admin", status_code=status.HTTP_303_SEE_OTHER)
+    return JSONResponse(content=result.model_dump(mode="json"))
+
+
+@api.patch("/users/{user_id}", response_model=None)
+async def patch_user(
+    request: Request,
+    db: DbSession,
+    actor: SuperAdminScope,
+    user_id: int = Path(..., ge=1),
+) -> Response:
+    return await _patch_user_impl(request, db, actor, user_id)
+
+
+@api.post(
+    "/users/{user_id}",
+    response_model=None,
+    include_in_schema=False,
+)
+async def patch_user_sibling(
+    request: Request,
+    db: DbSession,
+    actor: SuperAdminScope,
+    user_id: int = Path(..., ge=1),
+) -> Response:
+    """Form-fallback to PATCH (POST + ``_method=PATCH``)."""
+    return await _patch_user_impl(request, db, actor, user_id)
+
+
 @api.post("/users/{user_id}/reset", response_model=None)
 async def reset_password(
     request: Request,
     db: DbSession,
-    admin: AdminUser,
+    actor: SuperAdminScope,
     user_id: int = Path(..., ge=1),
 ) -> Response:
-    await consume(LIMIT_ADMIN_WRITE, str(admin.id))
+    await consume(LIMIT_ADMIN_WRITE, str(actor.user_id))
     ip = client_ip(request)
     ua = request.headers.get("user-agent", "")
     is_form = is_form_request(request)
     try:
         async with db.begin():
             await AdminService(db).reset_password(
+                actor=actor,
                 target_id=user_id,
-                actor_id=admin.id,
                 ip=ip,
                 user_agent=ua,
             )
@@ -207,19 +340,18 @@ async def reset_password(
 async def _delete_user_impl(
     request: Request,
     db: DbSession,
-    admin: AdminUser,
+    actor: SuperAdminScope,
     user_id: int,
 ) -> Response:
-    """Shared body for both ``DELETE /...`` and ``POST .../delete`` (override)."""
-    await consume(LIMIT_ADMIN_WRITE, str(admin.id))
+    await consume(LIMIT_ADMIN_WRITE, str(actor.user_id))
     ip = client_ip(request)
     ua = request.headers.get("user-agent", "")
     is_form = is_form_request(request)
     try:
         async with db.begin():
             result: DeleteUserResponse = await AdminService(db).delete_user(
+                actor=actor,
                 target_id=user_id,
-                actor_id=admin.id,
                 ip=ip,
                 user_agent=ua,
             )
@@ -239,10 +371,10 @@ async def _delete_user_impl(
 async def delete_user(
     request: Request,
     db: DbSession,
-    admin: AdminUser,
+    actor: SuperAdminScope,
     user_id: int = Path(..., ge=1),
 ) -> Response:
-    return await _delete_user_impl(request, db, admin, user_id)
+    return await _delete_user_impl(request, db, actor, user_id)
 
 
 @api.delete(
@@ -253,17 +385,11 @@ async def delete_user(
 async def delete_user_sibling(
     request: Request,
     db: DbSession,
-    admin: AdminUser,
+    actor: SuperAdminScope,
     user_id: int = Path(..., ge=1),
 ) -> Response:
-    """Sibling endpoint reachable from a plain HTML form via method override.
-
-    Browser form posts ``POST /api/admin/users/{id}/delete`` with hidden
-    ``_method=DELETE``. :class:`MethodOverrideMiddleware` rewrites scope
-    method to ``DELETE`` before this handler is matched. A direct ``POST``
-    on this path returns ``405 Method Not Allowed``.
-    """
-    return await _delete_user_impl(request, db, admin, user_id)
+    """Sibling endpoint reachable from a plain HTML form via method override."""
+    return await _delete_user_impl(request, db, actor, user_id)
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +400,7 @@ async def delete_user_sibling(
 @api.get("/audit", response_model=AuditListResponse)
 async def list_audit(
     db: DbSession,
-    admin: AdminUser,
+    actor: SuperAdminScope,
     action: Annotated[str | None, Query(max_length=64)] = None,
     target_user_id: Annotated[int | None, Query(ge=1)] = None,
     from_date: Annotated[datetime | None, Query(alias="from")] = None,
@@ -282,7 +408,7 @@ async def list_audit(
     page: Annotated[int, Query(ge=1)] = 1,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
 ) -> AuditListResponse:
-    _ = admin
+    _ = actor
     return await AdminService(db).list_audit(
         action=action,
         target_user_id=target_user_id,
@@ -303,13 +429,14 @@ async def list_audit(
 async def admin_users_page(
     request: Request,
     db: DbSession,
-    admin: AdminUser,
+    actor: SuperAdminScope,
     q: Annotated[str | None, Query(max_length=64)] = None,
     page: Annotated[int, Query(ge=1)] = 1,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
 ) -> Response:
     sess = request.state.session
-    listing = await AdminService(db).list_users(q=q, page=page, limit=limit)
+    listing = await AdminService(db).list_users(actor, q=q, page=page, limit=limit)
+    groups, _ = await GroupsRepo(db).list_all(q=None, page=1, limit=200)
     return await render(
         request,
         "admin/users.html",
@@ -319,7 +446,9 @@ async def admin_users_page(
             "page": listing.page,
             "limit": listing.limit,
             "q": q or "",
-            "current_admin_id": admin.id,
+            "current_admin_id": actor.user_id,
+            "groups": groups,
+            "is_super_admin": True,
             "csrf_token": sess.csrf_token,
             "session": sess,
         },
@@ -330,13 +459,13 @@ async def admin_users_page(
 async def admin_audit_page(
     request: Request,
     db: DbSession,
-    admin: AdminUser,
+    actor: SuperAdminScope,
     action: Annotated[str | None, Query(max_length=64)] = None,
     target_user_id: Annotated[int | None, Query(ge=1)] = None,
     page: Annotated[int, Query(ge=1)] = 1,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
 ) -> Response:
-    _ = admin
+    _ = actor
     sess = request.state.session
     listing = await AdminService(db).list_audit(
         action=action,
@@ -346,7 +475,6 @@ async def admin_audit_page(
         page=page,
         limit=limit,
     )
-    # Build query string for pagination links (preserves active filters).
     qs_parts = []
     if action:
         qs_parts.append(f"action={action}")
@@ -371,13 +499,18 @@ async def admin_audit_page(
                 "to": "",
             },
             "available_actions": [
-                "user_create",
-                "user_delete",
-                "password_reset",
+                "create_user",
+                "delete_user",
+                "reset_password",
                 "admin_login",
                 "admin_logout",
                 "lockout_triggered",
                 "account_auto_disabled",
+                "group_create",
+                "group_delete",
+                "group_rename",
+                "user_role_change",
+                "user_group_change",
             ],
             "query_qs": query_qs,
             "csrf_token": sess.csrf_token,

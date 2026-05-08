@@ -1,20 +1,20 @@
 {% extends "base.html" %}
 {% import "_macros.html" as m with context %}
 
-{% block title %}{% if reply_to %}Reply{% else %}Compose{% endif %} &middot; Mail Aggregator{% endblock %}
+{% block title %}{% if reply_to %}Ответ{% else %}Новое письмо{% endif %} &middot; Mail Aggregator{% endblock %}
 {% block body_class %}compose{% endblock %}
 
 {% block content %}
 <section class="compose" aria-labelledby="compose-heading">
 
-  <nav class="compose__toolbar" aria-label="Compose actions">
+  <nav class="compose__toolbar" aria-label="Действия">
     <a class="btn btn--secondary" href="{% if reply_to %}/messages/{{ reply_to }}{% else %}/{% endif %}">
-      &larr; Cancel
+      &larr; Отмена
     </a>
   </nav>
 
   <h1 id="compose-heading" class="compose__title">
-    {% if reply_to %}Reply{% else %}New message{% endif %}
+    {% if reply_to %}Ответ{% else %}Новое письмо{% endif %}
   </h1>
 
   {% if error_message %}
@@ -39,27 +39,30 @@
     {% endif %}
 
     <div class="field">
-      <label class="field__label" for="compose-from">From</label>
+      <label class="field__label" for="compose-from">От</label>
       <select
         class="field__input"
         id="compose-from"
         name="from_account_id"
         required>
         {% if not accounts %}
-          <option value="" disabled selected>(no mail accounts — add one first)</option>
+          <option value="" disabled selected>(нет почт — сначала добавьте аккаунт)</option>
         {% endif %}
         {% for acc in accounts | default([]) %}
+          {# Label uses display_name → email fallback (ADR-0020); full email
+             доступен в title атрибута для disambiguation. #}
           <option
             value="{{ acc.id }}"
+            title="{{ acc.email | e }}"
             {% if default_from_account_id is defined and default_from_account_id and default_from_account_id == acc.id %}selected{% elif loop.first and not default_from_account_id %}selected{% endif %}>
-            {{ acc.email | e }}
+            {{ m.effective_account_label(acc) }}
           </option>
         {% endfor %}
       </select>
     </div>
 
     <div class="field">
-      <label class="field__label" for="compose-to">To</label>
+      <label class="field__label" for="compose-to">Кому</label>
       <input
         class="field__input"
         type="text"
@@ -67,14 +70,14 @@
         name="to"
         required
         autocomplete="off"
-        placeholder="comma,separated@addresses"
+        placeholder="адреса через запятую"
         value="{{ form.to | default('') | e }}"
         data-compose-emails>
-      <p class="field__hint">Separate multiple addresses with commas.</p>
+      <p class="field__hint">Несколько адресов разделяйте запятыми.</p>
     </div>
 
     <div class="field">
-      <label class="field__label" for="compose-cc">Cc <span class="field__optional">(optional)</span></label>
+      <label class="field__label" for="compose-cc">Копия <span class="field__optional">(необязательно)</span></label>
       <input
         class="field__input"
         type="text"
@@ -86,7 +89,7 @@
     </div>
 
     <div class="field">
-      <label class="field__label" for="compose-bcc">Bcc <span class="field__optional">(optional)</span></label>
+      <label class="field__label" for="compose-bcc">Скрытая копия <span class="field__optional">(необязательно)</span></label>
       <input
         class="field__input"
         type="text"
@@ -98,7 +101,7 @@
     </div>
 
     <div class="field">
-      <label class="field__label" for="compose-subject">Subject</label>
+      <label class="field__label" for="compose-subject">Тема</label>
       <input
         class="field__input"
         type="text"
@@ -114,7 +117,7 @@
     </div>
 
     <div class="field">
-      <label class="field__label" for="compose-body">Message</label>
+      <label class="field__label" for="compose-body">Сообщение</label>
       <textarea
         class="field__input field__input--textarea"
         id="compose-body"
@@ -122,13 +125,13 @@
         rows="16"
         maxlength="1048576"
         data-compose-body>{{ form.body | default('') | e }}</textarea>
-      <p class="field__hint">Plain text only. Maximum 1 MiB.</p>
+      <p class="field__hint">Только обычный текст. Максимум 1 МиБ.</p>
     </div>
 
     <div class="form-actions">
       <button type="submit" class="btn btn--primary" data-compose-submit
               {% if not accounts %}disabled{% endif %}>
-        Send
+        Отправить
       </button>
     </div>
   </form>

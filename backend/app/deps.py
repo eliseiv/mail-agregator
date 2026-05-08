@@ -3,12 +3,21 @@
 - :func:`get_db` — provide an :class:`AsyncSession`.
 - :func:`current_session` — return the cached session payload or 401.
 - :func:`current_user` — load the :class:`User` row and check it still exists.
-- :func:`require_admin` — like :func:`current_user` but enforces ``is_admin``.
+- :func:`require_super_admin` / :func:`require_admin_or_leader` — role gates.
+- :func:`current_scope` — :class:`VisibilityScope` for read/list endpoints.
+
+Visibility model (ADR-0019 §7):
+
+- ``super_admin``  — sees all mail accounts / messages.
+- ``group_leader`` — sees mail accounts and messages of every member of the
+  group (including own).
+- ``group_member`` — same scope as the leader.
 """
 
 from __future__ import annotations
 
-from typing import Annotated
+from dataclasses import dataclass
+from typing import Annotated, Literal
 
 from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,7 +30,14 @@ from backend.app.exceptions import (
 from backend.app.repositories.users import UsersRepo
 from backend.app.sessions import SessionData, SessionStore
 from shared.db import get_session
-from shared.models import User
+from shared.models import (
+    ROLE_GROUP_LEADER,
+    ROLE_GROUP_MEMBER,
+    ROLE_SUPER_ADMIN,
+    User,
+)
+
+Role = Literal["super_admin", "group_leader", "group_member"]
 
 
 async def get_db() -> AsyncSession:  # type: ignore[misc]
@@ -85,9 +101,90 @@ async def current_user(
 CurrentUser = Annotated[User, Depends(current_user)]
 
 
+# ---------------------------------------------------------------------------
+# VisibilityScope (ADR-0019 §7)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class VisibilityScope:
+    """Caller-relative authorisation scope.
+
+    Built once per request from the active session and threaded through the
+    service layer. Any read/list/write that depends on "what can this user
+    see/touch" must consume a :class:`VisibilityScope`, not a raw
+    ``user_id``. See :class:`backend.app.accounts.service.MailAccountService`
+    and :class:`backend.app.messages.service.MessageService`.
+    """
+
+    user_id: int
+    role: Role
+    group_id: int | None  # None iff role == 'super_admin'
+
+    @property
+    def is_super_admin(self) -> bool:
+        return self.role == ROLE_SUPER_ADMIN
+
+    @property
+    def is_group_leader(self) -> bool:
+        return self.role == ROLE_GROUP_LEADER
+
+    @property
+    def is_group_member(self) -> bool:
+        return self.role == ROLE_GROUP_MEMBER
+
+
+def build_scope(user: User) -> VisibilityScope:
+    """Construct a :class:`VisibilityScope` from a fresh DB row.
+
+    Trusts the DB invariants (CHECK + trigger) — no extra validation.
+    """
+    return VisibilityScope(
+        user_id=user.id,
+        role=user.role,  # type: ignore[arg-type]
+        group_id=user.group_id,
+    )
+
+
+def current_scope(user: CurrentUser) -> VisibilityScope:
+    """FastAPI dependency: build a :class:`VisibilityScope` for the request."""
+    return build_scope(user)
+
+
+CurrentScope = Annotated[VisibilityScope, Depends(current_scope)]
+
+
+# ---------------------------------------------------------------------------
+# Role gates
+# ---------------------------------------------------------------------------
+
+
+def require_super_admin(scope: CurrentScope) -> VisibilityScope:
+    """Raise 403 unless the caller is the super-admin."""
+    if scope.role != ROLE_SUPER_ADMIN:
+        raise ForbiddenError("Super-admin only")
+    return scope
+
+
+SuperAdminScope = Annotated[VisibilityScope, Depends(require_super_admin)]
+
+
+def require_admin_or_leader(scope: CurrentScope) -> VisibilityScope:
+    """Raise 403 unless caller is super-admin or a group leader."""
+    if scope.role not in (ROLE_SUPER_ADMIN, ROLE_GROUP_LEADER):
+        raise ForbiddenError("Admin or group leader only")
+    return scope
+
+
+AdminOrLeaderScope = Annotated[VisibilityScope, Depends(require_admin_or_leader)]
+
+
+# Backwards-compat: ``require_admin`` previously checked ``user.is_admin``;
+# it now means "super_admin only" and returns the :class:`User` row to keep
+# pre-ADR-0019 routers compiling. New code should use :data:`SuperAdminScope`.
 def require_admin(user: CurrentUser) -> User:
-    if not user.is_admin:
-        raise ForbiddenError("Admin only")
+    if user.role != ROLE_SUPER_ADMIN:
+        raise ForbiddenError("Super-admin only")
     return user
 
 

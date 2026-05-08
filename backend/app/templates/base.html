@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="ru">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -21,29 +21,32 @@
   <script src="/static/js/tg.js" defer></script>
 </head>
 <body class="page page--{% block body_class %}default{% endblock %}">
-  <a class="skip-link" href="#main">Skip to main content</a>
+  <a class="skip-link" href="#main">Перейти к основному содержимому</a>
 
   <header class="topbar" role="banner">
     <div class="topbar__inner">
-      <a href="/" class="brand" aria-label="Mail Aggregator home">Mail Aggregator</a>
+      <a href="/" class="brand" aria-label="Mail Aggregator — на главную">Mail Aggregator</a>
 
       {% if request is defined and request.state is defined and request.state.session %}
-        <nav class="topnav" aria-label="Primary">
-          <a class="topnav__link" href="/">Inbox</a>
-          <a class="topnav__link" href="/accounts">Accounts</a>
+        {% import "_macros.html" as m with context %}
+        <nav class="topnav" aria-label="Основное меню">
+          <a class="topnav__link" href="/">Входящие</a>
+          <a class="topnav__link" href="/accounts">Почты</a>
           <a class="topnav__link" href="/tags">Теги</a>
-          {% if request.state.session.role == 'admin' %}
-            <a class="topnav__link" href="/admin">Admin</a>
+          {% if request.state.session.role == 'super_admin' %}
+            <a class="topnav__link" href="/admin">Пользователи</a>
+            <a class="topnav__link" href="/admin/groups">Группы</a>
           {% endif %}
         </nav>
         <div class="topbar__user">
-          <span class="topbar__username" title="Signed in user">
+          <span class="topbar__username" title="Текущий пользователь">
             {{ request.state.session.username | default('') | e }}
           </span>
-          <form method="POST" action="/logout" class="inline-form">
-            {% import "_macros.html" as m with context %}
+          {# Logout button (ADR-0019 UI-1; восстановлено после редизайна).
+             Оформлено как POST-форма с CSRF-токеном — GET для logout запрещён. #}
+          <form method="POST" action="/logout" class="inline-form logout-form">
             {{ m.csrf_input() }}
-            <button type="submit" class="btn btn--link" aria-label="Log out">Log out</button>
+            <button type="submit" class="btn btn--link" aria-label="Выйти из аккаунта">Выйти</button>
           </form>
         </div>
       {% endif %}
@@ -61,39 +64,51 @@
     <small>Mail Aggregator</small>
   </footer>
 
-  {# Bottom navigation: shown on mobile (≤640px) and inside Telegram WebApp.
+  {# Bottom navigation (ADR-0019 UI-2 / 08-frontend.md §11).
+     Shown on mobile (≤640px) and inside Telegram WebApp.
      CSS-only visibility: .bottom-nav is `display:none` by default, opens to
      flex inside `body.tg-app` and at narrow viewports. CSP-friendly — no
      inline styles or scripts. The Admin item is server-rendered conditionally
-     so non-admin sessions never receive markup that links to /admin. #}
+     so non-admin sessions never receive markup that links to /admin.
+
+     Logout is the 5-th nav item — implemented as <form method="POST"> so
+     it carries CSRF protection (GET-logout is forbidden by ADR-0019 §10). #}
   {% if request is defined and request.state is defined and request.state.session %}
-    <nav class="bottom-nav" aria-label="App navigation">
+    {% import "_macros.html" as m with context %}
+    <nav class="bottom-nav" aria-label="Нижняя навигация">
       <a href="/"
          class="bottom-nav__item{% if request.url.path == '/' %} bottom-nav__item--active{% endif %}"
          {% if request.url.path == '/' %}aria-current="page"{% endif %}>
         <span class="bottom-nav__icon" aria-hidden="true">&#128229;</span>
-        <span class="bottom-nav__label">Inbox</span>
+        <span class="bottom-nav__label">Входящие</span>
       </a>
       <a href="/accounts"
          class="bottom-nav__item{% if request.url.path.startswith('/accounts') %} bottom-nav__item--active{% endif %}"
          {% if request.url.path.startswith('/accounts') %}aria-current="page"{% endif %}>
         <span class="bottom-nav__icon" aria-hidden="true">&#128231;</span>
-        <span class="bottom-nav__label">Accounts</span>
+        <span class="bottom-nav__label">Почты</span>
       </a>
       <a href="/tags"
          class="bottom-nav__item{% if request.url.path.startswith('/tags') %} bottom-nav__item--active{% endif %}"
          {% if request.url.path.startswith('/tags') %}aria-current="page"{% endif %}>
         <span class="bottom-nav__icon" aria-hidden="true">&#127991;&#65039;</span>
-        <span class="bottom-nav__label">Tags</span>
+        <span class="bottom-nav__label">Теги</span>
       </a>
-      {% if request.state.session.role == 'admin' %}
+      {% if request.state.session.role == 'super_admin' %}
       <a href="/admin"
          class="bottom-nav__item{% if request.url.path.startswith('/admin') %} bottom-nav__item--active{% endif %}"
          {% if request.url.path.startswith('/admin') %}aria-current="page"{% endif %}>
         <span class="bottom-nav__icon" aria-hidden="true">&#9881;&#65039;</span>
-        <span class="bottom-nav__label">Admin</span>
+        <span class="bottom-nav__label">Админ</span>
       </a>
       {% endif %}
+      <form method="POST" action="/logout" class="bottom-nav__item bottom-nav__form" aria-label="Выйти из аккаунта">
+        {{ m.csrf_input() }}
+        <button type="submit" class="bottom-nav__button" aria-label="Выйти из аккаунта">
+          <span class="bottom-nav__icon" aria-hidden="true">&#128682;</span>
+          <span class="bottom-nav__label">Выйти</span>
+        </button>
+      </form>
     </nav>
   {% endif %}
 

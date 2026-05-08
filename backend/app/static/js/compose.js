@@ -81,10 +81,10 @@
     bodyInput.addEventListener('input', function () {
       const bytes = new Blob([bodyInput.value]).size;
       if (bytes > MAX_BODY_BYTES) {
-        setError('Message body exceeds 1 MiB.');
+        setError('Текст письма превышает 1 МиБ.');
         if (submitBtn) submitBtn.disabled = true;
       } else {
-        if (errorPane && !errorPane.hidden && errorPane.textContent.indexOf('1 MiB') !== -1) {
+        if (errorPane && !errorPane.hidden && errorPane.textContent.indexOf('МиБ') !== -1) {
           setError('');
         }
         if (submitBtn) submitBtn.disabled = false;
@@ -106,11 +106,11 @@
     const inReplyToInput = form.querySelector('[name="in_reply_to_message_id"]');
 
     if (!fromAccountId || !fromAccountId.value) {
-      setError('Please select a From account.');
+      setError('Выберите аккаунт отправителя.');
       return;
     }
     if (!toInput || !toInput.value.trim()) {
-      setError('Please enter at least one recipient.');
+      setError('Укажите хотя бы одного получателя.');
       return;
     }
 
@@ -122,7 +122,7 @@
     const allAddrs = [].concat(toAddrs, ccAddrs, bccAddrs);
     const badAddr = allAddrs.find(function (a) { return !EMAIL_RE.test(a); });
     if (badAddr) {
-      setError('Invalid address: ' + badAddr);
+      setError('Некорректный адрес: ' + badAddr);
       return;
     }
 
@@ -141,7 +141,7 @@
     if (submitBtn) {
       submitBtn.disabled = true;
       submitBtn.dataset.originalLabel = submitBtn.textContent;
-      submitBtn.textContent = 'Sending…';
+      submitBtn.textContent = 'Отправка…';
     }
 
     try {
@@ -150,7 +150,7 @@
         body: payload,
       });
       if (resp.ok) {
-        window.MAS.flash('Message sent.', 'success');
+        window.MAS.flash('Письмо отправлено.', 'success');
         window.location.href = '/';
         return;
       }
@@ -159,7 +159,7 @@
       const detail = err.details && err.details.detail ? ' — ' + err.details.detail : '';
       setError(err.message + detail);
     } catch (_e) {
-      setError('Network error. Please try again.');
+      setError('Сетевая ошибка. Попробуйте ещё раз.');
     } finally {
       if (submitBtn) {
         submitBtn.disabled = false;

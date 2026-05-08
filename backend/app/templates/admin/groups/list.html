@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m with context %}
+
+{# Groups list page (super_admin only, ADR-0019).
+
+   Backend контекст:
+     - groups : list[GroupDTO]  — каждая запись имеет
+                {id, name, leader: {id, username, display_name}|null,
+                 members_count: int, created_at}
+     - csrf_token : str         — для inline DELETE-форм.
+     - session    : SessionData — используется в base.html topnav.
+     - flashes    : iterable     — рендерятся в base.html.
+
+   Создание группы напрямую через UI не делается — группа авто-создаётся
+   при создании пользователя с ролью «Лидер группы» в /admin (см. ADR-0019 §5).
+#}
+
+{% block title %}Админ &middot; Группы{% endblock %}
+{% block body_class %}admin-groups{% endblock %}
+
+{% block content %}
+<section class="admin" aria-labelledby="groups-heading">
+  <header class="admin__toolbar">
+    <h1 id="groups-heading" class="admin__title">Группы</h1>
+    <div class="admin__actions">
+      <a class="topnav__link" href="/admin">&larr; К пользователям</a>
+    </div>
+  </header>
+
+  <p class="admin__hint">
+    Группы создаются автоматически при создании пользователя с ролью «Лидер группы» —
+    откройте <a href="/admin">список пользователей</a> и нажмите «Создать пользователя».
+  </p>
+
+  {% if not groups %}
+    <div class="admin__empty" role="status">
+      <p>Групп пока нет. Создайте первого лидера в разделе «Пользователи» — группа появится автоматически.</p>
+      <a href="/admin" class="btn btn--primary">К пользователям</a>
+    </div>
+  {% else %}
+    <div class="table-wrapper">
+      <table class="admin-groups-table">
+        <thead>
+          <tr>
+            <th scope="col">Название группы</th>
+            <th scope="col">Лидер</th>
+            <th scope="col">Участников</th>
+            <th scope="col">Создана</th>
+            <th scope="col" class="admin-groups-table__actions-col">Действия</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for grp in groups %}
+            <tr class="admin-groups-table__row" data-group-id="{{ grp.id }}">
+              <td class="admin-groups-table__name">
+                <strong>{{ grp.name | e }}</strong>
+              </td>
+              <td class="admin-groups-table__leader">
+                {% if grp.leader %}
+                  {{ m.effective_user_name(grp.leader) }}
+                  {% if grp.leader.username and grp.leader.username != (grp.leader.display_name | default('')) %}
+                    <span class="admin-users-table__muted">(@{{ grp.leader.username | e }})</span>
+                  {% endif %}
+                {% else %}
+                  <span class="admin-users-table__muted">&mdash;</span>
+                {% endif %}
+              </td>
+              <td class="admin-groups-table__members">
+                {{ grp.members_count | default(0) }}
+              </td>
+              <td class="admin-groups-table__date">
+                {% if grp.created_at %}
+                  {{ m.time_tag(grp.created_at, grp.created_at_human if grp.created_at_human is defined else None) }}
+                {% else %}
+                  <span class="admin-users-table__muted">&mdash;</span>
+                {% endif %}
+              </td>
+              <td class="admin-groups-table__actions">
+                <a class="btn btn--secondary btn--small"
+                   href="/admin/groups/{{ grp.id }}/edit"
+                   aria-label="Изменить группу {{ grp.name | e }}">
+                  Изменить
+                </a>
+
+                <form
+                  method="POST"
+                  action="/api/admin/groups/{{ grp.id }}/delete"
+                  class="inline-form"
+                  data-group-delete-form
+                  data-confirm="Удалить группу «{{ grp.name | e }}»?{% if grp.members_count and grp.members_count > 0 %} В группе ещё есть участники — операция будет отклонена сервером.{% endif %} Лидер останется в системе и потеряет статус.">
+                  {{ m.csrf_input() }}
+                  <input type="hidden" name="_method" value="DELETE">
+                  <button type="submit"
+                          class="btn btn--danger btn--small"
+                          aria-label="Удалить группу {{ grp.name | e }}">
+                    Удалить
+                  </button>
+                </form>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+</section>
+{% endblock %}

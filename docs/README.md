@@ -33,6 +33,13 @@
 | **Tag** | Per-user классификационная метка для писем; rule-based авто-применение при синке (см. [ADR-0017](./adr/ADR-0017-tags.md)). |
 | **Tag rule** | Условие срабатывания тега: `subject_contains` / `body_contains` / `sender_contains` / `sender_exact` (substring case-insensitive). Несколько rules одного тега соединены OR. |
 | **Builtin tag** | Встроенный тег (`is_builtin=true`), создаётся автоматически при первом login пользователя. На старте — 4 штуки: `DPLA.PLA`, `Диспут`, `Отменить подписку`, `Продление аккаунта`. Удалять нельзя; rules/name/color редактируемы. |
+| **Role** | Роль пользователя (`users.role`): `super_admin` \| `group_leader` \| `group_member`. Заменяет старое `is_admin: bool`. См. [ADR-0019](./adr/ADR-0019-groups-and-roles.md). |
+| **Group** | Рабочая группа пользователей (таблица `groups`). У группы ровно один лидер (`groups.leader_user_id UNIQUE`) и 0..N участников; все участники видят и управляют mail-аккаунтами и письмами всех в группе. См. [ADR-0019](./adr/ADR-0019-groups-and-roles.md). |
+| **Group leader** | Пользователь с `role='group_leader'`. Лидер ровно одной группы (1:1). Создаётся super-admin'ом; имя группы по умолчанию формируется как «Группа {display_name \| username}». Может управлять mail-аккаунтами/письмами всей группы; user-management не имеет (его делает только super_admin). |
+| **Group member** | Пользователь с `role='group_member'`. Привязан к одной группе. Видит и управляет mail-аккаунтами/письмами всех участников своей группы (включая лидера). |
+| **Display name (user)** | `users.display_name TEXT NULL` — человекочитаемое имя пользователя для UI (Алиса Иванова). Опционально; UI fallback на `username`. См. [ADR-0019](./adr/ADR-0019-groups-and-roles.md) §2. |
+| **Mail account nickname** | `mail_accounts.display_name TEXT NULL` — короткий ярлык для ящика (например, «Apple Test 1»). Опциональный; UI fallback на `email`. Помогает быстро ориентироваться в общих группах ящиков. См. [ADR-0020](./adr/ADR-0020-mail-account-nickname.md). |
+| **Visibility scope** | dataclass `(user_id, role, group_id)`, инкапсулирующий, какие mail-accounts и messages видит текущий пользователь. Создаётся в FastAPI dependency, пробрасывается в Service-методы для построения SQL WHERE-фильтра. См. [ADR-0019](./adr/ADR-0019-groups-and-roles.md) §7. |
 
 ## Принципы
 

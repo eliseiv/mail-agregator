@@ -10,6 +10,8 @@
 
 ```mermaid
 erDiagram
+    groups ||--o| users : "leader (1:1)"
+    groups ||--o{ users : "members (1:N)"
     users ||--o{ mail_accounts : owns
     users ||--o{ sent_messages : sends
     users ||--o{ admin_audit : "subject_user (nullable, no FK)"
@@ -27,8 +29,10 @@ erDiagram
         bigint id PK
         text username UK
         text email "nullable"
+        text display_name "nullable; UI fallback to username"
         text password_hash "nullable, argon2id"
-        boolean is_admin
+        text role "super_admin|group_leader|group_member"
+        bigint group_id FK "nullable; NULL only for super_admin"
         boolean password_reset_required
         timestamptz lockout_until "nullable"
         int failed_login_attempts
@@ -37,10 +41,18 @@ erDiagram
         timestamptz updated_at
     }
 
+    groups {
+        bigint id PK
+        text name "1..100 chars; auto = 'Группа <leader.display_name|username>'"
+        bigint leader_user_id FK "UNIQUE; one user can lead at most one group; ON DELETE RESTRICT"
+        timestamptz created_at
+    }
+
     mail_accounts {
         bigint id PK
-        bigint user_id FK
+        bigint user_id FK "owner; visibility computed via JOIN users.group_id"
         text email
+        text display_name "nullable; UI fallback to email"
         bytea encrypted_password "AES-GCM blob"
         text imap_host
         int imap_port
@@ -168,8 +180,10 @@ erDiagram
 | `id` | BIGSERIAL | PRIMARY KEY | |
 | `username` | TEXT | NOT NULL, UNIQUE | Lower-case стандарт; CITEXT не используем — нормализуем на уровне приложения. |
 | `email` | TEXT | NULL | Опциональный email пользователя (для будущего; сейчас не используется). |
+| `display_name` | TEXT | NULL, CHECK length 1..100 | Человекочитаемое имя для UI; fallback в UI на `username` если NULL. Произвольная UTF-8 (включая русский). Введено в ADR-0019 §2 — также используется как источник для авто-имени группы при создании лидера (`"Группа {display_name | username}"`). |
 | `password_hash` | VARCHAR(255) | NULL | argon2id. NULL — пароль ещё не задан или сброшен. |
-| `is_admin` | BOOLEAN | NOT NULL DEFAULT false | true только для одного супер-админа из env. |
+| `role` | TEXT | NOT NULL DEFAULT `'group_member'`, CHECK IN (`'super_admin'`, `'group_leader'`, `'group_member'`) | Роль пользователя. См. ADR-0019. Заменяет старую колонку `is_admin: BOOLEAN` (миграция: `is_admin=true → role='super_admin'`, иначе → `role='group_member'`). `seed_super_admin` upsert'ит `role='super_admin'` для админа из env. |
+| `group_id` | BIGINT | NULL, FK → `groups(id)` ON DELETE SET NULL, **DEFERRABLE INITIALLY DEFERRED** | Группа пользователя. NULL только для `super_admin`. См. ADR-0019 §4. DEFERRABLE — потому что при auto-create группы (новый лидер) сначала вставляется user, потом groups, потом UPDATE users.group_id; FK-проверка должна откладываться до COMMIT. |
 | `password_reset_required` | BOOLEAN | NOT NULL DEFAULT true | После seed/сброса — true; после установки пароля — false. |
 | `lockout_until` | TIMESTAMPTZ | NULL | Если заполнено и > now() — login отклоняется (см. ADR-0009). |
 | `failed_login_attempts` | INT | NOT NULL DEFAULT 0 | Сбрасывается при успешном login или истечении lockout. |
@@ -177,12 +191,56 @@ erDiagram
 | `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | |
 | `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | Обновляется триггером или из приложения. |
 
+**CHECK-constraints (см. ADR-0019 §6):**
+- `users_role_check` — `role IN ('super_admin', 'group_leader', 'group_member')`.
+- `users_role_group_invariant` — табличный CHECK:
+  ```sql
+  CHECK (
+      (role = 'super_admin'  AND group_id IS NULL) OR
+      (role = 'group_leader' AND group_id IS NOT NULL) OR
+      (role = 'group_member' AND group_id IS NOT NULL)
+  )
+  ```
+- `users_display_name_length_check` — `display_name IS NULL OR char_length(display_name) BETWEEN 1 AND 100`.
+
+**Триггер инвариантов лидерства** (`users_group_leader_consistency_check`, см. ADR-0019 §6):
+- AFTER INSERT OR UPDATE OF `role`, `group_id` ON `users`, DEFERRABLE INITIALLY DEFERRED.
+- Гарантирует, что при `role='group_leader'` строка существует в `groups` с `groups.id = users.group_id` И `groups.leader_user_id = users.id`. Иначе RAISE EXCEPTION.
+- Backend-сервис (`AdminService`) дополнительно валидирует ДО SQL для понятных error-codes; триггер — defense-in-depth.
+
 **Индексы:**
 - `UNIQUE (username)` — реализовано через UNIQUE constraint.
-- `INDEX (is_admin) WHERE is_admin = true` — partial; для быстрого поиска админа на старте.
+- `INDEX (role) WHERE role = 'super_admin'` — partial; для быстрого поиска админа на старте (заменяет старый `(is_admin) WHERE is_admin = true`).
+- `INDEX (group_id) WHERE group_id IS NOT NULL` — для фильтрации по visibility (см. модули `messages`, `accounts`).
 
-**Триггер:**
+**Триггер `updated_at`:**
 - `BEFORE UPDATE ON users` — `NEW.updated_at = now()`.
+
+---
+
+### `groups`
+
+Источник истины — [ADR-0019](./adr/ADR-0019-groups-and-roles.md). Группа = ровно один лидер + 0..N участников. Один user может быть лидером максимум одной группы (UNIQUE).
+
+| Колонка | Тип | Constraints | Описание |
+| --- | --- | --- | --- |
+| `id` | BIGSERIAL | PRIMARY KEY | |
+| `name` | TEXT | NOT NULL, CHECK length 1..100 | Имя группы. Авто-генерация при создании лидера: `"Группа {leader.display_name \| leader.username}"`. Может быть переименована super-admin'ом через `PATCH /api/admin/groups/{id}`. |
+| `leader_user_id` | BIGINT | NOT NULL, UNIQUE, FK → `users(id)` ON DELETE RESTRICT | Лидер группы. UNIQUE → один user не может быть лидером больше одной группы. ON DELETE RESTRICT → нельзя удалить user'а, пока он лидер; super-admin сначала удаляет группу, потом — user'а. |
+| `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | |
+
+**Индексы:**
+- `UNIQUE (leader_user_id)` — implied UNIQUE constraint.
+- (PK на `id` уже есть — для FK-lookups из `users.group_id`.)
+
+**Каскады:**
+- `users.group_id → groups(id) ON DELETE SET NULL` — при удалении группы все её участники получают `group_id = NULL`. Backend (`AdminService.delete_group`) **дополнительно** в той же транзакции UPDATE'ит участников: для тех, у кого `role='group_member'`, устанавливает `role` остаётся `'group_member'` (но `group_id=NULL` из-за SET NULL — это нарушает CHECK-инвариант!). **Поэтому**: `delete_group` обязан **в одной транзакции** либо удалить пользователей-членов, либо переназначить им группу, либо изменить их `role`. **Принятое решение**: при `delete_group` super-admin в UI явно подтверждает действие, backend в одной транзакции:
+  1. Лидер: `role='group_member'`, `group_id=NULL` (что снова нарушает CHECK!) — поэтому фактически: лидер становится **«висящим» group_member без группы**, что запрещено CHECK. **Корректное решение**: backend требует, чтобы super-admin перед `DELETE /api/admin/groups/{id}` **сначала** через `PATCH /api/admin/users/{leader_id}` перевёл лидера в другую группу или назначил `role='super_admin'` (что невозможно — super_admin один), либо удалил всех участников. На практике — UI flow: super-admin при попытке удалить группу видит список участников и обязан либо переназначить их в другую группу, либо удалить, прежде чем удалится сама группа. **Backend выбрасывает 400 `group_has_members`**, если в группе остались users.
+  2. Лидер удалить тоже нельзя из-за `ON DELETE RESTRICT`. То есть итог: чтобы удалить группу — super-admin должен сначала «опустошить» её (всех участников и лидера перевести/удалить).
+
+  Это последовательно с инвариантами: `group_leader.group_id IS NOT NULL`, `group_member.group_id IS NOT NULL`. ON DELETE SET NULL на FK сохраняется как **safety-net** (если кто-то обойдёт backend и сделает прямой DELETE FROM groups — БД хотя бы не оставит dangling-FK), но штатный flow всегда проходит через backend-валидацию.
+
+**Объём:** ≤ 5 групп на старте.
 
 ---
 
@@ -191,8 +249,9 @@ erDiagram
 | Колонка | Тип | Constraints | Описание |
 | --- | --- | --- | --- |
 | `id` | BIGSERIAL | PK | |
-| `user_id` | BIGINT | NOT NULL, FK → `users(id)` ON DELETE CASCADE | |
+| `user_id` | BIGINT | NOT NULL, FK → `users(id)` ON DELETE CASCADE | Владелец mail-аккаунта. Visibility (super_admin / group_leader / group_member) определяется через JOIN `mail_accounts.user_id → users.group_id` (см. ADR-0019 §7.1). |
 | `email` | TEXT | NOT NULL | Адрес почты пользователя в этом сервисе. |
+| `display_name` | TEXT | NULL, CHECK length 1..100 | Никнейм / ярлык для UI. Если задан — показывается вместо `email` (см. ADR-0020). Не уникален. Любая UTF-8 строка 1..100 (после trim'а пустая интерпретируется как NULL). |
 | `encrypted_password` | BYTEA | NOT NULL | AES-256-GCM blob (см. ADR-0005). |
 | `imap_host` | TEXT | NOT NULL | |
 | `imap_port` | INT | NOT NULL DEFAULT 993 | |
@@ -215,6 +274,7 @@ erDiagram
 **Constraints:**
 - CHECK `imap_port BETWEEN 1 AND 65535`, `smtp_port BETWEEN 1 AND 65535`.
 - CHECK `NOT (smtp_ssl AND smtp_starttls)` — взаимоисключающие.
+- CHECK `display_name IS NULL OR char_length(display_name) BETWEEN 1 AND 100` (см. ADR-0020).
 - UNIQUE `(user_id, email)` — один пользователь не может дважды добавить ту же почту.
 
 **Индексы:**
@@ -321,7 +381,7 @@ erDiagram
 | --- | --- | --- | --- |
 | `id` | BIGSERIAL | PK | |
 | `actor_user_id` | BIGINT | NOT NULL | id супер-админа. **БЕЗ FK** (запись должна жить даже если случайно удалили админа из БД; см. seed-логику). |
-| `action` | TEXT | NOT NULL | Enum-string: `admin_login`, `admin_logout`, `create_user`, `reset_password`, `delete_user`, `lockout_triggered`, `account_auto_disabled`. |
+| `action` | TEXT | NOT NULL | Enum-string: `admin_login`, `admin_logout`, `create_user`, `reset_password`, `delete_user`, `lockout_triggered`, `account_auto_disabled`, **`group_create`**, **`group_delete`**, **`group_rename`**, **`user_role_change`**, **`user_group_change`** (новые из ADR-0019 §9). |
 | `target_user_id` | BIGINT | NULL | id затронутого пользователя (для user-actions). |
 | `target_username` | TEXT | NULL | snapshot username на случай delete. |
 | `details` | JSONB | NULL | Произвольная структурированная информация (например, для `account_auto_disabled` — `{mail_account_id, reason}`). |
@@ -453,10 +513,11 @@ BUILTIN_TAGS = [
 
 | Удаление чего | Что каскадно удаляется (Postgres ON DELETE CASCADE) | Что чистится приложением |
 | --- | --- | --- |
-| `users(id)` | `mail_accounts`, `sent_messages`, `sent_attachments`, `messages` (через `mail_accounts → messages → attachments`), `attachments`, `tags`, `tag_rules` (через `tags`), `message_tags` (через `tags` и `messages`) | Объекты MinIO по префиксу `{user_id}/`; все session keys (Redis); запись в `admin_audit` (action=delete_user) |
+| `users(id)` | `mail_accounts`, `sent_messages`, `sent_attachments`, `messages` (через `mail_accounts → messages → attachments`), `attachments`, `tags`, `tag_rules` (через `tags`), `message_tags` (через `tags` и `messages`) | Объекты MinIO по префиксу `{user_id}/`; все session keys (Redis); запись в `admin_audit` (action=delete_user). **Защита от удаления лидера** — `groups.leader_user_id ON DELETE RESTRICT` (см. ADR-0019 §3): нельзя удалить user'а, пока он лидер; super-admin сначала удаляет группу. |
 | `mail_accounts(id)` | `messages`, `attachments`, `sent_messages` (FK from_account_id), `message_tags` (через `messages`) | Объекты MinIO по префиксу `{user_id}/{mail_account_id}/` |
 | `messages(id)` (retention) | `attachments`, `message_tags` | Объекты MinIO по prefix `{user_id}/{mail_account_id}/{uid}/` |
 | `tags(id)` (user delete tag) | `tag_rules`, `message_tags` | — |
+| `groups(id)` (super-admin delete group) | `users.group_id` → SET NULL (FK ON DELETE SET NULL — см. ADR-0019 §4) | Backend ОБЯЗАН в той же транзакции: проверить, что в группе нет участников (`SELECT 1 FROM users WHERE group_id = :group_id`) и нет лидера (тот же group). Если есть — `400 group_has_members`. Super-admin сначала переназначает участников / переводит лидера, потом удаляет группу. SET NULL остаётся как safety-net для прямого DDL обхода. |
 
 Приложение перед каждым DELETE собирает список s3_key заранее (одним SELECT) и удаляет объекты MinIO, потом DELETE из БД. Транзакционности между MinIO и Postgres нет; в случае сбоя возможны "осиротевшие" объекты — это допустимо (cleanup `orphan_scan` в backlog).
 
@@ -477,4 +538,50 @@ BUILTIN_TAGS = [
 - Используем Alembic (см. `02-tech-stack.md`). Каждая миграция — отдельный файл в `backend/migrations/versions/`.
 - **Первая миграция (V001_initial)** создаёт всю схему выше + триггеры `updated_at` (за исключением tags-таблиц — см. ниже).
 - Seed супер-админа — отдельная init-фаза приложения (не миграция; см. `05-modules.md → admin module → seed flow`).
-- **Миграция `add_tags`** (ADR-0017) создаёт `tags`, `tag_rules`, `message_tags` + триггер `updated_at` на `tags`. Builtin-теги в эту миграцию **не попадают** — они создаются post-login hook'ом (см. ADR-0017 §6).
+- **Миграция `002_add_tags`** (ADR-0017) создаёт `tags`, `tag_rules`, `message_tags` + триггер `updated_at` на `tags`. Builtin-теги в эту миграцию **не попадают** — они создаются post-login hook'ом (см. ADR-0017 §6).
+- **Миграция `003_groups_and_roles`** (ADR-0019 + ADR-0020) — последовательность:
+  1. `CREATE TABLE groups (...)` (см. секцию `groups` выше).
+  2. `ALTER TABLE users ADD COLUMN role TEXT NULL` (nullable временно).
+  3. `ALTER TABLE users ADD COLUMN display_name TEXT NULL`.
+  4. `ALTER TABLE users ADD COLUMN group_id BIGINT NULL REFERENCES groups(id) ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED`.
+  5. **Data-миграция** (см. ADR-0019 §1):
+     ```sql
+     UPDATE users SET role = 'super_admin' WHERE is_admin = true;
+     UPDATE users SET role = 'group_member' WHERE is_admin = false;
+     ```
+  6. Закрепить constraint'ы:
+     ```sql
+     ALTER TABLE users ALTER COLUMN role SET NOT NULL;
+     ALTER TABLE users ALTER COLUMN role SET DEFAULT 'group_member';
+     ALTER TABLE users ADD CONSTRAINT users_role_check
+         CHECK (role IN ('super_admin','group_leader','group_member'));
+     ALTER TABLE users ADD CONSTRAINT users_role_group_invariant CHECK (
+         (role = 'super_admin'  AND group_id IS NULL) OR
+         (role = 'group_leader' AND group_id IS NOT NULL) OR
+         (role = 'group_member' AND group_id IS NOT NULL)
+     );
+     ALTER TABLE users ADD CONSTRAINT users_display_name_length_check
+         CHECK (display_name IS NULL OR char_length(display_name) BETWEEN 1 AND 100);
+     ```
+  7. Удалить старую колонку и старый индекс:
+     ```sql
+     DROP INDEX IF EXISTS users_is_admin_idx;
+     ALTER TABLE users DROP COLUMN is_admin;
+     ```
+  8. Создать новые индексы:
+     ```sql
+     CREATE INDEX users_role_super_admin_idx ON users(role) WHERE role = 'super_admin';
+     CREATE INDEX users_group_id_idx ON users(group_id) WHERE group_id IS NOT NULL;
+     ```
+  9. Создать функцию + констрейнт-триггер `users_group_leader_consistency_check` (DEFERRABLE INITIALLY DEFERRED) — DDL целиком в ADR-0019 §6.
+  10. `ALTER TABLE mail_accounts ADD COLUMN display_name TEXT NULL`. Добавить CHECK `display_name IS NULL OR char_length(display_name) BETWEEN 1 AND 100`.
+
+  **Запуск миграции и совместимость с existing-данными:**
+  - Существующий super-admin (созданный seed'ом, `is_admin=true`) → `role='super_admin'`, `group_id=NULL`. Инвариант выполняется.
+  - Существующие обычные пользователи → `role='group_member'`. Но `group_id IS NULL` → нарушает инвариант `users_role_group_invariant`!
+  - **Решение для миграции** (важный edge case): если на момент миграции есть users с `is_admin=false` — миграция должна их обработать. Стратегия: `users_role_group_invariant` создаётся **NOT VALID** изначально, а `VALIDATE CONSTRAINT` выполняется отдельно после того, как **post-migration init-step** или сам super-admin вручную распределит существующих non-admin users по группам через UI.
+    ```sql
+    ALTER TABLE users ADD CONSTRAINT users_role_group_invariant CHECK (...) NOT VALID;
+    ```
+  - Альтернатива (проще, рекомендуемая для production deploy): на момент применения миграции в системе **есть только super-admin** (другие пользователи ещё не созданы или их < 5). Backend deploy script делает: «сначала миграция, затем super-admin создаёт группы и распределяет всех пользователей вручную через `/admin/groups` UI». Если есть legacy non-admin users — devops инструктируется (см. `07-deployment.md` release-notes этого спринта): создать дефолтную группу «Legacy» с лидером=super_admin (но super_admin не может быть лидером по инварианту — берётся первый non-admin user-кандидат или специально созданный технический user) и переназначить всех. Простейшая стратегия — на старте проекта (≤5 users все известны) — выполняется ручная одноразовая операция в Sprint deploy.
+  - Рекомендуем NOT VALID-вариант как defense, плюс post-deploy ручной шаг распределения. Backend в любом случае при попытке UPDATE/INSERT users проверит инвариант (CHECK не NOT VALID после `VALIDATE CONSTRAINT`).

@@ -1,11 +1,29 @@
-"""Pydantic schemas for the mail-accounts module."""
+"""Pydantic schemas for the mail-accounts module.
+
+Post-ADR-0019/ADR-0020:
+
+- ``display_name`` is an optional 1..100-character label for the account.
+- ``target_user_id`` controls the owner of a newly-created account
+  (super_admin can create on any user; group_leader on any group member;
+  group_member only on themselves — see ADR-0019 §8).
+- The output DTO embeds ``owner`` (id, username, display_name) so the
+  caller can render "whose mailbox is this" without an extra request.
+"""
 
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Annotated
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+
+class OwnerBriefDTO(BaseModel):
+    """Mailbox owner brief — used in account list / message rows."""
+
+    id: int
+    username: str
+    display_name: str | None = None
 
 
 class MailAccountTestRequest(BaseModel):
@@ -27,16 +45,8 @@ class MailAccountTestRequest(BaseModel):
     def _ssl_xor_starttls(self) -> MailAccountTestRequest:
         if self.smtp_ssl and self.smtp_starttls:
             raise ValueError("smtp_ssl and smtp_starttls are mutually exclusive")
-        # Sanity: deliberately narrow check (not full RFC 5322). Using
-        # ``EmailStr`` would pull in ``email-validator`` as a hard dependency
-        # which is not currently in ``pyproject.toml``; the IMAP/SMTP server
-        # performs the authoritative validation when the credentials are
-        # tested. We still reject obviously-broken addresses here so we fail
-        # before reaching the network round-trip.
         if "@" not in self.email or "." not in self.email.split("@", 1)[1]:
             raise ValueError("email is not a valid address")
-        # Reject empty local-part / domain-part / trailing dot patterns that
-        # the lightweight check above misses (e.g. ``a@.com``, ``@host.com``).
         local, _, domain = self.email.partition("@")
         if not local or domain.startswith(".") or domain.endswith(".") or ".." in domain:
             raise ValueError("email is not a valid address")
@@ -44,7 +54,19 @@ class MailAccountTestRequest(BaseModel):
 
 
 class MailAccountCreateRequest(MailAccountTestRequest):
-    """``POST /api/mail-accounts`` — same shape as test."""
+    """``POST /api/mail-accounts`` — same shape as test, plus optional
+    ``display_name`` (ADR-0020) and ``target_user_id`` (ADR-0019 §8)."""
+
+    display_name: str | None = Field(default=None, max_length=100)
+    target_user_id: int | None = Field(default=None, ge=1)
+
+    @field_validator("display_name")
+    @classmethod
+    def _trim_dn(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        s = v.strip()
+        return s or None
 
 
 class MailAccountUpdateRequest(BaseModel):
@@ -52,6 +74,10 @@ class MailAccountUpdateRequest(BaseModel):
 
     email: str | None = Field(default=None, max_length=254)
     password: str | None = Field(default=None, max_length=256)
+    display_name: str | None = Field(default=None, max_length=100)
+    # Sentinel for "explicitly clear display_name to NULL" (form-encoded
+    # empty value triggers this).
+    clear_display_name: bool = False
     imap_host: str | None = Field(default=None, max_length=253)
     imap_port: int | None = Field(default=None, ge=1, le=65535)
     imap_ssl: bool | None = None
@@ -62,12 +88,23 @@ class MailAccountUpdateRequest(BaseModel):
     smtp_username: str | None = Field(default=None, max_length=254)
     smtp_password: str | None = Field(default=None, max_length=256)
 
+    @field_validator("display_name")
+    @classmethod
+    def _trim_dn(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        s = v.strip()
+        return s or None
+
 
 class MailAccountDTO(BaseModel):
     """Public (non-secret) representation of a mail account."""
 
     id: int
+    user_id: int
+    owner: OwnerBriefDTO
     email: str
+    display_name: str | None = None
     imap_host: str
     imap_port: int
     imap_ssl: bool

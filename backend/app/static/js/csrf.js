@@ -99,14 +99,14 @@
     if (data && data.error && typeof data.error === 'object') {
       return {
         code: data.error.code || 'unknown_error',
-        message: data.error.message || 'Request failed.',
+        message: data.error.message || 'Запрос не выполнен.',
         field: data.error.field || null,
         details: data.error.details || null,
       };
     }
     return {
       code: 'http_' + response.status,
-      message: 'Request failed (HTTP ' + response.status + ').',
+      message: 'Запрос не выполнен (HTTP ' + response.status + ').',
       field: null,
       details: null,
     };

@@ -2,7 +2,7 @@
 
 - ``GET /healthz`` — liveness, no deps.
 - ``GET /readyz``  — readiness, checks Postgres + Redis + MinIO.
-- ``GET /api/me``  — current user summary.
+- ``GET /api/me``  — current user summary (post-ADR-0019: role + group).
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
 from backend.app.deps import CurrentUser, DbSession
+from backend.app.repositories.groups import GroupsRepo
 from backend.app.repositories.mail_accounts import MailAccountsRepo
 from shared.logging import get_logger
 from shared.redis_client import get_redis
@@ -71,10 +72,17 @@ async def readyz(db: DbSession) -> Response:
 @router.get("/api/me")
 async def me(db: DbSession, user: CurrentUser) -> dict[str, object]:
     accounts = await MailAccountsRepo(db).list_for_user(user.id)
+    group_brief: dict[str, object] | None = None
+    if user.group_id is not None:
+        group = await GroupsRepo(db).get_by_id(user.group_id)
+        if group is not None:
+            group_brief = {"id": group.id, "name": group.name}
     return {
         "id": user.id,
         "username": user.username,
-        "is_admin": user.is_admin,
+        "display_name": user.display_name,
+        "role": user.role,
+        "group": group_brief,
         "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None,
         "mail_accounts_count": len(accounts),
     }

@@ -140,6 +140,7 @@ _OVERRIDE_EXACT_PATHS: frozenset[str] = frozenset(
         "/api/messages/send",
         "/api/mail-accounts",
         "/api/admin/users",
+        "/api/admin/groups",  # ADR-0019: group create
         "/api/tags",
     }
 )
@@ -147,8 +148,12 @@ _OVERRIDE_REGEX_PATHS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^/api/mail-accounts/\d+$"),  # PATCH (override)
     re.compile(r"^/api/mail-accounts/\d+/delete$"),  # DELETE sibling
     re.compile(r"^/api/mail-accounts/\d+/sync-now$"),
+    re.compile(r"^/api/admin/users/\d+$"),  # PATCH (override)
     re.compile(r"^/api/admin/users/\d+/reset$"),
     re.compile(r"^/api/admin/users/\d+/delete$"),  # DELETE sibling
+    # Groups (ADR-0019)
+    re.compile(r"^/api/admin/groups/\d+$"),  # PATCH (override)
+    re.compile(r"^/api/admin/groups/\d+/delete$"),  # DELETE sibling
     # Tags (ADR-0017)
     re.compile(r"^/api/tags/\d+$"),  # PATCH (override)
     re.compile(r"^/api/tags/\d+/delete$"),  # DELETE sibling

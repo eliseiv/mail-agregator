@@ -52,8 +52,21 @@ def _now_iso() -> str:
 
 @dataclass(slots=True)
 class SessionData:
+    """Cookie-session payload (Redis ``session:{token}`` JSON).
+
+    Per ADR-0019 §10, ``role`` is the new three-valued enum
+    (``super_admin`` / ``group_leader`` / ``group_member``) and
+    ``group_id`` is the user's group (``None`` only for ``super_admin``).
+    The legacy ``"admin"`` / ``"user"`` strings used before ADR-0019 are
+    accepted on read for forward-compat with sessions created right
+    before the migration; ``from_json`` upgrades them silently to the
+    new vocabulary so a logged-in user does not get force-logged-out
+    by the deploy. New sessions always serialise the new role.
+    """
+
     user_id: int
-    role: str  # "admin" | "user"
+    role: str  # "super_admin" | "group_leader" | "group_member"
+    group_id: int | None
     csrf_token: str
     ip: str
     ua_hash: str
@@ -63,10 +76,25 @@ class SessionData:
     @classmethod
     def from_json(cls, raw: str) -> SessionData:
         d = json.loads(raw)
+        # Legacy upgrade: pre-ADR-0019 sessions had no ``group_id`` and
+        # used ``"admin"``/``"user"`` as the role. Map them so existing
+        # cookies survive the deploy. Once all users have re-logged-in
+        # this branch is dead code; safe to leave for the next release
+        # cycle, then drop.
+        legacy_role = d.get("role")
+        if legacy_role == "admin":
+            d["role"] = "super_admin"
+        elif legacy_role == "user":
+            d["role"] = "group_member"
+        d.setdefault("group_id", None)
         return cls(**d)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), separators=(",", ":"))
+
+    @property
+    def is_super_admin(self) -> bool:
+        return self.role == "super_admin"
 
 
 @dataclass(slots=True)
@@ -94,16 +122,35 @@ class SessionStore:
         self._ttl = s.SESSION_TTL_SECONDS
         self._abs_ttl = s.SESSION_ABSOLUTE_TTL_SECONDS
 
-    async def create(self, user_id: int, role: str, ip: str, ua: str | None) -> tuple[str, str]:
-        """Create a new session. Returns ``(session_token, csrf_token)``."""
-        if role not in {"admin", "user"}:
+    async def create(
+        self,
+        user_id: int,
+        role: str,
+        group_id: int | None,
+        ip: str,
+        ua: str | None,
+    ) -> tuple[str, str]:
+        """Create a new session. Returns ``(session_token, csrf_token)``.
+
+        Per ADR-0019 §10 the session payload now carries the three-valued
+        ``role`` plus ``group_id`` so :class:`backend.app.deps.VisibilityScope`
+        can be built without an extra DB lookup on every request.
+        """
+        if role not in {"super_admin", "group_leader", "group_member"}:
             raise ValueError(f"invalid role: {role!r}")
+        # Invariant mirror (ADR-0019 §6 / 03-data-model.md): super_admin has
+        # no group; non-admins must have one.
+        if role == "super_admin" and group_id is not None:
+            raise ValueError("super_admin must not have a group_id")
+        if role != "super_admin" and group_id is None:
+            raise ValueError(f"role={role!r} requires a non-null group_id")
         token = _new_token()
         csrf = _new_token()
         now = _now_iso()
         data = SessionData(
             user_id=user_id,
             role=role,
+            group_id=group_id,
             csrf_token=csrf,
             ip=ip or "",
             ua_hash=_ua_hash(ua),

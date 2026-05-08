@@ -59,16 +59,16 @@
           }
         );
         if (resp.status === 204 || resp.ok) {
-          window.MAS.flash('Marked as unread.', 'success');
+          window.MAS.flash('Помечено как непрочитанное.', 'success');
           // Send the user back to inbox so they immediately see the indicator update.
           window.setTimeout(function () { window.location.href = '/'; }, 400);
           return;
         }
         const err = await window.MAS.readJsonError(resp);
-        window.MAS.flash(err.message || 'Could not mark as unread.', 'error');
+        window.MAS.flash(err.message || 'Не удалось пометить как непрочитанное.', 'error');
         markUnreadBtn.disabled = false;
       } catch (_e) {
-        window.MAS.flash('Network error. Please try again.', 'error');
+        window.MAS.flash('Сетевая ошибка. Попробуйте ещё раз.', 'error');
         markUnreadBtn.disabled = false;
       }
     });

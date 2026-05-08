@@ -1,32 +1,36 @@
 {% extends "base.html" %}
 {% import "_macros.html" as m with context %}
 
-{% block title %}Mail accounts &middot; Mail Aggregator{% endblock %}
+{% block title %}Email-аккаунты &middot; Mail Aggregator{% endblock %}
 {% block body_class %}accounts-list{% endblock %}
 
 {% block content %}
 <section class="accounts" aria-labelledby="accounts-heading">
   <header class="accounts__toolbar">
-    <h1 id="accounts-heading" class="accounts__title">Your mail accounts</h1>
-    <a class="btn btn--primary" href="/accounts/new">+ Add account</a>
+    <h1 id="accounts-heading" class="accounts__title">Email-аккаунты</h1>
+    <a class="btn btn--primary" href="/accounts/new">+ Добавить аккаунт</a>
   </header>
 
   {% if not accounts %}
     <div class="accounts__empty" role="status">
-      <p>No mail accounts yet. Add one to start receiving mail.</p>
-      <a href="/accounts/new" class="btn btn--primary">Add account</a>
+      <p>Email-аккаунтов пока нет. Добавьте первый, чтобы начать получать почту.</p>
+      <a href="/accounts/new" class="btn btn--primary">Добавить аккаунт</a>
     </div>
   {% else %}
     <ul class="account-list">
       {% for acc in accounts %}
+        {% set _label = acc.display_name if (acc.display_name is defined and acc.display_name) else acc.email %}
+        {% set _has_nick = acc.display_name is defined and acc.display_name and acc.display_name != acc.email %}
         <li class="account-list__item {% if not acc.is_active %}account-list__item--disabled{% endif %}">
           <div class="account-list__row">
             <span class="account-list__indicator" aria-hidden="true">
               {% if acc.is_active %}&#9679;{% else %}&#10006;{% endif %}
             </span>
-            <span class="visually-hidden">{% if acc.is_active %}Active{% else %}Disabled{% endif %}</span>
+            <span class="visually-hidden">{% if acc.is_active %}Активен{% else %}Отключён{% endif %}</span>
 
-            <span class="account-list__email">{{ acc.email | e }}</span>
+            {# Главный заголовок строки = display_name → email. Если есть никнейм,
+               под ним мелким шрифтом показываем full email. #}
+            <span class="account-list__email">{{ _label | e }}</span>
 
             {% if acc.provider_label %}
               <span class="account-list__provider">{{ acc.provider_label | e }}</span>
@@ -34,14 +38,14 @@
 
             <span class="account-list__sync">
               {% if acc.last_synced_at %}
-                Last sync: {{ m.time_tag(acc.last_synced_at, acc.last_synced_at_human if acc.last_synced_at_human is defined else None) }}
+                Синхронизация: {{ m.time_tag(acc.last_synced_at, acc.last_synced_at_human if acc.last_synced_at_human is defined else None) }}
               {% else %}
-                Never synced
+                Ни разу не синхронизировано
               {% endif %}
             </span>
 
             <span class="account-list__actions">
-              <a class="btn btn--secondary btn--small" href="/accounts/{{ acc.id }}/edit">Edit</a>
+              <a class="btn btn--secondary btn--small" href="/accounts/{{ acc.id }}/edit">Изменить</a>
 
               <form
                 method="POST"
@@ -49,7 +53,7 @@
                 class="inline-form"
                 data-account-sync-form>
                 {{ m.csrf_input() }}
-                <button type="submit" class="btn btn--secondary btn--small">Sync now</button>
+                <button type="submit" class="btn btn--secondary btn--small">Синхр. сейчас</button>
               </form>
 
               <form
@@ -57,20 +61,27 @@
                 action="/api/mail-accounts/{{ acc.id }}/delete"
                 class="inline-form"
                 data-account-delete-form
-                data-confirm="Delete account {{ acc.email | e }}? All cached messages will be removed.">
+                data-confirm="Удалить аккаунт {{ acc.email | e }}? Все кешированные письма будут удалены.">
                 {{ m.csrf_input() }}
                 {# Backend exposes DELETE /api/mail-accounts/{id} for AJAX (account_form.js intercepts).
                    For no-JS fallback this POST endpoint should accept a method-override; if the
                    backend prefers the canonical DELETE, the JS handler still wins for users with JS. #}
                 <input type="hidden" name="_method" value="DELETE">
-                <button type="submit" class="btn btn--danger btn--small">Delete</button>
+                <button type="submit" class="btn btn--danger btn--small">Удалить</button>
               </form>
             </span>
           </div>
 
+          {% if _has_nick %}
+            <p class="account-list__email-secondary">
+              <span class="visually-hidden">Email:</span>
+              <code>{{ acc.email | e }}</code>
+            </p>
+          {% endif %}
+
           {% if acc.last_sync_error %}
             <p class="account-list__error" role="alert">
-              <strong>Sync error:</strong> {{ acc.last_sync_error | e }}
+              <strong>Ошибка синхронизации:</strong> {{ acc.last_sync_error | e }}
             </p>
           {% endif %}
         </li>

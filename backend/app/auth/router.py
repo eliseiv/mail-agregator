@@ -582,7 +582,7 @@ async def logout(request: Request, db: DbSession) -> Response:
         await svc.logout(
             session_token=token,
             actor_user_id=sess.user_id,
-            is_admin=(sess.role == "admin"),
+            is_admin=(sess.role == "super_admin"),
             ip=ip,
             user_agent=ua,
         )

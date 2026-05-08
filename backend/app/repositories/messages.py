@@ -32,6 +32,28 @@ class MessagesRepo:
         )
         return (await self._s.execute(stmt)).scalar_one_or_none()
 
+    async def get_for_user_ids(
+        self,
+        *,
+        message_id: int,
+        user_ids: list[int] | None,
+    ) -> Message | None:
+        """Visibility-aware get.
+
+        ``user_ids=None`` = "no scope filter" (super-admin path).
+        ``user_ids=[]`` = "no users visible" — returns ``None``.
+        """
+        if user_ids is None:
+            return await self._s.get(Message, message_id)
+        if not user_ids:
+            return None
+        stmt = (
+            select(Message)
+            .join(MailAccount, MailAccount.id == Message.mail_account_id)
+            .where(Message.id == message_id, MailAccount.user_id.in_(user_ids))
+        )
+        return (await self._s.execute(stmt)).scalar_one_or_none()
+
     async def list_for_user(
         self,
         *,
@@ -43,14 +65,10 @@ class MessagesRepo:
         cursor_id: int | None,
         limit: int,
     ) -> list[tuple[Message, str]]:
-        """List messages with their owning mail account email.
+        """Single-user list (legacy path retained for tags-tagging logic).
 
-        Returns ``[(Message, mail_account_email), ...]`` ordered by
-        ``(internal_date DESC, id DESC)``.
-
-        ``tag_id`` (ADR-0017) — when set, restricts results to messages
-        linked to that tag. Caller is responsible for verifying the tag
-        belongs to ``user_id`` (404 mismatch leaks otherwise).
+        See :meth:`list_for_user_ids` for the visibility-aware version
+        used by ``GET /api/messages``.
         """
         stmt = (
             select(Message, MailAccount.email)
@@ -85,6 +103,71 @@ class MessagesRepo:
         stmt = stmt.order_by(Message.internal_date.desc(), Message.id.desc()).limit(limit)
         rows = (await self._s.execute(stmt)).all()
         return [(row[0], row[1]) for row in rows]
+
+    async def list_for_user_ids(
+        self,
+        *,
+        user_ids: list[int] | None,
+        account_id: int | None,
+        tag_id: int | None = None,
+        unread: bool | None,
+        cursor_internal_date: datetime | None,
+        cursor_id: int | None,
+        limit: int,
+    ) -> list[tuple[Message, MailAccount]]:
+        """Visibility-aware listing.
+
+        ``user_ids=None`` = no filter (super-admin); ``user_ids=[]`` =
+        empty result. Returns ``[(Message, MailAccount)]`` so the caller
+        can build the per-row ``mail_account_display_name`` and ``owner``
+        without an extra round-trip.
+        """
+        stmt = select(Message, MailAccount).join(
+            MailAccount, MailAccount.id == Message.mail_account_id
+        )
+        if user_ids is not None:
+            if not user_ids:
+                return []
+            stmt = stmt.where(MailAccount.user_id.in_(user_ids))
+        if account_id is not None:
+            stmt = stmt.where(Message.mail_account_id == account_id)
+        if tag_id is not None:
+            stmt = stmt.join(
+                MessageTag,
+                and_(
+                    MessageTag.message_id == Message.id,
+                    MessageTag.tag_id == tag_id,
+                ),
+            )
+        if unread is True:
+            stmt = stmt.where(Message.is_read.is_(False))
+        elif unread is False:
+            stmt = stmt.where(Message.is_read.is_(True))
+        if cursor_internal_date is not None and cursor_id is not None:
+            stmt = stmt.where(
+                or_(
+                    Message.internal_date < cursor_internal_date,
+                    and_(
+                        Message.internal_date == cursor_internal_date,
+                        Message.id < cursor_id,
+                    ),
+                )
+            )
+        stmt = stmt.order_by(Message.internal_date.desc(), Message.id.desc()).limit(limit)
+        rows = (await self._s.execute(stmt)).all()
+        return [(row[0], row[1]) for row in rows]
+
+    async def count_unread_for_user_ids(self, user_ids: list[int] | None) -> int:
+        stmt = (
+            select(func.count(Message.id))
+            .join(MailAccount, MailAccount.id == Message.mail_account_id)
+            .where(Message.is_read.is_(False))
+        )
+        if user_ids is not None:
+            if not user_ids:
+                return 0
+            stmt = stmt.where(MailAccount.user_id.in_(user_ids))
+        return int((await self._s.execute(stmt)).scalar_one())
 
     async def is_tag_owned(self, *, tag_id: int, user_id: int) -> bool:
         """Return True iff the tag exists and belongs to ``user_id``.
@@ -135,6 +218,42 @@ class MessagesRepo:
                 Attachment.id == attachment_id,
                 Attachment.message_id == message_id,
                 MailAccount.user_id == user_id,
+            )
+        )
+        return (await self._s.execute(stmt)).scalar_one_or_none()
+
+    async def get_attachment_for_user_ids(
+        self,
+        *,
+        attachment_id: int,
+        message_id: int,
+        user_ids: list[int] | None,
+    ) -> Attachment | None:
+        """Visibility-aware get for ``GET /api/messages/{id}/attachments/{aid}``.
+
+        ``user_ids=None`` = super-admin (no filter); ``user_ids=[]`` =
+        empty result.
+        """
+        if user_ids is None:
+            stmt = (
+                select(Attachment)
+                .join(Message, Message.id == Attachment.message_id)
+                .where(
+                    Attachment.id == attachment_id,
+                    Attachment.message_id == message_id,
+                )
+            )
+            return (await self._s.execute(stmt)).scalar_one_or_none()
+        if not user_ids:
+            return None
+        stmt = (
+            select(Attachment)
+            .join(Message, Message.id == Attachment.message_id)
+            .join(MailAccount, MailAccount.id == Message.mail_account_id)
+            .where(
+                Attachment.id == attachment_id,
+                Attachment.message_id == message_id,
+                MailAccount.user_id.in_(user_ids),
             )
         )
         return (await self._s.execute(stmt)).scalar_one_or_none()

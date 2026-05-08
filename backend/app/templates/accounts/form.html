@@ -1,17 +1,17 @@
 {% extends "base.html" %}
 {% import "_macros.html" as m with context %}
 
-{% block title %}{% if account %}Edit account{% else %}Add mail account{% endif %} &middot; Mail Aggregator{% endblock %}
+{% block title %}{% if account %}Изменить аккаунт{% else %}Добавить email-аккаунт{% endif %} &middot; Mail Aggregator{% endblock %}
 {% block body_class %}accounts-form{% endblock %}
 
 {% block content %}
 <section class="accounts" aria-labelledby="acc-form-heading">
-  <nav class="accounts__nav" aria-label="Account navigation">
-    <a class="btn btn--secondary" href="/accounts">&larr; Accounts</a>
+  <nav class="accounts__nav" aria-label="Навигация по аккаунтам">
+    <a class="btn btn--secondary" href="/accounts">&larr; К аккаунтам</a>
   </nav>
 
   <h1 id="acc-form-heading" class="accounts__title">
-    {% if account %}Edit mail account{% else %}Add mail account{% endif %}
+    {% if account %}Изменить email-аккаунт{% else %}Добавить email-аккаунт{% endif %}
   </h1>
 
   {% if not account %}
@@ -27,28 +27,28 @@
       </p>
 
       <details class="help-provider">
-        <summary>📧 Gmail (<code>@gmail.com</code>)</summary>
+        <summary>Gmail (<code>@gmail.com</code>)</summary>
         <ol>
           <li>Включи 2FA: <a href="https://myaccount.google.com/security" target="_blank" rel="noopener noreferrer">myaccount.google.com/security</a> → «2-Step Verification» → On.</li>
-          <li>Включи IMAP: открой <a href="https://mail.google.com" target="_blank" rel="noopener noreferrer">Gmail</a> → ⚙️ → «See all settings» → вкладка «Forwarding and POP/IMAP» → «Enable IMAP» → «Save Changes».</li>
+          <li>Включи IMAP: открой <a href="https://mail.google.com" target="_blank" rel="noopener noreferrer">Gmail</a> → «See all settings» → вкладка «Forwarding and POP/IMAP» → «Enable IMAP» → «Save Changes».</li>
           <li>Создай app password: <a href="https://myaccount.google.com/apppasswords" target="_blank" rel="noopener noreferrer">myaccount.google.com/apppasswords</a> → введи название → «Create» → скопируй 16-символьный пароль <em>(показывается один раз)</em>.</li>
-          <li>В форме: email <code>you@gmail.com</code>, password — этот 16-символьный <em>(без пробелов)</em>. Хосты подставятся: <code>imap.gmail.com:993 SSL</code>, <code>smtp.gmail.com:465 SSL</code>.</li>
+          <li>В форме: email <code>you@gmail.com</code>, пароль — этот 16-символьный <em>(без пробелов)</em>. Хосты подставятся: <code>imap.gmail.com:993 SSL</code>, <code>smtp.gmail.com:465 SSL</code>.</li>
         </ol>
-        <p class="help-warning">⚠️ Корпоративный Workspace Gmail: app passwords часто отключены администратором домена. Тогда сервис не сможет подключиться (OAuth не поддерживается).</p>
+        <p class="help-warning">Корпоративный Workspace Gmail: app passwords часто отключены администратором домена. Тогда сервис не сможет подключиться (OAuth не поддерживается).</p>
       </details>
 
       <details class="help-provider">
-        <summary>📧 Яндекс (<code>@yandex.ru</code>, <code>@yandex.com</code>, <code>@ya.ru</code>)</summary>
+        <summary>Яндекс (<code>@yandex.ru</code>, <code>@yandex.com</code>, <code>@ya.ru</code>)</summary>
         <ol>
           <li>Включи 2FA: <a href="https://id.yandex.ru/security" target="_blank" rel="noopener noreferrer">id.yandex.ru/security</a> → «Двухфакторная аутентификация».</li>
-          <li>Включи IMAP в почте: <a href="https://mail.yandex.ru" target="_blank" rel="noopener noreferrer">mail.yandex.ru</a> → ⚙️ → «Все настройки» → раздел «Почтовые программы» → ✅ «С сервера imap.yandex.ru по протоколу IMAP» → «Сохранить изменения».</li>
+          <li>Включи IMAP в почте: <a href="https://mail.yandex.ru" target="_blank" rel="noopener noreferrer">mail.yandex.ru</a> → «Все настройки» → раздел «Почтовые программы» → «С сервера imap.yandex.ru по протоколу IMAP» → «Сохранить изменения».</li>
           <li>Создай пароль приложения: на той же странице безопасности секция «Пароли приложений» → «Создать новый пароль» → выбери «Почта».</li>
           <li>В форме: email + сгенерированный пароль. Подставятся <code>imap.yandex.ru:993 SSL</code>, <code>smtp.yandex.ru:465 SSL</code>.</li>
         </ol>
       </details>
 
       <details class="help-provider">
-        <summary>📧 Mail.ru и семейство (<code>@mail.ru</code>, <code>@inbox.ru</code>, <code>@bk.ru</code>, <code>@list.ru</code>)</summary>
+        <summary>Mail.ru и семейство (<code>@mail.ru</code>, <code>@inbox.ru</code>, <code>@bk.ru</code>, <code>@list.ru</code>)</summary>
         <ol>
           <li>Включи 2FA: <a href="https://account.mail.ru/user/2-step-auth/" target="_blank" rel="noopener noreferrer">account.mail.ru/user/2-step-auth</a> → «Включить».</li>
           <li>Создай пароль для внешнего приложения: <a href="https://account.mail.ru/user/2-step-auth/passwords" target="_blank" rel="noopener noreferrer">account.mail.ru/user/2-step-auth/passwords</a> → «Добавить» → имя любое → подтверди текущим паролем → скопируй.</li>
@@ -58,26 +58,26 @@
       </details>
 
       <details class="help-provider">
-        <summary>📧 Outlook / Hotmail / Live (<code>@outlook.com</code>, <code>@hotmail.com</code>, <code>@live.com</code>)</summary>
+        <summary>Outlook / Hotmail / Live (<code>@outlook.com</code>, <code>@hotmail.com</code>, <code>@live.com</code>)</summary>
         <ol>
           <li>Включи 2FA: <a href="https://account.live.com/proofs/Manage/additional" target="_blank" rel="noopener noreferrer">account.live.com/proofs/Manage</a> → «Two-step verification».</li>
           <li>Создай app password: <a href="https://account.live.com/proofs/AppPassword" target="_blank" rel="noopener noreferrer">account.live.com/proofs/AppPassword</a> → «Create a new app password».</li>
           <li>В форме: email + app password. Подставятся <code>outlook.office365.com:993 SSL</code>, <code>smtp.office365.com:587 STARTTLS</code> (важно — <strong>не SSL</strong>, а STARTTLS).</li>
         </ol>
-        <p class="help-warning">⚠️ Корпоративный Office 365 (рабочий ящик через свой домен): app passwords часто запрещены — не подключится.</p>
+        <p class="help-warning">Корпоративный Office 365 (рабочий ящик через свой домен): app passwords часто запрещены — не подключится.</p>
       </details>
 
       <details class="help-provider">
-        <summary>📧 Apple iCloud (<code>@icloud.com</code>, <code>@me.com</code>, <code>@mac.com</code>)</summary>
+        <summary>Apple iCloud (<code>@icloud.com</code>, <code>@me.com</code>, <code>@mac.com</code>)</summary>
         <ol>
           <li>Включи 2FA для Apple ID: <a href="https://appleid.apple.com" target="_blank" rel="noopener noreferrer">appleid.apple.com</a> → «Sign-In and Security» → 2FA.</li>
           <li>Создай app-specific password: там же → «App-Specific Passwords» → «Generate Password» → метка любая → скопируй (формат <code>xxxx-xxxx-xxxx-xxxx</code> с дефисами).</li>
-          <li>В форме параметры введи руками: <code>imap.mail.me.com:993 SSL</code>, <code>smtp.mail.me.com:587 STARTTLS</code>. В разделе «Use separate SMTP credentials» укажи свой email как «SMTP username» (для iCloud это обязательно).</li>
+          <li>В форме параметры введи руками: <code>imap.mail.me.com:993 SSL</code>, <code>smtp.mail.me.com:587 STARTTLS</code>. В разделе «Использовать отдельные SMTP-учётные данные» укажи свой email как «SMTP-логин» (для iCloud это обязательно).</li>
         </ol>
       </details>
 
       <details class="help-provider">
-        <summary>📧 Yahoo Mail (<code>@yahoo.com</code>, <code>@yahoo.ru</code>, <code>@ymail.com</code>)</summary>
+        <summary>Yahoo Mail (<code>@yahoo.com</code>, <code>@yahoo.ru</code>, <code>@ymail.com</code>)</summary>
         <ol>
           <li>Включи 2FA + создай app password: <a href="https://login.yahoo.com/account/security" target="_blank" rel="noopener noreferrer">login.yahoo.com/account/security</a> → «Two-step verification» → затем «Generate and manage app passwords» → «Generate».</li>
           <li>В форме руками: <code>imap.mail.yahoo.com:993 SSL</code>, <code>smtp.mail.yahoo.com:465 SSL</code>.</li>
@@ -85,7 +85,7 @@
       </details>
 
       <details class="help-provider">
-        <summary>🔧 Другой провайдер / свой mail-сервер</summary>
+        <summary>Другой провайдер / свой mail-сервер</summary>
         <p>
           Auto-suggest не подскажет — найди настройки на сайте провайдера
           (раздел «IMAP settings» / «настройка почтовой программы»). Чаще всего:
@@ -93,20 +93,20 @@
         <ul>
           <li>IMAP: <code>imap.&lt;домен&gt;:993 SSL</code> (или <code>mail.&lt;домен&gt;</code>)</li>
           <li>SMTP: <code>smtp.&lt;домен&gt;:465 SSL</code> либо <code>587 STARTTLS</code></li>
-          <li>Логин — обычно полный email; в редких случаях нужен отдельный SMTP username — раздел «Use separate SMTP credentials» ниже.</li>
+          <li>Логин — обычно полный email; в редких случаях нужен отдельный SMTP-логин — раздел «Использовать отдельные SMTP-учётные данные» ниже.</li>
         </ul>
-        <p class="help-warning">⚠️ ProtonMail без платной подписки не работает: IMAP/SMTP открывается только через локальный ProtonMail Bridge, до которого Docker-контейнер не дотянется.</p>
+        <p class="help-warning">ProtonMail без платной подписки не работает: IMAP/SMTP открывается только через локальный ProtonMail Bridge, до которого Docker-контейнер не дотянется.</p>
       </details>
 
       <details class="help-provider">
-        <summary>❓ Что делать если «Test connection» падает</summary>
+        <summary>Что делать если «Проверить соединение» не работает</summary>
         <ul>
           <li><code>Application-specific password required</code> (Gmail) — используешь обычный пароль, нужен app password.</li>
           <li><code>imap_login_failed</code> / <code>Invalid credentials</code> — пароль неверный, либо нужен app password.</li>
           <li><code>imap_connect_error</code> / <code>smtp_connect_error</code> — host/port/SSL не те. Сверь по таблице выше.</li>
           <li><code>invalid_host</code> — ввёл <code>localhost</code> или приватный IP, сервис их блокирует (защита от SSRF).</li>
           <li><code>Web login required</code> — провайдер требует первый раз войти в браузере (подтвердить «это вы»), затем повторить.</li>
-          <li>Тест проходит для IMAP, но падает для SMTP — попробуй раздел «Use separate SMTP credentials» и укажи свой email как SMTP username.</li>
+          <li>Тест проходит для IMAP, но падает для SMTP — попробуй раздел «Использовать отдельные SMTP-учётные данные» и укажи свой email как SMTP-логин.</li>
         </ul>
       </details>
     </div>
@@ -146,10 +146,28 @@
         data-account-email>
     </div>
 
+    {# Display name (никнейм почты, ADR-0020). Опционально, max 100, после trim
+       пустая строка → null. Если задан — отображается вместо email везде в UI. #}
+    <div class="field">
+      <label class="field__label" for="acc-display-name">
+        Никнейм почты <span class="field__optional">(необязательно)</span>
+      </label>
+      <input
+        class="field__input"
+        type="text"
+        id="acc-display-name"
+        name="display_name"
+        maxlength="100"
+        autocomplete="off"
+        placeholder="Например: Apple Test 1"
+        value="{{ (account.display_name if account and account.display_name else (form.display_name if form is defined else '')) | default('') | e }}">
+      <p class="field__hint">Если задан — будет показываться вместо email-адреса в списках. До 100 символов.</p>
+    </div>
+
     <div class="field">
       <label class="field__label" for="acc-password">
-        Password
-        {% if account %}<span class="field__optional">(leave empty to keep current)</span>{% endif %}
+        Пароль
+        {% if account %}<span class="field__optional">(оставьте пустым, чтобы не менять)</span>{% endif %}
       </label>
       <input
         class="field__input"
@@ -167,7 +185,7 @@
 
       <div class="field-grid">
         <div class="field">
-          <label class="field__label" for="acc-imap-host">Host</label>
+          <label class="field__label" for="acc-imap-host">Хост</label>
           <input
             class="field__input"
             type="text"
@@ -180,7 +198,7 @@
         </div>
 
         <div class="field field--narrow">
-          <label class="field__label" for="acc-imap-port">Port</label>
+          <label class="field__label" for="acc-imap-port">Порт</label>
           <input
             class="field__input"
             type="number"
@@ -212,7 +230,7 @@
 
       <div class="field-grid">
         <div class="field">
-          <label class="field__label" for="acc-smtp-host">Host</label>
+          <label class="field__label" for="acc-smtp-host">Хост</label>
           <input
             class="field__input"
             type="text"
@@ -225,7 +243,7 @@
         </div>
 
         <div class="field field--narrow">
-          <label class="field__label" for="acc-smtp-port">Port</label>
+          <label class="field__label" for="acc-smtp-port">Порт</label>
           <input
             class="field__input"
             type="number"
@@ -264,10 +282,10 @@
       </div>
 
       <details class="form-section__details">
-        <summary>Use separate SMTP credentials</summary>
+        <summary>Использовать отдельные SMTP-учётные данные</summary>
         <div class="field-grid">
           <div class="field">
-            <label class="field__label" for="acc-smtp-username">SMTP username</label>
+            <label class="field__label" for="acc-smtp-username">SMTP-логин</label>
             <input
               class="field__input"
               type="text"
@@ -277,7 +295,7 @@
               value="{{ (account.smtp_username if account else (form.smtp_username if form is defined else '')) | default('') | e }}">
           </div>
           <div class="field">
-            <label class="field__label" for="acc-smtp-password">SMTP password</label>
+            <label class="field__label" for="acc-smtp-password">SMTP-пароль</label>
             <input
               class="field__input"
               type="password"
@@ -292,13 +310,13 @@
     </fieldset>
 
     <div class="form-actions">
-      <button type="button" class="btn btn--secondary" data-account-test>Test connection</button>
+      <button type="button" class="btn btn--secondary" data-account-test>Проверить соединение</button>
       <span class="account-test-result" data-account-test-result aria-live="polite"></span>
     </div>
 
     <div class="form-actions">
       <button type="submit" class="btn btn--primary" data-account-submit>
-        {% if account %}Save changes{% else %}Save{% endif %}
+        {% if account %}Сохранить изменения{% else %}Сохранить{% endif %}
       </button>
     </div>
   </form>

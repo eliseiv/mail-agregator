@@ -22,3 +22,6 @@
 | [ADR-0016](./ADR-0016-two-step-login.md) | Two-step login (username then password, ADR-style flow as Google) | accepted | 2026-05-06 |
 | [ADR-0017](./ADR-0017-tags.md) | Теги для писем — rule-based авто-классификация и пользовательские правила | accepted | 2026-05-07 |
 | [ADR-0018](./ADR-0018-telegram-launcher.md) | Telegram launcher bot + WebApp без линковки аккаунтов | accepted | 2026-05-07 |
+| [ADR-0019](./ADR-0019-groups-and-roles.md) | Роли пользователей и группы (super_admin / group_leader / group_member) с visibility-моделью | accepted | 2026-05-08 |
+| [ADR-0020](./ADR-0020-mail-account-nickname.md) | Никнейм (display_name) у mail-аккаунтов | accepted | 2026-05-08 |
+| [ADR-0021](./ADR-0021-russian-localization.md) | Полная RU-локализация UI без i18n-фреймворка | accepted | 2026-05-08 |

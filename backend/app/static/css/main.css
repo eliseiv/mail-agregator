@@ -1039,6 +1039,121 @@ a:hover { color: var(--color-primary-hover); text-decoration: underline; }
 .admin-user__notice { margin: 0; color: var(--color-text-muted); font-size: var(--font-size-sm); }
 .admin-user__actions { display: flex; gap: var(--space-2); margin-top: var(--space-3); flex-wrap: wrap; }
 
+/* Admin users table (replacing the old summary/details list, ADR-0019) */
+.admin-users-table,
+.admin-groups-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+.admin-users-table th,
+.admin-users-table td,
+.admin-groups-table th,
+.admin-groups-table td {
+  padding: var(--space-3) var(--space-4);
+  text-align: left;
+  border-bottom: 1px solid var(--color-border);
+  vertical-align: top;
+  font-size: var(--font-size-sm);
+}
+.admin-users-table thead th,
+.admin-groups-table thead th {
+  background: var(--color-bg-subtle);
+  color: var(--color-text-muted);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: var(--font-size-xs);
+}
+.admin-users-table tbody tr:last-child td,
+.admin-groups-table tbody tr:last-child td { border-bottom: none; }
+.admin-users-table tbody tr:hover,
+.admin-groups-table tbody tr:hover { background: var(--color-bg-subtle); }
+.admin-users-table__row--system { color: var(--color-text-muted); }
+.admin-users-table__name { font-weight: 600; }
+.admin-users-table__muted { color: var(--color-text-muted); font-size: var(--font-size-xs); }
+
+/* Inline expand block inside the actions cell. Provides reset/delete + the
+   nested mail-accounts list without taking a whole row when collapsed. */
+.admin-user-details > .admin-user-details__summary {
+  cursor: pointer;
+  color: var(--color-primary);
+  font-weight: 600;
+  list-style: none;
+  padding: 0 var(--space-2);
+  user-select: none;
+}
+.admin-user-details > .admin-user-details__summary::-webkit-details-marker { display: none; }
+.admin-user-details[open] > .admin-user-details__summary { color: var(--color-primary-hover); }
+.admin-user-details__body {
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px dashed var(--color-border);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+/* Role badge variants */
+.admin-user__badge--super_admin { background: var(--color-bg-subtle); color: var(--color-text-muted); }
+.admin-user__badge--group_leader { background: rgba(124, 58, 237, 0.12); color: #6d28d9; }
+.admin-user__badge--group_member { background: rgba(37, 99, 235, 0.12); color: var(--color-primary); }
+
+.admin-groups-table__name strong { font-weight: 600; }
+.admin__hint {
+  margin: 0 0 var(--space-4);
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+}
+.admin__nav { margin-bottom: var(--space-4); }
+
+/* Group meta panel on /admin/groups/{id}/edit. Reuses message__meta-row
+   layout styles (see "message" section). */
+.admin-group__meta {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: var(--space-1);
+  margin: 0 0 var(--space-5);
+  padding: var(--space-3) var(--space-4);
+  background: var(--color-bg-subtle);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+
+/* Account row: secondary email line below the main label when nickname is set
+   (ADR-0020). Lets users always see the underlying email. */
+.account-list__email-secondary {
+  margin: var(--space-1) 0 0;
+  padding-left: calc(var(--space-3) + 12px);
+  color: var(--color-text-muted);
+  font-size: var(--font-size-xs);
+}
+.account-list__email-secondary code {
+  font-family: var(--font-family-mono);
+  font-size: inherit;
+}
+
+/* Message-view secondary email shown after the nickname (ADR-0020). */
+.message__meta-secondary {
+  margin-left: var(--space-2);
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+  font-family: var(--font-family-mono);
+}
+
+/* Radio button group used in admin "create user" dialog. */
+.radio-group { display: flex; flex-direction: column; gap: var(--space-2); margin: var(--space-2) 0; }
+.radio { display: inline-flex; align-items: center; gap: var(--space-2); cursor: pointer; }
+.radio input[type="radio"] {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  accent-color: var(--color-primary);
+}
+
 .table-wrapper { overflow-x: auto; }
 .audit-table {
   width: 100%;
@@ -1183,6 +1298,42 @@ a:hover { color: var(--color-primary-hover); text-decoration: underline; }
   font-weight: 500;
   letter-spacing: 0;
   font-size: 0.7rem;
+}
+
+/* Logout in bottom-nav: <form> styled identically to <a class="bottom-nav__item">
+   so the 5-th icon-button looks like the four nav links. POST + CSRF (no GET
+   logout, see ADR-0019 §10). The <form> itself is the flex item; its <button>
+   fills the slot with a transparent background and inherits colour. */
+.bottom-nav__form {
+  margin: 0;
+  padding: 0;
+  display: flex;
+}
+.bottom-nav__button {
+  flex: 1 1 auto;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  padding: var(--space-1) var(--space-2);
+  color: var(--color-text-muted);
+  font: inherit;
+  font-size: var(--font-size-xs);
+  font-family: inherit;
+  border-radius: var(--radius-md);
+  transition: color var(--transition), background-color var(--transition);
+  min-height: 48px;
+  width: 100%;
+  -webkit-tap-highlight-color: transparent;
+}
+.bottom-nav__button:hover,
+.bottom-nav__button:focus-visible {
+  color: var(--color-primary);
+  background: var(--color-bg-hover);
 }
 
 /* Show bottom nav on mobile (<=640px) and override main padding so the

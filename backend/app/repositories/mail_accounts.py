@@ -30,8 +30,46 @@ class MailAccountsRepo:
         )
         return (await self._s.execute(stmt)).scalar_one_or_none()
 
+    async def get_for_user_ids(
+        self, user_ids: list[int] | None, account_id: int
+    ) -> MailAccount | None:
+        """Visibility-aware get.
+
+        ``user_ids=None`` means "no scope filter" (super-admin path).
+        ``user_ids=[]`` means "no users visible" — always returns ``None``.
+        """
+        if user_ids is None:
+            return await self.get_by_id(account_id)
+        if not user_ids:
+            return None
+        stmt = select(MailAccount).where(
+            MailAccount.id == account_id, MailAccount.user_id.in_(user_ids)
+        )
+        return (await self._s.execute(stmt)).scalar_one_or_none()
+
     async def list_for_user(self, user_id: int) -> list[MailAccount]:
         stmt = select(MailAccount).where(MailAccount.user_id == user_id).order_by(MailAccount.id)
+        return list((await self._s.execute(stmt)).scalars().all())
+
+    async def list_for_user_ids(self, user_ids: list[int]) -> list[MailAccount]:
+        """Mail accounts for a set of users (visibility-scope aware).
+
+        Returns a flat list ordered by ``(user_id, id)``. Used by
+        :class:`backend.app.accounts.service.MailAccountService` to build
+        the list response for super-admin and group leaders/members.
+        """
+        if not user_ids:
+            return []
+        stmt = (
+            select(MailAccount)
+            .where(MailAccount.user_id.in_(user_ids))
+            .order_by(MailAccount.user_id, MailAccount.id)
+        )
+        return list((await self._s.execute(stmt)).scalars().all())
+
+    async def list_all(self) -> list[MailAccount]:
+        """All mail accounts (super-admin only). No pagination — small Ns."""
+        stmt = select(MailAccount).order_by(MailAccount.user_id, MailAccount.id)
         return list((await self._s.execute(stmt)).scalars().all())
 
     async def list_for_users(self, user_ids: list[int]) -> dict[int, list[MailAccount]]:
@@ -116,11 +154,13 @@ class MailAccountsRepo:
         smtp_starttls: bool,
         smtp_username: str | None,
         smtp_encrypted_password: bytes | None,
+        display_name: str | None = None,
     ) -> MailAccount:
         acc = MailAccount(
             id=account_id,
             user_id=user_id,
             email=email,
+            display_name=display_name,
             encrypted_password=encrypted_password,
             imap_host=imap_host,
             imap_port=imap_port,

@@ -323,9 +323,9 @@ async def _disable_after_failures(account_id: int, *, failed: int, user_id: int)
     async with make_session() as s, s.begin():
         await MailAccountsRepo(s).update_fields(account_id, is_active=False)
         # The audit log requires ``actor_user_id``. For system actions we
-        # attribute to the super-admin (the one with is_admin=true). If for
-        # whatever reason there is no admin row (e.g. seed didn't run), we
-        # fall back to the affected user.
+        # attribute to the super-admin (the one with role='super_admin').
+        # If for whatever reason there is no admin row (e.g. seed didn't
+        # run), we fall back to the affected user.
         admin = await UsersRepo(s).get_admin()
         actor_id = admin.id if admin else user_id
         await AuditWriter(s).log(

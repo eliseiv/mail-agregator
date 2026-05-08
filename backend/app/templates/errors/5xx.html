@@ -7,16 +7,16 @@
 <section class="error-page" aria-labelledby="error-heading">
   <p class="error-page__code">{{ status_code | default(500) }}</p>
   <h1 id="error-heading" class="error-page__title">
-    {{ error_title | default('Server error') | e }}
+    {{ error_title | default('Ошибка сервера') | e }}
   </h1>
   <p class="error-page__message">
-    {{ error_message | default('Something went wrong on our side. The team has been notified. Please try again in a moment.') | e }}
+    {{ error_message | default('Что-то пошло не так на нашей стороне. Команда уже уведомлена. Попробуйте через минуту.') | e }}
   </p>
   <p class="error-page__actions">
-    <a class="btn btn--primary" href="/">Go to inbox</a>
+    <a class="btn btn--primary" href="/">К входящим</a>
   </p>
   {% if request_id %}
-    <p class="error-page__rid">Request ID: <code>{{ request_id | e }}</code></p>
+    <p class="error-page__rid">ID запроса: <code>{{ request_id | e }}</code></p>
   {% endif %}
 </section>
 {% endblock %}

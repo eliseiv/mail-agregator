@@ -37,6 +37,7 @@ class MailAccount(Base):
         nullable=False,
     )
     email: Mapped[str] = mapped_column(Text, nullable=False)
+    display_name: Mapped[str | None] = mapped_column(Text, nullable=True)
     encrypted_password: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     imap_host: Mapped[str] = mapped_column(Text, nullable=False)
     imap_port: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("993"))
@@ -68,6 +69,10 @@ class MailAccount(Base):
         CheckConstraint("imap_port BETWEEN 1 AND 65535", name="ck_mail_accounts_imap_port"),
         CheckConstraint("smtp_port BETWEEN 1 AND 65535", name="ck_mail_accounts_smtp_port"),
         CheckConstraint("NOT (smtp_ssl AND smtp_starttls)", name="ck_mail_accounts_smtp_ssl_xor"),
+        CheckConstraint(
+            "display_name IS NULL OR char_length(display_name) BETWEEN 1 AND 100",
+            name="ck_mail_accounts_display_name_length",
+        ),
         UniqueConstraint("user_id", "email", name="uq_mail_accounts_user_email"),
         Index("ix_mail_accounts_user_id", "user_id"),
         Index(

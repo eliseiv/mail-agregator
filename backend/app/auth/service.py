@@ -44,8 +44,11 @@ class LoginResult:
     setup_token: str | None = None
     csrf: str | None = None
     role: str | None = None
+    group_id: int | None = None
     user_id: int | None = None
     retry_after_sec: int | None = None
+    # Backwards-compat shim for callers that still inspect ``is_admin``;
+    # mirrors ``role == 'super_admin'``.
     is_admin: bool = False
 
 
@@ -201,17 +204,13 @@ class AuthService:
         await self._users.record_login_success(user.id)
 
         # Builtin tags post-login hook (ADR-0017 §6). Idempotent — no-op
-        # for users who already have any builtin row. Run inside the same
-        # transaction as the login bookkeeping so a tag-write failure
-        # rolls everything back: builtin tags are a functional must-have
-        # and silently skipping them would leave users with empty
-        # "/tags" pages until next login.
+        # for users who already have any builtin row.
         await TagsService(self._db).ensure_builtin_tags(user_id=user.id)
 
-        role = "admin" if user.is_admin else "user"
-        token, csrf = await self._sessions.create(user.id, role, ip, user_agent)
+        is_super = user.role == "super_admin"
+        token, csrf = await self._sessions.create(user.id, user.role, user.group_id, ip, user_agent)
 
-        if user.is_admin:
+        if is_super:
             await self._audit.log(
                 actor_user_id=user.id,
                 action="admin_login",
@@ -223,9 +222,10 @@ class AuthService:
             kind="session_created",
             session_token=token,
             csrf=csrf,
-            role=role,
+            role=user.role,
+            group_id=user.group_id,
             user_id=user.id,
-            is_admin=user.is_admin,
+            is_admin=is_super,
         )
 
     # --- Set-password ------------------------------------------------------
@@ -258,13 +258,12 @@ class AuthService:
         # four builtin rows already present. Idempotent.
         await TagsService(self._db).ensure_builtin_tags(user_id=user.id)
 
-        role = "admin" if user.is_admin else "user"
-        session_token, csrf = await self._sessions.create(user.id, role, ip, user_agent)
+        is_super = user.role == "super_admin"
+        session_token, csrf = await self._sessions.create(
+            user.id, user.role, user.group_id, ip, user_agent
+        )
 
-        if user.is_admin:
-            # Edge: super-admin path normally goes through seed_super_admin
-            # which sets password_reset_required=false, so this branch only
-            # fires for an admin that was hand-reset. Still log to audit.
+        if is_super:
             await self._audit.log(
                 actor_user_id=user.id,
                 action="admin_login",
@@ -276,9 +275,10 @@ class AuthService:
             kind="session_created",
             session_token=session_token,
             csrf=csrf,
-            role=role,
+            role=user.role,
+            group_id=user.group_id,
             user_id=user.id,
-            is_admin=user.is_admin,
+            is_admin=is_super,
         )
 
     # --- Logout ------------------------------------------------------------
@@ -336,6 +336,10 @@ async def seed_super_admin(session: AsyncSession) -> str:
     and :meth:`UsersRepo.get_by_username` (defence-in-depth: migration
     ``20260505_002`` adds a CHECK constraint), so an ``ADMIN_LOGIN=Admin``
     env value is treated identically to ``admin``.
+
+    Post-ADR-0019: ``upsert_admin`` writes ``role='super_admin'`` and
+    ``group_id=NULL`` (the role-group invariant requires the super-admin
+    to be groupless).
     """
     settings = get_settings()
     repo = UsersRepo(session)
@@ -352,7 +356,8 @@ async def seed_super_admin(session: AsyncSession) -> str:
         if same_password:
             # Still ensure flags are correct in case admin row was tampered.
             if (
-                existing.is_admin
+                existing.role == "super_admin"
+                and existing.group_id is None
                 and not existing.password_reset_required
                 and existing.lockout_until is None
                 and existing.failed_login_attempts == 0

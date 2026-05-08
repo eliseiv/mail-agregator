@@ -19,12 +19,12 @@ from fastapi import APIRouter, Query, Request, Response, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import ValidationError as PydanticValidationError
 
-from backend.app.deps import CurrentUser, DbSession, is_form_request
-from backend.app.exceptions import DomainError, ValidationError
+from backend.app.accounts.service import MailAccountService
+from backend.app.deps import CurrentScope, DbSession, is_form_request
+from backend.app.exceptions import DomainError, NotFoundError, ValidationError
 from backend.app.flash import flash
+from backend.app.messages.service import MessageService
 from backend.app.rate_limit import LIMIT_MESSAGE_SEND, consume
-from backend.app.repositories.mail_accounts import MailAccountsRepo
-from backend.app.repositories.messages import MessagesRepo
 from backend.app.send.schemas import SendMessageRequest, SendMessageResponse
 from backend.app.send.service import SendService
 from backend.app.templates import render
@@ -102,22 +102,14 @@ async def _rerender_compose(
     request: Request,
     db: DbSession,
     *,
-    user_id: int,
+    scope: CurrentScope,
     error_message: str,
     status_code: int,
 ) -> Response:
-    """Re-render the compose form preserving submitted values.
-
-    Accepts ``user_id`` as a primitive (not the ORM ``User``) because this
-    helper is invoked after a rolled-back ``async with db.begin():`` block —
-    at that point the ORM instance's attributes are expired, and reading
-    ``user.id`` here would trigger a sync lazy-load that crashes the asyncpg
-    driver with ``MissingGreenlet`` (BUG-003). Callers must extract
-    primitives from the ORM ``User`` *before* opening the write transaction.
-    """
+    """Re-render the compose form preserving submitted values."""
     sess = request.state.session
-    accounts = await MailAccountsRepo(db).list_for_user(user_id)
-    active_accounts = [a for a in accounts if a.is_active]
+    accounts_dto = await MailAccountService(db).list_for_scope(scope)
+    active_accounts = [a for a in accounts_dto if a.is_active]
 
     form = await request.form()
 
@@ -172,16 +164,15 @@ async def _rerender_compose(
 async def send_message(
     request: Request,
     db: DbSession,
-    user: CurrentUser,
+    scope: CurrentScope,
 ) -> Response:
-    """Send a message. Accepts JSON or form-encoded (ADR-0015)."""
-    # Snapshot ORM-bound primitives before the write transaction. After a
-    # rollback inside ``async with db.begin():`` the ``user`` instance's
-    # attributes are expired; touching ``user.id`` in the ``except`` branch
-    # would trigger a sync lazy-load and crash asyncpg with
-    # ``MissingGreenlet`` (BUG-003).
-    user_id = user.id
+    """Send a message. Accepts JSON or form-encoded (ADR-0015).
 
+    Visibility (ADR-0019 §8): every visible mailbox in the caller's scope
+    is a valid ``from_account``. The author recorded in ``sent_messages``
+    is the caller, not the mailbox owner.
+    """
+    user_id = scope.user_id
     await consume(LIMIT_MESSAGE_SEND, str(user_id))
 
     is_form = is_form_request(request)
@@ -197,14 +188,14 @@ async def send_message(
 
     try:
         async with db.begin():
-            result = await SendService(db).send(user_id=user_id, payload=payload)
+            result = await SendService(db).send(scope=scope, payload=payload)
     except DomainError as exc:
         if is_form:
             await flash(request, "error", exc.message)
             return await _rerender_compose(
                 request,
                 db,
-                user_id=user_id,
+                scope=scope,
                 error_message=exc.message,
                 status_code=exc.status_code,
             )
@@ -225,12 +216,12 @@ async def send_message(
 async def compose_page(
     request: Request,
     db: DbSession,
-    user: CurrentUser,
+    scope: CurrentScope,
     reply_to: Annotated[int | None, Query(ge=1)] = None,
 ) -> Response:
     sess = request.state.session
-    accounts = await MailAccountsRepo(db).list_for_user(user.id)
-    active_accounts = [a for a in accounts if a.is_active]
+    accounts_dto = await MailAccountService(db).list_for_scope(scope)
+    active_accounts = [a for a in accounts_dto if a.is_active]
 
     prefill: dict[str, object] = {
         "to": "",
@@ -242,7 +233,11 @@ async def compose_page(
     default_from_id: int | None = active_accounts[0].id if active_accounts else None
 
     if reply_to is not None:
-        original = await MessagesRepo(db).get_owned(message_id=reply_to, user_id=user.id)
+        original = None
+        try:
+            original = await MessageService(db).get(scope=scope, message_id=reply_to)
+        except NotFoundError:
+            original = None
         if original is not None:
             subject = (original.subject or "").strip()
             prefill["subject"] = subject if subject.lower().startswith("re:") else f"Re: {subject}"

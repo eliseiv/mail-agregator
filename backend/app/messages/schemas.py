@@ -6,6 +6,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
+from backend.app.accounts.schemas import OwnerBriefDTO
 from backend.app.tags.schemas import TagBriefDTO
 
 
@@ -21,6 +22,10 @@ class MessageListItem(BaseModel):
     id: int
     mail_account_id: int
     mail_account_email: str
+    # ADR-0020: nickname for the mail account; UI fallback to ``email``.
+    mail_account_display_name: str | None = None
+    # ADR-0019 §7: who actually owns the mailbox (for group-aware UI).
+    owner: OwnerBriefDTO
     from_addr: str
     from_name: str | None
     subject: str | None
@@ -40,6 +45,8 @@ class MessageDetail(BaseModel):
     id: int
     mail_account_id: int
     mail_account_email: str
+    mail_account_display_name: str | None = None
+    owner: OwnerBriefDTO
     from_addr: str
     from_name: str | None
     to_addrs: str

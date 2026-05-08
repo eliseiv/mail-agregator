@@ -15,6 +15,7 @@ import imap_tools
 from imap_tools import MailBoxUnencrypted
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.app.deps import VisibilityScope
 from backend.app.exceptions import (
     NotFoundError,
     SMTPSendFailedError,
@@ -22,6 +23,7 @@ from backend.app.exceptions import (
 from backend.app.repositories.mail_accounts import MailAccountsRepo
 from backend.app.repositories.messages import MessagesRepo
 from backend.app.repositories.sent_messages import SentMessagesRepo
+from backend.app.repositories.users import UsersRepo
 from backend.app.security import assert_public_host
 from backend.app.send.mime import build_mime, generate_message_id
 from backend.app.send.schemas import SendMessageRequest, SendMessageResponse
@@ -100,10 +102,23 @@ class SendService:
         self._accounts = MailAccountsRepo(session)
         self._messages = MessagesRepo(session)
         self._sent = SentMessagesRepo(session)
+        self._users = UsersRepo(session)
 
-    async def send(self, *, user_id: int, payload: SendMessageRequest) -> SendMessageResponse:
-        # 1. Ownership: from_account must belong to user.
-        acc = await self._accounts.get_for_user(user_id, payload.from_account_id)
+    async def _visible_user_ids(self, scope: VisibilityScope) -> list[int] | None:
+        if scope.is_super_admin:
+            return None
+        if scope.group_id is None:
+            return []
+        return await self._users.list_user_ids_in_group(scope.group_id)
+
+    async def send(
+        self, *, scope: VisibilityScope, payload: SendMessageRequest
+    ) -> SendMessageResponse:
+        # 1. Visibility: from_account must be reachable by the caller's
+        #    scope (super-admin sees all; group_leader/group_member see
+        #    every member's mailboxes — ADR-0019 §7.1, §8).
+        visible = await self._visible_user_ids(scope)
+        acc = await self._accounts.get_for_user_ids(visible, payload.from_account_id)
         if acc is None:
             raise NotFoundError("Mail account not found")
 
@@ -111,8 +126,9 @@ class SendService:
         in_reply_header: str | None = None
         refs_header: str | None = None
         if payload.in_reply_to_message_id is not None:
-            original = await self._messages.get_owned(
-                message_id=payload.in_reply_to_message_id, user_id=user_id
+            original = await self._messages.get_for_user_ids(
+                message_id=payload.in_reply_to_message_id,
+                user_ids=visible,
             )
             if original is None:
                 raise NotFoundError("Original message not found")
@@ -204,9 +220,12 @@ class SendService:
                 detail=appended_error,
             )
 
-        # 7. Persist sent_messages.
+        # 7. Persist sent_messages. ``user_id`` records the *author*
+        # (the caller) — distinct from the mailbox owner ``acc.user_id``
+        # so a leader sending from a member's mailbox is correctly
+        # attributed (ADR-0019 §7.3).
         sent = await self._sent.insert(
-            user_id=user_id,
+            user_id=scope.user_id,
             from_account_id=acc.id,
             to_addrs=", ".join(payload.to),
             cc_addrs=", ".join(payload.cc) if payload.cc else None,

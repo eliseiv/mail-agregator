@@ -6,24 +6,35 @@ import re
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from backend.app.groups.schemas import UserBriefDTO
 
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
+_VALID_ROLES_FOR_CREATE: frozenset[str] = frozenset({"group_leader", "group_member"})
 
 
 class UserMailAccountSummary(BaseModel):
     id: int
     email: str
+    display_name: str | None = None
     is_active: bool
     last_synced_at: datetime | None
     last_sync_error: str | None
+
+
+class GroupBriefDTO(BaseModel):
+    id: int
+    name: str
 
 
 class UserDTO(BaseModel):
     id: int
     username: str
     email: str | None
-    is_admin: bool
+    display_name: str | None
+    role: str
+    group: GroupBriefDTO | None
     password_reset_required: bool
     lockout_until: datetime | None
     last_login_at: datetime | None
@@ -38,9 +49,19 @@ class UsersListResponse(BaseModel):
     limit: int
 
 
+def _trim_or_none(v: str | None) -> str | None:
+    if v is None:
+        return None
+    s = v.strip()
+    return s or None
+
+
 class CreateUserRequest(BaseModel):
     username: str = Field(min_length=3, max_length=64)
     email: str | None = Field(default=None, max_length=254)
+    display_name: str | None = Field(default=None, max_length=100)
+    role: str = Field(default="group_member")
+    group_id: int | None = Field(default=None, ge=1)
 
     @field_validator("username")
     @classmethod
@@ -50,11 +71,66 @@ class CreateUserRequest(BaseModel):
             raise ValueError("username may only contain A-Z, 0-9, _ . -")
         return v
 
+    @field_validator("email", "display_name")
+    @classmethod
+    def _trim(cls, v: str | None) -> str | None:
+        return _trim_or_none(v)
+
+    @field_validator("role")
+    @classmethod
+    def _v_role(cls, v: str) -> str:
+        if v not in _VALID_ROLES_FOR_CREATE:
+            raise ValueError(
+                "role must be 'group_leader' or 'group_member' " "(super_admin is seeded only)"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _v_role_group_pair(self) -> CreateUserRequest:
+        # ADR-0019 §5: new leader auto-creates the group → group_id must be null.
+        if self.role == "group_leader" and self.group_id is not None:
+            raise ValueError("group_id must be null when role='group_leader'")
+        if self.role == "group_member" and self.group_id is None:
+            raise ValueError("group_id is required for role='group_member'")
+        return self
+
 
 class CreateUserResponse(BaseModel):
     id: int
     username: str
     email: str | None
+    display_name: str | None
+    role: str
+    group_id: int | None
+    group: GroupBriefDTO | None
+
+
+class UpdateUserRequest(BaseModel):
+    display_name: str | None = Field(default=None, max_length=100)
+    role: str | None = None
+    group_id: int | None = Field(default=None, ge=1)
+
+    # Sentinel: distinguish "not provided" from "set to null". The simplest
+    # serialisation is a separate boolean for ``clear_display_name``.
+    clear_display_name: bool = False
+    clear_group_id: bool = False
+
+    @field_validator("display_name")
+    @classmethod
+    def _trim_dn(cls, v: str | None) -> str | None:
+        return _trim_or_none(v)
+
+    @field_validator("role")
+    @classmethod
+    def _v_role(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if v not in _VALID_ROLES_FOR_CREATE:
+            raise ValueError(
+                "role must be 'group_leader' or 'group_member' "
+                "(super_admin cannot be granted via API)"
+            )
+        return v
 
 
 class DeleteUserResponse(BaseModel):
@@ -80,3 +156,18 @@ class AuditListResponse(BaseModel):
     total: int
     page: int
     limit: int
+
+
+__all__ = [
+    "AuditEntryDTO",
+    "AuditListResponse",
+    "CreateUserRequest",
+    "CreateUserResponse",
+    "DeleteUserResponse",
+    "GroupBriefDTO",
+    "UpdateUserRequest",
+    "UserBriefDTO",
+    "UserDTO",
+    "UserMailAccountSummary",
+    "UsersListResponse",
+]

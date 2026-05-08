@@ -12,15 +12,14 @@ from urllib.parse import quote
 from fastapi import APIRouter, Path, Query, Request, Response, status
 from fastapi.responses import HTMLResponse, StreamingResponse
 
-from backend.app.deps import CurrentUser, DbSession
+from backend.app.accounts.service import MailAccountService
+from backend.app.deps import CurrentScope, DbSession
 from backend.app.messages.schemas import (
     MarkReadRequest,
     MessageDetail,
     MessageListResponse,
 )
 from backend.app.messages.service import MessageService
-from backend.app.repositories.mail_accounts import MailAccountsRepo
-from backend.app.repositories.messages import MessagesRepo
 from backend.app.tags.service import TagsService
 from backend.app.templates import render
 
@@ -36,30 +35,32 @@ html = APIRouter(tags=["messages-html"])
 @api.get("", response_model=MessageListResponse)
 async def list_messages(
     db: DbSession,
-    user: CurrentUser,
+    scope: CurrentScope,
     account_id: Annotated[int | None, Query(ge=1)] = None,
+    group_id: Annotated[int | None, Query(ge=1)] = None,
     tag_id: Annotated[int | None, Query(ge=1)] = None,
     unread: Annotated[bool | None, Query()] = None,
     cursor: Annotated[str | None, Query(max_length=200)] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
 ) -> MessageListResponse:
-    return await MessageService(db).list_for_user(
-        user_id=user.id,
+    return await MessageService(db).list_for_scope(
+        scope,
         account_id=account_id,
         tag_id=tag_id,
         unread=unread,
         cursor=cursor,
         limit=limit,
+        group_id=group_id,
     )
 
 
 @api.get("/{message_id}", response_model=MessageDetail)
 async def get_message(
     db: DbSession,
-    user: CurrentUser,
+    scope: CurrentScope,
     message_id: int = Path(..., ge=1),
 ) -> MessageDetail:
-    return await MessageService(db).get(user_id=user.id, message_id=message_id)
+    return await MessageService(db).get(scope=scope, message_id=message_id)
 
 
 @api.post(
@@ -69,11 +70,11 @@ async def get_message(
 async def mark_read(
     payload: MarkReadRequest,
     db: DbSession,
-    user: CurrentUser,
+    scope: CurrentScope,
     message_id: int = Path(..., ge=1),
 ) -> Response:
     async with db.begin():
-        await MessageService(db).mark_read(user_id=user.id, message_id=message_id, payload=payload)
+        await MessageService(db).mark_read(scope=scope, message_id=message_id, payload=payload)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -83,16 +84,15 @@ async def mark_read(
 )
 async def download_attachment(
     db: DbSession,
-    user: CurrentUser,
+    scope: CurrentScope,
     message_id: int = Path(..., ge=1),
     attachment_id: int = Path(..., ge=1),
 ) -> StreamingResponse:
     att, stream = await MessageService(db).stream_attachment(
-        user_id=user.id,
+        scope=scope,
         message_id=message_id,
         attachment_id=attachment_id,
     )
-    # RFC 5987 filename* for non-ASCII; ASCII fallback for legacy clients.
     safe_ascii = att.filename.encode("ascii", "ignore").decode("ascii") or "file"
     encoded = quote(att.filename, safe="")
     headers = {
@@ -119,10 +119,7 @@ async def download_attachment(
 async def inbox_page(
     request: Request,
     db: DbSession,
-    user: CurrentUser,
-    # ``account_id`` is accepted as a string so the empty value submitted by
-    # the "All accounts" option of the filter form (account_id=) doesn't blow
-    # up FastAPI's int parser. Same for ``unread`` and ``tag_id`` (ADR-0017).
+    scope: CurrentScope,
     account_id: Annotated[str | None, Query()] = None,
     tag_id: Annotated[str | None, Query()] = None,
     cursor: Annotated[str | None, Query(max_length=200)] = None,
@@ -140,18 +137,18 @@ async def inbox_page(
     if unread:
         parsed_unread = unread.lower() in ("1", "true", "on", "yes")
 
-    accounts = await MailAccountsRepo(db).list_for_user(user.id)
+    accounts = await MailAccountService(db).list_for_scope(scope)
     # Server-render dropdown of user's tags so the filter renders without JS.
-    tags = await TagsService(db).list_for_user(user.id)
-    listing = await MessageService(db).list_for_user(
-        user_id=user.id,
+    tags = await TagsService(db).list_for_user(scope.user_id)
+    listing = await MessageService(db).list_for_scope(
+        scope,
         account_id=parsed_account_id,
         tag_id=parsed_tag_id,
         unread=parsed_unread,
         cursor=cursor,
         limit=limit,
     )
-    unread_count = await MessagesRepo(db).count_unread_for_user(user.id)
+    unread_count = await MessageService(db).count_unread_for_scope(scope)
     return await render(
         request,
         "inbox.html",
@@ -164,6 +161,7 @@ async def inbox_page(
             "selected_tag_id": parsed_tag_id,
             "unread_only": bool(parsed_unread),
             "unread_count": unread_count,
+            "scope": scope,
             "csrf_token": sess.csrf_token,
             "session": sess,
         },
@@ -174,17 +172,16 @@ async def inbox_page(
 async def message_view_page(
     request: Request,
     db: DbSession,
-    user: CurrentUser,
+    scope: CurrentScope,
     message_id: int = Path(..., ge=1),
 ) -> Response:
     sess = request.state.session
-    detail = await MessageService(db).get(user_id=user.id, message_id=message_id)
+    detail = await MessageService(db).get(scope=scope, message_id=message_id)
     # Close the autobegun read-tx so the explicit begin() below does not collide.
     await db.commit()
-    # Mark as read on first view (idempotent).
     async with db.begin():
         await MessageService(db).mark_read(
-            user_id=user.id,
+            scope=scope,
             message_id=message_id,
             payload=MarkReadRequest(is_read=True),
         )
@@ -193,16 +190,12 @@ async def message_view_page(
         "message_view.html",
         {
             "message": detail,
+            "scope": scope,
             "csrf_token": sess.csrf_token,
             "session": sess,
         },
     )
 
-
-# Workaround for HTML pages that hit ``/`` when not authenticated:
-# the FastAPI dependency raises ``NotAuthenticatedError`` -> 401. For the
-# inbox we want a 302 redirect instead. We implement this by intercepting
-# in main.create_app via an exception handler. See backend/app/main.py.
 
 # Re-export
 router = APIRouter()

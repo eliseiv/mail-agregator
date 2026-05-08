@@ -143,6 +143,16 @@
         smtp_ssl:        !!fd.get('smtp_ssl'),
         smtp_starttls:   !!fd.get('smtp_starttls'),
       };
+      // Mail account nickname (ADR-0020). Trim; empty → null. On edit mode
+      // we always emit the field (including null) so the user can clear it;
+      // on create mode we omit when empty so the backend default kicks in.
+      const displayNameRaw = (fd.get('display_name') || '').toString();
+      const displayName = displayNameRaw.trim();
+      if (isEdit) {
+        payload.display_name = displayName ? displayName : null;
+      } else if (displayName) {
+        payload.display_name = displayName;
+      }
       const smtpUser = (fd.get('smtp_username') || '').toString().trim();
       const smtpPass = (fd.get('smtp_password') || '').toString();
       if (smtpUser) payload.smtp_username = smtpUser;
@@ -159,14 +169,14 @@
         setSuccess('');
         const payload = buildPayload();
         if (!payload.email || (!isEdit && !payload.password) || !payload.imap_host || !payload.smtp_host) {
-          setTestResult('Please fill in email, password, IMAP host, and SMTP host first.', 'error');
+          setTestResult('Заполните email, пароль, хост IMAP и хост SMTP.', 'error');
           return;
         }
         if (isEdit && !payload.password) {
-          setTestResult('Please enter the current password to test the connection.', 'error');
+          setTestResult('Введите текущий пароль, чтобы проверить соединение.', 'error');
           return;
         }
-        setTestResult('Testing…', 'pending');
+        setTestResult('Проверка…', 'pending');
         testBtn.disabled = true;
         try {
           const resp = await window.MAS.csrfFetch('/api/mail-accounts/test', {
@@ -178,10 +188,10 @@
           } else {
             const err = await window.MAS.readJsonError(resp);
             const detail = err.details && err.details.detail ? ' — ' + err.details.detail : '';
-            setTestResult('Failed: ' + err.message + detail, 'error');
+            setTestResult('Ошибка: ' + err.message + detail, 'error');
           }
         } catch (_e) {
-          setTestResult('Network error during test.', 'error');
+          setTestResult('Сетевая ошибка во время проверки.', 'error');
         } finally {
           testBtn.disabled = false;
         }
@@ -197,19 +207,19 @@
       const payload = buildPayload();
 
       // Basic client-side guards (server-side is authoritative).
-      if (!payload.email) { setError('Email is required.'); return; }
-      if (!isEdit && !payload.password) { setError('Password is required.'); return; }
+      if (!payload.email) { setError('Email обязателен.'); return; }
+      if (!isEdit && !payload.password) { setError('Пароль обязателен.'); return; }
       if (!payload.imap_host || !payload.smtp_host) {
-        setError('IMAP and SMTP host are required.'); return;
+        setError('Хосты IMAP и SMTP обязательны.'); return;
       }
       if (payload.imap_port < 1 || payload.imap_port > 65535) {
-        setError('Invalid IMAP port.'); return;
+        setError('Неверный порт IMAP.'); return;
       }
       if (payload.smtp_port < 1 || payload.smtp_port > 65535) {
-        setError('Invalid SMTP port.'); return;
+        setError('Неверный порт SMTP.'); return;
       }
       if (payload.smtp_ssl && payload.smtp_starttls) {
-        setError('SMTP cannot use SSL and STARTTLS at the same time.'); return;
+        setError('SMTP не может одновременно использовать SSL и STARTTLS.'); return;
       }
 
       submitBtn && (submitBtn.disabled = true);
@@ -220,7 +230,7 @@
         const method = isEdit ? 'PATCH' : 'POST';
         const resp = await window.MAS.csrfFetch(url, { method: method, body: payload });
         if (resp.ok) {
-          window.MAS.flash(isEdit ? 'Account updated.' : 'Account added.', 'success');
+          window.MAS.flash(isEdit ? 'Аккаунт обновлён.' : 'Аккаунт добавлен.', 'success');
           window.location.href = '/accounts';
           return;
         }
@@ -228,7 +238,7 @@
         const detail = err.details && err.details.detail ? ' — ' + err.details.detail : '';
         setError(err.message + detail);
       } catch (_e) {
-        setError('Network error. Please try again.');
+        setError('Сетевая ошибка. Попробуйте ещё раз.');
       } finally {
         submitBtn && (submitBtn.disabled = false);
       }
@@ -247,13 +257,13 @@
       try {
         const resp = await window.MAS.csrfFetch(action, { method: 'POST' });
         if (resp.ok || resp.status === 202) {
-          window.MAS.flash('Sync queued. New messages will appear within a minute.', 'info');
+          window.MAS.flash('Синхронизация запущена. Новые письма появятся в течение минуты.', 'info');
         } else {
           const err = await window.MAS.readJsonError(resp);
-          window.MAS.flash(err.message || 'Could not queue sync.', 'error');
+          window.MAS.flash(err.message || 'Не удалось запустить синхронизацию.', 'error');
         }
       } catch (_e) {
-        window.MAS.flash('Network error. Please try again.', 'error');
+        window.MAS.flash('Сетевая ошибка. Попробуйте ещё раз.', 'error');
       } finally {
         if (btn) btn.disabled = false;
       }
@@ -263,7 +273,7 @@
   document.querySelectorAll('[data-account-delete-form]').forEach(function (f) {
     f.addEventListener('submit', async function (event) {
       event.preventDefault();
-      const msg = f.getAttribute('data-confirm') || 'Delete account? All cached messages will be removed.';
+      const msg = f.getAttribute('data-confirm') || 'Удалить аккаунт? Все кешированные письма будут удалены.';
       if (!window.confirm(msg)) return;
       const action = f.getAttribute('action');
       if (!action) return;
@@ -276,14 +286,14 @@
       try {
         const resp = await window.MAS.csrfFetch(deleteUrl, { method: 'DELETE' });
         if (resp.ok || resp.status === 204) {
-          window.MAS.flash('Account deleted.', 'success');
+          window.MAS.flash('Аккаунт удалён.', 'success');
           window.location.reload();
           return;
         }
         const err = await window.MAS.readJsonError(resp);
-        window.MAS.flash(err.message || 'Could not delete account.', 'error');
+        window.MAS.flash(err.message || 'Не удалось удалить аккаунт.', 'error');
       } catch (_e) {
-        window.MAS.flash('Network error. Please try again.', 'error');
+        window.MAS.flash('Сетевая ошибка. Попробуйте ещё раз.', 'error');
       } finally {
         if (btn) btn.disabled = false;
       }

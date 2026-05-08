@@ -1,38 +1,38 @@
 {% extends "base.html" %}
 {% import "_macros.html" as m with context %}
 
-{% block title %}{{ message.subject | default('(no subject)') | e }} &middot; Mail Aggregator{% endblock %}
+{% block title %}{{ message.subject | default('(без темы)') | e }} &middot; Mail Aggregator{% endblock %}
 {% block body_class %}message-view{% endblock %}
 
 {% block content %}
 <article class="message" aria-labelledby="msg-subject" data-message-id="{{ message.id }}">
 
-  <nav class="message__toolbar" aria-label="Message actions">
-    <a class="btn btn--secondary" href="/">&larr; Inbox</a>
-    <a class="btn btn--primary" href="/compose?reply_to={{ message.id }}">Reply</a>
+  <nav class="message__toolbar" aria-label="Действия с письмом">
+    <a class="btn btn--secondary" href="/">&larr; Входящие</a>
+    <a class="btn btn--primary" href="/compose?reply_to={{ message.id }}">Ответить</a>
     <button
       type="button"
       class="btn btn--secondary"
       data-message-mark-unread
       data-message-id="{{ message.id }}">
-      Mark as unread
+      Пометить непрочитанным
     </button>
   </nav>
 
   <header class="message__header">
     <h1 id="msg-subject" class="message__subject">
-      {% if message.subject %}{{ message.subject | e }}{% else %}<em>(no subject)</em>{% endif %}
+      {% if message.subject %}{{ message.subject | e }}{% else %}<em>(без темы)</em>{% endif %}
     </h1>
 
     {% if message.tags %}
-      <div class="message__tags" aria-label="Tags">
+      <div class="message__tags" aria-label="Теги">
         {% for t in message.tags %}{{ m.tag_chip(t) }}{% endfor %}
       </div>
     {% endif %}
 
     <dl class="message__meta">
       <div class="message__meta-row">
-        <dt>From</dt>
+        <dt>От</dt>
         <dd>
           {% if message.from_name %}{{ message.from_name | e }}
             &lt;{{ message.from_addr | e }}&gt;
@@ -40,63 +40,79 @@
         </dd>
       </div>
       <div class="message__meta-row">
-        <dt>To</dt>
+        <dt>Кому</dt>
         <dd>
           {% if message.to_addrs %}{{ message.to_addrs | e }}{% else %}&mdash;{% endif %}
         </dd>
       </div>
       {% if message.cc_addrs %}
         <div class="message__meta-row">
-          <dt>Cc</dt>
+          <dt>Копия</dt>
           <dd>{{ message.cc_addrs | e }}</dd>
         </div>
       {% endif %}
       <div class="message__meta-row">
-        <dt>Date</dt>
+        <dt>Дата</dt>
         <dd>{{ m.time_tag(message.internal_date, message.internal_date_human if message.internal_date_human is defined else None) }}</dd>
       </div>
       <div class="message__meta-row">
-        <dt>Account</dt>
-        <dd>{{ message.mail_account_email | e }}</dd>
+        <dt>Аккаунт</dt>
+        {# Account label uses display_name (ADR-0020) если задан, иначе email.
+           Если есть никнейм — рядом мелким шрифтом отображается полный email. #}
+        {% set _acc_label = message.mail_account_display_name if (message.mail_account_display_name is defined and message.mail_account_display_name) else message.mail_account_email %}
+        <dd>
+          {{ _acc_label | e }}
+          {% if message.mail_account_display_name is defined and message.mail_account_display_name and message.mail_account_email and message.mail_account_display_name != message.mail_account_email %}
+            <span class="message__meta-secondary">&lt;{{ message.mail_account_email | e }}&gt;</span>
+          {% endif %}
+        </dd>
       </div>
+      {% if message.owner is defined and message.owner and (message.owner.id is defined or message.owner['id'] is defined) %}
+        {# Owner row — показываем только когда owner.id != self (group-видимость).
+           Backend может передавать owner=None для собственных писем. #}
+        <div class="message__meta-row">
+          <dt>Владелец</dt>
+          <dd>{{ m.effective_user_name(message.owner) }}</dd>
+        </div>
+      {% endif %}
     </dl>
   </header>
 
-  <section class="message__body" aria-label="Message body">
+  <section class="message__body" aria-label="Тело письма">
     {% if message.body_present %}
       <pre class="message__body-text">{{ message.body_text | e }}</pre>
       {% if message.body_truncated %}
         <p class="message__notice" role="note">
-          &#9432; Body truncated at 1 MiB.
+          &#9432; Тело письма обрезано до 1 МиБ.
         </p>
       {% endif %}
     {% else %}
       <p class="message__notice" role="note">
-        &#9432; This message has no readable text body.
+        &#9432; У этого письма нет читаемого текстового тела.
       </p>
     {% endif %}
   </section>
 
   {% if message.attachments %}
-    <section class="message__attachments" aria-label="Attachments">
-      <h2 class="message__attachments-title">Attachments</h2>
+    <section class="message__attachments" aria-label="Вложения">
+      <h2 class="message__attachments-title">Вложения</h2>
       <ul class="attachment-list">
         {% for att in message.attachments %}
           <li class="attachment-list__item {% if att.skipped_too_large %}attachment-list__item--skipped{% endif %}">
-            <span class="attachment-list__name">{{ att.filename | default('(unnamed)') | e }}</span>
+            <span class="attachment-list__name">{{ att.filename | default('(без имени)') | e }}</span>
             <span class="attachment-list__meta">
               {% if att.content_type %}{{ att.content_type | e }}{% endif %}
-              {% if att.size_human %}&middot; {{ att.size_human | e }}{% elif att.size_bytes %}&middot; {{ att.size_bytes }} bytes{% endif %}
+              {% if att.size_human %}&middot; {{ att.size_human | e }}{% elif att.size_bytes %}&middot; {{ att.size_bytes }} байт{% endif %}
             </span>
             {% if att.skipped_too_large %}
-              <span class="attachment-list__skipped" title="Attachment exceeds the 25 MiB download limit and was not stored.">
-                Skipped: too large (&gt; 25 MiB)
+              <span class="attachment-list__skipped" title="Вложение превышает лимит загрузки 25 МиБ и не было сохранено.">
+                Пропущено: слишком большое (&gt; 25 МиБ)
               </span>
             {% else %}
               <a class="btn btn--link"
                  href="/api/messages/{{ message.id }}/attachments/{{ att.id }}"
                  download="{{ att.filename | default('attachment') | e }}">
-                Download
+                Скачать
               </a>
             {% endif %}
           </li>

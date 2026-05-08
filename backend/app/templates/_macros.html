@@ -40,16 +40,16 @@
 
 {# Cursor pagination links (keyset; only prev/next URLs). #}
 {%- macro pagination_links(prev_url=None, next_url=None) -%}
-<nav class="pagination" aria-label="Pagination">
+<nav class="pagination" aria-label="Постраничная навигация">
   {%- if prev_url -%}
-    <a class="pagination__link" rel="prev" href="{{ prev_url | e }}">&larr; Prev</a>
+    <a class="pagination__link" rel="prev" href="{{ prev_url | e }}">&larr; Назад</a>
   {%- else -%}
-    <span class="pagination__link pagination__link--disabled" aria-disabled="true">&larr; Prev</span>
+    <span class="pagination__link pagination__link--disabled" aria-disabled="true">&larr; Назад</span>
   {%- endif -%}
   {%- if next_url -%}
-    <a class="pagination__link" rel="next" href="{{ next_url | e }}">Next &rarr;</a>
+    <a class="pagination__link" rel="next" href="{{ next_url | e }}">Далее &rarr;</a>
   {%- else -%}
-    <span class="pagination__link pagination__link--disabled" aria-disabled="true">Next &rarr;</span>
+    <span class="pagination__link pagination__link--disabled" aria-disabled="true">Далее &rarr;</span>
   {%- endif -%}
 </nav>
 {%- endmacro -%}
@@ -58,19 +58,19 @@
 {%- macro page_pagination(page, total, limit, base_url) -%}
 {%- set total_pages = ((total // limit) + (1 if total % limit else 0)) if total else 1 -%}
 {%- if total_pages > 1 -%}
-<nav class="pagination" aria-label="Pagination">
+<nav class="pagination" aria-label="Постраничная навигация">
   {%- set prev_p = page - 1 -%}
   {%- set next_p = page + 1 -%}
   {%- if page > 1 -%}
-    <a class="pagination__link" rel="prev" href="{{ base_url | e }}page={{ prev_p }}">&larr; Prev</a>
+    <a class="pagination__link" rel="prev" href="{{ base_url | e }}page={{ prev_p }}">&larr; Назад</a>
   {%- else -%}
-    <span class="pagination__link pagination__link--disabled" aria-disabled="true">&larr; Prev</span>
+    <span class="pagination__link pagination__link--disabled" aria-disabled="true">&larr; Назад</span>
   {%- endif -%}
-  <span class="pagination__info">Page {{ page }} of {{ total_pages }}</span>
+  <span class="pagination__info">Стр. {{ page }} из {{ total_pages }}</span>
   {%- if page < total_pages -%}
-    <a class="pagination__link" rel="next" href="{{ base_url | e }}page={{ next_p }}">Next &rarr;</a>
+    <a class="pagination__link" rel="next" href="{{ base_url | e }}page={{ next_p }}">Далее &rarr;</a>
   {%- else -%}
-    <span class="pagination__link pagination__link--disabled" aria-disabled="true">Next &rarr;</span>
+    <span class="pagination__link pagination__link--disabled" aria-disabled="true">Далее &rarr;</span>
   {%- endif -%}
 </nav>
 {%- endif -%}
@@ -118,4 +118,94 @@
 {%- set raw_color = (tag.color if tag.color is defined else '') | default('') | string | lower -%}
 {%- set cls = TAG_PALETTE_MAP.get(raw_color, 'c8') -%}
 <span class="tag-chip tag-color-{{ cls }}" title="{{ tag.name | e }}">{{ tag.name | e }}</span>
+{%- endmacro -%}
+
+{# ---------------------------------------------------------------------------
+   Localization helpers (ADR-0021).
+
+   error_text(code, default)
+       Maps backend snake_case error codes to user-facing Russian text.
+       Used in templates that display ``error.code`` from API responses or
+       ``form_error`` context.
+
+   effective_user_name(user)
+       Returns ``user.display_name`` if set, otherwise ``user.username``.
+       Used everywhere a user's human-readable name is shown (admin lists,
+       owner columns in inbox, leader of a group, etc.). Tolerates dict-like
+       objects and DTOs.
+
+   effective_account_label(account)
+       Returns ``account.display_name`` if set, otherwise ``account.email``.
+       Used in inbox row "account" column, message_view, accounts list, and
+       the compose "From" dropdown.
+
+   role_label(role)
+       Maps the backend role string ('super_admin'/'group_leader'/
+       'group_member') to its Russian label.
+   --------------------------------------------------------------------------- #}
+
+{%- macro error_text(code, default='Произошла ошибка') -%}
+{%- set MAP = {
+  'invalid_credentials': 'Неверный логин или пароль',
+  'not_authenticated': 'Требуется авторизация',
+  'account_locked': 'Аккаунт заблокирован после нескольких неудачных попыток',
+  'rate_limited': 'Слишком много запросов. Попробуйте позже',
+  'csrf_failed': 'Ошибка безопасности (CSRF). Перезагрузите страницу и повторите',
+  'validation_error': 'Ошибка валидации формы',
+  'method_override_not_allowed': 'Запрос отклонён',
+  'forbidden': 'Доступ запрещён',
+  'not_found': 'Не найдено',
+  'conflict': 'Такая запись уже существует',
+  'internal_error': 'Внутренняя ошибка сервера. Попробуйте позже',
+  'upstream_error': 'Внешний сервис недоступен. Попробуйте позже',
+  'dependency_unavailable': 'Сервис временно недоступен',
+  'imap_login_failed': 'Не удалось войти по IMAP — проверьте логин и пароль',
+  'imap_connect_error': 'Не удалось подключиться к IMAP-серверу',
+  'smtp_login_failed': 'Не удалось войти по SMTP',
+  'smtp_connect_error': 'Не удалось подключиться к SMTP-серверу',
+  'smtp_failed': 'Не удалось отправить письмо',
+  'cannot_select_inbox': 'Папка INBOX недоступна на сервере',
+  'invalid_host': 'Неверный хост',
+  'cannot_delete_admin': 'Нельзя удалить супер-админа',
+  'cannot_reset_admin': 'Нельзя сбросить пароль супер-админа',
+  'cannot_delete_self': 'Нельзя удалить самого себя',
+  'cannot_delete_builtin_tag': 'Встроенный тег нельзя удалить',
+  'tag_apply_too_many': 'Слишком много писем — лимит 100k',
+  'group_has_members': 'В группе есть участники — сначала удалите их',
+  'cannot_delete_leader': 'Удалите лидера через изменение его роли',
+  'group_leader_consistency_violation': 'Несогласованность роли и группы',
+  'group_id_must_be_null_for_new_leader': 'Для нового лидера группа создаётся автоматически',
+  'group_not_found': 'Группа не найдена',
+  'user_not_in_group_scope': 'Пользователь вне области видимости вашей группы',
+  'cannot_demote_lone_leader': 'Нельзя понизить единственного лидера группы. Сначала назначьте другого лидера или удалите группу'
+} -%}
+{{ MAP.get(code, default) | e }}
+{%- endmacro -%}
+
+{%- macro effective_user_name(user) -%}
+{%- if user is mapping -%}
+  {{ (user.get('display_name') or user.get('username') or '') | e }}
+{%- else -%}
+  {%- set dn = user.display_name if user is defined and user.display_name is defined else None -%}
+  {%- set un = user.username if user is defined and user.username is defined else '' -%}
+  {{ (dn if dn else un) | e }}
+{%- endif -%}
+{%- endmacro -%}
+
+{%- macro effective_account_label(account) -%}
+{%- if account is mapping -%}
+  {{ (account.get('display_name') or account.get('email') or '') | e }}
+{%- else -%}
+  {%- set dn = account.display_name if account is defined and account.display_name is defined else None -%}
+  {%- set em = account.email if account is defined and account.email is defined else '' -%}
+  {{ (dn if dn else em) | e }}
+{%- endif -%}
+{%- endmacro -%}
+
+{%- macro role_label(role) -%}
+{%- if role == 'super_admin' -%}Супер-админ
+{%- elif role == 'group_leader' -%}Лидер группы
+{%- elif role == 'group_member' -%}Участник группы
+{%- else -%}{{ role | default('') | e }}
+{%- endif -%}
 {%- endmacro -%}

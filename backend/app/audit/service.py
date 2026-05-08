@@ -12,7 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.repositories.audit import AuditRepo
 
-# Closed enum from ``docs/03-data-model.md`` table ``admin_audit``.
+# Closed enum from ``docs/03-data-model.md`` table ``admin_audit`` +
+# ADR-0019 §9 (group / role lifecycle actions).
 ALLOWED_ACTIONS: Final[frozenset[str]] = frozenset(
     {
         "admin_login",
@@ -22,6 +23,12 @@ ALLOWED_ACTIONS: Final[frozenset[str]] = frozenset(
         "delete_user",
         "lockout_triggered",
         "account_auto_disabled",
+        # ADR-0019 §9 — group / role lifecycle.
+        "group_create",
+        "group_delete",
+        "group_rename",
+        "user_role_change",
+        "user_group_change",
     }
 )
 

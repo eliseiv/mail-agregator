@@ -1,22 +1,22 @@
 {% extends "base.html" %}
 {% import "_macros.html" as m with context %}
 
-{% block title %}Admin &middot; Audit log{% endblock %}
+{% block title %}Админ &middot; Журнал действий{% endblock %}
 {% block body_class %}admin-audit{% endblock %}
 
 {% block content %}
 <section class="admin" aria-labelledby="audit-heading">
   <header class="admin__toolbar">
-    <h1 id="audit-heading" class="admin__title">Audit log</h1>
-    <a class="topnav__link" href="/admin">&larr; Users</a>
+    <h1 id="audit-heading" class="admin__title">Журнал действий</h1>
+    <a class="topnav__link" href="/admin">&larr; К пользователям</a>
   </header>
 
   <form method="GET" action="/admin/audit" class="admin__filter form" role="search">
     <div class="field-grid">
       <div class="field">
-        <label class="field__label" for="audit-action">Action</label>
+        <label class="field__label" for="audit-action">Действие</label>
         <select class="field__input" id="audit-action" name="action">
-          <option value="">All</option>
+          <option value="">Все</option>
           {% for a in available_actions | default([]) %}
             <option value="{{ a | e }}" {% if filter.action == a %}selected{% endif %}>{{ a | e }}</option>
           {% endfor %}
@@ -24,51 +24,51 @@
       </div>
 
       <div class="field">
-        <label class="field__label" for="audit-target">Target user id</label>
+        <label class="field__label" for="audit-target">ID целевого пользователя</label>
         <input class="field__input" type="number" id="audit-target" name="target_user_id"
                value="{{ filter.target_user_id | default('') | e }}" min="1">
       </div>
 
       <div class="field">
-        <label class="field__label" for="audit-from">From</label>
+        <label class="field__label" for="audit-from">С</label>
         <input class="field__input" type="date" id="audit-from" name="from"
                value="{{ filter['from'] | default('') | e }}">
       </div>
 
       <div class="field">
-        <label class="field__label" for="audit-to">To</label>
+        <label class="field__label" for="audit-to">По</label>
         <input class="field__input" type="date" id="audit-to" name="to"
                value="{{ filter['to'] | default('') | e }}">
       </div>
     </div>
     <div class="form-actions">
-      <button type="submit" class="btn btn--secondary">Filter</button>
-      <a class="btn btn--link" href="/admin/audit">Reset</a>
+      <button type="submit" class="btn btn--secondary">Применить</button>
+      <a class="btn btn--link" href="/admin/audit">Сбросить</a>
     </div>
   </form>
 
   {% if not items %}
     <div class="admin__empty" role="status">
-      <p>No audit entries match the current filter.</p>
+      <p>Под текущий фильтр записей не найдено.</p>
     </div>
   {% else %}
     <div class="table-wrapper">
       <table class="audit-table">
         <thead>
           <tr>
-            <th scope="col">When</th>
-            <th scope="col">Actor</th>
-            <th scope="col">Action</th>
-            <th scope="col">Target</th>
+            <th scope="col">Когда</th>
+            <th scope="col">Кто</th>
+            <th scope="col">Действие</th>
+            <th scope="col">Цель</th>
             <th scope="col">IP</th>
-            <th scope="col">Details</th>
+            <th scope="col">Детали</th>
           </tr>
         </thead>
         <tbody>
           {% for row in items %}
             <tr>
               <td>{{ m.time_tag(row.created_at, row.created_at_human if row.created_at_human is defined else None) }}</td>
-              <td>{{ row.actor_username | default('system') | e }}</td>
+              <td>{{ row.actor_username | default('система') | e }}</td>
               <td><code>{{ row.action | e }}</code></td>
               <td>
                 {% if row.target_username %}{{ row.target_username | e }}{% elif row.target_user_id %}#{{ row.target_user_id }}{% else %}&mdash;{% endif %}
@@ -77,7 +77,7 @@
               <td>
                 {% if row.details %}
                   <details class="audit-details">
-                    <summary>view</summary>
+                    <summary>показать</summary>
                     <pre class="audit-details__pre">{{ row.details_json | default(row.details | string) | e }}</pre>
                   </details>
                 {% else %}

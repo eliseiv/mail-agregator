@@ -1,36 +1,57 @@
 {% extends "base.html" %}
 {% import "_macros.html" as m with context %}
 
-{% block title %}Inbox &middot; Mail Aggregator{% endblock %}
+{% block title %}Входящие &middot; Mail Aggregator{% endblock %}
 {% block body_class %}inbox{% endblock %}
 
 {% block content %}
 <section class="inbox" aria-labelledby="inbox-heading">
 
   <header class="inbox__toolbar">
-    <h1 id="inbox-heading" class="inbox__title">Inbox</h1>
+    <h1 id="inbox-heading" class="inbox__title">Входящие</h1>
 
     <div class="inbox__actions">
-      <a class="btn btn--primary" href="/compose">Compose new</a>
+      <a class="btn btn--primary" href="/compose">Написать</a>
 
       <form method="GET" action="/" class="inbox__filter inline-form" role="search">
-        <label class="visually-hidden" for="filter-account">Filter by account</label>
+        {# Group filter — visible only to super_admin (ADR-0019 §7).
+           Backend передаёт ``groups: list[Group]`` в context для super_admin'а;
+           если контекста нет, dropdown не рендерим (graceful skip). #}
+        {% if request.state.session.role == 'super_admin' and (groups | default([])) %}
+          <label class="visually-hidden" for="filter-group">Фильтр по группе</label>
+          <select
+            class="field__input field__input--compact"
+            id="filter-group"
+            name="group_id"
+            data-inbox-filter>
+            <option value="">Все группы</option>
+            {% for grp in groups %}
+              <option
+                value="{{ grp.id }}"
+                {% if selected_group_id is defined and selected_group_id and selected_group_id == grp.id %}selected{% endif %}>
+                {{ grp.name | e }}
+              </option>
+            {% endfor %}
+          </select>
+        {% endif %}
+
+        <label class="visually-hidden" for="filter-account">Фильтр по почте</label>
         <select
           class="field__input field__input--compact"
           id="filter-account"
           name="account_id"
           data-inbox-filter>
-          <option value="">All accounts</option>
+          <option value="">Все почты</option>
           {% for acc in accounts | default([]) %}
             <option
               value="{{ acc.id }}"
               {% if selected_account_id is defined and selected_account_id and selected_account_id == acc.id %}selected{% endif %}>
-              {{ acc.email | e }}
+              {{ m.effective_account_label(acc) }}
             </option>
           {% endfor %}
         </select>
 
-        <label class="visually-hidden" for="filter-tag">Filter by tag</label>
+        <label class="visually-hidden" for="filter-tag">Фильтр по тегу</label>
         <select
           class="field__input field__input--compact"
           id="filter-tag"
@@ -53,32 +74,32 @@
             value="1"
             data-inbox-unread
             {% if unread_only %}checked{% endif %}>
-          <span>Unread only</span>
+          <span>Только непрочитанные</span>
         </label>
 
         <noscript>
-          <button type="submit" class="btn btn--secondary">Apply</button>
+          <button type="submit" class="btn btn--secondary">Применить</button>
         </noscript>
       </form>
 
-      <button type="button" class="btn btn--secondary" data-inbox-refresh>Refresh</button>
+      <button type="button" class="btn btn--secondary" data-inbox-refresh>Обновить</button>
     </div>
   </header>
 
   {% if not accounts %}
     {# Empty state — no mail accounts at all. #}
     <div class="inbox__empty" role="status">
-      <p>No messages yet. Add a mail account to start syncing.</p>
-      <a href="/accounts/new" class="btn btn--primary">Add account</a>
+      <p>Сообщений пока нет. Добавьте email-аккаунт, чтобы начать синхронизацию.</p>
+      <a href="/accounts/new" class="btn btn--primary">Добавить аккаунт</a>
     </div>
   {% elif not items %}
     {# Has accounts, no messages match the current filter. #}
     <div class="inbox__empty" role="status">
       <p>
-        {% if unread_only or selected_account_id or selected_tag_id %}
-          No messages match this filter.
+        {% if unread_only or selected_account_id or selected_tag_id or (selected_group_id is defined and selected_group_id) %}
+          Под текущий фильтр сообщений не нашлось.
         {% else %}
-          No messages yet. Sync runs automatically every few minutes.
+          Сообщений пока нет. Синхронизация выполняется автоматически каждые несколько минут.
         {% endif %}
       </p>
     </div>
@@ -95,6 +116,7 @@
        service layer does not expose a back-cursor. #}
     {% if next_cursor %}
       {% set next_qs = "?cursor=" ~ next_cursor %}
+      {% if selected_group_id is defined and selected_group_id %}{% set next_qs = next_qs ~ "&group_id=" ~ selected_group_id %}{% endif %}
       {% if selected_account_id %}{% set next_qs = next_qs ~ "&account_id=" ~ selected_account_id %}{% endif %}
       {% if selected_tag_id %}{% set next_qs = next_qs ~ "&tag_id=" ~ selected_tag_id %}{% endif %}
       {% if unread_only %}{% set next_qs = next_qs ~ "&unread=1" %}{% endif %}
