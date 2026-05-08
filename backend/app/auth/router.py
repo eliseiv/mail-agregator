@@ -514,7 +514,7 @@ async def set_password_submit(
                 db,
                 setup_token=setup_token,
                 error_message=(
-                    "Пароль не удовлетворяет требованиям: минимум 12 символов, "
+                    "Пароль не удовлетворяет требованиям: минимум 8 символов, "
                     "хотя бы одна буква и одна цифра."
                 ),
                 status_code=status.HTTP_400_BAD_REQUEST,

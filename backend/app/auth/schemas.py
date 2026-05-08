@@ -50,8 +50,8 @@ class LoginPasswordRequest(BaseModel):
 
 
 class SetPasswordRequest(BaseModel):
-    password: str = Field(min_length=12, max_length=128)
-    password_confirm: str = Field(min_length=12, max_length=128)
+    password: str = Field(min_length=8, max_length=128)
+    password_confirm: str = Field(min_length=8, max_length=128)
     csrf_token: str | None = None
 
     @field_validator("password")
