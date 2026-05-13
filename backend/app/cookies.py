@@ -21,6 +21,9 @@ SESSION_COOKIE = "mas_session"
 CSRF_COOKIE = "mas_csrf"
 SETUP_COOKIE = "mas_setup"
 LOGIN_COOKIE = "mas_login"
+# ADR-0022 §1.2/§1.3 — one-shot opaque token referencing
+# ``tg_pending:{token}`` in Redis. HttpOnly + 15 min TTL.
+TG_PENDING_COOKIE = "mas_tg_pending"
 
 # Two-step login state cookie TTL — 15 minutes is enough for a normal user to
 # move from the username form to the password form, and short enough that an
@@ -134,4 +137,45 @@ def read_login_cookie(request: Request) -> str | None:
     if not raw:
         return None
     cleaned = raw.strip().lower()
+    return cleaned or None
+
+
+# ---------------------------------------------------------------------------
+# Telegram pending-link cookie (ADR-0022 §1.2)
+# ---------------------------------------------------------------------------
+
+
+def set_tg_pending_cookie(response: Response, token: str, settings: Settings) -> None:
+    """Persist the pending-link opaque token for ``TG_PENDING_LINK_TTL_SECONDS``.
+
+    HttpOnly + Secure (prod) + SameSite=Lax. The cookie itself is meaningless
+    without the Redis record at ``tg_pending:{token}``.
+    """
+    if not token:
+        return
+    response.set_cookie(
+        key=TG_PENDING_COOKIE,
+        value=token,
+        max_age=settings.TG_PENDING_LINK_TTL_SECONDS,
+        httponly=True,
+        secure=settings.cookie_secure,
+        samesite="lax",
+        path="/",
+        domain=settings.COOKIE_DOMAIN or None,
+    )
+
+
+def clear_tg_pending_cookie(response: Response, settings: Settings) -> None:
+    response.delete_cookie(
+        key=TG_PENDING_COOKIE,
+        path="/",
+        domain=settings.COOKIE_DOMAIN or None,
+    )
+
+
+def read_tg_pending_cookie(request: Request) -> str | None:
+    raw = request.cookies.get(TG_PENDING_COOKIE)
+    if not raw:
+        return None
+    cleaned = raw.strip()
     return cleaned or None

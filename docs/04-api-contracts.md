@@ -73,6 +73,8 @@
 | 400 | `cannot_delete_group_with_super_admin_target` | Внутренняя защита от ошибочного удаления группы, ссылающейся на super_admin как лидера (по инварианту невозможно, но defensive). |
 | 404 | `group_not_found` | Запрос про группу, которой нет (или у запрашивающего нет прав её видеть). |
 | 403 | `user_not_in_group_scope` | Лидер пытается выполнить действие на пользователя/аккаунт вне своей группы. |
+| 401 | `invalid_init_data` | `POST /api/telegram/auth`: HMAC-подпись Telegram `init_data` некорректна. См. [ADR-0022](./adr/ADR-0022-telegram-sso-and-notifications.md) §1.2. |
+| 401 | `init_data_expired` | `POST /api/telegram/auth`: `auth_date` в `init_data` старше 5 минут. |
 
 ---
 
@@ -542,8 +544,20 @@ csrf_token=...
 ### Self
 
 #### `GET /api/me`
-| 200 | `{id, username, display_name, role, group: {id, name}\|null, last_login_at, mail_accounts_count}` |
-| Note | Поле `is_admin` **удалено** в пользу `role` (см. ADR-0019). Frontend использует `role === 'super_admin'` для проверки админских прав. Для UX-помощи возвращается inline-объект `group` (id+name) — чтобы избежать второго запроса. |
+| 200 | `{id, username, display_name, role, group: {id, name}\|null, last_login_at, mail_accounts_count, tg_notifications_enabled: bool, telegram_linked: bool}` |
+| Note | Поле `is_admin` **удалено** в пользу `role` (см. ADR-0019). Frontend использует `role === 'super_admin'` для проверки админских прав. Для UX-помощи возвращается inline-объект `group` (id+name) — чтобы избежать второго запроса. Поле `tg_notifications_enabled` (ADR-0022 §2.7) — `COALESCE(users_settings.tg_notifications_enabled, true)`, default `true` если в `users_settings` нет строки. Поле `telegram_linked` — `EXISTS(SELECT 1 FROM telegram_links WHERE user_id=me AND dead_at IS NULL)`. |
+
+#### `PATCH /api/me/settings` (ADR-0022 §2.7)
+| Запрос | `{tg_notifications_enabled?: bool}` — любое подмножество. На текущей итерации поддерживается только `tg_notifications_enabled`; в будущем добавятся другие preferences. |
+| Поведение | Upsert в `users_settings` (`INSERT … ON CONFLICT (user_id) DO UPDATE SET tg_notifications_enabled=EXCLUDED.tg_notifications_enabled, updated_at=now()`). |
+| Доступ | user-сессия (любая роль). |
+| CSRF | yes. |
+| 200 | `{tg_notifications_enabled: bool}` — итоговое значение. |
+| 400 | `validation_error` если поле не bool. |
+
+##### Form-encoded request (no-JS) — не требуется на MVP
+
+UI toggle отложен (см. ADR-0022 Open question Q-002-1). API endpoint реализуется в этом спринте; form-fallback добавится в следующем sprint вместе с UI.
 
 ---
 
@@ -727,9 +741,13 @@ _method=DELETE&csrf_token=...
 
 ---
 
-## 4a. Telegram webhook
+## 4a. Telegram webhook + Persistent SSO + Push-нотификации
 
-Источник истины — [ADR-0018](./adr/ADR-0018-telegram-launcher.md). Бот используется **только** как launcher: одна команда `/start` отдаёт inline-keyboard с WebApp-кнопкой на основной URL сервиса. Никакой линковки Telegram ↔ user, никакой initData-аутентификации, никакого нового способа login. Auth-flow для пользователя, открывшего WebApp, — обычный two-step login (ADR-0016).
+Источники истины — [ADR-0018](./adr/ADR-0018-telegram-launcher.md) (launcher) + [ADR-0022](./adr/ADR-0022-telegram-sso-and-notifications.md) (persistent SSO + push-нотификации; partially supersedes ADR-0018).
+
+- **Бот-launcher (ADR-0018)**: `/start` отдаёт inline-keyboard с WebApp-кнопкой на основной URL сервиса.
+- **Persistent SSO (ADR-0022 §1)**: открытие WebApp с активной `telegram_links` записью даёт автоматический login без повторного ввода username+password. Реализуется отдельным эндпоинтом `POST /api/telegram/auth` (см. ниже), который валидирует подписанный Telegram `init_data` (HMAC-SHA256 + auth_date TTL 5 мин) и при наличии линковки выпускает session-cookie.
+- **Push-нотификации (ADR-0022 §2)**: после auto-tagging новых писем worker диспатчит `sendMessage` в Telegram всем получателям, у которых: (а) есть активная линковка, (б) есть свой тег на письме, (в) включены уведомления (`users_settings.tg_notifications_enabled = true`).
 
 ### `POST /api/telegram/webhook/{secret}`
 
@@ -747,6 +765,52 @@ _method=DELETE&csrf_token=...
 | 503 | `dependency_unavailable` (если бот включён, но `httpx`-вызов на api.telegram.org упал — возвращаем 503, чтобы Telegram повторил позже; обычно это transient). |
 
 Если env `TELEGRAM_BOT_ENABLED=false`, endpoint регистрируется и валидирует secret, но `sendMessage` не отправляет — просто 200 OK. Это упрощает запуск окружений без bot-настройки (CI, dev без BotFather).
+
+### `POST /api/telegram/auth` (ADR-0022 §1)
+
+Persistent SSO endpoint: принимает Telegram WebApp `init_data`, валидирует HMAC, ищет линковку и либо выпускает session-cookie, либо ставит pending-cookie для последующей линковки после ручного login.
+
+| | |
+| --- | --- |
+| Доступ | публичный |
+| CSRF | exempt (нет session при first call; защита — HMAC + TTL) |
+| Запрос | `application/json`, тело: `{"init_data": "<raw initData string from Telegram.WebApp.initData>"}`. `init_data` — строка 1..4096 chars. |
+| Валидация init_data | (1) Parse как URL-encoded; (2) извлечь `hash`; (3) `data_check_string = "\n".join(sorted(k=v for non-hash keys))`; (4) `secret_key = HMAC_SHA256("WebAppData", TELEGRAM_BOT_TOKEN)`; (5) constant-time compare `HMAC_SHA256(secret_key, data_check_string)` vs `hash`; (6) `auth_date` не старше 5 минут (env `TG_AUTH_INIT_DATA_TTL_SEC=300`). Спецификация: https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app |
+| Rate-limit | 30/min per IP **+** 10/min per `telegram_user_id` (применяется ПОСЛЕ HMAC валидации). |
+| 200 (linked=true) | `{"linked": true, "redirect": "/"}` + Set-Cookie `mas_session` (HttpOnly, Secure, SameSite=Lax, sliding 12h) + Set-Cookie `mas_csrf` (не HttpOnly). |
+| 200 (linked=false) | `{"linked": false, "redirect": "/login"}` + Set-Cookie `mas_tg_pending` (HttpOnly, Secure, SameSite=Lax, **15 минут**) — opaque token указывающий на Redis ключ `tg_pending:{token}` = `{telegram_user_id}`. После успешного `POST /login/password` или `POST /set-password` backend читает cookie, делает upsert в `telegram_links` и удаляет Redis ключ. |
+| 401 | `invalid_init_data` (HMAC mismatch / парсинг провалился). |
+| 401 | `init_data_expired` (`auth_date` старше TTL). |
+| 429 | `rate_limited` + `Retry-After`. |
+| Audit | при успешной перепривязке (upsert обновил `user_id`) — `telegram_link_created` с `details={telegram_user_id, replaced: true|false}`; при коллизии (UNIQUE `user_id`) — `telegram_link_collision`. |
+| Side effects | См. ADR-0022 §1.3 sequence diagram. |
+
+#### Связанные изменения flow
+
+| Endpoint | Изменение от base-логики |
+| --- | --- |
+| `POST /login/password` | После успешного verify password, если в request есть cookie `mas_tg_pending` — backend читает Redis `tg_pending:{token}`, делает `INSERT INTO telegram_links (telegram_user_id, user_id) … ON CONFLICT (telegram_user_id) DO UPDATE SET user_id=EXCLUDED.user_id, created_at=now(), dead_at=NULL` (атомарно перепривязывает); удаляет Redis-ключ; clear cookie `mas_tg_pending`. Audit: `telegram_link_created`. |
+| `POST /set-password` | То же поведение, что и `POST /login/password` — линковка создаётся после успешной установки пароля. |
+| `POST /logout` | Дополнительно: `DELETE FROM telegram_links WHERE user_id=:uid` в той же транзакции с revoke session. Audit: `telegram_link_revoked` с `details={telegram_user_id}`. |
+| `POST /api/admin/users/{id}/reset` | Дополнительно: `DELETE FROM telegram_links WHERE user_id=:id`. Audit: `telegram_link_revoked` с `details={telegram_user_id, reason: 'password_reset'}`. |
+| `DELETE /api/admin/users/{id}` | Каскад: `telegram_links ON DELETE CASCADE` автоматически удалит row (отдельный audit не нужен — покрыт `delete_user`). |
+
+### `GET /messages/{id}` — поддержка `embed=tg` (ADR-0022 §2.6)
+
+| Query | `embed: str | None = None` — если `embed='tg'` (рендер внутри Telegram WebApp по inline-keyboard button), backend выставляет в Jinja-контекст `embed_tg=True`. Шаблон `message_view.html` при `embed_tg=True` скрывает секцию `<section class="attachments">`. Остальной функционал (mark-read, bottom-nav, logout) остаётся. |
+
+### Push-уведомления о письмах с тегами (ADR-0022 §2)
+
+Доставка происходит **асинхронно** через worker-job (см. `05-modules.md` модуль `telegram` + `worker → tg_notify_dispatch`). Нет публичного HTTP-эндпоинта для триггера/просмотра очереди — это внутренний механизм. Получатель видит уведомление в Telegram-боте как Message с inline-keyboard кнопкой «Посмотреть сообщение» (WebApp-button → открывает `/messages/{id}?embed=tg` внутри Telegram WebView с persistent SSO).
+
+Шаблон текста (HTML mode):
+```
+Вы получили письмо на почту <b>{acc.display_name|acc.email}</b>
+Тег «<b>X</b>»            ИЛИ          Теги «<b>X</b>», «<b>Y</b>», «<b>Z</b>»
+Отправитель <b>{from_name|from_addr}</b>
+
+[ Посмотреть сообщение ]   ← inline_keyboard.web_app.url = {TELEGRAM_WEBAPP_URL}/messages/{message_id}?embed=tg
+```
 
 ### Setup webhook (one-shot)
 
@@ -865,5 +929,7 @@ FastAPI автогенерит OpenAPI 3.1. UI:
 | POST | `/api/admin/groups/{id}/delete` | super_admin | yes | 50/h | yes | form-fallback delete (`_method=DELETE`) |
 | GET | `/api/admin/audit` | super_admin | — | — | — | audit log |
 | POST | `/api/telegram/webhook/{secret}` | secret in URL + header | exempt | 60/min per IP | — | Telegram bot webhook (launcher only — `/start` отдаёт WebApp button); см. ADR-0018 |
+| POST | `/api/telegram/auth` | initData HMAC | exempt | 30/min per IP + 10/min per tg_user_id | — | Persistent SSO: validate Telegram WebApp initData, выпустить session либо pending-cookie; см. ADR-0022 |
+| PATCH | `/api/me/settings` | user | yes | — | — | user preferences (tg_notifications_enabled); см. ADR-0022 |
 | GET | `/healthz` | none | — | — | — | liveness |
 | GET | `/readyz` | none | — | — | — | readiness |

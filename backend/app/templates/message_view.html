@@ -93,7 +93,10 @@
     {% endif %}
   </section>
 
-  {% if message.attachments %}
+  {# ADR-0022 §2.6: hide attachments when rendered inside Telegram WebApp.
+     Binary downloads from a WebApp WebView are unreliable; users open the
+     full Inbox to fetch attachments. #}
+  {% if message.attachments and not embed_tg %}
     <section class="message__attachments" aria-label="Вложения">
       <h2 class="message__attachments-title">Вложения</h2>
       <ul class="attachment-list">

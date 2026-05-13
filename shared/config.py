@@ -88,7 +88,8 @@ class Settings(BaseSettings):
     SAFE_REDIRECT_AFTER_LOGIN: str = "/"
     LOGIN_PATH: str = "/login"
 
-    # --- Telegram launcher bot (ADR-0018) ---
+    # --- Telegram launcher bot (ADR-0018) + persistent SSO / notifications
+    #     (ADR-0022) ---
     # NOTE: ADR-0018 + docs/05-modules.md sec. 18 reference the env name
     # ``TELEGRAM_BOT_TOKEN``. Operator deployment uses ``BOT_TOKEN`` (it is
     # what BotFather copy-paste UX surfaces and what is already provisioned
@@ -98,6 +99,24 @@ class Settings(BaseSettings):
     BOT_TOKEN: str = ""
     TELEGRAM_WEBHOOK_SECRET: str = ""
     TELEGRAM_WEBAPP_URL: str = ""
+
+    # --- Telegram persistent SSO (ADR-0022 §1) ---
+    # TTL for ``initData.auth_date`` — 5 minutes (jSO ADR-0022 §1.2).
+    TG_AUTH_INIT_DATA_TTL_SECONDS: int = Field(default=300, ge=30, le=86_400)
+    # TTL of ``mas_tg_pending`` cookie / Redis token — 15 minutes.
+    TG_PENDING_LINK_TTL_SECONDS: int = Field(default=900, ge=60, le=86_400)
+
+    # --- Telegram push-notifications dispatcher (ADR-0022 §2.4 + §2.8) ---
+    # How often the dispatcher drains the Redis ``tg_notify_queue``.
+    TG_NOTIFY_DISPATCH_INTERVAL_SECONDS: int = Field(default=5, ge=1, le=600)
+    # Recovery scan cadence — finds messages with tags but no notification row.
+    TG_NOTIFY_RECOVERY_INTERVAL_SECONDS: int = Field(default=3600, ge=60, le=86_400)
+    # Lookback window for recovery scan.
+    TG_NOTIFY_RECOVERY_WINDOW_HOURS: int = Field(default=24, ge=1, le=720)
+    # Per-tick LPOP batch size (cap on dispatcher throughput / tick).
+    TG_NOTIFY_BATCH_SIZE: int = Field(default=30, ge=1, le=500)
+    # Per-tick recovery LPUSH batch size.
+    TG_NOTIFY_RECOVERY_BATCH_SIZE: int = Field(default=200, ge=1, le=10_000)
 
     @field_validator("MAIL_ENCRYPTION_KEY")
     @classmethod

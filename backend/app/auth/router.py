@@ -30,7 +30,9 @@ from backend.app.cookies import (
     clear_login_cookie,
     clear_session_cookies,
     clear_setup_cookie,
+    clear_tg_pending_cookie,
     read_login_cookie,
+    read_tg_pending_cookie,
     set_login_cookie,
     set_session_cookies,
     set_setup_cookie,
@@ -51,6 +53,7 @@ from backend.app.rate_limit import (
 )
 from backend.app.repositories.users import UsersRepo
 from backend.app.sessions import SetupSessionStore
+from backend.app.telegram.sso_service import TelegramSSOService
 from backend.app.templates import render
 from shared.config import get_settings
 from shared.logging import get_logger
@@ -63,6 +66,46 @@ def _wants_json(request: Request) -> bool:
     accept = request.headers.get("accept", "")
     ct = request.headers.get("content-type", "")
     return "application/json" in accept or ct.startswith("application/json")
+
+
+async def _link_tg_if_pending(
+    request: Request,
+    response: Response,
+    db: DbSession,
+    *,
+    user_id: int,
+    ip: str,
+    user_agent: str | None,
+) -> None:
+    """If the request carries an ``mas_tg_pending`` cookie, redeem the
+    Redis token and upsert ``telegram_links`` for ``user_id``.
+
+    Safe to call even when the cookie is absent — returns silently.
+    Cookie is always cleared from ``response`` on this path (whether the
+    redemption succeeded, failed validation, or there was no token);
+    leftover stale cookies waste future requests.
+
+    Caller MUST invoke this within an active DB transaction —
+    :class:`TelegramSSOService.link_pending` writes audit rows.
+    """
+    settings = get_settings()
+    token = read_tg_pending_cookie(request)
+    if not token:
+        return
+
+    svc = TelegramSSOService(db)
+    telegram_user_id = await svc.consume_pending(token)
+    # Always clear the cookie. If the Redis lookup failed (expired /
+    # tampered token) we still don't want it lingering.
+    clear_tg_pending_cookie(response, settings)
+    if telegram_user_id is None:
+        return
+    await svc.link_pending(
+        telegram_user_id=telegram_user_id,
+        user_id=user_id,
+        ip=ip,
+        user_agent=user_agent,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +415,20 @@ async def login_password_submit(  # noqa: PLR0911 - each return is a distinct ou
         )
     set_session_cookies(response, result.session_token, result.csrf, settings)
     clear_login_cookie(response, settings)
+    # ADR-0022 §1.3 step 3: if the WebApp opened this login and stored a
+    # pending Telegram-link token, redeem it now.
+    if result.user_id is not None:
+        # Close the autobegun read-tx so the explicit begin() below does not collide.
+        await db.commit()
+        async with db.begin():
+            await _link_tg_if_pending(
+                request,
+                response,
+                db,
+                user_id=result.user_id,
+                ip=ip,
+                user_agent=ua,
+            )
     return response
 
 
@@ -555,6 +612,19 @@ async def set_password_submit(
     clear_setup_cookie(response, settings)
     clear_login_cookie(response, settings)
     set_session_cookies(response, result.session_token, result.csrf, settings)
+    # ADR-0022 §1.3 step 3 (first-login path).
+    if result.user_id is not None:
+        # Close the autobegun read-tx so the explicit begin() below does not collide.
+        await db.commit()
+        async with db.begin():
+            await _link_tg_if_pending(
+                request,
+                response,
+                db,
+                user_id=result.user_id,
+                ip=ip,
+                user_agent=ua,
+            )
     return response
 
 
@@ -583,6 +653,13 @@ async def logout(request: Request, db: DbSession) -> Response:
             session_token=token,
             actor_user_id=sess.user_id,
             is_admin=(sess.role == "super_admin"),
+            ip=ip,
+            user_agent=ua,
+        )
+        # ADR-0022 §1.5: logout drops the persistent Telegram link.
+        await TelegramSSOService(db).revoke_for_user(
+            user_id=sess.user_id,
+            reason="logout",
             ip=ip,
             user_agent=ua,
         )

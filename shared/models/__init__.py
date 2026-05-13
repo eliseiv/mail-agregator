@@ -12,6 +12,8 @@ from shared.models.message import Message
 from shared.models.sent_attachment import SentAttachment
 from shared.models.sent_message import SentMessage
 from shared.models.tag import MessageTag, Tag, TagRule
+from shared.models.telegram_link import TelegramLink
+from shared.models.telegram_notification import TelegramNotification
 from shared.models.user import (
     ALL_ROLES,
     ROLE_GROUP_LEADER,
@@ -19,6 +21,7 @@ from shared.models.user import (
     ROLE_SUPER_ADMIN,
     User,
 )
+from shared.models.user_settings import UserSettings
 
 __all__ = [
     "ALL_ROLES",
@@ -35,5 +38,8 @@ __all__ = [
     "SentMessage",
     "Tag",
     "TagRule",
+    "TelegramLink",
+    "TelegramNotification",
     "User",
+    "UserSettings",
 ]

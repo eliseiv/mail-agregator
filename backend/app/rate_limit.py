@@ -81,6 +81,11 @@ LIMIT_ADMIN_WRITE = Limit(name="admin_write", capacity=50, window_seconds=60 * 6
 # ``apply_to_existing`` is a heavier path and gets its own 5/h limit per user.
 LIMIT_TAGS_WRITE = Limit(name="tags_write", capacity=30, window_seconds=60 * 60)
 LIMIT_TAGS_APPLY = Limit(name="tags_apply", capacity=5, window_seconds=60 * 60)
+# Telegram persistent SSO (ADR-0022 §1.2):
+# - per IP:           30 / min  (front line — covers HMAC-fail flooding).
+# - per tg_user_id:   10 / min  (post-HMAC — covers replay of valid init_data).
+LIMIT_TG_AUTH_IP = Limit(name="tg_auth_ip", capacity=30, window_seconds=60)
+LIMIT_TG_AUTH_USER = Limit(name="tg_auth_user", capacity=10, window_seconds=60)
 
 
 async def consume(limit: Limit, key: str) -> None:

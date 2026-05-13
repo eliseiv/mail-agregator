@@ -65,11 +65,13 @@ backend/
       schemas.py           # Pydantic для request/response
       builtin.py           # Список 4 builtin-тегов + правил (статичный)
       sql.py               # Готовые SQL для apply (используются service'ом и worker'ом)
-    telegram/              # ADR-0018; bot launcher only (no DB tables, no auth changes)
+    telegram/              # ADR-0018 (launcher) + ADR-0022 (SSO + push-нотификации)
       __init__.py
-      router.py            # POST /api/telegram/webhook/{secret}
-      bot.py               # send_message_with_webapp_button(chat_id, text), handle_update(update); httpx async к api.telegram.org
-      schemas.py           # Pydantic минимально: TelegramUpdate с message.chat.id, message.text, message.from.id
+      router.py            # POST /api/telegram/webhook/{secret}, POST /api/telegram/auth
+      bot.py               # send_message_with_webapp_button, send_notification, handle_update; httpx async к api.telegram.org
+      auth_service.py      # TelegramAuthService: validate_init_data, try_sso, link_pending, revoke_for_user, mark_link_dead
+      schemas.py           # TelegramUpdate, TelegramAuthRequest, TelegramAuthResponse, ValidatedTelegramUser
+      notify_format.py     # format_notification(acc_label, from_label, tag_names) -> HTML-строка
     audit/
       service.py
     models/                # SQLAlchemy ORM
@@ -83,6 +85,9 @@ backend/
       sent_attachment.py
       admin_audit.py
       tag.py                # Tag, TagRule, MessageTag ORM
+      telegram_link.py      # ADR-0022 — TelegramLink ORM
+      telegram_notification.py  # ADR-0022 — TelegramNotification ORM
+      user_settings.py      # ADR-0022 — UserSettings ORM
     repositories/
       users.py
       groups.py             # GroupsRepo — ADR-0019
@@ -91,6 +96,9 @@ backend/
       sent_messages.py
       audit.py
       tags.py               # TagsRepo, TagRulesRepo, MessageTagsRepo
+      telegram_links.py     # ADR-0022 — TelegramLinksRepo (get_active_*, upsert, revoke_for_user, mark_dead)
+      telegram_notifications.py  # ADR-0022 — TelegramNotificationsRepo (try_claim, mark_sent, rollback, list_recipients_for_message, list_tags_for_recipient)
+      user_settings.py      # ADR-0022 — UserSettingsRepo (get, upsert)
     templates/             # Jinja2 — все на русском, см. ADR-0021
       base.html              # включает Log out button (восстановлен после редизайна)
       _macros.html           # csrf_input, flash_messages, error_text(code) — RU mapping (ADR-0021); tag_chip
@@ -121,6 +129,7 @@ backend/
       001_initial.py
       002_add_tags.py            # ADR-0017
       003_groups_and_roles.py    # ADR-0019 + ADR-0020 — см. 03-data-model.md секция Миграции
+      004_telegram_sso_and_notifications.py  # ADR-0022 — telegram_links, telegram_notifications, users_settings
   tests/
     unit/
     integration/
@@ -128,12 +137,14 @@ backend/
 worker/
   app/
     __init__.py
-    main.py                # APScheduler entrypoint
+    main.py                # APScheduler entrypoint (jobs: sync_cycle, force_sync_dispatch, retention_cleanup, tg_notify_dispatch, tg_notify_recovery_scan)
     config.py              # shared with backend (через общий пакет, см. ниже)
     sync_cycle.py
     cleanup.py
     imap_fetcher.py
     smtp_appender.py       # IMAP APPEND wrapper
+    tg_notify_dispatch.py  # ADR-0022 — диспатчер Telegram-нотификаций (каждые 5 сек)
+    tg_notify_recovery.py  # ADR-0022 — recovery_scan (каждый час)
   tests/
 shared/                    # общий пакет, импортируется и api, и worker
   __init__.py
@@ -1171,6 +1182,7 @@ async def sync_one_account(account: MailAccount) -> AccountSyncResult
 - INSERT messages + attachments в одной транзакции.
 - ON CONFLICT (`mail_account_id`, `uidvalidity`, `uid`) DO NOTHING.
 - **Apply tags (ADR-0017):** если INSERT messages вернул `RETURNING id` (т.е. это была новая запись, не дубль), в той же транзакции выполняется `tags_service.apply_tags_to_message(message_id, user_id)` (использует SQL `APPLY_TAGS_TO_MESSAGE` из `app/tags/sql.py`). Все условия — один SQL-запрос, ON CONFLICT DO NOTHING. Падение apply откатывает всю транзакцию (включая INSERT messages) → message будет пере-обработан при следующем sync. `user_id` берётся из `mail_accounts.user_id` (resolve один раз перед циклом save_message). При ON CONFLICT (письмо уже было) apply пропускается — повторно теги не применяются.
+- **Enqueue notification (ADR-0022 §2.1):** ПОСЛЕ COMMIT транзакции save_message (а не внутри неё — чтобы доставка не зависела от транзакционной видимости), если `apply_tags_to_message` вернул `applied_count > 0`, добавить `message_id` в локальный аккумулятор `notify_ids`. После завершения цикла обработки одного account'а (т.е. в `sync_one_account` после `mailbox.logout()`) выполнить **один** `LPUSH tg_notify_queue val1 val2 …` всеми накопленными ID. Padение LPUSH (Redis down) — ловится try/except + log warn `event=tg_notify_enqueue_failed`; **не** прерывает sync_cycle. Recovery_scan (см. 14.1) подберёт упущенные.
 
 ### Обработка ошибок (per-account)
 | Ошибка | Действие |
@@ -1191,6 +1203,112 @@ async def sync_one_account(account: MailAccount) -> AccountSyncResult
 - Failure одного аккаунта не валит остальные.
 - Каждый цикл логирует start и finish (даже если все упали).
 - Sync строго последовательный per-account (один task = одно соединение).
+
+---
+
+## 14.1. worker — tg_notify_dispatch + tg_notify_recovery_scan
+
+Источник истины — [ADR-0022](./adr/ADR-0022-telegram-sso-and-notifications.md) §2.
+
+### Назначение
+- `tg_notify_dispatch` — каждые `TG_NOTIFY_DISPATCH_INTERVAL_SEC=5` сек драйнит Redis `tg_notify_queue` (LIST), доставляет Bot API `sendMessage` всем получателям, обеспечивает идемпотентность через `telegram_notifications`. Обрабатывает 429 backoff и mark-dead при 403/400.
+- `tg_notify_recovery_scan` — раз в час сканирует messages последних `TG_NOTIFY_RECOVERY_WINDOW_HOURS=24` ч с `message_tags` без `telegram_notifications` и LPUSH'ит их в очередь (защита от потерь при crash Redis/worker).
+
+### Публичный API
+```python
+async def tg_notify_dispatch() -> None        # APScheduler interval=5s; max_instances=1, coalesce=True
+async def tg_notify_recovery_scan() -> None   # APScheduler interval=1h; max_instances=1, coalesce=True
+async def dispatch_one(message_id: int) -> DispatchOneResult
+```
+
+### Зависимости
+- redis (LPOP с count, LPUSH).
+- repositories: `telegram_notifications` (try_claim, mark_sent, rollback, list_recipients_for_message, list_tags_for_recipient), `telegram_links` (mark_dead), `messages` (для контекста — acc label, from_name|from_addr).
+- `backend/app/telegram/bot.py:send_notification`.
+- audit (для mark-dead).
+
+### Алгоритм tg_notify_dispatch
+
+```text
+1. items = await redis.lpop("tg_notify_queue", count=TG_NOTIFY_BATCH_SIZE)  # default 30
+2. if not items: return
+3. for raw in items:
+     message_id = json.loads(raw)["message_id"]
+     await dispatch_one(message_id)
+4. log event=tg_notify_dispatch_finish с per-cycle stats (sent, skipped_idempotent, marked_dead, retried)
+```
+
+### Алгоритм dispatch_one
+
+```text
+1. ctx = SELECT message.id, ma.email, ma.display_name, m.from_addr, m.from_name
+        FROM messages m JOIN mail_accounts ma ON ma.id=m.mail_account_id WHERE m.id=:mid
+   if not ctx: log warn (message удалён до доставки) and return
+2. recipients = await TelegramNotificationsRepo.list_recipients_for_message(message_id)  # SQL из ADR-0022 §2.2
+3. for r in recipients:
+     a. notif_id = await TelegramNotificationsRepo.try_claim(message_id, r.user_id)
+        if notif_id is None: continue                              # уже отправлено (идемпотентность)
+     b. tags = await TelegramNotificationsRepo.list_tags_for_recipient(message_id, r.user_id)
+        if not tags:                                                 # защита: recipient SQL должен это исключать
+            await TelegramNotificationsRepo.rollback(notif_id); continue
+     c. text_html = format_notification(
+            acc_label = ctx.display_name or ctx.email,
+            from_label = ctx.from_name or ctx.from_addr,
+            tag_names = [t.name for t in tags],
+        )
+     d. retries = 0
+        while True:
+            res = await bot.send_notification(chat_id=r.telegram_user_id,
+                                              text_html=text_html, message_id=message_id)
+            if res.kind == 'ok':
+                await TelegramNotificationsRepo.mark_sent(notif_id, res.telegram_message_id)
+                break
+            elif res.kind == 'dead':
+                await telegram_auth_service.mark_link_dead(r.user_id, reason='bot_api_403_or_400')
+                # row остаётся как "попытка-отказ" (sent_at IS NULL, telegram_message_id IS NULL)
+                break
+            elif res.kind == 'retry_after':
+                if retries >= 1:                       # max 1 in-place retry, дальше — back to queue
+                    await TelegramNotificationsRepo.rollback(notif_id)
+                    await redis.lpush("tg_notify_queue", json.dumps({"message_id": message_id}))
+                    break
+                await asyncio.sleep(min(res.retry_after_sec, 60))
+                retries += 1
+                continue
+            else:  # 'transient' (5xx, network)
+                await TelegramNotificationsRepo.rollback(notif_id)
+                await redis.lpush("tg_notify_queue", json.dumps({"message_id": message_id}))
+                break
+```
+
+### Алгоритм tg_notify_recovery_scan
+
+```text
+1. threshold = now() - interval 'TG_NOTIFY_RECOVERY_WINDOW_HOURS hours'
+2. ids = SELECT m.id FROM messages m
+         WHERE m.fetched_at > :threshold
+           AND EXISTS (SELECT 1 FROM message_tags mt WHERE mt.message_id=m.id)
+           AND NOT EXISTS (SELECT 1 FROM telegram_notifications tn WHERE tn.message_id=m.id)
+         ORDER BY m.id
+         LIMIT 5000
+3. if not ids: return
+4. await redis.lpush("tg_notify_queue", *[json.dumps({"message_id": i}) for i in ids])
+5. log event=tg_notify_recovery_scan_finish count=len(ids)
+```
+
+### Edge cases
+- Redis недоступен в момент LPOP — APScheduler следующий тик повторит. exception вверх — APScheduler логирует и продолжает по расписанию.
+- Bot API rate-limit hit на конкретного recipient (`Too Many Requests: retry after X` per-chat): retry_after-логика покрывает.
+- `mail_accounts` удалён между `save_message` и `dispatch_one` — recipients SQL вернёт пустой list (JOIN не найдёт mail_accounts → users → telegram_links). Тогда try_claim не выполняется, telegram_notifications не появляется, recovery_scan позже не подберёт (нет message → NOT EXISTS не сработает). Допустимо: письмо тоже скоро удалится каскадом.
+- Recipient `users.role` сменился (с group_member на group_leader, например) — recipients SQL пересчитывается на каждый dispatch_one, динамическая правка group_id уже отражена. Это покрывает scenario «added to group after message arrived».
+- `mail_accounts.group_id` сменился (см. round-10 patch) — то же, SQL пересчитан, recipients актуальны.
+- Очень много recipients (e.g., super_admin + 4 member группы) — dispatcher делает sendMessage последовательно (await в цикле), не параллельно, чтобы не выходить за лимиты per-chat.
+
+### Инварианты
+- Идемпотентность: повторный dispatch_one(message_id) → try_claim вернёт None → пропуск.
+- mark_dead не каскадно валит другие линковки (UPDATE WHERE user_id=:uid, не глобальный).
+- sync_cycle никогда не падает из-за ошибок Bot API/Redis на этом пути (изоляция через try/except в LPUSH).
+- Bot API token не появляется в логах (redact-list).
 
 ---
 
@@ -1408,12 +1526,18 @@ WHITELIST_PATHS = [
 ## 18. telegram (модуль)
 
 ### Назначение
-Webhook-приёмник Telegram Bot API; bot выступает **исключительно** launcher'ом — отдаёт WebApp-кнопку, ведущую на основной URL сервиса (`TELEGRAM_WEBAPP_URL`). Источник истины — [ADR-0018](./adr/ADR-0018-telegram-launcher.md).
+Telegram-интеграция в трёх ролях:
+1. **Bot launcher (ADR-0018)** — `/start` → inline-keyboard с WebApp-кнопкой на `TELEGRAM_WEBAPP_URL`.
+2. **Persistent SSO (ADR-0022 §1)** — при открытии WebApp с валидным `init_data` и существующей `telegram_links`-записью пользователь логинится без ввода username+password. При первом login через бот линковка `telegram_user_id ↔ user_id` создаётся автоматически и удаляется при logout.
+3. **Push-нотификации (ADR-0022 §2)** — диспатчер в worker'е шлёт `sendMessage` всем получателям, у которых: (а) активная линковка, (б) свой тег на новом письме, (в) включены уведомления.
 
-**Никаких** изменений в auth/session/CSRF/БД. **Никакой** линковки telegram_user_id ↔ user_id. **Никакой** initData-аутентификации. Пользователь, открывший WebApp из бота, видит обычную login-форму (two-step, ADR-0016) и логинится cookie-сессией так же, как в браузере.
+Источники истины — [ADR-0018](./adr/ADR-0018-telegram-launcher.md) (launcher) + [ADR-0022](./adr/ADR-0022-telegram-sso-and-notifications.md) (SSO + нотификации; partially supersedes ADR-0018 в части «нет линковки / нет initData auth»).
 
 ### Публичный API
-- HTTP route: `POST /api/telegram/webhook/{secret}` — см. `04-api-contracts.md` секция 4a.
+- HTTP routes (см. `04-api-contracts.md` секция 4a):
+  - `POST /api/telegram/webhook/{secret}` — webhook launcher (ADR-0018).
+  - `POST /api/telegram/auth` — Persistent SSO (ADR-0022 §1.2).
+  - `PATCH /api/me/settings` — opt-out toggle для push-нотификаций (ADR-0022 §2.7).
 - Bot helpers (`backend/app/telegram/bot.py`):
 ```python
 async def send_message_with_webapp_button(chat_id: int, text: str) -> None
@@ -1424,6 +1548,95 @@ async def handle_update(update: TelegramUpdate) -> None
     # message.text starts with "/start" → send_message_with_webapp_button
     # message.text starts with "/help"  → send plain "Send /start to open the app"
     # all other updates                 → no-op
+
+# ADR-0022 — Push-уведомления о письмах с тегами
+async def send_notification(*, chat_id: int, text_html: str, message_id: int) -> SendNotificationResult
+    # POST sendMessage parse_mode=HTML с inline_keyboard:
+    #   [[{text: "Посмотреть сообщение",
+    #      web_app: {url: f"{TELEGRAM_WEBAPP_URL}/messages/{message_id}?embed=tg"}}]]
+    # Returns:
+    #   SendNotificationResult(kind: 'ok'|'dead'|'retry_after'|'transient',
+    #                          telegram_message_id: int|None, retry_after_sec: int|None)
+    # kind='dead' — 403 Forbidden (user blocked bot) или 400 chat not found → диспатчер mark-dead на telegram_links
+    # kind='retry_after' — 429 + parameters.retry_after из body
+    # kind='transient' — 5xx или network — диспатчер делает DELETE row и LPUSH back to queue
+```
+
+- Auth-service (`backend/app/telegram/auth_service.py`):
+```python
+@dataclass(frozen=True)
+class ValidatedTelegramUser:
+    telegram_user_id: int
+    first_name: str | None
+    username: str | None
+    auth_date: int
+
+class TelegramAuthService:
+    async def validate_init_data(init_data: str) -> ValidatedTelegramUser
+        # HMAC-SHA256 + auth_date TTL (env TG_AUTH_INIT_DATA_TTL_SEC=300)
+        # raises InvalidInitDataError | InitDataExpiredError
+
+    async def try_sso(init_data: str, ip: str, ua: str) -> SSOResult
+        # SSOResult.kind: 'linked' (session_token+csrf) | 'pending' (pending_token)
+        # 'linked' — нашли telegram_links запись с dead_at IS NULL → создали session
+        # 'pending' — линковки нет → создали Redis tg_pending:{token} TTL 15min с {telegram_user_id}
+
+    async def link_pending(pending_token: str, user_id: int, ip: str, ua: str) -> bool
+        # Вызывается из AuthService.login (step-2) и complete_set_password ПОСЛЕ успешного verify.
+        # Читает Redis tg_pending:{token} → telegram_user_id; делает upsert в telegram_links;
+        # удаляет Redis ключ; пишет audit (telegram_link_created | telegram_link_collision).
+        # Returns True если линковка создана/обновлена, False если token expired/missing/collision.
+
+    async def revoke_for_user(user_id: int, reason: str = 'logout') -> None
+        # DELETE FROM telegram_links WHERE user_id=:uid; audit telegram_link_revoked
+        # Вызывается из AuthService.logout и AdminService.reset_password.
+
+    async def mark_link_dead(user_id: int, reason: str) -> None
+        # UPDATE telegram_links SET dead_at=now() WHERE user_id=:uid AND dead_at IS NULL
+        # audit telegram_link_dead_marked
+        # Вызывается из worker.tg_notify_dispatch при Bot API 403/400.
+```
+
+- Repository (`backend/app/repositories/telegram_links.py`):
+```python
+class TelegramLinksRepo:
+    async def get_active_by_telegram_user_id(tid: int) -> TelegramLink | None  # WHERE dead_at IS NULL
+    async def get_active_by_user_id(uid: int) -> TelegramLink | None           # WHERE dead_at IS NULL
+    async def upsert(telegram_user_id: int, user_id: int) -> tuple[TelegramLink, bool]
+        # SQL: INSERT … ON CONFLICT (telegram_user_id) DO UPDATE SET user_id=EXCLUDED.user_id,
+        #      created_at=now(), dead_at=NULL RETURNING *
+        # Bool = True если запись обновлена (replaced), False если новая
+        # ВАЖНО: ловит IntegrityError на UNIQUE(user_id) — это collision (другой tg уже залинкован к этому user'у)
+    async def revoke_for_user(user_id: int) -> bool                            # returns True if row existed
+    async def mark_dead(user_id: int) -> None
+```
+
+- Repository (`backend/app/repositories/telegram_notifications.py`):
+```python
+@dataclass
+class NotifyRecipient:
+    user_id: int
+    telegram_user_id: int
+
+class TelegramNotificationsRepo:
+    async def try_claim(message_id: int, user_id: int) -> int | None
+        # INSERT INTO telegram_notifications (message_id, user_id) VALUES (:mid, :uid)
+        # ON CONFLICT (message_id, user_id) DO NOTHING RETURNING id
+        # None если уже было (доставка идемпотентна)
+    async def mark_sent(notif_id: int, telegram_message_id: int) -> None
+    async def rollback(notif_id: int) -> None                                  # DELETE WHERE id=:nid
+    async def list_recipients_for_message(message_id: int) -> list[NotifyRecipient]
+        # SQL из ADR-0022 §2.2
+    async def list_tags_for_recipient(message_id: int, user_id: int) -> list[TagDTO]
+        # SELECT t.id, t.name, t.color FROM message_tags mt JOIN tags t ON … WHERE mt.message_id=:mid AND t.user_id=:uid
+```
+
+- Repository (`backend/app/repositories/user_settings.py`):
+```python
+class UserSettingsRepo:
+    async def get(user_id: int) -> UserSettings | None
+    async def upsert(user_id: int, *, tg_notifications_enabled: bool) -> UserSettings
+        # INSERT … ON CONFLICT (user_id) DO UPDATE SET tg_notifications_enabled=EXCLUDED.…, updated_at=now()
 ```
 - Schemas (`backend/app/telegram/schemas.py`) — Pydantic `TelegramUpdate` с минимальными полями:
 ```python
@@ -1445,12 +1658,20 @@ class TelegramUpdate(BaseModel):
 ```
 
 ### Зависимости
-- `httpx` (async) — уже в зависимостях для IMAP/SMTP-связанных задач не используется, но добавлен в `pyproject.toml` для других целей; реиспользуется. Если по факту ещё не подключён — devops добавляет одной строкой.
-- `Settings.TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `TELEGRAM_WEBAPP_URL`, `TELEGRAM_BOT_ENABLED` — см. `07-deployment.md` секция 4.
-- structlog redact-list дополнен `TELEGRAM_BOT_TOKEN` (см. `06-security.md` §1.8 + ADR-0014).
+- `httpx` (async) — уже в `pyproject.toml`. Используется для всех Bot API вызовов (sendMessage, и launcher, и notifications).
+- `Settings.TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `TELEGRAM_WEBAPP_URL`, `TELEGRAM_BOT_ENABLED` — см. `07-deployment.md` секция 4. Новые env-переменные ADR-0022: `TG_AUTH_INIT_DATA_TTL_SEC` (default 300), `TG_PENDING_COOKIE_TTL_SEC` (default 900), `TG_NOTIFY_BATCH_SIZE` (default 30), `TG_NOTIFY_DISPATCH_INTERVAL_SEC` (default 5), `TG_NOTIFY_RECOVERY_WINDOW_HOURS` (default 24).
+- structlog redact-list содержит `TELEGRAM_BOT_TOKEN` (см. `06-security.md` §1.8 + ADR-0014). Дополнительно: `init_data` НЕ логируется в полной форме (логируем только `telegram_user_id` и `auth_date` после валидации).
+- repositories: `telegram_links`, `telegram_notifications`, `user_settings`.
+- redis: ключи `tg_pending:{token}` (SSO pending), `tg_notify_queue` (list, дисптчер).
+- audit (новые actions): `telegram_link_created`, `telegram_link_revoked`, `telegram_link_dead_marked`, `telegram_link_collision`.
 
 ### Состояния
-- Модуль stateless — нет persisted state; апдейты обрабатываются и забываются.
+- Webhook handler — stateless.
+- SSO (`/api/telegram/auth`) — частично stateful через Redis (`tg_pending:{token}` 15min TTL).
+- Persistent линковка — `telegram_links` (Postgres), 3 состояния:
+  - **none** — нет строки в таблице. По умолчанию.
+  - **active** — строка есть, `dead_at IS NULL`. SSO срабатывает, нотификации доставляются.
+  - **dead** — строка есть, `dead_at IS NOT NULL`. SSO **не** срабатывает (treat as none — пользователь увидит /login); нотификации не доставляются. При следующем `POST /api/telegram/auth` от того же tg_user_id upsert обнуляет dead_at → переход в active.
 
 ### Алгоритм webhook handler
 ```text
@@ -1462,13 +1683,70 @@ class TelegramUpdate(BaseModel):
 6. return 200 (всегда; HTTPException только для secret-fail)
 ```
 
+### Алгоритм SSO (`POST /api/telegram/auth`) — ADR-0022 §1
+```text
+1. Rate-limit check (slowapi): 30/min per IP → 429 если превышен
+2. Parse JSON body: TelegramAuthRequest(init_data: str)
+3. Через TelegramAuthService.validate_init_data:
+   a. Parse init_data как application/x-www-form-urlencoded
+   b. Extract hash, build data_check_string (отсортировано "k=v", joined by "\n", без поля "hash")
+   c. secret_key = HMAC_SHA256("WebAppData", TELEGRAM_BOT_TOKEN)
+   d. expected = HMAC_SHA256(secret_key, data_check_string).hex()
+   e. hmac.compare_digest(expected, hash) — invalid → InvalidInitDataError → 401 invalid_init_data
+   f. auth_date = int(fields["auth_date"]); now - auth_date > TG_AUTH_INIT_DATA_TTL_SEC → InitDataExpiredError → 401 init_data_expired
+   g. user_payload = json.loads(fields["user"]); telegram_user_id = int(user_payload["id"])
+4. Дополнительный rate-limit: 10/min per telegram_user_id → 429
+5. SELECT FROM telegram_links WHERE telegram_user_id=:tid AND dead_at IS NULL
+6. IF row exists:
+   a. Создать session (SessionStore.create_for_user(user_id=row.user_id, ip, ua))
+   b. Set-Cookie mas_session + mas_csrf
+   c. log event=telegram_sso_success, telegram_user_id=…, user_id=…
+   d. return 200 {linked: true, redirect: "/"}
+7. ELSE:
+   a. pending_token = secrets.token_urlsafe(32)
+   b. Redis SETEX tg_pending:{pending_token} 900 json.dumps({telegram_user_id})
+   c. Set-Cookie mas_tg_pending=pending_token (HttpOnly, Secure, SameSite=Lax, 15min)
+   d. log event=telegram_sso_pending, telegram_user_id=…
+   e. return 200 {linked: false, redirect: "/login"}
+```
+
+### Алгоритм линковки (вызов из AuthService.login / complete_set_password)
+```text
+1. После успешного verify password / set password, ДО возврата LoginResult:
+2. pending_token = request.cookies.get("mas_tg_pending"); if None → return (нечего линковать)
+3. raw = await redis.get(f"tg_pending:{pending_token}"); if None → return (expired или невалиден)
+4. telegram_user_id = json.loads(raw)["telegram_user_id"]
+5. try:
+   a. row, replaced = await telegram_links_repo.upsert(telegram_user_id, user.id)
+   b. await audit.log(action="telegram_link_created", actor_user_id=user.id, target_user_id=user.id,
+                       details={"telegram_user_id": telegram_user_id, "replaced": replaced}, ip, ua)
+6. except IntegrityError on UNIQUE(user_id):
+   a. existing = await telegram_links_repo.get_active_by_user_id(user.id)
+   b. await audit.log(action="telegram_link_collision", actor_user_id=user.id, target_user_id=user.id,
+                       details={"existing_telegram_user_id": existing.telegram_user_id,
+                                "attempted_telegram_user_id": telegram_user_id}, ip, ua)
+   c. log warn event=telegram_link_collision
+   d. (Не падать — login успешен, просто линковка не создана; UI может показать flash)
+7. Redis DEL tg_pending:{pending_token}; clear cookie mas_tg_pending в response
+```
+
+### Алгоритм logout-revoke
+```text
+В AuthService.logout(session_token) ПЕРЕД revoke session:
+1. user_id = current_session.user_id
+2. await telegram_auth_service.revoke_for_user(user_id, reason='logout')
+   а. был_link = await telegram_links_repo.revoke_for_user(user_id)  # DELETE returning bool
+   b. if был_link: await audit.log(action='telegram_link_revoked', target_user_id=user_id, details={...}, …)
+3. revoke session как обычно (Redis DEL session:{token}; SREM user_sessions:{uid})
+```
+
 ### Edge cases
 - Bot API временно недоступен (timeout/5xx от api.telegram.org) — `send_message_with_webapp_button` логирует warn и возвращает None; webhook возвращает 200 (Telegram не должен ретраить — пользователь и так увидит, что бот молчит, и отправит /start ещё раз).
 - Произвольный текст без `/start` — игнорируется молча. Допустимо: бот не диалоговый.
 - Forwarded-update от Telegram (re-delivery) — обрабатываем как новый: `/start` снова отдаст кнопку, никаких side-effects не возникает (нет dedup по `update_id`, idempotent by design).
 - Несовпадение `update_id` контракта — ловится Pydantic.
 
-### Тестируемые инварианты
+### Тестируемые инварианты (launcher, ADR-0018)
 - `POST /api/telegram/webhook/<wrong>` → `403`, нет вызова `send_message`.
 - `POST /api/telegram/webhook/<correct>` без header `X-Telegram-Bot-Api-Secret-Token` → `403`.
 - `POST /api/telegram/webhook/<correct>` с правильным header и body `{"update_id": 1, "message": {"chat": {"id": 100}, "text": "/start", "from": {"id": 200}}}` → `200`, Bot API получил `sendMessage` с inline-keyboard, в keyboard ровно одна кнопка с `web_app.url == TELEGRAM_WEBAPP_URL`.
@@ -1476,6 +1754,43 @@ class TelegramUpdate(BaseModel):
 - Body без `message` (например, `callback_query`) → `200`, Bot API не дёргался.
 - `TELEGRAM_BOT_ENABLED=false` + правильный secret + body `/start` → `200`, Bot API не дёргался.
 - `TELEGRAM_BOT_TOKEN` не появляется в логах ни на одном уровне (включая DEBUG) — проверяется отдельным redact-тестом (см. модуль 6 logging).
+
+### Тестируемые инварианты (SSO, ADR-0022 §1)
+- HMAC valid init_data + auth_date свежий + есть telegram_links запись → 200 `{linked: true}` + Set-Cookie `mas_session`.
+- HMAC valid + auth_date `> 5min` → 401 `init_data_expired`, никаких side effects.
+- HMAC искажённый (изменено любое поле в `init_data`) → 401 `invalid_init_data`.
+- HMAC valid + нет линковки → 200 `{linked: false}` + Set-Cookie `mas_tg_pending`; Redis ключ `tg_pending:{token}` создан с TTL=900s.
+- После 200 `linked=false` → выполнить `POST /login/password` под user X → запись `telegram_links` создана, audit `telegram_link_created` `replaced=false`.
+- Повторный SSO под тем же tg_user_id → 200 `linked=true` без повторного login (использует существующую линковку).
+- Один tg_user_id логинится под user X, затем (logout + повторный SSO + login) под user Y → `telegram_links.user_id` обновлён на Y; audit `telegram_link_created` `replaced=true`.
+- Два разных tg_user_id пытаются залинковаться к одному user_id → 200 на SSO; на step-2 login во втором случае → audit `telegram_link_collision`; telegram_links запись остаётся как у первого tg.
+- `POST /logout` → `telegram_links` строка удалена; audit `telegram_link_revoked`.
+- `POST /api/admin/users/{id}/reset` → `telegram_links` строка удалена для target user'а; audit `telegram_link_revoked` `reason='password_reset'`.
+- `DELETE /api/admin/users/{id}` → `telegram_links` строка каскадно удалена.
+- Rate-limit: 31-й запрос `/api/telegram/auth` с одного IP в течение минуты → 429.
+- `mas_tg_pending` cookie expired (>15min) или Redis ключ исчез → login проходит без линковки (no-op в `link_pending`, no audit).
+- `init_data` НЕ появляется в логах ни на одном уровне (полная строка); только `telegram_user_id` + `auth_date` после валидации.
+
+### Тестируемые инварианты (push-нотификации, ADR-0022 §2)
+- message с message_tags попадает в `tg_notify_queue` после COMMIT в save_message (если applied_count>0).
+- Recipient SQL возвращает только users с активной `telegram_links`, своим тегом на письме, `tg_notifications_enabled=true`.
+- Recipient без своих тегов → НЕ получает нотификацию (telegram_notifications row не создан).
+- Recipient с opt-out (`tg_notifications_enabled=false`) → НЕ получает (row не создан).
+- Recipient с `telegram_links.dead_at IS NOT NULL` → НЕ получает.
+- super_admin получает уведомления про сообщения **всех** групп (если у него самого есть тег на письме).
+- group_leader получает уведомления про письма в ящиках своей группы (по `mail_accounts.group_id`) если у него есть тег.
+- group_member — то же.
+- Идемпотентность: повторный sync_cycle того же message_id → диспатчер на try_claim получит None → пропустит, sendMessage не вызван.
+- Bot API 403 (user blocked) → `telegram_links.dead_at = now()`; audit `telegram_link_dead_marked`; следующие письма этому user'у не шлются.
+- Bot API 429 + `retry_after=N` → диспатчер ждёт N сек и повторяет; на 2-й 429 — LPUSH back to queue.
+- Bot API 5xx/network → DELETE telegram_notifications row + LPUSH back to queue → retry на следующем тике.
+- sync_cycle не падает при ошибке LPUSH в очередь (try/except + warn log).
+- recovery_scan находит message с message_tags без telegram_notifications в окне 24ч → LPUSH в очередь → доставлено на следующем тике.
+- HTML escape: tag name `<script>x</script>` или email `<x@y>` корректно экранированы в notification text.
+- inline_keyboard содержит ровно одну кнопку с `web_app.url` равным `{TELEGRAM_WEBAPP_URL}/messages/{mid}?embed=tg`.
+- `GET /messages/{id}?embed=tg` → HTML не содержит секции `<section class="attachments">`; mark-read button присутствует.
+- `PATCH /api/me/settings {tg_notifications_enabled: false}` → upsert в `users_settings`; следующие нотификации тому же user'у не шлются.
+- `GET /api/me` возвращает `tg_notifications_enabled` (default `true`, либо актуальное значение) и `telegram_linked: bool`.
 
 ### Frontend (тонкий клиент)
 - `backend/app/static/js/tg.js` — на DOMContentLoaded:
@@ -1492,10 +1807,43 @@ class TelegramUpdate(BaseModel):
 - CSS-правила для `body.tg-app` — в `static/css/main.css` (см. `08-frontend.md` §10): скрытие `header.topbar nav`, переопределение `--bg`/`--text`/`--primary` из `--tg-*` с fallback.
 
 ### Интеграция с другими модулями
-- **auth** — не изменяется. Cookies `mas_session`/`mas_csrf` ставятся при обычном login независимо от того, открыт ли клиент через бот или браузер. Telegram WebView shares cookies with system WebView (на iOS WKWebView, на Android system WebView), `SameSite=Lax` + `Secure` поверх HTTPS работают.
-- **redis** — не изменяется (нет новых ключей).
-- **БД** — не изменяется (нет новых таблиц, нет новых колонок).
-- **middlewares** — webhook-роут не подпадает под `SessionMiddleware`/`CSRFMiddleware` через path-prefix `/api/telegram/webhook/*` (явный exempt в стеке middleware рядом с `/healthz`/`/readyz`/`/login`).
+- **auth** — расширен (ADR-0022):
+  - `AuthService.login` (step-2) после успешного verify password проверяет cookie `mas_tg_pending` → если есть, вызывает `TelegramAuthService.link_pending(...)`.
+  - `AuthService.complete_set_password` — то же.
+  - `AuthService.logout` ПЕРЕД revoke session вызывает `TelegramAuthService.revoke_for_user(user_id, reason='logout')`.
+  - Cookies `mas_session`/`mas_csrf` ставятся ровно как в браузере. Telegram WebView shares cookies with system WebView (на iOS WKWebView, на Android system WebView), `SameSite=Lax` + `Secure` поверх HTTPS работают.
+- **admin** — `AdminService.reset_password` дополнительно вызывает `TelegramAuthService.revoke_for_user(user_id, reason='password_reset')`. `AdminService.delete_user` НЕ требует явного вызова — `telegram_links` каскадно удаляется через FK `ON DELETE CASCADE`.
+- **redis** — два новых ключа:
+  - `tg_pending:{token}` — SSO pending (TTL 15min, value `{"telegram_user_id": int}`).
+  - `tg_notify_queue` — LIST для диспатчера нотификаций; LPUSH со стороны `worker.sync_cycle.save_message`, LPOP со стороны `worker.tg_notify_dispatch`.
+- **БД** — три новые таблицы (см. `03-data-model.md`): `telegram_links`, `telegram_notifications`, `users_settings`. Каскады описаны в data-model.
+- **middlewares** — `/api/telegram/webhook/*` и `/api/telegram/auth` имеют CSRF-exempt (нет session при first call); SessionMiddleware применяется (для `mas_tg_pending` cookie). Rate-limit slowapi применяется для обоих.
+- **messages module** — `GET /messages/{id}` принимает query `embed: str | None`; при `embed=='tg'` шаблон `message_view.html` скрывает секцию attachments (ADR-0022 §2.6).
+- **worker.sync_cycle** (см. модуль 14) — после успешного COMMIT INSERT messages + apply_tags, если `applied_count > 0`, LPUSH в `tg_notify_queue`. Падение LPUSH **не** валит sync_cycle (try/except + log).
+- **worker.tg_notify_dispatch** (см. модуль 14.1 ниже) — drainит `tg_notify_queue` каждые 5 сек, шлёт sendMessage всем получателям.
+- **worker.tg_notify_recovery_scan** (см. модуль 14.1) — раз в час сканирует messages последних 24ч с `message_tags` без `telegram_notifications` и LPUSH'ит их обратно.
+
+### Persistent SSO frontend flow
+- `static/js/tg.js` (расширен от ADR-0018):
+  - Существующая логика (theme vars + `body.tg-app`) сохраняется.
+  - Новая логика на DOMContentLoaded:
+    ```js
+    const tg = window.Telegram?.WebApp;
+    if (tg && tg.initData && document.body.dataset.anonymous === '1') {
+      fetch('/api/telegram/auth', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({init_data: tg.initData}),
+        credentials: 'same-origin',
+      }).then(r => r.json().then(b => ({status: r.status, body: b})))
+        .then(({status, body}) => {
+          if (status === 200 && body.linked) { window.location.replace(body.redirect || '/'); }
+          // linked=false — backend выставил mas_tg_pending, оставляем пользователя на текущей странице (/login)
+          // 401/429 — оставляем на текущей странице, пользователь увидит обычный /login form
+        }).catch(() => { /* network — no-op, fallback на manual login */ });
+    }
+    ```
+  - `data-anonymous="1"` устанавливается в `base.html` когда у запроса нет активной сессии: `<body class="..." {% if not session %}data-anonymous="1"{% endif %}>`.
 
 ---
 

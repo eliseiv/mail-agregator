@@ -105,11 +105,7 @@ class MailAccountsRepo:
         cond = MailAccount.user_id == owner_user_id
         if group_id is not None:
             cond = or_(cond, MailAccount.group_id == group_id)
-        stmt = (
-            select(MailAccount)
-            .where(cond)
-            .order_by(MailAccount.user_id, MailAccount.id)
-        )
+        stmt = select(MailAccount).where(cond).order_by(MailAccount.user_id, MailAccount.id)
         return list((await self._s.execute(stmt)).scalars().all())
 
     async def get_for_group_or_owner(

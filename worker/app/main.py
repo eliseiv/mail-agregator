@@ -36,6 +36,8 @@ from shared.redis_client import close_redis
 from shared.storage import get_storage
 from worker.app.cleanup import retention_cleanup
 from worker.app.sync_cycle import force_sync_dispatch, sync_cycle
+from worker.app.tg_notify_dispatch import tg_notify_dispatch
+from worker.app.tg_notify_recovery import tg_notify_recovery_scan
 
 log = get_logger(__name__)
 
@@ -82,6 +84,30 @@ async def _safe_cleanup() -> None:
     except Exception as exc:
         log.error(
             "retention_cleanup_unhandled",
+            detail=str(exc)[:300],
+            exc_info=True,
+        )
+
+
+async def _safe_tg_notify_dispatch() -> None:
+    """Wrapper for the Telegram notification dispatcher (ADR-0022 §2.4)."""
+    try:
+        await tg_notify_dispatch()
+    except Exception as exc:
+        log.error(
+            "tg_notify_dispatch_unhandled",
+            detail=str(exc)[:300],
+            exc_info=True,
+        )
+
+
+async def _safe_tg_notify_recovery() -> None:
+    """Wrapper for the Telegram notification recovery scan (ADR-0022 §2.8)."""
+    try:
+        await tg_notify_recovery_scan()
+    except Exception as exc:
+        log.error(
+            "tg_notify_recovery_unhandled",
             detail=str(exc)[:300],
             exc_info=True,
         )
@@ -140,6 +166,24 @@ async def main() -> None:
         coalesce=True,
         misfire_grace_time=10,
     )
+    # ADR-0022 §2.4: Telegram notification dispatcher (drains Redis queue).
+    scheduler.add_job(
+        _safe_tg_notify_dispatch,
+        trigger=IntervalTrigger(seconds=settings.TG_NOTIFY_DISPATCH_INTERVAL_SECONDS),
+        id="tg_notify_dispatch",
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=30,
+    )
+    # ADR-0022 §2.8: recovery scan (re-enqueues lost notifications).
+    scheduler.add_job(
+        _safe_tg_notify_recovery,
+        trigger=IntervalTrigger(seconds=settings.TG_NOTIFY_RECOVERY_INTERVAL_SECONDS),
+        id="tg_notify_recovery",
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=600,
+    )
 
     # Touch once immediately so the health-check works even before the first
     # 30-second tick.
@@ -151,6 +195,8 @@ async def main() -> None:
         sync_interval_minutes=settings.SYNC_INTERVAL_MINUTES,
         force_sync_dispatch_seconds=10,
         max_concurrent_imap=settings.MAX_CONCURRENT_IMAP,
+        tg_notify_dispatch_seconds=settings.TG_NOTIFY_DISPATCH_INTERVAL_SECONDS,
+        tg_notify_recovery_seconds=settings.TG_NOTIFY_RECOVERY_INTERVAL_SECONDS,
     )
 
     # Optional: kick off one sync immediately on boot, so we don't wait the

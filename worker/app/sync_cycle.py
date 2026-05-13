@@ -40,6 +40,7 @@ from backend.app.repositories.messages import MessagesRepo
 from backend.app.repositories.users import UsersRepo
 from backend.app.security import assert_public_host
 from backend.app.tags.service import TagsService
+from backend.app.telegram.notify_service import TelegramNotifyService
 from shared.config import get_settings
 from shared.crypto import decrypt_mail_password
 from shared.db import make_session
@@ -205,6 +206,11 @@ async def sync_one_account(
     new_count = 0
     conflict_count = 0
     tags_applied_total = 0
+    # ADR-0022 §2.1: collect message_ids that received at least one tag so
+    # we can LPUSH them onto ``tg_notify_queue`` after the transaction
+    # commits. Inserting from inside the transaction would risk pushing
+    # message_ids whose tags get rolled back on tag-apply failure.
+    notified_message_ids: list[int] = []
     async with make_session() as s, s.begin():
         repo = MessagesRepo(s)
         tags_service = TagsService(s)
@@ -277,6 +283,8 @@ async def sync_one_account(
                     user_id=account.user_id,
                 )
                 tags_applied_total += applied
+                if applied > 0:
+                    notified_message_ids.append(inserted_id)
             except Exception as exc:
                 # Don't lose the message; just record that we couldn't
                 # tag it. Subsequent ingest of the same UID is impossible
@@ -297,6 +305,26 @@ async def sync_one_account(
             last_synced_uidnext=box.uidnext,
             last_uidvalidity=box.uidvalidity,
         )
+
+    # ADR-0022 §2.1: enqueue Telegram-notifications for messages that got
+    # at least one tag. LPUSH after COMMIT so a recipient SQL inside the
+    # dispatcher can see the committed rows. We swallow any failure here
+    # — a Redis outage must NEVER abort the sync cycle.
+    if notified_message_ids:
+        try:
+            async with make_session() as s:
+                pushed = await TelegramNotifyService(s).enqueue_message_ids(notified_message_ids)
+            cycle_log.info(
+                "tg_notify_enqueued",
+                count=pushed,
+                mail_account_id=account.id,
+            )
+        except Exception as exc:
+            cycle_log.warning(
+                "tg_notify_enqueue_failed",
+                detail=str(exc)[:200],
+                count=len(notified_message_ids),
+            )
 
     cycle_log.info(
         "sync_account_finish",

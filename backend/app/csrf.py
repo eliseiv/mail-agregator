@@ -39,6 +39,10 @@ EXEMPT_PATHS: frozenset[str] = frozenset(
         "/login/password",  # step-2; protected by username|ip rate-limit
         "/healthz",
         "/readyz",
+        # ADR-0022 §1.2: first call from Telegram WebApp; no session yet.
+        # Defence is HMAC of ``init_data`` + ``auth_date`` TTL + rate-limit
+        # per IP and per ``telegram_user_id``.
+        "/api/telegram/auth",
     }
 )
 

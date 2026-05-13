@@ -64,6 +64,8 @@
 
 | ID | Где задан | Кратко | Статус |
 | --- | --- | --- | --- |
-| _(пусто)_ | — | — | — |
+| Q-001-1 | [ADR-0022](./adr/ADR-0022-telegram-sso-and-notifications.md) §1.4 | Anti-replay set для `init_data` сверх TTL (`tg_seen:{auth_date}:{hash[:8]}` в Redis 5min)? | open — отложено в `100-known-tech-debt.md` (TD-018); реализовать при появлении реального риска. |
+| Q-002-1 | [ADR-0022](./adr/ADR-0022-telegram-sso-and-notifications.md) §2.7 | UI toggle для opt-out push-нотификаций — где разместить (Settings page / admin)? | open — backend endpoint `PATCH /api/me/settings` готов; frontend-агенту решить в следующем sprint. |
+| ~~Q-003-1~~ | [ADR-0022](./adr/ADR-0022-telegram-sso-and-notifications.md) §1.3 | Persistent SSO в `complete_set_password` flow? | closed by ADR-0022 — да, читаем `mas_tg_pending` cookie и создаём линковку. |
 
-Следующий свободный `NNN`: **001**.
+Следующий свободный `NNN`: **004**.

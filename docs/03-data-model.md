@@ -17,9 +17,13 @@ erDiagram
     users ||--o{ admin_audit : "subject_user (nullable, no FK)"
     users ||--o{ admin_audit : "performed (super-admin only, no FK)"
     users ||--o{ tags : owns
+    users ||--o| telegram_links : "linked_to (0..1)"
+    users ||--o{ telegram_notifications : "received_by"
+    users ||--o| users_settings : "has (0..1)"
     mail_accounts ||--o{ messages : "stores"
     messages ||--o{ attachments : "has"
     messages ||--o{ message_tags : "tagged_with"
+    messages ||--o{ telegram_notifications : "notified_for"
     tags ||--o{ tag_rules : "matches_via"
     tags ||--o{ message_tags : "applied_to"
     sent_messages ||--o{ sent_attachments : "has"
@@ -166,6 +170,27 @@ erDiagram
         bigint message_id FK
         bigint tag_id FK
         timestamptz created_at
+    }
+
+    telegram_links {
+        bigint telegram_user_id PK "Telegram User.id from signed init_data"
+        bigint user_id FK "UNIQUE; ON DELETE CASCADE"
+        timestamptz created_at
+        timestamptz dead_at "nullable; set on Bot API 403/400"
+    }
+
+    telegram_notifications {
+        bigint id PK
+        bigint message_id FK "ON DELETE CASCADE"
+        bigint user_id FK "ON DELETE CASCADE"
+        timestamptz sent_at "nullable"
+        bigint telegram_message_id "nullable; from sendMessage response"
+    }
+
+    users_settings {
+        bigint user_id PK "FK ON DELETE CASCADE"
+        boolean tg_notifications_enabled "default true"
+        timestamptz updated_at
     }
 ```
 
@@ -381,7 +406,7 @@ erDiagram
 | --- | --- | --- | --- |
 | `id` | BIGSERIAL | PK | |
 | `actor_user_id` | BIGINT | NOT NULL | id супер-админа. **БЕЗ FK** (запись должна жить даже если случайно удалили админа из БД; см. seed-логику). |
-| `action` | TEXT | NOT NULL | Enum-string: `admin_login`, `admin_logout`, `create_user`, `reset_password`, `delete_user`, `lockout_triggered`, `account_auto_disabled`, **`group_create`**, **`group_delete`**, **`group_rename`**, **`user_role_change`**, **`user_group_change`** (новые из ADR-0019 §9). |
+| `action` | TEXT | NOT NULL | Enum-string: `admin_login`, `admin_logout`, `create_user`, `reset_password`, `delete_user`, `lockout_triggered`, `account_auto_disabled`, **`group_create`**, **`group_delete`**, **`group_rename`**, **`user_role_change`**, **`user_group_change`** (новые из ADR-0019 §9), **`telegram_link_created`**, **`telegram_link_revoked`**, **`telegram_link_dead_marked`**, **`telegram_link_collision`** (новые из ADR-0022). |
 | `target_user_id` | BIGINT | NULL | id затронутого пользователя (для user-actions). |
 | `target_username` | TEXT | NULL | snapshot username на случай delete. |
 | `details` | JSONB | NULL | Произвольная структурированная информация (например, для `account_auto_disabled` — `{mail_account_id, reason}`). |
@@ -473,6 +498,69 @@ Many-to-many линки тегов и сообщений. Создаются wor
 
 ---
 
+### `telegram_links`
+
+Источник истины — [ADR-0022](./adr/ADR-0022-telegram-sso-and-notifications.md). Связка `telegram_user_id` (внешний ID в Telegram Bot API) с внутренним `users.id`. Создаётся при первом успешном `POST /login`/`POST /set-password` после открытия WebApp через бот; удаляется при `POST /logout`, `POST /api/admin/users/{id}/reset`, `DELETE /api/admin/users/{id}` (каскад). Активная линковка обеспечивает persistent SSO и доставку push-уведомлений.
+
+| Колонка | Тип | Constraints | Описание |
+| --- | --- | --- | --- |
+| `telegram_user_id` | BIGINT | PRIMARY KEY | Telegram User.id (из подписанного `init_data.user`). PK выбран для атомарного `INSERT … ON CONFLICT (telegram_user_id) DO UPDATE` при перепривязке. |
+| `user_id` | BIGINT | NOT NULL, UNIQUE, FK → `users(id)` ON DELETE CASCADE | Внутренний user. UNIQUE → один internal user — максимум один Telegram. |
+| `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | Обновляется при перепривязке через `ON CONFLICT DO UPDATE SET created_at=now()`. |
+| `dead_at` | TIMESTAMPTZ | NULL | Если != NULL — Bot API вернул 403/400 (user заблокировал бота); диспатчер пропускает доставку. При следующем успешном `POST /api/telegram/auth` от того же tg-user'а — обнуляется через upsert. |
+
+**Индексы:**
+- PK на `telegram_user_id` — обслуживает lookup при SSO (`/api/telegram/auth`).
+- `telegram_links_user_id_idx` на `(user_id)` — обслуживает logout (`DELETE WHERE user_id=:uid`) и SQL получателей нотификаций (`JOIN telegram_links tl ON tl.user_id = u.id`).
+
+**Объём:** ≤ 5 строк (≤ 5 пользователей × ≤ 1 tg-аккаунт).
+
+---
+
+### `telegram_notifications`
+
+Источник истины — [ADR-0022](./adr/ADR-0022-telegram-sso-and-notifications.md) §2.3. Реестр доставленных push-уведомлений в Telegram (дедуп per `(message_id, user_id)`). Создаётся диспатчером перед `sendMessage` (через `INSERT … ON CONFLICT DO NOTHING`); если RETURNING пустой — доставка пропускается (уже было).
+
+| Колонка | Тип | Constraints | Описание |
+| --- | --- | --- | --- |
+| `id` | BIGSERIAL | PK | |
+| `message_id` | BIGINT | NOT NULL, FK → `messages(id)` ON DELETE CASCADE | Привязка к письму. CASCADE → автоматическая очистка при retention cleanup (ADR-0011). |
+| `user_id` | BIGINT | NOT NULL, FK → `users(id)` ON DELETE CASCADE | Получатель. |
+| `sent_at` | TIMESTAMPTZ | NULL | NULL → row claim'ed диспатчером, но `sendMessage` ещё не завершён (или провалился до COMMIT). Используется как маркер «попытка-без-доставки» при mark-dead. |
+| `telegram_message_id` | BIGINT | NULL | message_id в Telegram chat (ответ Bot API `sendMessage.result.message_id`). Зарезервирован под будущие операции (edit/delete уведомлений). |
+
+**Constraints:**
+- UNIQUE `(message_id, user_id)` (constraint `telegram_notifications_unique`) — идемпотентность доставки.
+
+**Индексы:**
+- UNIQUE-индекс по `(message_id, user_id)` — также обслуживает lookup «было ли уже отправлено».
+- `telegram_notifications_message_id_idx` на `(message_id)` — для recovery_scan LEFT JOIN.
+- `telegram_notifications_user_id_idx` на `(user_id)` — для будущих аудит-запросов «что отправлено user'у X».
+
+**Объём:** оценка ≤ 5 users × ≤ 100 ящиков × ~5 писем-с-тегами/день × 30 дней retention = **~75 000 строк max**. С `ON DELETE CASCADE` от `messages` автоматически очищается вместе с письмами (ADR-0011).
+
+---
+
+### `users_settings`
+
+Источник истины — [ADR-0022](./adr/ADR-0022-telegram-sso-and-notifications.md) §2.7. Пользовательские preferences (1:1 с `users`). На текущей итерации — только opt-out для Telegram-нотификаций; в будущем — другие preferences (язык, плотность списка, etc.).
+
+| Колонка | Тип | Constraints | Описание |
+| --- | --- | --- | --- |
+| `user_id` | BIGINT | PRIMARY KEY, FK → `users(id)` ON DELETE CASCADE | 1:1 с users. |
+| `tg_notifications_enabled` | BOOLEAN | NOT NULL DEFAULT TRUE | true (default) — пользователь получает push-уведомления о письмах с тегами. false — диспатчер пропускает. Default true намеренно — opt-out, не opt-in (пользователь сам отключит, если будет завален). |
+| `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | Обновляется триггером `BEFORE UPDATE ON users_settings`. |
+
+**Индексы:** PK на `user_id`.
+
+**Триггер:** `BEFORE UPDATE ON users_settings` — `NEW.updated_at = now()`.
+
+**Особенность:** запрос «есть ли opt-out» — `LEFT JOIN users_settings us ON us.user_id = u.id` + `COALESCE(us.tg_notifications_enabled, true) = true`. Строка в `users_settings` создаётся лениво при первом `PATCH /api/me/settings`; до этого — поведение default `true`.
+
+**Объём:** ≤ N (число пользователей сервиса), <100 строк на обозримом горизонте.
+
+---
+
 ### Заполнение builtin-тегов
 
 Builtin-теги создаются **не через миграцию**, а через **post-login hook** в `auth.AuthService` — при первом успешном login пользователя или завершении set-password flow (см. ADR-0017 §6 и `05-modules.md` модуль `auth`). Реализация — в `backend/app/tags/builtin.py` (статичный список из 4 объектов).
@@ -513,9 +601,9 @@ BUILTIN_TAGS = [
 
 | Удаление чего | Что каскадно удаляется (Postgres ON DELETE CASCADE) | Что чистится приложением |
 | --- | --- | --- |
-| `users(id)` | `mail_accounts`, `sent_messages`, `sent_attachments`, `messages` (через `mail_accounts → messages → attachments`), `attachments`, `tags`, `tag_rules` (через `tags`), `message_tags` (через `tags` и `messages`) | Объекты MinIO по префиксу `{user_id}/`; все session keys (Redis); запись в `admin_audit` (action=delete_user). **Защита от удаления лидера** — `groups.leader_user_id ON DELETE RESTRICT` (см. ADR-0019 §3): нельзя удалить user'а, пока он лидер; super-admin сначала удаляет группу. |
-| `mail_accounts(id)` | `messages`, `attachments`, `sent_messages` (FK from_account_id), `message_tags` (через `messages`) | Объекты MinIO по префиксу `{user_id}/{mail_account_id}/` |
-| `messages(id)` (retention) | `attachments`, `message_tags` | Объекты MinIO по prefix `{user_id}/{mail_account_id}/{uid}/` |
+| `users(id)` | `mail_accounts`, `sent_messages`, `sent_attachments`, `messages` (через `mail_accounts → messages → attachments`), `attachments`, `tags`, `tag_rules` (через `tags`), `message_tags` (через `tags` и `messages`), **`telegram_links`** (ADR-0022), **`telegram_notifications`** (ADR-0022), **`users_settings`** (ADR-0022) | Объекты MinIO по префиксу `{user_id}/`; все session keys (Redis); запись в `admin_audit` (action=delete_user). **Защита от удаления лидера** — `groups.leader_user_id ON DELETE RESTRICT` (см. ADR-0019 §3): нельзя удалить user'а, пока он лидер; super-admin сначала удаляет группу. |
+| `mail_accounts(id)` | `messages`, `attachments`, `sent_messages` (FK from_account_id), `message_tags` (через `messages`), **`telegram_notifications`** (через `messages`) | Объекты MinIO по префиксу `{user_id}/{mail_account_id}/` |
+| `messages(id)` (retention) | `attachments`, `message_tags`, **`telegram_notifications`** (ADR-0022) | Объекты MinIO по prefix `{user_id}/{mail_account_id}/{uid}/` |
 | `tags(id)` (user delete tag) | `tag_rules`, `message_tags` | — |
 | `groups(id)` (super-admin delete group) | `users.group_id` → SET NULL (FK ON DELETE SET NULL — см. ADR-0019 §4) | Backend ОБЯЗАН в той же транзакции: проверить, что в группе нет участников (`SELECT 1 FROM users WHERE group_id = :group_id`) и нет лидера (тот же group). Если есть — `400 group_has_members`. Super-admin сначала переназначает участников / переводит лидера, потом удаляет группу. SET NULL остаётся как safety-net для прямого DDL обхода. |
 
@@ -585,3 +673,11 @@ BUILTIN_TAGS = [
     ```
   - Альтернатива (проще, рекомендуемая для production deploy): на момент применения миграции в системе **есть только super-admin** (другие пользователи ещё не созданы или их < 5). Backend deploy script делает: «сначала миграция, затем super-admin создаёт группы и распределяет всех пользователей вручную через `/admin/groups` UI». Если есть legacy non-admin users — devops инструктируется (см. `07-deployment.md` release-notes этого спринта): создать дефолтную группу «Legacy» с лидером=super_admin (но super_admin не может быть лидером по инварианту — берётся первый non-admin user-кандидат или специально созданный технический user) и переназначить всех. Простейшая стратегия — на старте проекта (≤5 users все известны) — выполняется ручная одноразовая операция в Sprint deploy.
   - Рекомендуем NOT VALID-вариант как defense, плюс post-deploy ручной шаг распределения. Backend в любом случае при попытке UPDATE/INSERT users проверит инвариант (CHECK не NOT VALID после `VALIDATE CONSTRAINT`).
+- **Миграция `004_telegram_sso_and_notifications`** (ADR-0022):
+  1. `CREATE TABLE telegram_links` (см. секцию `telegram_links` выше) + индекс `telegram_links_user_id_idx`.
+  2. `CREATE TABLE telegram_notifications` (см. секцию `telegram_notifications` выше) + UNIQUE constraint + индексы.
+  3. `CREATE TABLE users_settings` (см. секцию `users_settings` выше) + триггер `BEFORE UPDATE`.
+  4. Никакой data-миграции — все три таблицы стартуют пустыми. Первые записи появятся:
+     - `telegram_links` — после первого успешного `POST /api/telegram/auth` + login flow.
+     - `telegram_notifications` — после первого письма с тегами у user'а с активной `telegram_links` записью.
+     - `users_settings` — после первого `PATCH /api/me/settings`.

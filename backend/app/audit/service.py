@@ -13,7 +13,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.repositories.audit import AuditRepo
 
 # Closed enum from ``docs/03-data-model.md`` table ``admin_audit`` +
-# ADR-0019 §9 (group / role lifecycle actions).
+# ADR-0019 §9 (group / role lifecycle actions) +
+# ADR-0022 §1.4 (Telegram SSO + notification lifecycle).
 ALLOWED_ACTIONS: Final[frozenset[str]] = frozenset(
     {
         "admin_login",
@@ -29,6 +30,11 @@ ALLOWED_ACTIONS: Final[frozenset[str]] = frozenset(
         "group_rename",
         "user_role_change",
         "user_group_change",
+        # ADR-0022 §1.4 — Telegram SSO + notification lifecycle.
+        "telegram_link_created",
+        "telegram_link_revoked",
+        "telegram_link_dead_marked",
+        "telegram_link_collision",
     }
 )
 

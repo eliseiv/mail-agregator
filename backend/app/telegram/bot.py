@@ -1,13 +1,17 @@
-"""Telegram Bot API client + update dispatcher (ADR-0018).
+"""Telegram Bot API client + update dispatcher (ADR-0018 + ADR-0022).
 
-Two outbound helpers:
+Outbound helpers:
 
 - :func:`send_message_with_webapp_button` — POST ``sendMessage`` with an
   inline keyboard that contains a single ``web_app`` button targeting
-  ``settings.TELEGRAM_WEBAPP_URL``.
-- :func:`send_message` — POST ``sendMessage`` with plain text (no keyboard).
+  ``settings.TELEGRAM_WEBAPP_URL`` (used by ``/start``).
+- :func:`send_message` — POST ``sendMessage`` with plain text.
+- :func:`send_notification` — POST ``sendMessage`` with parse_mode=HTML and
+  a ``web_app`` inline-button pointing at ``{WEBAPP_URL}/messages/{id}?embed=tg``.
+  Returns a structured :class:`SendNotificationResult` so the dispatcher
+  can act on 403/429/transient separately (ADR-0022 §2.4).
 
-One inbound dispatcher:
+Inbound dispatcher:
 
 - :func:`handle_update` — parses :class:`TelegramUpdate`, routes ``/start``
   and ``/help`` and silently ignores anything else.
@@ -20,17 +24,21 @@ Networking notes (per ADR-0018 + ``docs/06-security.md`` §1.8):
   request per webhook hit and there is no real latency win from a shared
   pool at this volume; a process-wide pool would just complicate
   shutdown / forking semantics.
-- Errors are logged at ``warning`` level and **swallowed**: the webhook
-  must always return 200 to Telegram so the update is dropped from the
-  retry queue (Telegram replays for hours on non-2xx). The user can
-  always re-send ``/start`` if the first attempt did not produce a reply.
+- For webhook-driven outbounds errors are logged at ``warning`` level and
+  **swallowed**: the webhook must always return 200 to Telegram so the
+  update is dropped from the retry queue.
+- For push-notifications (:func:`send_notification`) we return structured
+  outcomes — the dispatcher needs to mark dead links, back off on 429
+  and retry on transient failures.
 - The bot token is never logged: it appears only as part of the URL we
   POST to, and the URL is never passed to logger calls.
 """
 
 from __future__ import annotations
 
-from typing import Any
+import contextlib
+from dataclasses import dataclass
+from typing import Any, Literal
 
 import httpx
 
@@ -119,6 +127,218 @@ async def send_message_with_webapp_button(chat_id: int, text: str) -> None:
 async def send_message(chat_id: int, text: str) -> None:
     """Send a plain-text message (no inline keyboard) to ``chat_id``."""
     await _post_send_message({"chat_id": chat_id, "text": text})
+
+
+# ---------------------------------------------------------------------------
+# Push-notifications (ADR-0022 sec. 2.4 - 2.5)
+# ---------------------------------------------------------------------------
+
+
+NotificationKind = Literal["ok", "dead", "retry_after", "transient", "disabled"]
+
+
+@dataclass(frozen=True, slots=True)
+class SendNotificationResult:
+    """Structured outcome of :func:`send_notification`.
+
+    ``kind``:
+
+    - ``"ok"``           — sendMessage succeeded; ``telegram_message_id`` set.
+    - ``"dead"``         — 403 or 400 — user blocked the bot / chat gone.
+                           Dispatcher MUST mark the link as dead.
+    - ``"retry_after"``  — 429 rate-limit; dispatcher should sleep
+                           ``retry_after_sec`` and retry the same payload.
+    - ``"transient"``    — network / 5xx; dispatcher rolls back the
+                           ``telegram_notifications`` row and re-enqueues.
+    - ``"disabled"``     — bot is not configured (TELEGRAM_BOT_ENABLED=false).
+                           Treated as "skip silently"; no audit, no retry.
+    """
+
+    kind: NotificationKind
+    telegram_message_id: int | None = None
+    retry_after_sec: int | None = None
+    detail: str | None = None
+
+
+# HTTP status code constants — named for grep-ability.
+_HTTP_TOO_MANY_REQUESTS: int = 429
+_HTTP_FORBIDDEN: int = 403
+_HTTP_BAD_REQUEST: int = 400
+_HTTP_SERVER_ERROR_FLOOR: int = 500
+
+
+def _is_dead_response_body(body: dict[str, Any]) -> bool:
+    """Heuristic: Bot API 400/403 with descriptions that indicate the chat
+    is gone / blocked. Bot API returns a JSON like
+    ``{ok: false, error_code: 403, description: "Forbidden: bot was blocked by the user"}``.
+    """
+    description = (body.get("description") or "").lower()
+    # Documented strings — defensive list, not exhaustive.
+    dead_markers = (
+        "bot was blocked",
+        "user is deactivated",
+        "chat not found",
+        "chat_not_found",
+        "bot was kicked",
+    )
+    return any(marker in description for marker in dead_markers)
+
+
+async def send_notification(  # noqa: PLR0911 - each return is a distinct, documented Bot API outcome
+    *,
+    chat_id: int,
+    text_html: str,
+    message_id: int,
+) -> SendNotificationResult:
+    """POST ``sendMessage`` with HTML parse-mode + an inline WebApp button.
+
+    Returns a :class:`SendNotificationResult`; caller dispatches the
+    outcome (see :mod:`worker.app.tg_notify_dispatch`).
+    """
+    settings = get_settings()
+    if not settings.telegram_bot_enabled:
+        # Bot disabled (CI / dev). Caller treats this as "skip silently".
+        return SendNotificationResult(kind="disabled")
+
+    webapp_base = settings.TELEGRAM_WEBAPP_URL.rstrip("/")
+    button_url = f"{webapp_base}/messages/{message_id}?embed=tg"
+
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "text": text_html,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+        "reply_markup": {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "Посмотреть сообщение",
+                        "web_app": {"url": button_url},
+                    }
+                ]
+            ]
+        },
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_SECONDS) as client:
+            resp = await client.post(_api_url("sendMessage"), json=payload)
+    except httpx.HTTPError as exc:
+        log.warning(
+            "telegram_send_notification_network_error",
+            chat_id=chat_id,
+            message_id=message_id,
+            error_type=type(exc).__name__,
+        )
+        return SendNotificationResult(kind="transient", detail=type(exc).__name__)
+
+    status = resp.status_code
+
+    # 200 OK — usually the happy path; Bot API does sometimes return
+    # ``{ok: false}`` in 200 envelopes too, so check both.
+    if status < _HTTP_BAD_REQUEST:
+        try:
+            body = resp.json()
+        except ValueError:
+            log.warning(
+                "telegram_send_notification_non_json_200",
+                chat_id=chat_id,
+                message_id=message_id,
+            )
+            return SendNotificationResult(kind="transient", detail="non_json_200")
+        if body.get("ok") is True:
+            result = body.get("result") or {}
+            tg_msg_id_raw = result.get("message_id")
+            tg_msg_id = int(tg_msg_id_raw) if isinstance(tg_msg_id_raw, int) else None
+            return SendNotificationResult(kind="ok", telegram_message_id=tg_msg_id)
+        # 200 with ok=false — translate based on description as for 4xx.
+        if _is_dead_response_body(body):
+            return SendNotificationResult(
+                kind="dead",
+                detail=str(body.get("description") or "")[:200],
+            )
+        log.warning(
+            "telegram_send_notification_unexpected_200_body",
+            chat_id=chat_id,
+            message_id=message_id,
+            description_excerpt=str(body.get("description") or "")[:200],
+        )
+        return SendNotificationResult(
+            kind="transient",
+            detail=str(body.get("description") or "")[:200],
+        )
+
+    # 429: read retry_after from Telegram's response body (or Retry-After header).
+    if status == _HTTP_TOO_MANY_REQUESTS:
+        retry_after = 1
+        try:
+            body = resp.json()
+            params = body.get("parameters") or {}
+            value = params.get("retry_after")
+            if isinstance(value, int) and value > 0:
+                retry_after = int(value)
+        except ValueError:
+            pass
+        header_value = resp.headers.get("retry-after")
+        if header_value:
+            with contextlib.suppress(ValueError):
+                retry_after = max(retry_after, int(header_value))
+        log.info(
+            "telegram_send_notification_rate_limited",
+            chat_id=chat_id,
+            message_id=message_id,
+            retry_after_sec=retry_after,
+        )
+        return SendNotificationResult(kind="retry_after", retry_after_sec=retry_after)
+
+    # 403 / 400 with a "dead" description: user blocked / chat gone.
+    if status in (_HTTP_FORBIDDEN, _HTTP_BAD_REQUEST):
+        try:
+            body = resp.json()
+        except ValueError:
+            body = {}
+        if status == _HTTP_FORBIDDEN or _is_dead_response_body(body):
+            log.info(
+                "telegram_send_notification_dead_link",
+                chat_id=chat_id,
+                message_id=message_id,
+                status_code=status,
+                description_excerpt=str(body.get("description") or "")[:200],
+            )
+            return SendNotificationResult(
+                kind="dead",
+                detail=str(body.get("description") or "")[:200],
+            )
+        # Plain 400 with another reason — treat as transient (likely our bug).
+        log.warning(
+            "telegram_send_notification_bad_request",
+            chat_id=chat_id,
+            message_id=message_id,
+            description_excerpt=str(body.get("description") or "")[:200],
+        )
+        return SendNotificationResult(
+            kind="transient",
+            detail=str(body.get("description") or "")[:200],
+        )
+
+    # 5xx: transient by definition.
+    if status >= _HTTP_SERVER_ERROR_FLOOR:
+        log.warning(
+            "telegram_send_notification_server_error",
+            chat_id=chat_id,
+            message_id=message_id,
+            status_code=status,
+        )
+        return SendNotificationResult(kind="transient", detail=f"http_{status}")
+
+    # Anything else (e.g. 401 — token revoked) → transient; operator must fix.
+    log.warning(
+        "telegram_send_notification_unexpected_status",
+        chat_id=chat_id,
+        message_id=message_id,
+        status_code=status,
+    )
+    return SendNotificationResult(kind="transient", detail=f"http_{status}")
 
 
 async def handle_update(update: TelegramUpdate) -> None:

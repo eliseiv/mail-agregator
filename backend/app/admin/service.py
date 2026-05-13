@@ -47,6 +47,7 @@ from backend.app.repositories.mail_accounts import MailAccountsRepo
 from backend.app.repositories.messages import MessagesRepo
 from backend.app.repositories.users import UsersRepo
 from backend.app.sessions import SessionStore
+from backend.app.telegram.sso_service import TelegramSSOService
 from shared.logging import get_logger
 from shared.models import (
     ROLE_GROUP_LEADER,
@@ -169,9 +170,7 @@ class AdminService:
             # FE-FIX round-4 #4: group_id is required for group_member at
             # creation time (schema validator enforces it; defensive check here).
             if payload.group_id is None:
-                raise ValidationError(
-                    "group_id is required for group_member", field="group_id"
-                )
+                raise ValidationError("group_id is required for group_member", field="group_id")
             group = await self._groups.get_by_id(payload.group_id)
             if group is None:
                 raise ValidationError("group_not_found", field="group_id")
@@ -496,6 +495,14 @@ class AdminService:
             action="reset_password",
             target_user_id=target.id,
             target_username=target.username,
+            ip=ip,
+            user_agent=user_agent,
+        )
+        # ADR-0022 §1.5: a password reset invalidates the Telegram link
+        # (new owner / new device assumed).
+        await TelegramSSOService(self._db).revoke_for_user(
+            user_id=target.id,
+            reason="password_reset",
             ip=ip,
             user_agent=user_agent,
         )

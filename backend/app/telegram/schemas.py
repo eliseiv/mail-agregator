@@ -1,4 +1,5 @@
-"""Pydantic schemas for Telegram Bot API ``Update`` payload.
+"""Pydantic schemas for Telegram Bot API ``Update`` payload + ADR-0022
+SSO request/response.
 
 Per ADR-0018 the bot consumes only the minimum fields needed to dispatch
 ``/start`` / ``/help`` — everything else (callback_query, edited_message,
@@ -68,3 +69,30 @@ class TelegramUpdate(BaseModel):
     message: TelegramMessage | None = None
 
     model_config = ConfigDict(extra="ignore")
+
+
+# ---------------------------------------------------------------------------
+# ADR-0022 — Persistent SSO request / response
+# ---------------------------------------------------------------------------
+
+
+class TelegramAuthRequest(BaseModel):
+    """``POST /api/telegram/auth`` body.
+
+    ``init_data`` is the verbatim ``window.Telegram.WebApp.initData``
+    string. Length-bound to 4096 chars — well above Telegram's documented
+    payload size, but bounded for defence-in-depth.
+    """
+
+    init_data: str = Field(min_length=1, max_length=4096)
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class TelegramAuthResponse(BaseModel):
+    """``POST /api/telegram/auth`` body for both linked/unlinked outcomes."""
+
+    linked: bool
+    redirect: str
+
+    model_config = ConfigDict(extra="forbid")

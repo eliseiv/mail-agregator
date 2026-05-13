@@ -12,17 +12,18 @@ from urllib.parse import quote
 from fastapi import APIRouter, Path, Query, Request, Response, status
 from fastapi.responses import HTMLResponse, StreamingResponse
 
-from backend.app.accounts.service import MailAccountService, _to_dto as _acc_to_dto
+from backend.app.accounts.service import MailAccountService
+from backend.app.accounts.service import _to_dto as _acc_to_dto
 from backend.app.deps import CurrentScope, DbSession
 from backend.app.groups.service import GroupsService
-from backend.app.repositories.mail_accounts import MailAccountsRepo
-from backend.app.repositories.users import UsersRepo
 from backend.app.messages.schemas import (
     MarkReadRequest,
     MessageDetail,
     MessageListResponse,
 )
 from backend.app.messages.service import MessageService
+from backend.app.repositories.mail_accounts import MailAccountsRepo
+from backend.app.repositories.users import UsersRepo
 from backend.app.tags.service import TagsService
 from backend.app.templates import render
 
@@ -149,9 +150,7 @@ async def inbox_page(
     # the template hides the <select> when ``groups`` is empty.
     groups: list = []
     if scope.is_super_admin:
-        groups_resp = await GroupsService(db).list_for_scope(
-            scope, q=None, page=1, limit=200
-        )
+        groups_resp = await GroupsService(db).list_for_scope(scope, q=None, page=1, limit=200)
         groups = groups_resp.items
 
     # Account / tag dropdowns cascade off the selected group (FE-FIX round-8):
@@ -171,9 +170,7 @@ async def inbox_page(
         rows = await MailAccountsRepo(db).list_by_ids(ids) if ids else []
         owner_ids = sorted({a.user_id for a in rows})
         users_map = await UsersRepo(db).get_many_by_ids(owner_ids) if owner_ids else {}
-        accounts = [
-            _acc_to_dto(a, users_map[a.user_id]) for a in rows if a.user_id in users_map
-        ]
+        accounts = [_acc_to_dto(a, users_map[a.user_id]) for a in rows if a.user_id in users_map]
         member_ids = await UsersRepo(db).list_user_ids_in_group(effective_group_id)
         tags_by_id: dict[int, object] = {}
         for uid in [*member_ids, scope.user_id]:
@@ -221,8 +218,18 @@ async def message_view_page(
     db: DbSession,
     scope: CurrentScope,
     message_id: int = Path(..., ge=1),
+    embed: Annotated[str | None, Query(max_length=16)] = None,
 ) -> Response:
+    """Render the message view page.
+
+    ADR-0022 §2.6: when ``embed=tg`` the page is rendered as a Telegram
+    WebApp view — attachments are hidden so the user gets a focused read
+    experience without binary downloads (they can switch back to the
+    Inbox to access attachments). Other UI (mark-read, top toolbar
+    minus the Reply button is still useful for context) stays.
+    """
     sess = request.state.session
+    embed_tg = embed == "tg"
     detail = await MessageService(db).get(scope=scope, message_id=message_id)
     # Close the autobegun read-tx so the explicit begin() below does not collide.
     await db.commit()
@@ -240,6 +247,7 @@ async def message_view_page(
             "scope": scope,
             "csrf_token": sess.csrf_token,
             "session": sess,
+            "embed_tg": embed_tg,
         },
     )
 

@@ -1,19 +1,24 @@
 """Health & self endpoints.
 
-- ``GET /healthz`` — liveness, no deps.
-- ``GET /readyz``  — readiness, checks Postgres + Redis + MinIO.
-- ``GET /api/me``  — current user summary (post-ADR-0019: role + group).
+- ``GET /healthz``           — liveness, no deps.
+- ``GET /readyz``            — readiness, checks Postgres + Redis + MinIO.
+- ``GET /api/me``            — current user summary (role + group + telegram).
+- ``PATCH /api/me/settings`` — user preferences (ADR-0022 §2.7).
 """
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Response, status
+from fastapi import APIRouter, Request, Response, status
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, ValidationError
 from sqlalchemy import select
 
 from backend.app.deps import CurrentUser, DbSession
+from backend.app.exceptions import ValidationError as DomainValidationError
 from backend.app.repositories.groups import GroupsRepo
 from backend.app.repositories.mail_accounts import MailAccountsRepo
+from backend.app.repositories.telegram_links import TelegramLinksRepo
+from backend.app.repositories.user_settings import UserSettingsRepo
 from shared.logging import get_logger
 from shared.redis_client import get_redis
 from shared.storage import get_storage
@@ -77,6 +82,10 @@ async def me(db: DbSession, user: CurrentUser) -> dict[str, object]:
         group = await GroupsRepo(db).get_by_id(user.group_id)
         if group is not None:
             group_brief = {"id": group.id, "name": group.name}
+    # ADR-0022 §2.7 — surface preferences + linkage status.
+    tg_enabled = await UserSettingsRepo(db).get_tg_notifications_enabled(user.id)
+    tg_link = await TelegramLinksRepo(db).get_by_user_id(user.id)
+    telegram_linked = tg_link is not None and tg_link.dead_at is None
     return {
         "id": user.id,
         "username": user.username,
@@ -85,4 +94,73 @@ async def me(db: DbSession, user: CurrentUser) -> dict[str, object]:
         "group": group_brief,
         "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None,
         "mail_accounts_count": len(accounts),
+        "tg_notifications_enabled": tg_enabled,
+        "telegram_linked": telegram_linked,
     }
+
+
+# ---------------------------------------------------------------------------
+# PATCH /api/me/settings (ADR-0022 §2.7)
+# ---------------------------------------------------------------------------
+
+
+class _MeSettingsPatch(BaseModel):
+    """``PATCH /api/me/settings`` body.
+
+    All fields are optional — empty body is rejected at the service layer
+    (``validation_error``). On this iteration only
+    ``tg_notifications_enabled`` is supported; future preferences become
+    additional optional fields here.
+    """
+
+    tg_notifications_enabled: bool | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+@router.patch("/api/me/settings")
+async def patch_me_settings(request: Request, db: DbSession, user: CurrentUser) -> Response:
+    try:
+        body = await request.json()
+    except ValueError as exc:
+        raise DomainValidationError("Body is not valid JSON") from exc
+    try:
+        payload = _MeSettingsPatch.model_validate(body)
+    except ValidationError as exc:
+        raise DomainValidationError("Invalid settings payload") from exc
+
+    if payload.tg_notifications_enabled is None:
+        raise DomainValidationError(
+            "At least one settings field is required",
+            field="tg_notifications_enabled",
+        )
+
+    settings_repo = UserSettingsRepo(db)
+
+    old_value = await settings_repo.get_tg_notifications_enabled(user.id)
+    new_value = bool(payload.tg_notifications_enabled)
+
+    # Close the autobegun read-tx so the explicit begin() below does not collide.
+    await db.commit()
+    async with db.begin():
+        row = await settings_repo.upsert_tg_notifications_enabled(
+            user_id=user.id, enabled=new_value
+        )
+
+    if old_value != new_value:
+        # ADR-0022 §2.7: preference changes are not an admin-audit event
+        # (the audit log table is reserved for super-admin actions per
+        # ``docs/03-data-model.md``). We still emit a structured log line so
+        # operators can correlate "user X stopped receiving notifications"
+        # with their own toggle.
+        log.info(
+            "tg_notifications_setting_changed",
+            user_id=user.id,
+            from_value=old_value,
+            to_value=new_value,
+        )
+
+    return JSONResponse(
+        content={"tg_notifications_enabled": bool(row.tg_notifications_enabled)},
+        status_code=status.HTTP_200_OK,
+    )

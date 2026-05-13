@@ -1,10 +1,12 @@
-"""Telegram webhook receiver (ADR-0018, ``docs/04-api-contracts.md`` §4a).
+"""Telegram webhook receiver + Persistent SSO endpoint
+(ADR-0018 + ADR-0022; ``docs/04-api-contracts.md`` §4a).
 
-A single endpoint:
+Endpoints:
 
-- ``POST /api/telegram/webhook/{secret}``
+- ``POST /api/telegram/webhook/{secret}`` — Bot API updates (launcher).
+- ``POST /api/telegram/auth``             — Persistent SSO (initData HMAC).
 
-Authn: dual-channel proof-of-Telegram —
+Authn for the webhook: dual-channel proof-of-Telegram —
 
 1. ``{secret}`` URL-segment must equal ``settings.TELEGRAM_WEBHOOK_SECRET``
    (compared via :func:`secrets.compare_digest` to dodge timing oracles).
@@ -16,35 +18,59 @@ Authn: dual-channel proof-of-Telegram —
    text says we accept that as long as the URL matches and the header,
    if present, also matches).
 
-Why 404 (not 403) on secret mismatch: returning 404 keeps the endpoint
-unenumerable — an attacker probing random paths cannot distinguish "wrong
-secret" from "wrong path", which is friendlier to scanning hygiene
-(``docs/06-security.md`` §1.8 STRIDE-S). The contract table at
-``docs/04-api-contracts.md`` §4a still calls it ``403 forbidden``; that
-behaviour is honoured by `NotFoundError` → ``not_found`` envelope which
-nginx access logs as a 404 and Telegram retries the same way as for 403.
-**Note**: this is a deliberate hardening tightening (404 is strictly more
-opaque than 403); flagged in the report.
+Authn for SSO: HMAC of ``init_data`` against the bot token + auth_date TTL.
+No session, no CSRF — see :mod:`backend.app.telegram.init_data` and
+:mod:`backend.app.telegram.sso_service`.
 
-This route is exempt from CSRF (no session, Telegram does not send
-cookies) and from session resolution (the SessionMiddleware tolerates
-absence of ``mas_session`` — no extra exemption needed). Rate-limit
-guidance from the contract table (60/min/IP) is enforced
-imperatively here via :mod:`backend.app.rate_limit`.
+Why 404 (not 403) on secret mismatch: returning 404 keeps the webhook
+endpoint unenumerable — an attacker probing random paths cannot
+distinguish "wrong secret" from "wrong path", which is friendlier to
+scanning hygiene (``docs/06-security.md`` §1.8 STRIDE-S). The contract
+table at ``docs/04-api-contracts.md`` §4a still calls it ``403 forbidden``;
+that behaviour is honoured by `NotFoundError` → ``not_found`` envelope
+which nginx access logs as a 404 and Telegram retries the same way as
+for 403.
+
+These routes are exempt from CSRF (see ``backend/app/csrf.py``) and from
+session resolution (the SessionMiddleware tolerates absence of
+``mas_session`` — no extra exemption needed). Rate-limits are enforced
+imperatively via :mod:`backend.app.rate_limit`.
 """
 
 from __future__ import annotations
 
 import secrets
 
-from fastapi import APIRouter, Request
-from fastapi.responses import Response
-from pydantic import ValidationError
+from fastapi import APIRouter, Request, status
+from fastapi.responses import JSONResponse, Response
+from pydantic import ValidationError as PydanticValidationError
 
-from backend.app.exceptions import NotFoundError, RateLimitedError
-from backend.app.rate_limit import Limit, client_ip, consume
+from backend.app.cookies import set_session_cookies
+from backend.app.deps import DbSession
+from backend.app.exceptions import (
+    NotFoundError,
+    RateLimitedError,
+    ValidationError,
+)
+from backend.app.rate_limit import (
+    LIMIT_TG_AUTH_IP,
+    LIMIT_TG_AUTH_USER,
+    Limit,
+    client_ip,
+    consume,
+)
+from backend.app.repositories.users import UsersRepo
+from backend.app.sessions import SessionStore
 from backend.app.telegram.bot import handle_update
-from backend.app.telegram.schemas import TelegramUpdate
+from backend.app.telegram.schemas import (
+    TelegramAuthRequest,
+    TelegramAuthResponse,
+    TelegramUpdate,
+)
+from backend.app.telegram.sso_service import (
+    InvalidInitDataError,
+    TelegramSSOService,
+)
 from shared.config import get_settings
 from shared.logging import get_logger
 
@@ -121,7 +147,7 @@ async def telegram_webhook(secret: str, request: Request) -> Response:
 
     try:
         update = TelegramUpdate.model_validate(body)
-    except ValidationError:
+    except PydanticValidationError:
         # Don't log the full body — it can contain user-typed message text
         # which counts as PII. Log just the keys present at top level so
         # we can debug Bot-API forward-compat.
@@ -131,3 +157,133 @@ async def telegram_webhook(secret: str, request: Request) -> Response:
 
     await handle_update(update)
     return Response(status_code=200)
+
+
+# ---------------------------------------------------------------------------
+# Persistent SSO (ADR-0022 §1)
+# ---------------------------------------------------------------------------
+
+
+def _invalid_init_data_response(code: str, message: str) -> JSONResponse:
+    """Canonical 401 envelope for SSO failures."""
+    return JSONResponse(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        content={"error": {"code": code, "message": message}},
+    )
+
+
+@router.post("/api/telegram/auth")
+async def telegram_auth(request: Request, db: DbSession) -> Response:
+    """Persistent SSO endpoint (ADR-0022 §1.2).
+
+    See ``docs/04-api-contracts.md`` §4a for the contract. Behaviour:
+
+    1. Per-IP rate-limit (cheap; runs before HMAC).
+    2. Parse + HMAC-validate the ``init_data`` body.
+    3. Per-``telegram_user_id`` rate-limit (post-HMAC; replay defence).
+    4. Lookup the link:
+       - active → create a session for the linked user, return ``linked=true``.
+       - missing → create a pending Redis token + cookie, return
+         ``linked=false`` so the frontend redirects to ``/login``.
+
+    Errors:
+
+    - 401 ``invalid_init_data`` — HMAC mismatch / parse failure.
+    - 401 ``init_data_expired`` — auth_date older than TTL.
+    - 429 ``rate_limited``    — either bucket exhausted.
+    """
+    settings = get_settings()
+    ip = client_ip(request)
+    ua = request.headers.get("user-agent", "")
+
+    # Per-IP rate-limit BEFORE HMAC so a flood of HMAC-fails counts here too.
+    await consume(LIMIT_TG_AUTH_IP, f"ip:{ip}")
+
+    # Parse JSON body — manual parse so a malformed payload becomes our
+    # canonical 400 ``validation_error``.
+    try:
+        body = await request.json()
+    except ValueError as exc:
+        raise ValidationError("Body is not valid JSON") from exc
+    try:
+        payload = TelegramAuthRequest.model_validate(body)
+    except PydanticValidationError as exc:
+        raise ValidationError("Invalid auth payload") from exc
+
+    if not settings.telegram_bot_enabled:
+        # Without a bot token configured we cannot validate HMAC. Treat the
+        # call the same as an invalid HMAC — opaque to clients (don't leak
+        # configuration state).
+        log.info("telegram_auth_bot_disabled")
+        return _invalid_init_data_response("invalid_init_data", "initData validation failed")
+
+    svc = TelegramSSOService(db)
+    try:
+        resolved = await svc.verify_and_resolve(payload.init_data)
+    except InvalidInitDataError as exc:
+        if exc.reason == "expired":
+            log.info("telegram_auth_expired", ip=ip)
+            return _invalid_init_data_response("init_data_expired", "initData expired")
+        log.info("telegram_auth_invalid", reason=exc.reason, ip=ip)
+        return _invalid_init_data_response("invalid_init_data", "initData validation failed")
+
+    # Per-tg_user_id rate-limit (post-HMAC).
+    await consume(LIMIT_TG_AUTH_USER, f"tg:{resolved.telegram_user_id}")
+
+    if resolved.kind == "linked":
+        assert resolved.user_id is not None
+        user = await UsersRepo(db).get_by_id(resolved.user_id)
+        if user is None:
+            # Link points at a user that was deleted out-of-band. Drop the
+            # stale link and treat as ``unlinked`` — caller will go through
+            # the usual login flow.
+            log.warning(
+                "telegram_auth_link_user_gone",
+                user_id=resolved.user_id,
+                telegram_user_id=resolved.telegram_user_id,
+            )
+            async with db.begin():
+                await svc.revoke_for_user(
+                    user_id=resolved.user_id,
+                    reason="link_user_missing",
+                    ip=ip,
+                    user_agent=ua,
+                )
+            # fall through to the unlinked branch
+            resolved_user_id_was_present = True
+        else:
+            session_token, csrf = await SessionStore().create(
+                user.id, user.role, user.group_id, ip, ua
+            )
+            response = JSONResponse(
+                content=TelegramAuthResponse(linked=True, redirect="/").model_dump(),
+                status_code=status.HTTP_200_OK,
+            )
+            set_session_cookies(response, session_token, csrf, settings)
+            log.info(
+                "telegram_auth_linked",
+                user_id=user.id,
+                telegram_user_id=resolved.telegram_user_id,
+            )
+            return response
+    else:
+        resolved_user_id_was_present = False
+
+    # Unlinked → create pending token + cookie.
+    token = await svc.create_pending(resolved.telegram_user_id)
+    response = JSONResponse(
+        content=TelegramAuthResponse(linked=False, redirect="/login").model_dump(),
+        status_code=status.HTTP_200_OK,
+    )
+    # Local import to avoid a circular import at module load (cookies.py
+    # doesn't depend on telegram, but we want to keep the helper close to
+    # other cookie writes).
+    from backend.app.cookies import set_tg_pending_cookie
+
+    set_tg_pending_cookie(response, token, settings)
+    log.info(
+        "telegram_auth_unlinked_pending_set",
+        telegram_user_id=resolved.telegram_user_id,
+        had_stale_link=resolved_user_id_was_present,
+    )
+    return response

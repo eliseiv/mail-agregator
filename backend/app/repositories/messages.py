@@ -50,12 +50,9 @@ class MessagesRepo:
             return await self._s.get(Message, message_id)
         if not mail_account_ids:
             return None
-        stmt = (
-            select(Message)
-            .where(
-                Message.id == message_id,
-                Message.mail_account_id.in_(mail_account_ids),
-            )
+        stmt = select(Message).where(
+            Message.id == message_id,
+            Message.mail_account_id.in_(mail_account_ids),
         )
         return (await self._s.execute(stmt)).scalar_one_or_none()
 

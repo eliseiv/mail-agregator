@@ -210,16 +210,21 @@ Healthcheck не настроен — это бесконечный sleep-цик
 | `SERVER_DOMAIN` | (none) | yes (prod) | FQDN для TLS (например, `mail.example.com`). nginx envsubst-ит в `default.conf`; certbot использует для запроса cert. |
 | `ACME_EMAIL` | `admin@example.com` | yes (prod) | Контакт для Let's Encrypt — приходят уведомления о истечении сертификата + reset-ссылки для аккаунта LE. |
 
-### Telegram bot (ADR-0018)
+### Telegram bot (ADR-0018 launcher + ADR-0022 SSO/notifications)
 
 | Переменная | Default | Required | Описание |
 | --- | --- | --- | --- |
-| `TELEGRAM_BOT_ENABLED` | `false` | no | Если `false` — webhook-роут регистрируется и валидирует secret, но не вызывает Bot API. Включается одноразово после deploy + `setWebhook`. |
-| `TELEGRAM_BOT_TOKEN` | (none) | yes (если enabled) | Bot-token от BotFather. Маскируется в structlog redact-list рядом с `MAIL_ENCRYPTION_KEY` (см. ADR-0014, `06-security.md` §1.8). |
+| `TELEGRAM_BOT_ENABLED` | `false` | no | Если `false` — webhook-роут регистрируется и валидирует secret, но не вызывает Bot API; диспатчер нотификаций также пропускает доставку. Включается одноразово после deploy + `setWebhook`. |
+| `TELEGRAM_BOT_TOKEN` | (none) | yes (если enabled) | Bot-token от BotFather. Маскируется в structlog redact-list рядом с `MAIL_ENCRYPTION_KEY` (см. ADR-0014, `06-security.md` §1.8). **TD-014 cleanup (ADR-0022 migration plan)**: код переименовывается с `BOT_TOKEN` на `TELEGRAM_BOT_TOKEN` (alias на переходный период); devops синхронизирует prod `.env`. |
 | `TELEGRAM_WEBHOOK_SECRET` | (none) | yes (если enabled) | 32 hex-символа, генерация: `openssl rand -hex 16`. Используется и в URL-path webhook'а, и в header `X-Telegram-Bot-Api-Secret-Token` (двойная проверка). |
-| `TELEGRAM_WEBAPP_URL` | (none) | yes (если enabled) | URL, который бот вкладывает в `web_app.url` inline-кнопки. Prod: `https://postapp.store`. Dev: ngrok URL (Telegram требует HTTPS). |
+| `TELEGRAM_WEBAPP_URL` | (none) | yes (если enabled) | URL, который бот вкладывает в `web_app.url` inline-кнопки (для `/start` launcher и для notification «Посмотреть сообщение»). Prod: `https://postapp.store`. Dev: ngrok URL (Telegram требует HTTPS). |
+| `TG_AUTH_INIT_DATA_TTL_SEC` | `300` | no | TTL (секунды) для `auth_date` в `init_data` при `POST /api/telegram/auth` (ADR-0022 §1.2). |
+| `TG_PENDING_COOKIE_TTL_SEC` | `900` | no | TTL (секунды) cookie `mas_tg_pending` и Redis ключа `tg_pending:{token}` (ADR-0022 §1.2). |
+| `TG_NOTIFY_BATCH_SIZE` | `30` | no | Сколько items LPOP'ит `tg_notify_dispatch` за один тик (ADR-0022 §2.4). |
+| `TG_NOTIFY_DISPATCH_INTERVAL_SEC` | `5` | no | Интервал APScheduler для `tg_notify_dispatch` (ADR-0022 §2.4). |
+| `TG_NOTIFY_RECOVERY_WINDOW_HOURS` | `24` | no | Окно (часы) для `tg_notify_recovery_scan` — не пытаемся доставить уведомления о письмах старше этого срока (ADR-0022 §2.8). |
 
-`TELEGRAM_BOT_TOKEN` хранится в `.env` (`chmod 600`). Никогда не передаётся в worker (он не использует Telegram API). Маскировка в логах гарантируется redact-list'ом structlog.
+`TELEGRAM_BOT_TOKEN` хранится в `.env` (`chmod 600`). **Изменение от ADR-0018:** `worker` теперь использует Telegram API для доставки push-нотификаций (ADR-0022 §2) — `TELEGRAM_BOT_TOKEN` передаётся **и** в `api`, **и** в `worker` контейнеры. Маскировка в логах гарантируется redact-list'ом structlog (одинаково для обоих контейнеров).
 
 ### CI / Build
 
