@@ -108,5 +108,19 @@ class GroupsRepo:
             .values(name=name, updated_at=datetime.now(UTC))
         )
 
+    async def set_leader(self, *, group_id: int, leader_user_id: int | None) -> None:
+        """Update ``groups.leader_user_id`` directly.
+
+        Used by AdminService when (re)assigning a leader to an existing
+        orphan group, and when dissolving a leader's group on user delete
+        (detaches the pointer before the ON DELETE RESTRICT would fire).
+        The UNIQUE constraint on ``leader_user_id`` is honoured by the DB.
+        """
+        await self._s.execute(
+            update(Group)
+            .where(Group.id == group_id)
+            .values(leader_user_id=leader_user_id, updated_at=datetime.now(UTC))
+        )
+
     async def delete(self, group_id: int) -> None:
         await self._s.execute(delete(Group).where(Group.id == group_id))

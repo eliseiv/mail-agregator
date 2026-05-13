@@ -51,11 +51,11 @@ def _user_brief(u: User) -> UserBriefDTO:
 def _auto_group_name(user: User) -> str:
     """Build the auto-generated group name for a new leader.
 
-    Per ADR-0019 §5: ``"Группа {display_name | username}"``. Always ≤ 100
+    Per ADR-0019 §5: ``"Команда {display_name | username}"``. Always ≤ 100
     characters because both source fields are length-bounded.
     """
     label = (user.display_name or user.username).strip()
-    return f"Группа {label}"[:100]
+    return f"Команда {label}"[:100]
 
 
 class GroupsService:

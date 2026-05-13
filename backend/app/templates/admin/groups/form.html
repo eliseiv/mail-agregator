@@ -10,22 +10,22 @@
      - csrf_token  : str
      - session     : SessionData
 
-   Создание группы через эту форму не предусмотрено — group auto-created
+   Создание команды через эту форму не предусмотрено — group auto-created
    при назначении лидера (ADR-0019 §5). Поэтому шаблон используется только
    на маршруте /admin/groups/{id}/edit.
 #}
 
-{% block title %}Редактировать группу &middot; Mail Aggregator{% endblock %}
+{% block title %}Редактировать команду &middot; Mail Aggregator{% endblock %}
 {% block body_class %}admin-groups-form{% endblock %}
 
 {% block content %}
 <section class="admin" aria-labelledby="group-form-heading">
-  <nav class="admin__nav" aria-label="Навигация по группам">
-    <a class="btn btn--secondary" href="/admin/groups">&larr; К группам</a>
+  <nav class="admin__nav" aria-label="Навигация по командам">
+    <a class="btn btn--secondary" href="/admin/groups">&larr; К командам</a>
   </nav>
 
   <h1 id="group-form-heading" class="admin__title">
-    Редактировать группу{% if group and group.name %} «{{ group.name | e }}»{% endif %}
+    Редактировать команду{% if group and group.name %} «{{ group.name | e }}»{% endif %}
   </h1>
 
   {% if error_message %}
@@ -55,7 +55,7 @@
     <input type="hidden" name="_method" value="PATCH">
 
     <div class="field">
-      <label class="field__label" for="group-name">Название группы</label>
+      <label class="field__label" for="group-name">Название команды</label>
       <input
         class="field__input"
         type="text"

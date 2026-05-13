@@ -7,9 +7,13 @@ Outbound helpers:
   ``settings.TELEGRAM_WEBAPP_URL`` (used by ``/start``).
 - :func:`send_message` — POST ``sendMessage`` with plain text.
 - :func:`send_notification` — POST ``sendMessage`` with parse_mode=HTML and
-  a ``web_app`` inline-button pointing at ``{WEBAPP_URL}/messages/{id}?embed=tg``.
+  a ``callback_data`` inline-button carrying ``msg:{message_id}``. When the
+  user taps the button, the webhook receives a :class:`callback_query` and
+  the bot replies in-chat with the full email body (bug-fix #5).
   Returns a structured :class:`SendNotificationResult` so the dispatcher
   can act on 403/429/transient separately (ADR-0022 §2.4).
+- :func:`answer_callback_query` — POST ``answerCallbackQuery`` to clear
+  the spinner on the user's button tap (bug-fix #5).
 
 Inbound dispatcher:
 
@@ -129,6 +133,68 @@ async def send_message(chat_id: int, text: str) -> None:
     await _post_send_message({"chat_id": chat_id, "text": text})
 
 
+async def send_html_message(chat_id: int, text_html: str) -> None:
+    """Send an HTML-formatted message (parse_mode=HTML) to ``chat_id``.
+
+    Used by the callback-query handler (bug-fix #5) to deliver the full
+    email body in the chat. Web-page previews are disabled because the
+    body often contains URLs we don't want auto-expanded. Network /
+    Bot-API failures are absorbed as warnings — the webhook must return
+    200 to Telegram regardless.
+    """
+    await _post_send_message(
+        {
+            "chat_id": chat_id,
+            "text": text_html,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+    )
+
+
+async def answer_callback_query(
+    callback_query_id: str,
+    *,
+    text: str | None = None,
+    show_alert: bool = False,
+) -> None:
+    """POST ``answerCallbackQuery`` for ``callback_query_id``.
+
+    Telegram requires *every* callback_query to be acknowledged within
+    a few seconds — otherwise the user sees a perpetual spinner on the
+    button they tapped. ``text`` is optional (None → just dismiss the
+    spinner); ``show_alert=True`` pops a modal instead of a transient
+    toast (used for error feedback like "session expired").
+
+    Errors are swallowed at warning level for the same reason as
+    :func:`_post_send_message` — the webhook must return 200.
+    """
+    payload: dict[str, Any] = {"callback_query_id": callback_query_id}
+    if text:
+        # Telegram caps callback-query response text at 200 chars; the
+        # client truncates silently if we overshoot.
+        payload["text"] = text[:200]
+    if show_alert:
+        payload["show_alert"] = True
+    try:
+        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_SECONDS) as client:
+            resp = await client.post(_api_url("answerCallbackQuery"), json=payload)
+    except httpx.HTTPError as exc:
+        log.warning(
+            "telegram_answer_callback_network_error",
+            callback_query_id=callback_query_id,
+            error_type=type(exc).__name__,
+        )
+        return
+    if resp.status_code >= 400:
+        log.warning(
+            "telegram_answer_callback_api_error",
+            callback_query_id=callback_query_id,
+            status_code=resp.status_code,
+            response_excerpt=resp.text[:200],
+        )
+
+
 # ---------------------------------------------------------------------------
 # Push-notifications (ADR-0022 sec. 2.4 - 2.5)
 # ---------------------------------------------------------------------------
@@ -200,8 +266,11 @@ async def send_notification(  # noqa: PLR0911 - each return is a distinct, docum
         # Bot disabled (CI / dev). Caller treats this as "skip silently".
         return SendNotificationResult(kind="disabled")
 
-    webapp_base = settings.TELEGRAM_WEBAPP_URL.rstrip("/")
-    button_url = f"{webapp_base}/messages/{message_id}?embed=tg"
+    # Bug-fix #5: the «Посмотреть сообщение» button is now a
+    # callback_data button (≤ 64 bytes) — tapping it sends a
+    # callback_query to the webhook which replies in-chat with the full
+    # message body. Replaces the previous web_app Mini-App opener.
+    callback_data = f"msg:{message_id}"
 
     payload: dict[str, Any] = {
         "chat_id": chat_id,
@@ -213,7 +282,7 @@ async def send_notification(  # noqa: PLR0911 - each return is a distinct, docum
                 [
                     {
                         "text": "Посмотреть сообщение",
-                        "web_app": {"url": button_url},
+                        "callback_data": callback_data,
                     }
                 ]
             ]

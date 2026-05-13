@@ -11,17 +11,17 @@
        role ('super_admin'|'group_leader'|'group_member'),
        group ({id, name}|null),
        created_at, last_login_at, password_reset_required, mail_accounts.
-   - groups: list[{id, name}] — все группы (для select при создании
+   - groups: list[{id, name}] — все команды (для select при создании
        group_member); может быть пустым на старте.
    - is_super_admin: bool — true для super_admin сессии (всегда — иначе 403). #}
 <section class="admin" aria-labelledby="admin-heading">
   <header class="admin__toolbar">
     <h1 id="admin-heading" class="admin__title">Пользователи</h1>
     <div class="admin__actions">
-      <a class="topnav__link" href="/admin/groups">Группы &rarr;</a>
+      <a class="topnav__link" href="/admin/groups">Команды &rarr;</a>
       <a class="topnav__link" href="/admin/audit">Журнал действий &rarr;</a>
       <button type="button" class="btn btn--primary" data-admin-create-user>+ Создать пользователя</button>
-      <button type="button" class="btn btn--secondary" data-admin-create-group>+ Создать группу</button>
+      <button type="button" class="btn btn--secondary" data-admin-create-group>+ Создать команду</button>
     </div>
   </header>
 
@@ -56,7 +56,7 @@
           <tr>
             <th scope="col">Имя</th>
             <th scope="col">Роль</th>
-            <th scope="col">Группа</th>
+            <th scope="col">Команда</th>
             <th scope="col">Создан</th>
             <th scope="col">Последний вход</th>
             <th scope="col" class="admin-users-table__actions-col">Действия</th>
@@ -90,8 +90,8 @@
                       <button
                         type="button"
                         class="admin-users-table__add-group"
-                        title="Перенести в другую группу"
-                        aria-label="Перенести {{ u.username | e }} в другую группу"
+                        title="Перенести в другую команду"
+                        aria-label="Перенести {{ u.username | e }} в другую команду"
                         data-admin-move-group
                         data-user-id="{{ u.id }}"
                         data-username="{{ u.username | e }}"
@@ -112,7 +112,7 @@
                   {% if u.group %}
                     {{ _gname | e }}
                   {% else %}
-                    <span class="admin-users-table__muted">без группы</span>
+                    <span class="admin-users-table__muted">без команды</span>
                   {% endif %}
                 </td>
                 <td class="admin-users-table__date">
@@ -198,7 +198,7 @@
               value="group_leader"
               data-admin-role-input
               data-role-value="group_leader">
-            <span>Лидер группы</span>
+            <span>Лидер команды</span>
           </label>
           <label class="radio">
             <input
@@ -209,33 +209,45 @@
               data-admin-role-input
               data-role-value="group_member"
               checked>
-            <span>Участник группы</span>
+            <span>Участник команды</span>
           </label>
         </div>
         <p class="field__hint">
-          Для лидера группа создаётся автоматически с именем «Группа &lt;логин&gt;».
-          Для участника группа обязательна — выбор ниже.
+          Для лидера команду можно выбрать (тогда он становится лидером существующей команды без лидера)
+          либо оставить пустой (тогда команда создаётся автоматически с именем «Команда &lt;логин&gt;»).
+          Для участника команда обязательна — выбор ниже.
         </p>
       </fieldset>
 
-      <div class="field" data-admin-group-field>
-        <label class="field__label" for="new-user-group-id">Группа</label>
+      {# Bug-fix #2: orphan_group_ids is a list[int] of groups with no
+         current leader. Embedded as a JSON-encoded data-attribute so the
+         JS can filter the dropdown to leader-eligible groups when the
+         role=group_leader radio is selected. #}
+      <div class="field"
+           data-admin-group-field
+           data-orphan-group-ids="{{ (orphan_group_ids | default([])) | tojson | e }}">
+        <label class="field__label" for="new-user-group-id">Команда</label>
         <select
           class="field__input"
           id="new-user-group-id"
           name="group_id"
           data-admin-group-select>
-          <option value="">— выберите группу —</option>
+          <option value="">— выберите команду —</option>
           {% for grp in groups | default([]) %}
             <option value="{{ grp.id }}">{{ grp.name | e }}</option>
           {% endfor %}
         </select>
         {% if not groups %}
           <p class="field__hint">
-            Групп ещё нет. <a href="/admin/groups">Создайте лидера группы</a> — группа появится автоматически.
+            Команд ещё нет. <a href="/admin/groups">Создайте лидера команды</a> — команда появится автоматически.
           </p>
         {% else %}
-          <p class="field__hint">Обязательное поле для участника группы.</p>
+          {# Bug-fix #2: separate hints per role; JS toggles visibility. #}
+          <p class="field__hint" data-admin-group-hint-leader hidden>
+            Если выбрать команду — пользователь станет лидером этой команды (доступны только команды без лидера).
+            Если оставить пустым — будет создана новая команда автоматически.
+          </p>
+          <p class="field__hint" data-admin-group-hint-member>Обязательное поле для участника команды.</p>
         {% endif %}
       </div>
 
@@ -246,14 +258,14 @@
   </dialog>
 
   {# Create-group dialog (FE-FIX 7). Two select-like controls populated via
-     fetch /api/admin/users/eligible on first open. The "Лидер группы" select
+     fetch /api/admin/users/eligible on first open. The "Лидер команды" select
      is required; "Участники" is a multi-select (optional). On submit we POST
      JSON {name, leader_user_id, member_ids:[...]} to /api/admin/groups. #}
   <dialog class="dialog" id="dialog-create-group" data-admin-create-group-dialog>
     <form method="dialog" class="dialog__form-cancel">
       <button type="submit" class="btn btn--link" aria-label="Закрыть">&times;</button>
     </form>
-    <h2 class="dialog__title">Создать группу</h2>
+    <h2 class="dialog__title">Создать команду</h2>
 
     <p class="form-error" role="alert" data-admin-create-group-error hidden></p>
 
@@ -265,7 +277,7 @@
       {{ m.csrf_input() }}
 
       <div class="field">
-        <label class="field__label" for="new-group-name">Название группы</label>
+        <label class="field__label" for="new-group-name">Название команды</label>
         <input
           class="field__input"
           type="text"
@@ -279,7 +291,7 @@
       </div>
 
       <div class="field">
-        <label class="field__label" for="new-group-leader">Лидер группы <span class="field__optional">(необязательно)</span></label>
+        <label class="field__label" for="new-group-leader">Лидер команды <span class="field__optional">(необязательно)</span></label>
         <select
           class="field__input"
           id="new-group-leader"
@@ -287,7 +299,7 @@
           data-admin-group-leader-select>
           <option value="">— без лидера —</option>
         </select>
-        <p class="field__hint">Если не выбрать лидера — первый участник станет лидером автоматически. Группу можно создать и без участников.</p>
+        <p class="field__hint">Если не выбрать лидера — первый участник станет лидером автоматически. Команду можно создать и без участников.</p>
       </div>
 
       <div class="field">
@@ -317,12 +329,12 @@
     <form method="dialog" class="dialog__form-cancel">
       <button type="submit" class="btn btn--link" aria-label="Закрыть">&times;</button>
     </form>
-    <h2 class="dialog__title">Перенести в группу</h2>
+    <h2 class="dialog__title">Перенести в команду</h2>
     <p>Пользователь <strong data-admin-move-username></strong></p>
     <p class="form-error" role="alert" data-admin-move-error hidden></p>
     <form class="form" data-admin-move-form>
       <div class="field">
-        <label class="field__label" for="move-group-id">Группа</label>
+        <label class="field__label" for="move-group-id">Команда</label>
         <select
           class="field__input"
           id="move-group-id"

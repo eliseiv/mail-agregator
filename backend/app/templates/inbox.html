@@ -18,13 +18,13 @@
            Backend передаёт ``groups: list[Group]`` в context для super_admin'а;
            если контекста нет, dropdown не рендерим (graceful skip). #}
         {% if request.state.session.role == 'super_admin' and (groups | default([])) %}
-          <label class="visually-hidden" for="filter-group">Фильтр по группе</label>
+          <label class="visually-hidden" for="filter-group">Фильтр по команде</label>
           <select
             class="field__input field__input--compact"
             id="filter-group"
             name="group_id"
             data-inbox-filter>
-            <option value="">Все группы</option>
+            <option value="">Все команды</option>
             {% for grp in groups %}
               <option
                 value="{{ grp.id }}"

@@ -4,20 +4,20 @@
 {# Group-leader view: "Участники" (FE-FIX round-9 #1).
 
    Backend контекст:
-     - users           : list[UserDTO] — все пользователи группы лидера
+     - users           : list[UserDTO] — все пользователи команды лидера
        (включая самого лидера). Sorted by ``list_paged`` already.
      - current_user_id : int           — id лидера; рядом с самим собой не
                                          показываем кнопки Сброс/Удалить.
      - csrf_token      : str
      - session         : SessionData — для base.html topnav. #}
 
-{% block title %}Участники группы &middot; Mail Aggregator{% endblock %}
+{% block title %}Участники команды &middot; Mail Aggregator{% endblock %}
 {% block body_class %}admin-members{% endblock %}
 
 {% block content %}
 <section class="admin" aria-labelledby="members-heading">
   <header class="admin__toolbar">
-    <h1 id="members-heading" class="admin__title">Участники группы</h1>
+    <h1 id="members-heading" class="admin__title">Участники команды</h1>
     <div class="admin__actions">
       <button type="button" class="btn btn--primary" data-admin-create-user>+ Добавить участника</button>
     </div>
@@ -25,7 +25,7 @@
 
   {% if not users %}
     <div class="admin__empty" role="status">
-      <p>В вашей группе пока только вы. Нажмите «+ Добавить участника», чтобы пригласить кого-то.</p>
+      <p>В вашей команде пока только вы. Нажмите «+ Добавить участника», чтобы пригласить кого-то.</p>
     </div>
   {% else %}
     <div class="table-wrapper">
@@ -121,7 +121,7 @@
       <input type="hidden" name="role" value="group_member">
       <input type="hidden" name="group_id" value="{{ current_group_id | default('') }}">
       <p class="field__hint">
-        Пользователь будет добавлен в вашу группу как участник.
+        Пользователь будет добавлен в вашу команду как участник.
         Сообщите ему логин — пароль он задаст при первом входе.
       </p>
       <div class="form-actions">

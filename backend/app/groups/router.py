@@ -198,7 +198,7 @@ async def create_group(
         raise
 
     if is_form:
-        await flash(request, "success", "Группа создана")
+        await flash(request, "success", "Команда создана")
         return RedirectResponse(url="/admin/groups", status_code=status.HTTP_303_SEE_OTHER)
     return JSONResponse(
         content=dto.model_dump(mode="json"),
@@ -229,7 +229,7 @@ async def _patch_group_impl(
 
     if payload.name is None:
         if is_form:
-            await flash(request, "error", "Имя группы обязательно")
+            await flash(request, "error", "Имя команды обязательно")
             return RedirectResponse(
                 url=f"/admin/groups/{group_id}/edit",
                 status_code=status.HTTP_303_SEE_OTHER,
@@ -255,7 +255,7 @@ async def _patch_group_impl(
         raise
 
     if is_form:
-        await flash(request, "success", "Группа переименована")
+        await flash(request, "success", "Команда переименована")
         return RedirectResponse(url="/admin/groups", status_code=status.HTTP_303_SEE_OTHER)
     return JSONResponse(content=dto.model_dump(mode="json"))
 
@@ -310,7 +310,7 @@ async def _delete_group_impl(
             return RedirectResponse(url="/admin/groups", status_code=status.HTTP_303_SEE_OTHER)
         raise
     if is_form:
-        await flash(request, "success", "Группа удалена")
+        await flash(request, "success", "Команда удалена")
         return RedirectResponse(url="/admin/groups", status_code=status.HTTP_303_SEE_OTHER)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 

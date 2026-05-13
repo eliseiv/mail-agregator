@@ -33,16 +33,21 @@ def format_notification(
     """
     acc_safe = html.escape(acc_label)
     from_safe = html.escape(from_label)
+    # Bug-fix #4: Telegram's parse_mode=HTML does NOT decode HTML entities
+    # like ``&laquo;`` / ``&raquo;`` / ``&mdash;`` — they ship to the client
+    # verbatim and the user sees literal "&laquo;google&raquo;". Use the
+    # actual UTF-8 punctuation. The file-level ``# ruff: noqa: RUF001`` keeps
+    # ruff from complaining about Cyrillic-look-alike characters.
     if not tag_names:
         # Defensive: format_notification is only called when there is at
         # least one recipient tag (the recipient-resolver guarantees it).
         # Surface a benign placeholder rather than raising — Telegram still
         # delivers a useful message.
-        tag_line = "Тег &laquo;<b>&mdash;</b>&raquo;"
+        tag_line = "Тег «<b>—</b>»"
     elif len(tag_names) == 1:
-        tag_line = f"Тег &laquo;<b>{html.escape(tag_names[0])}</b>&raquo;"
+        tag_line = f"Тег «<b>{html.escape(tag_names[0])}</b>»"
     else:
-        names = ", ".join(f"&laquo;<b>{html.escape(t)}</b>&raquo;" for t in tag_names)
+        names = ", ".join(f"«<b>{html.escape(t)}</b>»" for t in tag_names)
         tag_line = f"Теги {names}"
     return (
         f"Вы получили письмо на почту <b>{acc_safe}</b>\n"

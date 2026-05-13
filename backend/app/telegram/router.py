@@ -62,6 +62,7 @@ from backend.app.rate_limit import (
 from backend.app.repositories.users import UsersRepo
 from backend.app.sessions import SessionStore
 from backend.app.telegram.bot import handle_update
+from backend.app.telegram.callback_handler import handle_callback_query
 from backend.app.telegram.schemas import (
     TelegramAuthRequest,
     TelegramAuthResponse,
@@ -96,7 +97,7 @@ def _secret_matches(provided: str, expected: str) -> bool:
 
 
 @router.post("/api/telegram/webhook/{secret}")
-async def telegram_webhook(secret: str, request: Request) -> Response:
+async def telegram_webhook(secret: str, request: Request, db: DbSession) -> Response:
     """Telegram Bot API webhook endpoint.
 
     Returns 200 on every accepted request — even if the body is malformed
@@ -153,6 +154,15 @@ async def telegram_webhook(secret: str, request: Request) -> Response:
         # we can debug Bot-API forward-compat.
         top_keys = sorted(body.keys()) if isinstance(body, dict) else []
         log.warning("telegram_webhook_invalid_update", top_keys=top_keys)
+        return Response(status_code=200)
+
+    # Bug-fix #5: callback_query updates fire when a user taps a button
+    # rendered with ``callback_data`` (the «Посмотреть сообщение» button
+    # on push notifications). Handled separately because it needs DB
+    # access (visibility check + message lookup) and writes a follow-up
+    # ``sendMessage`` reply in-chat.
+    if update.callback_query is not None:
+        await handle_callback_query(update.callback_query, db)
         return Response(status_code=200)
 
     await handle_update(update)

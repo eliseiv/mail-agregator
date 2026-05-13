@@ -43,25 +43,77 @@
   const createForm   = document.querySelector('[data-admin-create-user-form]');
 
   // Toggle the group select visibility according to the selected role.
-  // - role=group_leader  → group select hidden + cleared (auto-create on backend).
-  // - role=group_member  → group select visible (optional — user can be created without a group).
+  // - role=group_leader  → group select VISIBLE but optional (bug-fix #2):
+  //     - empty   → backend auto-creates a new group named «Команда {логин}»
+  //     - chosen  → backend assigns the new leader to that orphan group
+  //       (400 if the group already has a leader)
+  // - role=group_member  → group select visible AND required.
   const roleInputs   = document.querySelectorAll('[data-admin-role-input]');
   const groupField   = document.querySelector('[data-admin-group-field]');
   const groupSelect  = document.querySelector('[data-admin-group-select]');
+  const groupHintLeader = document.querySelector('[data-admin-group-hint-leader]');
+  const groupHintMember = document.querySelector('[data-admin-group-hint-member]');
+
+  // Parse the orphan-group ids whitelist once (data-orphan-group-ids is a
+  // JSON-encoded list of integers — server-side ``tojson`` filter). When
+  // role=group_leader is active we hide every <option> whose value isn't
+  // in this set; switching back to group_member restores them.
+  function parseOrphanGroupIds() {
+    if (!groupField) return [];
+    const raw = groupField.getAttribute('data-orphan-group-ids');
+    if (!raw) return [];
+    try {
+      const arr = JSON.parse(raw);
+      if (!Array.isArray(arr)) return [];
+      return arr.map(function (n) { return parseInt(n, 10); })
+                .filter(function (n) { return Number.isFinite(n) && n > 0; });
+    } catch (_e) {
+      return [];
+    }
+  }
+  const orphanGroupIds = parseOrphanGroupIds();
+  const orphanSet = {};
+  for (let i = 0; i < orphanGroupIds.length; i++) {
+    orphanSet[String(orphanGroupIds[i])] = true;
+  }
 
   function applyRoleVisibility() {
     let role = 'group_member';
     roleInputs.forEach(function (r) { if (r.checked) role = r.value; });
     if (!groupField || !groupSelect) return;
-    // FE-FIX round-4 #4: group_id is required for group_member, hidden for
-    // group_leader (auto-created on backend).
+    // Bug-fix #2: group field stays visible for both roles. Required only
+    // for group_member (leader can leave it blank → auto-create).
+    groupField.hidden = false;
     if (role === 'group_leader') {
-      groupField.hidden = true;
       groupSelect.required = false;
-      groupSelect.value = '';
+      if (groupHintLeader) groupHintLeader.hidden = false;
+      if (groupHintMember) groupHintMember.hidden = true;
+      // Filter options: leaders can only be assigned to orphan groups
+      // (the backend re-validates this — we just guide the UI). The empty
+      // "— выберите команду —" entry stays selectable.
+      const opts = groupSelect.options;
+      let selectedIsOrphan = false;
+      for (let i = 0; i < opts.length; i++) {
+        const opt = opts[i];
+        if (!opt.value) { opt.hidden = false; opt.disabled = false; continue; }
+        const eligible = !!orphanSet[opt.value];
+        opt.hidden = !eligible;
+        opt.disabled = !eligible;
+        if (eligible && opt.selected) selectedIsOrphan = true;
+      }
+      if (!selectedIsOrphan) {
+        groupSelect.value = '';
+      }
     } else {
-      groupField.hidden = false;
       groupSelect.required = true;
+      if (groupHintLeader) groupHintLeader.hidden = true;
+      if (groupHintMember) groupHintMember.hidden = false;
+      // Re-show every option for group_member.
+      const opts = groupSelect.options;
+      for (let i = 0; i < opts.length; i++) {
+        opts[i].hidden = false;
+        opts[i].disabled = false;
+      }
     }
   }
 
@@ -98,14 +150,18 @@
       const role = (fd.get('role') || '').toString().trim();
       if (role) payload.role = role;
       const groupIdRaw = (fd.get('group_id') || '').toString().trim();
-      // group_id is optional even for group_member (FE-FIX round-2 #4).
-      if (role === 'group_member' && groupIdRaw) {
+      // group_id semantics by role:
+      //   - group_member: optional but normally required by the UI; the
+      //     backend rejects creation without a group (FE-FIX round-2 #4).
+      //   - group_leader (bug-fix #2): optional. When set, backend assigns
+      //     the new leader to that existing orphan group; when omitted,
+      //     backend auto-creates a new group.
+      if (groupIdRaw) {
         const gid = parseInt(groupIdRaw, 10);
         if (Number.isFinite(gid) && gid > 0) {
           payload.group_id = gid;
         }
       }
-      // For group_leader we deliberately omit group_id — backend auto-creates.
 
       const submitBtn = createForm.querySelector('button[type="submit"]');
       if (submitBtn) submitBtn.disabled = true;
@@ -283,7 +339,7 @@
       const name = (fd.get('name') || '').toString().trim();
       const leaderRaw = (fd.get('leader_user_id') || '').toString().trim();
       if (!name) {
-        showGroupError('Укажите название группы.');
+        showGroupError('Укажите название команды.');
         return;
       }
       // FE-FIX round-2 #3: leader is optional. If empty, the first
@@ -317,7 +373,7 @@
           body: payload,
         });
         if (resp.ok) {
-          window.MAS.flash('Группа создана.', 'success');
+          window.MAS.flash('Команда создана.', 'success');
           if (createGroupDialog && typeof createGroupDialog.close === 'function') {
             createGroupDialog.close();
           }
@@ -325,7 +381,7 @@
           return;
         }
         const err = await window.MAS.readJsonError(resp);
-        showGroupError(err.message || 'Не удалось создать группу.');
+        showGroupError(err.message || 'Не удалось создать команду.');
       } catch (_e) {
         showGroupError('Сетевая ошибка. Попробуйте ещё раз.');
       } finally {
@@ -488,7 +544,7 @@
       if (!pendingMoveUserId || !moveSelect) return;
       const gid = parseInt((moveSelect.value || '').toString(), 10);
       if (!Number.isFinite(gid) || gid < 1) {
-        showMoveError('Выберите группу.');
+        showMoveError('Выберите команду.');
         return;
       }
       if (moveGoBtn) moveGoBtn.disabled = true;
@@ -498,7 +554,7 @@
           body: { group_id: gid },
         });
         if (resp.ok) {
-          window.MAS.flash('Пользователь перенесён в новую группу.', 'success');
+          window.MAS.flash('Пользователь перенесён в новую команду.', 'success');
           if (typeof moveDialog.close === 'function') moveDialog.close();
           window.location.reload();
           return;

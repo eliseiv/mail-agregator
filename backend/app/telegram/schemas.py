@@ -58,15 +58,42 @@ class TelegramMessage(BaseModel):
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
 
+class TelegramCallbackQuery(BaseModel):
+    """Subset of Telegram ``CallbackQuery`` (bug-fix #5).
+
+    A callback_query fires when the user taps an inline-keyboard button
+    that has ``callback_data`` set. We need:
+
+    - ``id``    — opaque token to POST back to ``answerCallbackQuery``;
+    - ``from_`` — the Telegram User who tapped (we resolve to internal
+      user via ``telegram_links`` to enforce visibility);
+    - ``data``  — the button's ``callback_data`` payload (we encode it
+      as ``"msg:{message_id}"`` — see :func:`send_notification`);
+    - ``message.chat.id`` — where to ``sendMessage`` the response.
+
+    Telegram caps ``callback_data`` at 64 bytes, hence the compact key.
+    Pydantic ignores other Bot-API fields so this stays forward-compat.
+    """
+
+    id: str
+    from_: TelegramUser = Field(alias="from")
+    message: TelegramMessage | None = None
+    data: str | None = None
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+
 class TelegramUpdate(BaseModel):
     """Top-level Telegram ``Update`` envelope.
 
-    ``message`` is optional: webhooks also fire for ``callback_query``,
-    ``edited_message``, channel posts etc., all of which we ignore.
+    ``message`` and ``callback_query`` are both optional; webhooks also
+    fire for ``edited_message`` / channel posts etc. which we still
+    ignore. Bug-fix #5 added ``callback_query`` handling.
     """
 
     update_id: int
     message: TelegramMessage | None = None
+    callback_query: TelegramCallbackQuery | None = None
 
     model_config = ConfigDict(extra="ignore")
 

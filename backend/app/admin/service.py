@@ -165,8 +165,22 @@ class AdminService:
         """
         if actor.is_super_admin:
             if payload.role == ROLE_GROUP_LEADER:
-                # Auto-create the group → group_id is None for now.
-                return ROLE_GROUP_LEADER, None
+                if payload.group_id is None:
+                    # Auto-create the group → group_id is None for now.
+                    return ROLE_GROUP_LEADER, None
+                # Bug-fix #2: assigning a new leader to an existing orphan
+                # group. The target group must exist and have no current
+                # leader; otherwise we'd silently steal leadership.
+                group = await self._groups.get_by_id(payload.group_id)
+                if group is None:
+                    raise ValidationError("group_not_found", field="group_id")
+                if group.leader_user_id is not None:
+                    raise ValidationError(
+                        "group_already_has_leader",
+                        field="group_id",
+                        details={"group_id": group.id},
+                    )
+                return ROLE_GROUP_LEADER, payload.group_id
             # FE-FIX round-4 #4: group_id is required for group_member at
             # creation time (schema validator enforces it; defensive check here).
             if payload.group_id is None:
@@ -195,6 +209,19 @@ class AdminService:
     ) -> CreateUserResponse:
         role, group_id = await self._resolve_create_role_and_group(actor, payload)
 
+        # Bug-fix #2: when assigning a new leader to an existing orphan
+        # group, the user row already carries the final ``role`` +
+        # ``group_id`` (the FK is DEFERRABLE so the order is permissive).
+        # For the auto-create path we insert with ``group_id=NULL`` and
+        # let :meth:`GroupsService.create_for_leader` wire it up. The
+        # ``users_role_group_invariant`` trigger validates at COMMIT.
+        assign_to_orphan_group: bool = role == ROLE_GROUP_LEADER and group_id is not None
+        insert_group_id = (
+            group_id
+            if assign_to_orphan_group
+            else (group_id if role == ROLE_GROUP_MEMBER else None)
+        )
+
         try:
             # ``email`` is no longer accepted in the request payload (the
             # field was removed from the public API). New users are created
@@ -205,7 +232,7 @@ class AdminService:
                 username=payload.username,
                 email=None,
                 role=role,
-                group_id=group_id,
+                group_id=insert_group_id,
                 display_name=payload.display_name,
                 password_hash=None,
                 password_reset_required=True,
@@ -224,17 +251,51 @@ class AdminService:
             user_agent=user_agent,
         )
 
-        # Auto-create group flow for new leader.
+        # Auto-create / assign-to-orphan group flow for new leader.
         group: Group | None = None
         if role == ROLE_GROUP_LEADER:
-            group = await GroupsService(self._db).create_for_leader(
-                leader_user_id=user.id,
-                name=_auto_group_name(user),
-                actor_user_id=actor.user_id,
-                ip=ip,
-                user_agent=user_agent,
-                auto_created=True,
-            )
+            if assign_to_orphan_group:
+                # Bind the existing orphan group to the freshly inserted
+                # leader. ``set_leader`` honours the UNIQUE constraint on
+                # ``groups.leader_user_id`` (the resolver verified the
+                # group is leaderless, but a concurrent caller could race
+                # — that IntegrityError surfaces as a 409 to the client).
+                assert group_id is not None  # mypy: assign_to_orphan_group ⇒ group_id set
+                try:
+                    await self._groups.set_leader(
+                        group_id=group_id,
+                        leader_user_id=user.id,
+                    )
+                except IntegrityError as exc:
+                    raise ConflictError(
+                        "User already leads another group",
+                        field="group_id",
+                    ) from exc
+                await self._audit.log(
+                    actor_user_id=actor.user_id,
+                    action="user_role_change",
+                    target_user_id=user.id,
+                    target_username=user.username,
+                    details={
+                        "from_role": None,
+                        "to_role": ROLE_GROUP_LEADER,
+                        "group_id_before": None,
+                        "group_id_after": group_id,
+                        "leader_assigned_to_orphan_group": True,
+                    },
+                    ip=ip,
+                    user_agent=user_agent,
+                )
+                group = await self._groups.get_by_id(group_id)
+            else:
+                group = await GroupsService(self._db).create_for_leader(
+                    leader_user_id=user.id,
+                    name=_auto_group_name(user),
+                    actor_user_id=actor.user_id,
+                    ip=ip,
+                    user_agent=user_agent,
+                    auto_created=True,
+                )
             # Refresh user attrs so the response reflects the new group.
             user = await self._users.get_by_id(user.id) or user
         elif group_id is not None:
@@ -507,6 +568,73 @@ class AdminService:
             user_agent=user_agent,
         )
 
+    async def _dissolve_leader_group(
+        self,
+        *,
+        actor: VisibilityScope,
+        target: User,
+        ip: str,
+        user_agent: str | None,
+    ) -> None:
+        """Dissolve the group led by ``target`` when ``target`` is about to
+        be deleted.
+
+        Pre: ``target.role == 'group_leader'`` and ``target.group_id`` is set.
+
+        Behaviour:
+
+        - If any other user still belongs to the group → raise
+          :class:`ValidationError` so the operator first redistributes the
+          members.
+        - Otherwise: detach the leader pointer (``groups.leader_user_id =
+          NULL``) so the upcoming ``DELETE FROM users`` is not blocked by
+          ``ON DELETE RESTRICT``; then DELETE the now-empty group and write
+          a ``group_delete`` audit row.
+
+        The actual ``DELETE FROM users`` is performed by the caller (
+        :meth:`delete_user`) right after this helper returns.
+        """
+        assert target.group_id is not None  # invariant: pre-condition
+        led_group = await self._groups.get_by_id(target.group_id)
+        if led_group is None:
+            # Defensive: the user's group_id points at a deleted group.
+            # Nothing to dissolve — the caller may proceed with the user
+            # delete, the SET NULL FK on users.group_id already detached.
+            return
+
+        # Count members in the group excluding the leader itself.
+        member_ids = await self._users.list_user_ids_in_group(led_group.id)
+        other_members = [uid for uid in member_ids if uid != target.id]
+        if other_members:
+            raise ValidationError(
+                "Сначала переведите участников команды в другую команду",
+                field="role",
+                details={
+                    "group_id": led_group.id,
+                    "members_count": len(other_members),
+                },
+            )
+
+        # Detach the leader pointer first so ``DELETE FROM users`` (run by
+        # the caller) is not blocked by ``ON DELETE RESTRICT`` on
+        # ``groups.leader_user_id``.
+        await self._groups.set_leader(group_id=led_group.id, leader_user_id=None)
+        # Delete the now-empty, leaderless group.
+        await self._groups.delete(led_group.id)
+        await self._audit.log(
+            actor_user_id=actor.user_id,
+            action="group_delete",
+            target_user_id=target.id,
+            target_username=target.username,
+            details={
+                "group_id": led_group.id,
+                "group_name": led_group.name,
+                "auto_dissolved": True,
+            },
+            ip=ip,
+            user_agent=user_agent,
+        )
+
     async def delete_user(
         self,
         *,
@@ -522,17 +650,18 @@ class AdminService:
             raise CannotDeleteAdminError("Cannot delete super-admin")
         await self._assert_can_act_on(actor, target)
 
-        # group_leader cannot be deleted while still leading a group:
-        # ``groups.leader_user_id`` has ON DELETE RESTRICT. Surface a
-        # readable error instead of bubbling the IntegrityError up.
-        if target.role == ROLE_GROUP_LEADER:
-            led_group = await self._groups.get_by_leader(target_id)
-            if led_group is not None:
-                raise ValidationError(
-                    "Cannot delete a leader while their group exists",
-                    field="user_id",
-                    details={"group_id": led_group.id},
-                )
+        # Leader-being-deleted edge case (bug #1): ``groups.leader_user_id``
+        # has ``ON DELETE RESTRICT``, so deleting a leader directly trips
+        # an IntegrityError. We instead dissolve the (now-empty) group as
+        # part of the same transaction — but only when there are no other
+        # members; otherwise the operator must redistribute members first.
+        if target.role == ROLE_GROUP_LEADER and target.group_id is not None:
+            await self._dissolve_leader_group(
+                actor=actor,
+                target=target,
+                ip=ip,
+                user_agent=user_agent,
+            )
 
         msgs_n, atts_n, accs_n = await self._messages.stats_for_user(target_id)
         keys = await self._messages.select_attachment_keys_for_user(target_id)

@@ -40,10 +40,10 @@
           <a class="topnav__link" href="/tags">Теги</a>
           {% if request.state.session.role == 'super_admin' %}
             <a class="topnav__link" href="/admin">Пользователи</a>
-            <a class="topnav__link" href="/admin/groups">Группы</a>
+            <a class="topnav__link" href="/admin/groups">Команды</a>
           {% elif request.state.session.role == 'group_leader' %}
             <a class="topnav__link" href="/my/members">Участники</a>
-            <a class="topnav__link" href="/admin/groups">Моя группа</a>
+            <a class="topnav__link" href="/admin/groups">Моя команда</a>
           {% endif %}
         </nav>
         <div class="topbar__user">
@@ -108,7 +108,7 @@
       <a href="/my/members"
          class="bottom-nav__item{% if request.url.path.startswith('/my/members') or request.url.path.startswith('/admin/groups') %} bottom-nav__item--active{% endif %}"
          {% if request.url.path.startswith('/my/members') or request.url.path.startswith('/admin/groups') %}aria-current="page"{% endif %}>
-        <span class="bottom-nav__label">Группа</span>
+        <span class="bottom-nav__label">Команда</span>
       </a>
       {% endif %}
     </nav>

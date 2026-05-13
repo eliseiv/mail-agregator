@@ -94,9 +94,13 @@ class CreateUserRequest(BaseModel):
 
     @model_validator(mode="after")
     def _v_role_group_pair(self) -> CreateUserRequest:
-        # ADR-0019 §5: new leader auto-creates the group → group_id must be null.
-        if self.role == "group_leader" and self.group_id is not None:
-            raise ValueError("group_id must be null when role='group_leader'")
+        # Bug-fix #2: ``group_leader`` may now optionally be assigned to an
+        # existing orphan group (``leader_user_id IS NULL``). The previous
+        # rule ("group_id must be null for group_leader") was relaxed —
+        # super-admin can either:
+        #   - omit group_id → auto-create a new group (ADR-0019 §5), or
+        #   - pass an existing group_id → service-layer validates that the
+        #     group is leaderless and assigns the new user as leader.
         # FE-FIX round-4 #4: group_id is required for group_member at creation
         # time. Super-admin must pick a group; reassignment is via PATCH later.
         if self.role == "group_member" and self.group_id is None:

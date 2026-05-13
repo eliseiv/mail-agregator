@@ -207,13 +207,13 @@
   'cannot_delete_self': 'Нельзя удалить самого себя',
   'cannot_delete_builtin_tag': 'Встроенный тег нельзя удалить',
   'tag_apply_too_many': 'Слишком много писем — лимит 100k',
-  'group_has_members': 'В группе есть участники — сначала удалите их',
+  'group_has_members': 'В команде есть участники — сначала удалите их',
   'cannot_delete_leader': 'Удалите лидера через изменение его роли',
-  'group_leader_consistency_violation': 'Несогласованность роли и группы',
-  'group_id_must_be_null_for_new_leader': 'Для нового лидера группа создаётся автоматически',
-  'group_not_found': 'Группа не найдена',
-  'user_not_in_group_scope': 'Пользователь вне области видимости вашей группы',
-  'cannot_demote_lone_leader': 'Нельзя понизить единственного лидера группы. Сначала назначьте другого лидера или удалите группу'
+  'group_leader_consistency_violation': 'Несогласованность роли и команды',
+  'group_id_must_be_null_for_new_leader': 'Для нового лидера команда создаётся автоматически',
+  'group_not_found': 'Команда не найдена',
+  'user_not_in_group_scope': 'Пользователь вне области видимости вашей команды',
+  'cannot_demote_lone_leader': 'Нельзя понизить единственного лидера команды. Сначала назначьте другого лидера или удалите команду'
 } -%}
 {{ MAP.get(code, default) | e }}
 {%- endmacro -%}
@@ -240,8 +240,8 @@
 
 {%- macro role_label(role) -%}
 {%- if role == 'super_admin' -%}Супер-админ
-{%- elif role == 'group_leader' -%}Лидер группы
-{%- elif role == 'group_member' -%}Участник группы
+{%- elif role == 'group_leader' -%}Лидер команды
+{%- elif role == 'group_member' -%}Участник команды
 {%- else -%}{{ role | default('') | e }}
 {%- endif -%}
 {%- endmacro -%}

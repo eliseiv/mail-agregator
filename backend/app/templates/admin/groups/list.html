@@ -11,30 +11,30 @@
      - session    : SessionData — используется в base.html topnav.
      - flashes    : iterable     — рендерятся в base.html.
 
-   Создание группы напрямую через UI не делается — группа авто-создаётся
-   при создании пользователя с ролью «Лидер группы» в /admin (см. ADR-0019 §5).
+   Создание команды напрямую через UI не делается — команда авто-создаётся
+   при создании пользователя с ролью «Лидер команды» в /admin (см. ADR-0019 §5).
 #}
 
-{% block title %}Админ &middot; Группы{% endblock %}
+{% block title %}Админ &middot; Команды{% endblock %}
 {% block body_class %}admin-groups{% endblock %}
 
 {% block content %}
 <section class="admin" aria-labelledby="groups-heading">
   <header class="admin__toolbar">
-    <h1 id="groups-heading" class="admin__title">Группы</h1>
+    <h1 id="groups-heading" class="admin__title">Команды</h1>
     <div class="admin__actions">
       <a class="topnav__link" href="/admin">&larr; К пользователям</a>
     </div>
   </header>
 
   <p class="admin__hint">
-    Группы создаются автоматически при создании пользователя с ролью «Лидер группы» —
+    Команды создаются автоматически при создании пользователя с ролью «Лидер команды» —
     откройте <a href="/admin">список пользователей</a> и нажмите «Создать пользователя».
   </p>
 
   {% if not groups %}
     <div class="admin__empty" role="status">
-      <p>Групп пока нет. Создайте первого лидера в разделе «Пользователи» — группа появится автоматически.</p>
+      <p>Команд пока нет. Создайте первого лидера в разделе «Пользователи» — команда появится автоматически.</p>
       <a href="/admin" class="btn btn--primary">К пользователям</a>
     </div>
   {% else %}
@@ -42,7 +42,7 @@
       <table class="admin-groups-table">
         <thead>
           <tr>
-            <th scope="col">Название группы</th>
+            <th scope="col">Название команды</th>
             <th scope="col">Лидер</th>
             <th scope="col">Участников</th>
             <th scope="col">Создана</th>
@@ -82,7 +82,7 @@
               <td class="admin-groups-table__actions">
                 <a class="btn btn--secondary btn--small"
                    href="/admin/groups/{{ grp.id }}/edit"
-                   aria-label="Изменить группу {{ grp.name | e }}">
+                   aria-label="Изменить команду {{ grp.name | e }}">
                   Изменить
                 </a>
 
@@ -92,12 +92,12 @@
                     action="/api/admin/groups/{{ grp.id }}/delete"
                     class="inline-form"
                     data-group-delete-form
-                    data-confirm="Удалить группу «{{ grp.name | e }}»?{% if grp.members_count and grp.members_count > 0 %} В группе ещё есть участники — операция будет отклонена сервером.{% endif %} Лидер останется в системе и потеряет статус.">
+                    data-confirm="Удалить команду «{{ grp.name | e }}»?{% if grp.members_count and grp.members_count > 0 %} В команде ещё есть участники — операция будет отклонена сервером.{% endif %} Лидер останется в системе и потеряет статус.">
                     {{ m.csrf_input() }}
                     <input type="hidden" name="_method" value="DELETE">
                     <button type="submit"
                             class="btn btn--danger btn--small"
-                            aria-label="Удалить группу {{ grp.name | e }}">
+                            aria-label="Удалить команду {{ grp.name | e }}">
                       Удалить
                     </button>
                   </form>
@@ -109,7 +109,7 @@
                 {% set accs = (accounts_by_group.get(grp.id) if accounts_by_group is defined else None) or [] %}
                 <div class="group-accounts">
                   <div class="group-accounts__title">
-                    Email-аккаунты группы
+                    Email-аккаунты команды
                     <span class="group-accounts__count">({{ accs | length }})</span>
                   </div>
                   {% if accs %}
@@ -142,7 +142,7 @@
                     </ul>
                   {% else %}
                     <p class="group-accounts__empty admin-users-table__muted">
-                      Email-аккаунтов в группе пока нет.
+                      Email-аккаунтов в команде пока нет.
                     </p>
                   {% endif %}
                 </div>

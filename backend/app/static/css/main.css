@@ -1002,8 +1002,8 @@ a:hover { color: var(--color-primary-hover); text-decoration: underline; }
   background: var(--color-primary-soft);
   color: var(--color-primary);
   border: 1px solid var(--color-primary);
-  /* FE-FIX 5: Russian role labels (Супер-админ, Лидер группы, Участник
-     группы) need horizontal padding without fixed widths, and must stay on
+  /* FE-FIX 5: Russian role labels (Супер-админ, Лидер команды, Участник
+     команды) need horizontal padding without fixed widths, and must stay on
      one line. */
   padding: 0.15em 0.7em;
   border-radius: var(--radius-full);

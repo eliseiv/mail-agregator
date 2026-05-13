@@ -473,6 +473,10 @@ async def admin_users_page(
     sess = request.state.session
     listing = await AdminService(db).list_users(actor, q=q, page=page, limit=limit)
     groups, _ = await GroupsRepo(db).list_all(q=None, page=1, limit=200)
+    # Bug-fix #2: orphan groups (no leader yet) are the only ones a new
+    # group_leader can be assigned to. The JS filters the group dropdown
+    # to these ids when role=group_leader is selected.
+    orphan_group_ids = [g.id for g in groups if g.leader_user_id is None]
 
     # FE-FIX round-5 #2: pre-group users by group_id so the template can
     # render each group as a separate <tbody> with its own border + spacing.
@@ -505,6 +509,7 @@ async def admin_users_page(
             "q": q or "",
             "current_admin_id": actor.user_id,
             "groups": groups,
+            "orphan_group_ids": orphan_group_ids,
             "is_super_admin": True,
             "csrf_token": sess.csrf_token,
             "session": sess,
