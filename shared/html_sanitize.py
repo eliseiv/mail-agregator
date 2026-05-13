@@ -104,8 +104,11 @@ _EMAIL_ALLOWED_PROTOCOLS: Final[list[str]] = ["http", "https", "mailto"]
 
 # Telegram Bot API parse_mode=HTML supports exactly this set:
 # https://core.telegram.org/bots/api#html-style
+# NOTE: <br> is NOT in Telegram's whitelist — line breaks must be literal
+# "\n". We convert <br>/<br/>/<br /> → "\n" before bleach (see _BR_TO_NL_RE
+# in sanitize_telegram_html below).
 _TELEGRAM_ALLOWED_TAGS: Final[frozenset[str]] = frozenset(
-    {"b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "a", "code", "pre", "br"}
+    {"b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "a", "code", "pre"}
 )
 _TELEGRAM_ALLOWED_ATTRS: Final[dict[str, list[str]]] = {
     "a": ["href"],
@@ -152,6 +155,18 @@ _DROP_HTML_COMMENT_RE: Final[re.Pattern[str]] = re.compile(
 # fidelity. ``re.MULTILINE`` is not needed — we match on ``\n`` runs
 # directly.
 _COLLAPSE_BLANK_LINES_RE: Final[re.Pattern[str]] = re.compile(r"\n{3,}")
+
+# Round-15 fix: Telegram HTML mode rejects <br>; we must convert it to a
+# literal newline BEFORE bleach so the line break is preserved as text.
+_BR_TO_NL_RE: Final[re.Pattern[str]] = re.compile(
+    r"<\s*br\s*/?\s*>", re.IGNORECASE
+)
+# Block-level closers in marketing HTML often imply a paragraph break;
+# we mirror that to "\n" so collapsing tables/divs in the TG view doesn't
+# concatenate everything into one wall of text.
+_BLOCK_CLOSE_TO_NL_RE: Final[re.Pattern[str]] = re.compile(
+    r"</\s*(p|div|tr|li|h[1-6]|blockquote|table)\s*>", re.IGNORECASE
+)
 
 
 def _prestrip_unsafe_blocks(html: str) -> str:
@@ -239,6 +254,12 @@ def sanitize_telegram_html(html: str) -> str:
     # Telegram subset (which excludes essentially all layout/metadata
     # tags) this would otherwise leak CSS/JS as plain text into the chat.
     prestripped = _prestrip_unsafe_blocks(html)
+    # Round-15 fix: replace <br> and block-level closers with literal "\n"
+    # BEFORE bleach. Telegram HTML mode does NOT accept <br>, and bleach
+    # would otherwise drop these tags silently — collapsing the text to
+    # one unreadable line.
+    prestripped = _BR_TO_NL_RE.sub("\n", prestripped)
+    prestripped = _BLOCK_CLOSE_TO_NL_RE.sub("\n", prestripped)
     cleaned = bleach.clean(
         prestripped,
         tags=_TELEGRAM_ALLOWED_TAGS,
