@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import delete, exists, func, select, update
+from sqlalchemy import and_, delete, exists, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -155,16 +155,34 @@ class MessageTagsRepo:
             out[int(mid)].append(tag)
         return out
 
-    async def count_messages_for_user(self, user_id: int) -> int:
-        """Total number of messages owned by ``user_id`` (across accounts).
+    async def count_messages_visible(self, *, user_id: int, user_group_id: int | None) -> int:
+        """Total messages visible to ``user_id`` under the round-10 model.
+
+        Visibility = personal accounts (``ma.user_id = user_id``) OR
+        team accounts (``ma.group_id = user_group_id``). Pass
+        ``user_group_id=None`` for callers without a group; the second
+        branch is then omitted and only personal accounts count.
 
         Used by the ``apply_to_existing`` path to enforce the 100k limit
-        guard documented in ADR-0017 §7.
+        guard documented in ADR-0017 §7. Must mirror the visibility scope
+        of :data:`APPLY_TAG_TO_EXISTING` to avoid under-counting (which
+        would let an apply call write more rows than the guard accounted
+        for).
         """
+        if user_group_id is None:
+            cond = MailAccount.user_id == user_id
+        else:
+            cond = or_(
+                MailAccount.user_id == user_id,
+                and_(
+                    MailAccount.group_id.is_not(None),
+                    MailAccount.group_id == user_group_id,
+                ),
+            )
         stmt = (
             select(func.count(Message.id))
             .join(MailAccount, MailAccount.id == Message.mail_account_id)
-            .where(MailAccount.user_id == user_id)
+            .where(cond)
         )
         return int((await self._s.execute(stmt)).scalar_one())
 

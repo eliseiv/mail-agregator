@@ -25,6 +25,7 @@ from backend.app.exceptions import (
     ValidationError,
 )
 from backend.app.repositories.tags import MessageTagsRepo, TagRulesRepo, TagsRepo
+from backend.app.repositories.users import UsersRepo
 from backend.app.tags.builtin import BUILTIN_TAGS
 from backend.app.tags.schemas import (
     PALETTE_COLORS,
@@ -88,6 +89,24 @@ class TagsService:
         self._tags = TagsRepo(session)
         self._rules = TagRulesRepo(session)
         self._links = MessageTagsRepo(session)
+        self._users = UsersRepo(session)
+
+    async def _resolve_user_group_id(self, user_id: int) -> int | None:
+        """Look up the user's ``group_id`` for visibility-scoped tag apply.
+
+        Returns ``None`` for users without a group (super-admin and
+        ungrouped users). The caller passes that NULL straight into the
+        SQL where the second branch of the visibility filter is gated by
+        ``:user_group_id IS NOT NULL``, so the apply naturally scopes
+        down to personal accounts only.
+        """
+        user = await self._users.get_by_id(user_id)
+        if user is None:
+            # Defensive: a tag exists for a user that vanished. Treat as
+            # ungrouped — the apply will scope to that user's (now empty)
+            # account set, i.e. effectively a no-op.
+            return None
+        return user.group_id
 
     # --- Reads -------------------------------------------------------------
 
@@ -124,9 +143,16 @@ class TagsService:
         the user's messages first; over :data:`APPLY_TO_EXISTING_LIMIT` we
         raise :class:`TagApplyTooManyError` (422) per ADR-0017 §7.
         """
-        # Optimistic message count check ahead of the heavy SQL.
+        # Optimistic message count check ahead of the heavy SQL. The
+        # count must include team-visible messages because the apply
+        # itself does — otherwise the guard would under-count and let an
+        # apply blow past the 100k cap.
+        user_group_id: int | None = None
         if apply_to_existing:
-            count = await self._links.count_messages_for_user(user_id)
+            user_group_id = await self._resolve_user_group_id(user_id)
+            count = await self._links.count_messages_visible(
+                user_id=user_id, user_group_id=user_group_id
+            )
             if count > APPLY_TO_EXISTING_LIMIT:
                 raise TagApplyTooManyError(
                     "User has too many messages for synchronous apply",
@@ -146,7 +172,9 @@ class TagsService:
 
         applied = 0
         if apply_to_existing and rules:
-            applied = await self._apply_tag_to_existing(user_id=user_id, tag_id=tag.id)
+            applied = await self._apply_tag_to_existing(
+                user_id=user_id, user_group_id=user_group_id, tag_id=tag.id
+            )
 
         # Reload rules so the response shape carries DB-assigned ids/timestamps.
         loaded_rules = await self._rules.list_for_tag(tag.id)
@@ -209,23 +237,30 @@ class TagsService:
         tag = await self._tags.get_owned(user_id, tag_id)
         if tag is None:
             raise NotFoundError()
-        count = await self._links.count_messages_for_user(user_id)
+        user_group_id = await self._resolve_user_group_id(user_id)
+        count = await self._links.count_messages_visible(
+            user_id=user_id, user_group_id=user_group_id
+        )
         if count > APPLY_TO_EXISTING_LIMIT:
             raise TagApplyTooManyError(
                 "User has too many messages for synchronous apply",
                 details={"limit": APPLY_TO_EXISTING_LIMIT, "actual": count},
             )
-        return await self._apply_tag_to_existing(user_id=user_id, tag_id=tag_id)
+        return await self._apply_tag_to_existing(
+            user_id=user_id, user_group_id=user_group_id, tag_id=tag_id
+        )
 
     # --- Worker hooks ------------------------------------------------------
 
-    async def apply_tags_to_message(self, *, message: _MessageLike, user_id: int) -> int:
+    async def apply_tags_to_message(self, *, message: _MessageLike, mail_account_id: int) -> int:
         """Run ``APPLY_TAGS_TO_MESSAGE`` for one freshly-inserted message.
 
         Called from ``worker.app.sync_cycle.sync_one_account`` after a
-        successful ``insert_message_idempotent``. The query is one round
-        trip (filter on ``user_id`` plus correlated EXISTS over
-        ``tag_rules``); per ADR-0017 §5 cost is negligible at our scale.
+        successful ``insert_message_idempotent``. The query JOINs
+        ``tags`` + ``users`` + ``mail_accounts`` so that every user who
+        SEES the message — its owner plus all teammates whose
+        ``users.group_id`` matches the mail account's ``group_id`` — has
+        their matching tags applied. Single round trip per ADR-0017 §5.
 
         Returns the number of newly inserted ``message_tags`` rows; the
         caller logs this for observability.
@@ -234,7 +269,7 @@ class TagsService:
             text(APPLY_TAGS_TO_MESSAGE),
             {
                 "message_id": message.id,
-                "user_id": user_id,
+                "mail_account_id": mail_account_id,
                 "subject": message.subject or "",
                 "body": message.body_text or "",
                 "sender": message.from_addr,
@@ -283,11 +318,19 @@ class TagsService:
 
     # --- Internal helpers --------------------------------------------------
 
-    async def _apply_tag_to_existing(self, *, user_id: int, tag_id: int) -> int:
-        """Bulk INSERT ``message_tags`` for every matching existing message."""
+    async def _apply_tag_to_existing(
+        self, *, user_id: int, user_group_id: int | None, tag_id: int
+    ) -> int:
+        """Bulk INSERT ``message_tags`` for every visible matching message.
+
+        Visibility scope mirrors ``MailAccountsRepo.list_account_ids_visible``:
+        personal accounts plus the user's team accounts. Pass
+        ``user_group_id=None`` for users without a group — the SQL then
+        narrows to personal accounts only.
+        """
         result = await self._db.execute(
             text(APPLY_TAG_TO_EXISTING),
-            {"tag_id": tag_id, "user_id": user_id},
+            {"tag_id": tag_id, "user_id": user_id, "user_group_id": user_group_id},
         )
         rowcount = getattr(result, "rowcount", 0)
         return int(rowcount or 0)

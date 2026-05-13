@@ -281,7 +281,7 @@ async def sync_one_account(
                         body_text=fmsg.body_text,
                         from_addr=fmsg.from_addr,
                     ),
-                    user_id=account.user_id,
+                    mail_account_id=account.id,
                 )
                 tags_applied_total += applied
                 if applied > 0:
