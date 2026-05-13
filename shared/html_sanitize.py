@@ -26,6 +26,7 @@ backend can both pull it in without extra dependency surface.
 
 from __future__ import annotations
 
+import re
 from typing import Final
 
 import bleach
@@ -113,6 +114,68 @@ _TELEGRAM_ALLOWED_ATTRS: Final[dict[str, list[str]]] = {
 _TELEGRAM_ALLOWED_PROTOCOLS: Final[list[str]] = ["http", "https", "mailto", "tg"]
 
 
+# --- Tags whose CONTENT must be dropped before bleach (round-13 bug B fix) ---
+#
+# ``bleach.clean(strip=True)`` removes the *tags* not on the whitelist but
+# leaves the **text content** between the opening and closing tag intact.
+# For tags like ``<style>``, ``<script>``, ``<head>`` (and friends) the
+# "content" is CSS / JavaScript / metadata — the user ends up seeing raw
+# ``aepl-item-no-original-price-4col { height: 20px !important; }`` blocks
+# in the Telegram preview. We pre-strip those tags **including their inner
+# content** before handing the body to bleach.
+#
+# Self-closing / void elements (``<meta>``, ``<link>``, ``<base>``) don't
+# have closing tags; they still leak attributes that bleach would keep
+# stripping, but they don't carry text content. We drop them here for
+# cheap predictability.
+#
+# HTML comments are also dropped — they frequently contain Outlook
+# conditional comments (``<!--[if mso]>...<![endif]-->``) or tracking
+# pixels we do not want to leak into the rendered body.
+_DROP_TAG_CONTENT_RE: Final[re.Pattern[str]] = re.compile(
+    r"<\s*(style|script|head|title|meta|link|noscript|svg|canvas|iframe|"
+    r"object|embed|form|input|button|select|textarea)\b[^>]*>.*?"
+    r"<\s*/\s*\1\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+_DROP_SELF_CLOSING_RE: Final[re.Pattern[str]] = re.compile(
+    r"<\s*(meta|link|base)\b[^>]*?/?>",
+    re.IGNORECASE,
+)
+_DROP_HTML_COMMENT_RE: Final[re.Pattern[str]] = re.compile(
+    r"<!--.*?-->",
+    re.DOTALL,
+)
+
+# Collapse runs of 3+ newlines into a paragraph break. Applied to the
+# Telegram-flavour output where compactness matters more than visual
+# fidelity. ``re.MULTILINE`` is not needed — we match on ``\n`` runs
+# directly.
+_COLLAPSE_BLANK_LINES_RE: Final[re.Pattern[str]] = re.compile(r"\n{3,}")
+
+
+def _prestrip_unsafe_blocks(html: str) -> str:
+    """Drop the *content* of style/script/etc. blocks before bleach.
+
+    ``bleach.clean(strip=True)`` only removes the wrapping tags — for
+    ``<style>`` and ``<script>`` that leaves the CSS / JS body inline as
+    plain text. We must remove the entire block (open tag + content +
+    close tag) before invoking bleach.
+
+    Also removes HTML comments and self-closing void elements (``<meta>``,
+    ``<link>``, ``<base>``) that bleach would otherwise leave behind as
+    empty markers.
+
+    The function is intentionally idempotent — running it twice produces
+    the same result, which simplifies reasoning at call sites.
+    """
+    if not html:
+        return html
+    cleaned = _DROP_TAG_CONTENT_RE.sub("", html)
+    cleaned = _DROP_HTML_COMMENT_RE.sub("", cleaned)
+    return _DROP_SELF_CLOSING_RE.sub("", cleaned)
+
+
 def strip_invisible_padding(text: str) -> str:
     """Drop zero-width / invisible padding characters from ``text``.
 
@@ -141,8 +204,13 @@ def sanitize_email_html(html: str) -> str:
     """
     if not html:
         return ""
+    # Round-13 bug B: pre-strip <style>/<script>/<head>/... blocks *with*
+    # their text content before bleach. Otherwise the user sees raw CSS /
+    # JS dumped into the rendered body (bleach removes tags only, not the
+    # text inside them).
+    prestripped = _prestrip_unsafe_blocks(html)
     cleaned = bleach.clean(
-        html,
+        prestripped,
         tags=_EMAIL_ALLOWED_TAGS,
         attributes=_EMAIL_ALLOWED_ATTRS,
         protocols=_EMAIL_ALLOWED_PROTOCOLS,
@@ -160,18 +228,32 @@ def sanitize_telegram_html(html: str) -> str:
     chrome (``<table>``, ``<div>``, inline images) Telegram cannot
     render.
 
-    Zero-width padding is also stripped.
+    Zero-width padding is also stripped. Multi-blank-line runs that the
+    HTML→text reduction often produces are collapsed to a single paragraph
+    break so the Telegram preview stays compact (bug fix round-13).
     """
     if not html:
         return ""
+    # Round-13 bug B: <style>/<script>/<head>/... bodies must be dropped
+    # together with their content. Bleach removes only the tags; for the
+    # Telegram subset (which excludes essentially all layout/metadata
+    # tags) this would otherwise leak CSS/JS as plain text into the chat.
+    prestripped = _prestrip_unsafe_blocks(html)
     cleaned = bleach.clean(
-        html,
+        prestripped,
         tags=_TELEGRAM_ALLOWED_TAGS,
         attributes=_TELEGRAM_ALLOWED_ATTRS,
         protocols=_TELEGRAM_ALLOWED_PROTOCOLS,
         strip=True,
     )
-    return strip_invisible_padding(cleaned)
+    cleaned = strip_invisible_padding(cleaned)
+    # Telegram messages have a 4096-char budget; long marketing emails
+    # frequently leave behind dozens of blank lines after the layout
+    # tags get stripped. Collapse 3+ consecutive newlines into a
+    # paragraph break and trim trailing whitespace so the user sees a
+    # compact preview.
+    cleaned = _COLLAPSE_BLANK_LINES_RE.sub("\n\n", cleaned)
+    return cleaned.strip()
 
 
 def linkify_plain_text(text: str) -> str:
