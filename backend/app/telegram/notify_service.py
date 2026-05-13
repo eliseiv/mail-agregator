@@ -149,9 +149,12 @@ class TelegramNotifyService:
         2. Load the message and account meta in one DB hit each.
         3. Resolve the recipient set via the SQL in
            :class:`TelegramNotificationsRepo`.
-        4. For each recipient:
+        4. Resolve the tag list **once** per message (round-12 bug A:
+           used to be per-recipient; group members had no tags of their
+           own and were silently dropped).
+        5. For each recipient:
            a. ``try_reserve`` — if the row already existed, skip silently.
-           b. Format the text using the recipient's own tags.
+           b. Format the text using the message-level tag list.
            c. Call :func:`send_notification`.
            d. Handle the outcome:
               - ``ok`` → ``mark_sent`` with ``telegram_message_id``.
@@ -201,6 +204,23 @@ class TelegramNotifyService:
         if not recipients:
             return
 
+        # Round-12 bug A: tags are now resolved **once per message** (not
+        # per recipient). Every group member receives the same tag-name
+        # list, which matches the visibility model (if you can see the
+        # mailbox, you see the tags applied to its messages). Auto-tagging
+        # is owner-scoped, so without this change a leader's group-mates
+        # got no notification at all (recipient SQL ANDed on per-user tag).
+        message_tags = await self._notifications.list_tags_for_message(
+            message_id=payload.message_id
+        )
+        if not message_tags:
+            # Defence-in-depth: recipient SQL already filters on "any tag
+            # exists", so this branch is only reached on a race where
+            # someone deleted the tags between the two queries. Skip
+            # silently rather than send a notification with no context.
+            return
+        tag_names = [t.name for t in message_tags]
+
         acc_label = account.display_name or account.email
         from_label = message.from_name or message.from_addr
         # Track whether any recipient asked for a retry — if so, we need
@@ -215,6 +235,7 @@ class TelegramNotifyService:
                 recipient=recipient,
                 acc_label=acc_label,
                 from_label=from_label,
+                tag_names=tag_names,
             )
             if outcome is None:
                 continue
@@ -243,18 +264,15 @@ class TelegramNotifyService:
         recipient: NotifyRecipient,
         acc_label: str,
         from_label: str,
+        tag_names: list[str],
     ) -> SendNotificationResult | None:
         """Process one ``(message_id, recipient)`` pair. Returns the
         :class:`SendNotificationResult` if a Bot API call was attempted,
-        else ``None`` (e.g. row already existed)."""
+        else ``None`` (e.g. row already existed).
 
-        tags = await self._notifications.list_tags_for_recipient(
-            message_id=payload.message_id, user_id=recipient.user_id
-        )
-        if not tags:
-            # SQL should not return such a recipient, but defence-in-depth.
-            return None
-
+        Round-12 bug A: ``tag_names`` is now resolved once by the caller
+        and shared across all recipients — see :meth:`dispatch_one_payload`.
+        """
         notification_id = await self._notifications.try_reserve(
             message_id=payload.message_id, user_id=recipient.user_id
         )
@@ -265,7 +283,7 @@ class TelegramNotifyService:
         text_html = format_notification(
             acc_label=acc_label,
             from_label=from_label,
-            tag_names=[t.name for t in tags],
+            tag_names=tag_names,
         )
 
         outcome = await send_notification(

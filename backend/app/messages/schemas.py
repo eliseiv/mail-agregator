@@ -54,6 +54,10 @@ class MessageDetail(BaseModel):
     subject: str | None
     internal_date: datetime
     body_text: str
+    # Round-12 bug B: sanitised HTML body (``shared.html_sanitize``).
+    # ``None`` for legacy rows or text/plain-only emails; the template
+    # falls back to ``body_text`` in that case.
+    body_html: str | None = None
     body_truncated: bool
     body_present: bool
     in_reply_to: str | None

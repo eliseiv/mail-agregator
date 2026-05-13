@@ -80,7 +80,16 @@
 
   <section class="message__body" aria-label="Тело письма">
     {% if message.body_present %}
-      <pre class="message__body-text">{{ message.body_text | e }}</pre>
+      {# Round-12 bug B: prefer the sanitised HTML body when available. The
+         sanitiser (``shared.html_sanitize.sanitize_email_html``) has already
+         stripped <script>, event handlers and ``javascript:`` URLs, so
+         ``| safe`` is the right Jinja filter. Legacy rows / text-only
+         emails fall back to the plain-text path. #}
+      {% if message.body_html %}
+        <div class="msg-body msg-body--html">{{ message.body_html | safe }}</div>
+      {% else %}
+        <pre class="message__body-text">{{ message.body_text | e }}</pre>
+      {% endif %}
       {% if message.body_truncated %}
         <p class="message__notice" role="note">
           &#9432; Тело письма обрезано до 1 МиБ.

@@ -227,6 +227,7 @@ async def sync_one_account(
                 subject=fmsg.subject,
                 internal_date=fmsg.internal_date,
                 body_text=fmsg.body_text,
+                body_html=fmsg.body_html,
                 body_truncated=fmsg.body_truncated,
                 body_present=fmsg.body_present,
                 in_reply_to=fmsg.in_reply_to,

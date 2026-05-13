@@ -36,6 +36,9 @@ dependencies = [
   "aiosmtplib==3.0.2",
   "imap-tools==1.6.0",
   "html2text==2024.2.26",
+  # round-12 bug B: HTML body sanitiser for ``messages.body_html`` and
+  # the Telegram callback path. Whitelist-based, drops <script> etc.
+  "bleach==6.1.0",
   # --- MinIO / S3 ---
   "aioboto3==13.2.0",
   # --- Scheduler ---
@@ -145,6 +148,7 @@ module = [
   "slowapi.*",
   "html2text.*",
   "apscheduler.*",
+  "bleach.*",
 ]
 ignore_missing_imports = true
 

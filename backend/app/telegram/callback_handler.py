@@ -47,6 +47,11 @@ from backend.app.telegram.bot import (
     send_html_message,
 )
 from backend.app.telegram.schemas import TelegramCallbackQuery
+from shared.html_sanitize import (
+    linkify_plain_text,
+    sanitize_telegram_html,
+    strip_invisible_padding,
+)
 from shared.logging import get_logger
 
 log = get_logger(__name__)
@@ -71,16 +76,40 @@ def _format_message_body(
     subject: str | None,
     from_label: str,
     body_text: str,
+    body_html: str | None,
 ) -> str:
     """Build the HTML-formatted full-body reply (parse_mode=HTML).
 
-    Every user-controlled field is :func:`html.escape`-d. The body is
-    rendered verbatim (no Markdown / HTML formatting inside) — the
-    underlying ``messages.body_text`` is plain text already.
+    Round-12 bug B: when ``body_html`` is present we run it through
+    :func:`shared.html_sanitize.sanitize_telegram_html` — the Bot API
+    accepts only ``b/i/u/s/a/code/pre/br``, so the helper strips
+    ``<table>``/``<div>``/inline images while preserving anchor tags so
+    links stay clickable in the chat. When only ``body_text`` is
+    available we still ``linkify`` plain URLs so the user gets clickable
+    links instead of raw text.
+
+    Headers (``subject``, ``from_label``) remain ``html.escape``-d — they
+    are short and there is no value in linkifying them.
     """
     subject_safe = html.escape(subject) if subject else "<em>(без темы)</em>"
     from_safe = html.escape(from_label)
-    body_safe = html.escape(body_text) if body_text else "<em>(пустое тело)</em>"
+
+    if body_html:
+        body_safe = sanitize_telegram_html(body_html)
+        if not body_safe.strip():
+            # Sanitiser may strip the body to nothing if every tag was
+            # disallowed (rare). Fall back to the plain-text path so the
+            # user still sees the message content.
+            body_safe = ""
+
+    if not body_html or not body_safe.strip():
+        if body_text:
+            # Strip invisible padding before linkification so we don't
+            # bloat the message; ``linkify_plain_text`` escapes for us.
+            body_safe = linkify_plain_text(strip_invisible_padding(body_text))
+        else:
+            body_safe = "<em>(пустое тело)</em>"
+
     return f"<b>Тема:</b> {subject_safe}\n<b>От:</b> {from_safe}\n\n{body_safe}"
 
 
@@ -224,12 +253,15 @@ async def handle_callback_query(
         return
 
     # Step 5: build + send the full body. Prefer ``from_name`` for the
-    # "От" label, fall back to the address.
+    # "От" label, fall back to the address. Round-12 bug B: the body now
+    # preserves clickable links by routing through the HTML pipeline when
+    # available.
     from_label = detail.from_name or detail.from_addr
     text_html = _format_message_body(
         subject=detail.subject,
         from_label=from_label,
         body_text=detail.body_text or "",
+        body_html=detail.body_html,
     )
     chunks = _split_for_telegram(text_html)
     for chunk in chunks:

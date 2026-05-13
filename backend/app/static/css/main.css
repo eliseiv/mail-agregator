@@ -792,6 +792,30 @@ a:hover { color: var(--color-primary-hover); text-decoration: underline; }
   border-radius: var(--radius-md);
   padding: var(--space-4);
 }
+
+/* Round-12 bug B: rendered (sanitised) HTML body. ``shared.html_sanitize``
+   has already stripped scripts / event handlers, so the only job here is
+   visual containment — keep tables, images and long URLs inside the
+   message viewport instead of forcing horizontal page scroll. */
+.msg-body--html {
+  max-width: 100%;
+  overflow-x: auto;
+  line-height: 1.55;
+  font-size: var(--font-size-sm);
+  background: var(--color-bg-subtle);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: var(--space-4);
+}
+.msg-body--html img { max-width: 100%; height: auto; }
+.msg-body--html a { word-break: break-word; }
+.msg-body--html table { border-collapse: collapse; max-width: 100%; }
+.msg-body--html td,
+.msg-body--html th { padding: 2px 6px; vertical-align: top; }
+.msg-body--html pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 .message__notice {
   margin: var(--space-3) 0 0;
   padding: var(--space-2) var(--space-3);

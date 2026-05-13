@@ -15,6 +15,7 @@ from dataclasses import dataclass
 import imap_tools
 from imap_tools import AND, MailBoxUnencrypted
 
+from shared.html_sanitize import sanitize_email_html, strip_invisible_padding
 from shared.logging import get_logger
 
 log = get_logger(__name__)
@@ -39,6 +40,9 @@ class FetchedMessage:
     subject: str | None
     internal_date: _dt.datetime
     body_text: str
+    # Round-12 bug B: sanitised HTML body (``bleach.clean`` whitelist).
+    # ``None`` when the source email had no ``text/html`` part.
+    body_html: str | None
     body_truncated: bool
     body_present: bool
     in_reply_to: str | None
@@ -85,7 +89,25 @@ def _from_imap_msg(
         body_present = False
         text = ""
 
+    # Strip the zero-width / invisible padding mass-mail engines insert
+    # into the plain-text part — they survive html2text and bloat both
+    # ``body_text`` and Telegram messages.
+    text = strip_invisible_padding(text)
+
     text_clamped, truncated = _truncate_body(text, max_body_bytes)
+
+    # Round-12 bug B: keep the sanitised HTML body when the source has
+    # a ``text/html`` part — the inbox renders it for clickable links and
+    # tables, and the Telegram callback path converts it on the fly to
+    # the Bot-API HTML subset. We apply the same byte budget as the
+    # plain-text path so a 50 MB marketing email cannot blow up the DB
+    # row.
+    body_html: str | None = None
+    if msg.html:
+        sanitised = sanitize_email_html(msg.html)
+        if sanitised:
+            html_clamped, _html_truncated = _truncate_body(sanitised, max_body_bytes)
+            body_html = html_clamped
 
     # Attachments — skip oversized.
     atts: list[FetchedAttachment] = []
@@ -133,6 +155,7 @@ def _from_imap_msg(
         subject=msg.subject or None,
         internal_date=idate,
         body_text=text_clamped,
+        body_html=body_html,
         # Truncation flag is independent of source format (text vs html2text).
         body_truncated=truncated,
         body_present=body_present,

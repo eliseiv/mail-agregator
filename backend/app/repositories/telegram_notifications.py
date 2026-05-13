@@ -10,8 +10,12 @@ Implements:
   layer so the retry path can re-claim.
 - :meth:`list_recipients_for_message` — full SQL from ADR-0022 §2.2:
   who should receive a notification for a given ``message_id``.
-- :meth:`list_tags_for_recipient` — load the recipient-scoped tags
-  applied to the message (used by the notification text formatter).
+- :meth:`list_tags_for_message` — load every tag applied to the message
+  (used by the notification text formatter). Round-12: changed from
+  per-recipient filtering to "all tags on the message" so group members
+  receive notifications about messages whose mailbox owner (the leader)
+  has tagged them — see the round-12 bug A fix in
+  :mod:`backend.app.telegram.notify_service`.
 - :meth:`list_missing_for_recovery` — recovery_scan query from §2.8.
 """
 
@@ -46,8 +50,14 @@ class NotifyRecipient:
 
 @dataclass(frozen=True, slots=True)
 class RecipientTag:
-    """A tag applied to a message that belongs to a specific recipient
-    (used to render the notification text)."""
+    """A tag applied to a message (used to render the notification text).
+
+    Round-12 bug A: previously this was a "per-recipient" tag (only the
+    recipient's own tags were returned). Now it represents *any* tag on
+    the message — every recipient sees the same set, which matches the
+    visibility model: if a user can see the mailbox, they can see all
+    auto-applied tags on its messages.
+    """
 
     id: int
     name: str
@@ -105,15 +115,26 @@ class TelegramNotificationsRepo:
     # --- Reads -------------------------------------------------------------
 
     async def list_recipients_for_message(self, *, message_id: int) -> list[NotifyRecipient]:
-        """SQL from ADR-0022 §2.2.
+        """SQL from ADR-0022 §2.2 (round-12 bug A fix).
 
-        Selects users who: (a) can see the message under visibility rules
-        (super_admin / same group / explicit owner), (b) have an active
-        ``telegram_links`` row, (c) have at least one of their own
-        ``message_tags`` rows on the message, (d) are not opted-out via
-        ``users_settings``.
+        Selects users who:
+
+        (a) can see the message under visibility rules (super_admin /
+            same group / explicit owner — same as ADR-0019 §7);
+        (b) have an active ``telegram_links`` row;
+        (c) the message has **at least one** tag applied (any tag, any
+            user) — auto-tagging tags only the mailbox owner, but every
+            group-mate should also be notified;
+        (d) are not opted-out via ``users_settings``.
 
         Returns one row per eligible recipient.
+
+        Round-12 (bug A): the previous SQL required the recipient to own
+        a tag on the message via ``JOIN tags t ON t.user_id = u.id`` —
+        which excluded every group member whose leader tagged the
+        message. We now require only "the message has any tag at all"
+        via ``EXISTS (... message_tags ...)``; the per-user filter is
+        gone.
         """
         stmt = text(
             """
@@ -132,13 +153,14 @@ class TelegramNotificationsRepo:
             JOIN   telegram_links tl
                    ON tl.user_id = u.id
                    AND tl.dead_at IS NULL
-            JOIN   message_tags mt ON mt.message_id = m.id
-            JOIN   tags t
-                   ON t.id = mt.tag_id
-                   AND t.user_id = u.id
             LEFT JOIN users_settings us ON us.user_id = u.id
             WHERE  m.id = :message_id
               AND  COALESCE(us.tg_notifications_enabled, true) = true
+              AND  EXISTS (
+                       SELECT 1
+                       FROM   message_tags mt
+                       WHERE  mt.message_id = m.id
+                   )
             """
         )
         result = await self._s.execute(stmt, {"message_id": message_id})
@@ -151,11 +173,17 @@ class TelegramNotificationsRepo:
             for row in result
         ]
 
-    async def list_tags_for_recipient(self, *, message_id: int, user_id: int) -> list[RecipientTag]:
-        """Tags applied to ``message_id`` that belong to ``user_id``.
+    async def list_tags_for_message(self, *, message_id: int) -> list[RecipientTag]:
+        """Every tag applied to ``message_id`` (deduplicated by tag id).
 
-        Used to render the notification text. Sorted by tag name so the
-        output is deterministic.
+        Round-12 bug A: replaces ``list_tags_for_recipient`` which used to
+        scope tags to a single user. The new model is "all recipients see
+        the same tag set" — the mailbox owner is the natural source of
+        truth for tagging, and there is no UX value in hiding tag names
+        from a group-mate who can already open the message.
+
+        Sorted by tag id for stable display order (the per-message
+        ordering corresponds to the order auto-tagging applied them).
         """
         stmt = text(
             """
@@ -163,11 +191,10 @@ class TelegramNotificationsRepo:
             FROM   message_tags mt
             JOIN   tags t ON t.id = mt.tag_id
             WHERE  mt.message_id = :message_id
-              AND  t.user_id = :user_id
-            ORDER  BY t.name
+            ORDER  BY mt.tag_id
             """
         )
-        result = await self._s.execute(stmt, {"message_id": message_id, "user_id": user_id})
+        result = await self._s.execute(stmt, {"message_id": message_id})
         return [
             RecipientTag(id=int(row.id), name=str(row.name), color=str(row.color)) for row in result
         ]

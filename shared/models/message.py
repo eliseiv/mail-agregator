@@ -44,6 +44,11 @@ class Message(Base):
     subject: Mapped[str | None] = mapped_column(Text, nullable=True)
     internal_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     body_text: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("''"))
+    # Round-12 bug B: sanitised HTML body (whitelist via bleach). NULL when
+    # the source email had no ``text/html`` part (legacy rows are NULL too).
+    # Rendered as ``{{ ... | safe }}`` because the sanitiser already
+    # stripped scripts / event handlers / ``javascript:`` URLs.
+    body_html: Mapped[str | None] = mapped_column(Text, nullable=True)
     body_truncated: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
     )

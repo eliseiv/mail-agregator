@@ -204,6 +204,7 @@ class MessageService:
             subject=msg.subject,
             internal_date=msg.internal_date,
             body_text=msg.body_text,
+            body_html=msg.body_html,
             body_truncated=msg.body_truncated,
             body_present=msg.body_present,
             in_reply_to=msg.in_reply_to,

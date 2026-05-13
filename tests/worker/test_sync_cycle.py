@@ -215,6 +215,7 @@ class TestSyncOneAccount:
                     subject="hello",
                     internal_date=_dt.now(UTC),
                     body_text="hi",
+                    body_html=None,
                     body_truncated=False,
                     body_present=True,
                     in_reply_to=None,

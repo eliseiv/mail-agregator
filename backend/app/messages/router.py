@@ -154,8 +154,8 @@ async def inbox_page(
         groups = groups_resp.items
 
     # Account / tag dropdowns cascade off the selected group (FE-FIX round-8):
-    # when super_admin picks group N, "Все почты" narrows to mail accounts of
-    # that group's users, and "Все теги" narrows to tags owned by the group's
+    # when super_admin picks group N, "Все почты" narrows to mail accounts of  # noqa: RUF003
+    # that group's users, and "Все теги" narrows to tags owned by the group's  # noqa: RUF003
     # members. The caller's own tags are merged in so the admin's personal
     # tags stay reachable. For non-super_admin, ``parsed_group_id`` is None
     # and the original behaviour is preserved.

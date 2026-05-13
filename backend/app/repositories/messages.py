@@ -272,6 +272,7 @@ class MessagesRepo:
         subject: str | None,
         internal_date: datetime,
         body_text: str,
+        body_html: str | None,
         body_truncated: bool,
         body_present: bool,
         in_reply_to: str | None,
@@ -279,7 +280,9 @@ class MessagesRepo:
     ) -> int | None:
         """``ON CONFLICT DO NOTHING`` insert. Returns the new id or None on conflict.
 
-        See ADR-0008 (idempotency invariant).
+        See ADR-0008 (idempotency invariant). Round-12 bug B: ``body_html``
+        is the sanitised HTML body (NULL when the email has no
+        ``text/html`` part).
         """
         stmt = (
             pg_insert(Message)
@@ -295,6 +298,7 @@ class MessagesRepo:
                 subject=subject,
                 internal_date=internal_date,
                 body_text=body_text,
+                body_html=body_html,
                 body_truncated=body_truncated,
                 body_present=body_present,
                 in_reply_to=in_reply_to,
