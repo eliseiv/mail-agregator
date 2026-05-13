@@ -115,7 +115,8 @@ class TelegramNotificationsRepo:
     # --- Reads -------------------------------------------------------------
 
     async def list_recipients_for_message(self, *, message_id: int) -> list[NotifyRecipient]:
-        """SQL from ADR-0022 §2.2 (round-12 bug A fix).
+        """SQL from ADR-0022 §2.2 (round-12 bug A fix + round-13 first-link
+        backfill fix).
 
         Selects users who:
 
@@ -125,7 +126,9 @@ class TelegramNotificationsRepo:
         (c) the message has **at least one** tag applied (any tag, any
             user) — auto-tagging tags only the mailbox owner, but every
             group-mate should also be notified;
-        (d) are not opted-out via ``users_settings``.
+        (d) are not opted-out via ``users_settings``;
+        (e) the message arrived *at or after* the moment the user linked
+            their Telegram account (``m.internal_date >= tl.created_at``).
 
         Returns one row per eligible recipient.
 
@@ -135,6 +138,17 @@ class TelegramNotificationsRepo:
         message. We now require only "the message has any tag at all"
         via ``EXISTS (... message_tags ...)``; the per-user filter is
         gone.
+
+        Round-13 (first-link backfill bug): on first link the user has
+        no ``telegram_notifications`` rows, so the recovery scan picked
+        up every historic tagged message visible to them and flooded
+        the chat. The ``m.internal_date >= tl.created_at`` predicate
+        scopes notifications to mail that arrived *after* linking, both
+        for the recovery path and (trivially) for the sync path (links
+        are always created before any new mail can arrive for them).
+        ``internal_date`` (origin time at the IMAP source) is used
+        rather than ``fetched_at`` so a delayed backfill of historic
+        mail also stays silent for first-time linkers.
         """
         stmt = text(
             """
@@ -153,6 +167,7 @@ class TelegramNotificationsRepo:
             JOIN   telegram_links tl
                    ON tl.user_id = u.id
                    AND tl.dead_at IS NULL
+                   AND m.internal_date >= tl.created_at
             LEFT JOIN users_settings us ON us.user_id = u.id
             WHERE  m.id = :message_id
               AND  COALESCE(us.tg_notifications_enabled, true) = true
