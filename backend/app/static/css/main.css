@@ -1848,6 +1848,18 @@ body.tg-app .main {
   width: auto;
   min-width: 12rem;
   flex: 1 1 12rem;
+  /* Round-19: HARD cap. Some WebViews (Telegram on iOS in particular)
+     stretch <select>/<input> inside flex containers to absurd heights.
+     Pin the size unconditionally so a rule row is never taller than one
+     line of text. Applies to every page using .rule-row so the create-
+     and edit-tag forms behave the same. */
+  min-height: 36px !important;
+  max-height: 36px !important;
+  height: 36px !important;
+  padding: var(--space-1) var(--space-2) !important;
+  font-size: var(--font-size-sm) !important;
+  line-height: 1.2 !important;
+  box-sizing: border-box !important;
 }
 .rule-row__remove {
   background: transparent;
