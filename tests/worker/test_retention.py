@@ -27,7 +27,7 @@ async def seeded_old_and_new(db_engine: AsyncEngine, storage: Any) -> dict[str, 
     async with factory() as ses, ses.begin():
         u = User(
             username="cleanup_user",
-            is_admin=False,
+            role="group_member",
             password_reset_required=False,
         )
         ses.add(u)

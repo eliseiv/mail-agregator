@@ -29,7 +29,7 @@ class TestTagPluralisation:
             from_label="boss@corp.com",
             tag_names=["Работа"],
         )
-        assert "Тег &laquo;<b>Работа</b>&raquo;" in out
+        assert "Тег «<b>Работа</b>»" in out
         # The plural template marker is absent.
         assert "Теги " not in out
 
@@ -53,7 +53,7 @@ class TestTagPluralisation:
         )
         assert "Теги " in out
         # Comma-joined.
-        assert out.count("&laquo;") == 3
+        assert out.count("«") == 3
         assert "<b>A</b>" in out and "<b>B</b>" in out and "<b>C</b>" in out
 
     def test_empty_tag_list_uses_placeholder(self) -> None:

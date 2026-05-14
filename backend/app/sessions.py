@@ -18,9 +18,10 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+from collections.abc import Awaitable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 import redis.asyncio as redis_asyncio
 
@@ -194,7 +195,12 @@ class SessionStore:
     async def revoke_all_for_user(self, user_id: int) -> int:
         """Force-logout every session of ``user_id``. Returns count deleted."""
         set_key = USER_SESSIONS_KEY_PREFIX + str(user_id)
-        tokens = await self._r.smembers(set_key)  # type: ignore[misc]
+        # ``smembers`` is typed as ``Awaitable[set] | set`` (redis-py supports
+        # both sync/async clients); the runtime here is always async. ``cast``
+        # picks the async branch in a way that satisfies both local mypy
+        # (which sees the union) and CI mypy (which would flag a ``type: ignore``
+        # here as unused).
+        tokens = await cast(Awaitable[set[Any]], self._r.smembers(set_key))
         if not tokens:
             return 0
         async with self._r.pipeline(transaction=False) as pipe:

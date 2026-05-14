@@ -34,7 +34,7 @@ async def admin_user_with_account(
     async with factory() as ses, ses.begin():
         admin = User(
             username="sync_admin",
-            is_admin=True,
+            role="super_admin",
             password_hash="$argon2id$v=19$m=65536,t=3,p=4$abc$def",
             password_reset_required=False,
         )

@@ -118,11 +118,13 @@ class TestExtractMethodFromForm:
 
 class TestRegexCount:
     def test_regex_paths_present(self) -> None:
-        # Per docs/04-api-contracts.md sec. 8 + ADR-0017 (tags):
+        # Per docs/04-api-contracts.md sec. 8 + ADR-0017 (tags) + ADR-0019 (groups):
         # mail-accounts (PATCH/delete-sibling/sync-now), admin user (reset/delete),
-        # tags (PATCH/delete-sibling/rules/rule-delete-sibling/apply).
-        assert len(_OVERRIDE_REGEX_PATHS) == 10
+        # tags (PATCH/delete-sibling/rules/rule-delete-sibling/apply), groups
+        # (PATCH/delete-sibling).
+        assert len(_OVERRIDE_REGEX_PATHS) == 13
 
     def test_exact_paths_present(self) -> None:
-        # /api/messages/send, /api/mail-accounts, /api/admin/users, /api/tags
-        assert len(_OVERRIDE_EXACT_PATHS) == 4
+        # /api/messages/send, /api/mail-accounts, /api/admin/users, /api/tags,
+        # /api/admin/groups (ADR-0019).
+        assert len(_OVERRIDE_EXACT_PATHS) == 5

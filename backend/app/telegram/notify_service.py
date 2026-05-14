@@ -19,8 +19,9 @@ mutations atomic.
 from __future__ import annotations
 
 import json
+from collections.abc import Awaitable
 from dataclasses import dataclass
-from typing import Final
+from typing import Final, cast
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -119,7 +120,11 @@ class TelegramNotifyService:
         # redis-py async client annotates lpush as returning Awaitable[int] |
         # int (the union accommodates the sync facade). awaiting on the
         # union is correct at runtime; mypy can't narrow it for us.
-        await redis.lpush(TG_NOTIFY_QUEUE_KEY, *items)  # type: ignore[misc]
+        # ``lpush`` is typed ``Awaitable[int] | int`` (redis-py sync/async
+        # union); the runtime here is always async. ``cast`` keeps both
+        # local mypy and CI mypy quiet without an ``# type: ignore`` that
+        # CI would flag as unused.
+        await cast(Awaitable[int], redis.lpush(TG_NOTIFY_QUEUE_KEY, *items))
         return len(items)
 
     async def enqueue_recovery(self, message_ids: list[int]) -> int:
@@ -134,7 +139,11 @@ class TelegramNotifyService:
         # redis-py async client annotates lpush as returning Awaitable[int] |
         # int (the union accommodates the sync facade). awaiting on the
         # union is correct at runtime; mypy can't narrow it for us.
-        await redis.lpush(TG_NOTIFY_QUEUE_KEY, *items)  # type: ignore[misc]
+        # ``lpush`` is typed ``Awaitable[int] | int`` (redis-py sync/async
+        # union); the runtime here is always async. ``cast`` keeps both
+        # local mypy and CI mypy quiet without an ``# type: ignore`` that
+        # CI would flag as unused.
+        await cast(Awaitable[int], redis.lpush(TG_NOTIFY_QUEUE_KEY, *items))
         return len(items)
 
     # --- Dispatch ---------------------------------------------------------

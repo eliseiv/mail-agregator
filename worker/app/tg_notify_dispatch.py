@@ -17,6 +17,9 @@ recipient receives the same notification twice.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable
+from typing import Any, cast
+
 from shared.config import get_settings
 from shared.db import make_session
 from shared.logging import get_logger
@@ -34,11 +37,14 @@ async def tg_notify_dispatch() -> None:
     batch_size = settings.TG_NOTIFY_BATCH_SIZE
 
     # ``LPOP key count=N`` returns ``[]`` (not None) for an empty list when
-    # count is supplied. Cope with both shapes.
-    # ``type: ignore`` — redis-py annotates the awaited result as
-    # ``Awaitable[T] | T`` to accommodate sync/async; the runtime here
-    # is always async, but mypy can't narrow the union.
-    raw_items = await redis.lpop(_QUEUE_KEY, count=batch_size)  # type: ignore[misc]
+    # count is supplied. redis-py types the awaited result as
+    # ``Awaitable[T] | T`` (sync/async union); the runtime here is always
+    # async — ``cast`` picks the async branch in a way that satisfies both
+    # local mypy and the stricter CI mypy.
+    raw_items = await cast(
+        Awaitable[bytes | str | list[Any] | None],
+        redis.lpop(_QUEUE_KEY, count=batch_size),
+    )
     if not raw_items:
         return
 
