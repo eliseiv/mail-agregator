@@ -201,6 +201,21 @@ class MailAccountService:
     ) -> MailAccountDTO:
         target_user_id = await self._resolve_target_user_id(scope, payload.target_user_id)
 
+        # Bug fix round-16: global email uniqueness. Adding the same address
+        # in two teams creates duplicate IMAP polls -> duplicate messages
+        # rows -> duplicate Inbox entries and duplicate auto-tags. We run
+        # this check BEFORE the IMAP/SMTP probe to fail fast and avoid
+        # exposing creds against a server we won't end up using.
+        existing_any = await self._repo.find_any_by_email(payload.email)
+        if existing_any is not None:
+            raise ConflictError(
+                "Эта почта уже добавлена в системе. Обратитесь к администратору, "
+                "чтобы перенести её в нужную команду.",
+                field="email",
+            )
+
+        # Per-user duplicate guard kept as defence-in-depth — the global
+        # check above already covers this strict subset.
         existing = await self._repo.find_by_user_email(target_user_id, payload.email)
         if existing is not None:
             raise ConflictError("Email already added", field="email")

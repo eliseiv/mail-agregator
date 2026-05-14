@@ -208,6 +208,19 @@ class MailAccountsRepo:
         )
         return (await self._s.execute(stmt)).scalar_one_or_none()
 
+    async def find_any_by_email(self, email: str) -> MailAccount | None:
+        """Find ANY mail_account with this email (case-insensitive), regardless of owner.
+
+        Round-16 bug fix: the historical ``UNIQUE (user_id, email)`` constraint
+        allows the same address to be added by two different users (e.g. into
+        two teams). Worker ``sync_cycle`` then polls IMAP independently for
+        each row, inserts duplicate ``messages`` rows, and the Inbox shows
+        every email twice — also resulting in duplicate auto-tags. Service
+        layer uses this method to reject duplicates before SMTP/IMAP probe.
+        """
+        stmt = select(MailAccount).where(func.lower(MailAccount.email) == email.lower())
+        return (await self._s.execute(stmt)).scalar_one_or_none()
+
     # --- Writes ------------------------------------------------------------
 
     async def next_account_id(self) -> int:

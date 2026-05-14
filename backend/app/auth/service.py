@@ -253,6 +253,11 @@ class AuthService:
         await self._users.set_password_hash(user.id, new_hash)
         await self._setup.revoke(setup_token)
 
+        # Round-17: set-password is the first successful auth for this user.
+        # Without this call the ``last_login_at`` column stays NULL forever
+        # for users that joined the system via the set-password flow.
+        await self._users.record_login_success(user.id)
+
         # Builtin tags post-login hook (ADR-0017 §6) — fired here too so
         # that the user-after-set-password-flow lands on /tags with the
         # four builtin rows already present. Idempotent.

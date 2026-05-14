@@ -262,6 +262,11 @@ async def telegram_auth(request: Request, db: DbSession) -> Response:
             # fall through to the unlinked branch
             resolved_user_id_was_present = True
         else:
+            # Round-17: Telegram SSO is a successful authentication for the
+            # linked user. Without this call ``last_login_at`` stays at its
+            # previous value (or NULL) for users that only sign in via TG.
+            async with db.begin():
+                await UsersRepo(db).record_login_success(user.id)
             session_token, csrf = await SessionStore().create(
                 user.id, user.role, user.group_id, ip, ua
             )

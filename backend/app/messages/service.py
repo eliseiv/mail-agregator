@@ -159,6 +159,20 @@ class MessageService:
             owner_user = owner_map.get(a.user_id)
             if owner_user is None:
                 continue  # FK should prevent it
+            # Round-16: dedup tag badges by (name, color). Pre-fix history
+            # could land the same email into two mail_accounts (one per team)
+            # and apply two team-scoped tags with identical name/color — the
+            # UI would then render two indistinguishable chips. Even after
+            # the duplicate accounts are removed, defensive dedup here is
+            # cheap and protects against any future tag-naming collisions.
+            seen_tag_keys: set[tuple[str, str]] = set()
+            unique_tags: list[Tag] = []
+            for t in tags_map.get(m.id, []):
+                key = (t.name, t.color)
+                if key in seen_tag_keys:
+                    continue
+                seen_tag_keys.add(key)
+                unique_tags.append(t)
             items.append(
                 MessageListItem(
                     id=m.id,
@@ -172,7 +186,7 @@ class MessageService:
                     internal_date=m.internal_date,
                     is_read=m.is_read,
                     has_attachments=att_map.get(m.id, False),
-                    tags=[_to_tag_brief(t) for t in tags_map.get(m.id, [])],
+                    tags=[_to_tag_brief(t) for t in unique_tags],
                 )
             )
         return MessageListResponse(items=items, next_cursor=next_cursor)
