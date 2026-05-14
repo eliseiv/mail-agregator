@@ -23,8 +23,6 @@ from shared.models import (
     UserSettings,
 )
 
-from tests.integration.telegram.conftest import make_init_data
-
 pytestmark = pytest.mark.integration
 
 
@@ -64,9 +62,7 @@ class TestLogoutRevokes:
 
         # Login then logout.
         csrf = await _login_admin_two_step(client)
-        resp = await client.post(
-            "/logout", headers={"X-CSRF-Token": csrf}
-        )
+        resp = await client.post("/logout", headers={"X-CSRF-Token": csrf})
         assert resp.status_code in (302, 303), resp.text
 
         # Link row gone.
@@ -82,9 +78,7 @@ class TestLogoutRevokes:
             revokes = (
                 (
                     await ses.execute(
-                        select(AdminAudit).where(
-                            AdminAudit.action == "telegram_link_revoked"
-                        )
+                        select(AdminAudit).where(AdminAudit.action == "telegram_link_revoked")
                     )
                 )
                 .scalars()
@@ -117,9 +111,7 @@ class TestAdminResetRevokes:
         factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
         async with factory() as ses:
             link = (
-                await ses.execute(
-                    select(TelegramLink).where(TelegramLink.user_id == leader.id)
-                )
+                await ses.execute(select(TelegramLink).where(TelegramLink.user_id == leader.id))
             ).scalar_one_or_none()
             assert link is None
 
@@ -127,9 +119,7 @@ class TestAdminResetRevokes:
             revokes = (
                 (
                     await ses.execute(
-                        select(AdminAudit).where(
-                            AdminAudit.action == "telegram_link_revoked"
-                        )
+                        select(AdminAudit).where(AdminAudit.action == "telegram_link_revoked")
                     )
                 )
                 .scalars()
@@ -175,27 +165,19 @@ class TestDeleteUserCascades:
                 TelegramNotificationsRepo,
             )
 
-            await TelegramNotificationsRepo(ses).try_reserve(
-                message_id=msg.id, user_id=member.id
-            )
+            await TelegramNotificationsRepo(ses).try_reserve(message_id=msg.id, user_id=member.id)
 
         # Sanity: all the rows are there.
         async with factory() as ses:
             assert (
-                await ses.execute(
-                    select(TelegramLink).where(TelegramLink.user_id == member.id)
-                )
+                await ses.execute(select(TelegramLink).where(TelegramLink.user_id == member.id))
+            ).scalar_one_or_none() is not None
+            assert (
+                await ses.execute(select(UserSettings).where(UserSettings.user_id == member.id))
             ).scalar_one_or_none() is not None
             assert (
                 await ses.execute(
-                    select(UserSettings).where(UserSettings.user_id == member.id)
-                )
-            ).scalar_one_or_none() is not None
-            assert (
-                await ses.execute(
-                    select(TelegramNotification).where(
-                        TelegramNotification.user_id == member.id
-                    )
+                    select(TelegramNotification).where(TelegramNotification.user_id == member.id)
                 )
             ).scalar_one_or_none() is not None
 
@@ -213,19 +195,13 @@ class TestDeleteUserCascades:
                 await ses.execute(select(User).where(User.id == member.id))
             ).scalar_one_or_none() is None
             assert (
-                await ses.execute(
-                    select(TelegramLink).where(TelegramLink.user_id == member.id)
-                )
+                await ses.execute(select(TelegramLink).where(TelegramLink.user_id == member.id))
+            ).scalar_one_or_none() is None
+            assert (
+                await ses.execute(select(UserSettings).where(UserSettings.user_id == member.id))
             ).scalar_one_or_none() is None
             assert (
                 await ses.execute(
-                    select(UserSettings).where(UserSettings.user_id == member.id)
-                )
-            ).scalar_one_or_none() is None
-            assert (
-                await ses.execute(
-                    select(TelegramNotification).where(
-                        TelegramNotification.user_id == member.id
-                    )
+                    select(TelegramNotification).where(TelegramNotification.user_id == member.id)
                 )
             ).scalar_one_or_none() is None

@@ -24,7 +24,6 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from shared.config import get_settings
 from shared.models import AdminAudit, TelegramLink, User
-
 from tests.integration.telegram.conftest import make_init_data
 
 pytestmark = pytest.mark.integration
@@ -94,9 +93,7 @@ class TestPendingRedeemOnLogin:
             audits = (
                 (
                     await ses.execute(
-                        select(AdminAudit).where(
-                            AdminAudit.action == "telegram_link_created"
-                        )
+                        select(AdminAudit).where(AdminAudit.action == "telegram_link_created")
                     )
                 )
                 .scalars()
@@ -115,9 +112,7 @@ class TestPendingRedeemOnLogin:
         raw = make_init_data(telegram_user_id=tg_id)
         await client.post("/api/telegram/auth", json={"init_data": raw})
         assert client.cookies.get("mas_tg_pending") is not None
-        resp = await _login_two_step(
-            client, username=s.ADMIN_LOGIN, password=s.ADMIN_PASSWORD
-        )
+        resp = await _login_two_step(client, username=s.ADMIN_LOGIN, password=s.ADMIN_PASSWORD)
         # On the login redirect the cookie must be cleared.
         set_cookies = resp.headers.get_list("set-cookie")
         assert any("mas_tg_pending" in c for c in set_cookies)
@@ -149,9 +144,7 @@ class TestPendingRedeemOnLogin:
         csrf = login_resp.cookies.get("mas_csrf") or client.cookies.get("mas_csrf")
         assert csrf, "CSRF cookie missing after login"
         # Logout — must pass CSRF token.
-        logout_resp = await client.post(
-            "/logout", headers={"X-CSRF-Token": csrf}
-        )
+        logout_resp = await client.post("/logout", headers={"X-CSRF-Token": csrf})
         assert logout_resp.status_code in (302, 303), logout_resp.text
 
         # Second call with the same tg_id: should be linked=False because
@@ -171,9 +164,7 @@ class TestPendingRedeemOnLogin:
         tg_id = 91004
         raw = make_init_data(telegram_user_id=tg_id)
         await client.post("/api/telegram/auth", json={"init_data": raw})
-        await _login_two_step(
-            client, username=s.ADMIN_LOGIN, password=s.ADMIN_PASSWORD
-        )
+        await _login_two_step(client, username=s.ADMIN_LOGIN, password=s.ADMIN_PASSWORD)
         # Do NOT logout; just call SSO again with fresh initData.
         raw2 = make_init_data(telegram_user_id=tg_id)
         resp = await client.post("/api/telegram/auth", json={"init_data": raw2})
@@ -221,20 +212,16 @@ class TestCollision:
         # The original link is untouched.
         async with factory() as ses:
             link = (
-                await ses.execute(
-                    select(TelegramLink).where(TelegramLink.user_id == admin_id)
-                )
+                await ses.execute(select(TelegramLink).where(TelegramLink.user_id == admin_id))
             ).scalar_one_or_none()
             assert link is not None
-            assert link.telegram_user_id == existing_tg, (
-                "existing link must NOT be re-bound to attempted_tg"
-            )
+            assert (
+                link.telegram_user_id == existing_tg
+            ), "existing link must NOT be re-bound to attempted_tg"
             # No telegram_links row was created for attempted_tg.
             attempted_row = (
                 await ses.execute(
-                    select(TelegramLink).where(
-                        TelegramLink.telegram_user_id == attempted_tg
-                    )
+                    select(TelegramLink).where(TelegramLink.telegram_user_id == attempted_tg)
                 )
             ).scalar_one_or_none()
             assert attempted_row is None
@@ -243,9 +230,7 @@ class TestCollision:
             collisions = (
                 (
                     await ses.execute(
-                        select(AdminAudit).where(
-                            AdminAudit.action == "telegram_link_collision"
-                        )
+                        select(AdminAudit).where(AdminAudit.action == "telegram_link_collision")
                     )
                 )
                 .scalars()

@@ -194,7 +194,7 @@ class SessionStore:
     async def revoke_all_for_user(self, user_id: int) -> int:
         """Force-logout every session of ``user_id``. Returns count deleted."""
         set_key = USER_SESSIONS_KEY_PREFIX + str(user_id)
-        tokens = await self._r.smembers(set_key)
+        tokens = await self._r.smembers(set_key)  # type: ignore[misc]
         if not tokens:
             return 0
         async with self._r.pipeline(transaction=False) as pipe:

@@ -11,6 +11,8 @@ HTML string. We verify the documented behaviours:
   send this in practice).
 """
 
+# ruff: noqa: RUF001 RUF002 RUF003
+
 from __future__ import annotations
 
 import pytest

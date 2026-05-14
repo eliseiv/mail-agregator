@@ -24,6 +24,7 @@ from backend.app.messages.schemas import (
 from backend.app.messages.service import MessageService
 from backend.app.repositories.mail_accounts import MailAccountsRepo
 from backend.app.repositories.users import UsersRepo
+from backend.app.tags.schemas import TagDTO
 from backend.app.tags.service import TagsService
 from backend.app.templates import render
 
@@ -172,7 +173,7 @@ async def inbox_page(
         users_map = await UsersRepo(db).get_many_by_ids(owner_ids) if owner_ids else {}
         accounts = [_acc_to_dto(a, users_map[a.user_id]) for a in rows if a.user_id in users_map]
         member_ids = await UsersRepo(db).list_user_ids_in_group(effective_group_id)
-        tags_by_id: dict[int, object] = {}
+        tags_by_id: dict[int, TagDTO] = {}
         for uid in [*member_ids, scope.user_id]:
             for t in await TagsService(db).list_for_user(uid):
                 tags_by_id[t.id] = t

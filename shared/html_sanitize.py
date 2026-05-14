@@ -158,9 +158,7 @@ _COLLAPSE_BLANK_LINES_RE: Final[re.Pattern[str]] = re.compile(r"\n{3,}")
 
 # Round-15 fix: Telegram HTML mode rejects <br>; we must convert it to a
 # literal newline BEFORE bleach so the line break is preserved as text.
-_BR_TO_NL_RE: Final[re.Pattern[str]] = re.compile(
-    r"<\s*br\s*/?\s*>", re.IGNORECASE
-)
+_BR_TO_NL_RE: Final[re.Pattern[str]] = re.compile(r"<\s*br\s*/?\s*>", re.IGNORECASE)
 # Block-level closers in marketing HTML often imply a paragraph break;
 # we mirror that to "\n" so collapsing tables/divs in the TG view doesn't
 # concatenate everything into one wall of text.
@@ -274,7 +272,7 @@ def sanitize_telegram_html(html: str) -> str:
     # paragraph break and trim trailing whitespace so the user sees a
     # compact preview.
     cleaned = _COLLAPSE_BLANK_LINES_RE.sub("\n\n", cleaned)
-    return cleaned.strip()
+    return str(cleaned.strip())
 
 
 def linkify_plain_text(text: str) -> str:

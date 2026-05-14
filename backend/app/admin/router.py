@@ -152,7 +152,7 @@ async def _rerender_admin_users(
                 }
             )
             current_key = gid
-        grouped[-1]["users"].append(u)  # type: ignore[union-attr]
+        grouped[-1]["users"].append(u)  # type: ignore[attr-defined]
 
     return await render(
         request,
@@ -495,7 +495,7 @@ async def admin_users_page(
                 }
             )
             current_key = gid
-        grouped[-1]["users"].append(u)  # type: ignore[union-attr]
+        grouped[-1]["users"].append(u)  # type: ignore[attr-defined]
 
     return await render(
         request,

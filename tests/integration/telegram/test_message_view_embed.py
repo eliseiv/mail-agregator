@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from shared.config import get_settings
 from shared.crypto import encrypt_mail_password
-from shared.models import Attachment, MailAccount, Message, User
+from shared.models import MailAccount, Message, User
 from shared.storage import Storage
 
 pytestmark = pytest.mark.integration
@@ -44,9 +44,7 @@ async def _seed_message_with_attachment(db_engine: AsyncEngine) -> dict[str, Any
     s = get_settings()
     factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
     async with factory() as ses, ses.begin():
-        admin = (
-            await ses.execute(select(User).where(User.username == s.ADMIN_LOGIN))
-        ).scalar_one()
+        admin = (await ses.execute(select(User).where(User.username == s.ADMIN_LOGIN))).scalar_one()
         from backend.app.repositories.mail_accounts import MailAccountsRepo
 
         repo = MailAccountsRepo(ses)

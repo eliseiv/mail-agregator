@@ -57,9 +57,7 @@ class TestPatchMeSettings:
         assert me.status_code == 200
         assert me.json()["tg_notifications_enabled"] is False
 
-    async def test_re_enable_tg_notifications(
-        self, client: httpx.AsyncClient
-    ) -> None:
+    async def test_re_enable_tg_notifications(self, client: httpx.AsyncClient) -> None:
         csrf = await _login_admin(client)
         # Disable, then re-enable.
         r1 = await client.patch(
@@ -76,9 +74,7 @@ class TestPatchMeSettings:
         assert r2.status_code == 200
         assert r2.json()["tg_notifications_enabled"] is True
 
-    async def test_empty_body_returns_400_validation_error(
-        self, client: httpx.AsyncClient
-    ) -> None:
+    async def test_empty_body_returns_400_validation_error(self, client: httpx.AsyncClient) -> None:
         csrf = await _login_admin(client)
         resp = await client.patch(
             "/api/me/settings",
@@ -88,9 +84,7 @@ class TestPatchMeSettings:
         assert resp.status_code == 400, resp.text
         assert resp.json()["error"]["code"] == "validation_error"
 
-    async def test_disallowed_field_returns_400(
-        self, client: httpx.AsyncClient
-    ) -> None:
+    async def test_disallowed_field_returns_400(self, client: httpx.AsyncClient) -> None:
         csrf = await _login_admin(client)
         resp = await client.patch(
             "/api/me/settings",
@@ -100,9 +94,7 @@ class TestPatchMeSettings:
         # Schema config is ``extra="forbid"`` so unknown fields fail.
         assert resp.status_code == 400, resp.text
 
-    async def test_malformed_json_returns_400(
-        self, client: httpx.AsyncClient
-    ) -> None:
+    async def test_malformed_json_returns_400(self, client: httpx.AsyncClient) -> None:
         csrf = await _login_admin(client)
         resp = await client.patch(
             "/api/me/settings",

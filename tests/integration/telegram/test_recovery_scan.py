@@ -55,9 +55,7 @@ class TestRecoveryScan:
         create_message: Any,
         tag_message_for_user: Any,
     ) -> None:
-        acc = await create_mail_account(
-            super_admin_user.id, "rec@example.com"
-        )
+        acc = await create_mail_account(super_admin_user.id, "rec@example.com")
         msg = await create_message(acc.id, uid=130001)
         await tag_message_for_user(super_admin_user.id, msg.id, "tag")
 
@@ -83,9 +81,7 @@ class TestRecoveryScan:
         create_message: Any,
         tag_message_for_user: Any,
     ) -> None:
-        acc = await create_mail_account(
-            super_admin_user.id, "rec2@example.com"
-        )
+        acc = await create_mail_account(super_admin_user.id, "rec2@example.com")
         msg = await create_message(acc.id, uid=130002)
         await tag_message_for_user(super_admin_user.id, msg.id, "tag")
 
@@ -93,9 +89,7 @@ class TestRecoveryScan:
         old = datetime.now(UTC) - timedelta(hours=48)
         factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
         async with factory() as ses, ses.begin():
-            await ses.execute(
-                update(Message).where(Message.id == msg.id).values(fetched_at=old)
-            )
+            await ses.execute(update(Message).where(Message.id == msg.id).values(fetched_at=old))
 
         ids = await _list_recovery(db_engine, window_hours=24)
         assert msg.id not in ids
@@ -109,9 +103,7 @@ class TestRecoveryScan:
         create_message: Any,
         tag_message_for_user: Any,
     ) -> None:
-        acc = await create_mail_account(
-            super_admin_user.id, "rec3@example.com"
-        )
+        acc = await create_mail_account(super_admin_user.id, "rec3@example.com")
         msg = await create_message(acc.id, uid=130003)
         await tag_message_for_user(super_admin_user.id, msg.id, "tag")
 
@@ -133,9 +125,7 @@ class TestRecoveryScan:
         create_mail_account: Any,
         create_message: Any,
     ) -> None:
-        acc = await create_mail_account(
-            super_admin_user.id, "rec4@example.com"
-        )
+        acc = await create_mail_account(super_admin_user.id, "rec4@example.com")
         msg = await create_message(acc.id, uid=130004)
         # No tag → recovery scan ignores.
 

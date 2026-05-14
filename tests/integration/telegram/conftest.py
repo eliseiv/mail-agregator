@@ -20,11 +20,10 @@ import json
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import quote
 
-import httpx
 import pytest
 import pytest_asyncio
 from sqlalchemy import select
@@ -32,7 +31,6 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from shared.config import get_settings
 from shared.models import Group, MailAccount, Message, Tag, User
-
 
 # ---------------------------------------------------------------------------
 # HMAC builder — production code (init_data.py) is the reference; we mirror
@@ -99,9 +97,9 @@ async def _ensure_super_admin(db_engine: AsyncEngine) -> User:
         u = (
             await ses.execute(select(User).where(User.username == s.ADMIN_LOGIN))
         ).scalar_one_or_none()
-        assert u is not None, (
-            "super-admin was not seeded; the app startup must run before this fixture."
-        )
+        assert (
+            u is not None
+        ), "super-admin was not seeded; the app startup must run before this fixture."
         return u
 
 
@@ -185,15 +183,11 @@ class FakeSendNotificationRecorder:
     def push(self, *outcomes: FakeSendResult) -> None:
         self.script.extend(outcomes)
 
-    async def __call__(
-        self, *, chat_id: int, text_html: str, message_id: int
-    ) -> Any:
+    async def __call__(self, *, chat_id: int, text_html: str, message_id: int) -> Any:
         # Import here to avoid a hard dependency at module load.
         from backend.app.telegram.bot import SendNotificationResult
 
-        self.calls.append(
-            {"chat_id": chat_id, "text_html": text_html, "message_id": message_id}
-        )
+        self.calls.append({"chat_id": chat_id, "text_html": text_html, "message_id": message_id})
         if self.script:
             outcome = self.script.pop(0) if len(self.script) > 1 else self.script[0]
         else:
@@ -222,9 +216,7 @@ def fake_send_notification(
       (notify_service.send_notification).
     """
     recorder = FakeSendNotificationRecorder()
-    monkeypatch.setattr(
-        "backend.app.telegram.bot.send_notification", recorder, raising=True
-    )
+    monkeypatch.setattr("backend.app.telegram.bot.send_notification", recorder, raising=True)
     monkeypatch.setattr(
         "backend.app.telegram.notify_service.send_notification",
         recorder,
@@ -444,9 +436,7 @@ async def _create_telegram_link(
     async with factory() as ses, ses.begin():
         from shared.models import TelegramLink
 
-        link = TelegramLink(
-            telegram_user_id=telegram_user_id, user_id=user_id, dead_at=dead_at
-        )
+        link = TelegramLink(telegram_user_id=telegram_user_id, user_id=user_id, dead_at=dead_at)
         ses.add(link)
         await ses.flush()
 
@@ -470,15 +460,15 @@ def make_link(db_engine: AsyncEngine) -> Callable[..., Any]:
 
 
 __all__ = [
-    "make_init_data",
-    "FakeSendResult",
     "FakeSendNotificationRecorder",
-    "fake_send_notification",
-    "super_admin_user",
-    "leader_and_group",
-    "create_member",
+    "FakeSendResult",
     "create_mail_account",
+    "create_member",
     "create_message",
-    "tag_message_for_user",
+    "fake_send_notification",
+    "leader_and_group",
+    "make_init_data",
     "make_link",
+    "super_admin_user",
+    "tag_message_for_user",
 ]

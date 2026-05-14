@@ -31,7 +31,7 @@ from backend.app.telegram.init_data import (
 
 pytestmark = pytest.mark.unit
 
-_BOT_TOKEN = "7217762321:AAGQWEOrLYPz1F1E1ZaJGn66GAbKiV2R8ns"
+_BOT_TOKEN = "0000000000:TEST_BOT_TOKEN_FOR_UNIT_TESTS_DO_NOT_USE_xxxxxx"
 _TTL = 300
 
 
@@ -145,9 +145,7 @@ class TestFailureModes:
     def test_garbage_input_returns_malformed(self) -> None:
         # parse_qsl with strict_parsing=True rejects a pair with no '=' as well
         # as an empty key (``=v``).
-        out = verify_init_data(
-            "no_equals_at_all", bot_token=_BOT_TOKEN, max_age_seconds=_TTL
-        )
+        out = verify_init_data("no_equals_at_all", bot_token=_BOT_TOKEN, max_age_seconds=_TTL)
         # parse_qsl accepts the bare token as ('no_equals_at_all','')
         # so we expect missing_hash, not malformed. Either way it is NOT a
         # ValidatedInitData — that is the safety contract.
@@ -195,9 +193,7 @@ class TestFailureModes:
 
     def test_wrong_bot_token_returns_hash_mismatch(self) -> None:
         raw = _make_init_data(bot_token=_BOT_TOKEN)
-        outcome = verify_init_data(
-            raw, bot_token="not-the-same-token:secret", max_age_seconds=_TTL
-        )
+        outcome = verify_init_data(raw, bot_token="not-the-same-token:secret", max_age_seconds=_TTL)
         assert outcome == "hash_mismatch"
 
     def test_modified_query_string_after_signing_returns_hash_mismatch(self) -> None:
@@ -221,14 +217,10 @@ class TestFailureModes:
         old = 100
         raw = _make_init_data(auth_date=old)
         # 'now' two hours ahead of auth_date → expired (TTL is 5 min).
-        outcome = verify_init_data(
-            raw, bot_token=_BOT_TOKEN, max_age_seconds=_TTL, now=old + 7200
-        )
+        outcome = verify_init_data(raw, bot_token=_BOT_TOKEN, max_age_seconds=_TTL, now=old + 7200)
         assert outcome == "expired"
         # 'now' equal to auth_date → fresh.
-        outcome2 = verify_init_data(
-            raw, bot_token=_BOT_TOKEN, max_age_seconds=_TTL, now=old
-        )
+        outcome2 = verify_init_data(raw, bot_token=_BOT_TOKEN, max_age_seconds=_TTL, now=old)
         assert isinstance(outcome2, ValidatedInitData)
 
     def test_user_payload_not_dict_returns_invalid_user_payload(self) -> None:
@@ -310,10 +302,7 @@ class TestConstantTimeComparison:
             verify_init_data(good, bot_token=_BOT_TOKEN, max_age_seconds=_TTL),
             ValidatedInitData,
         )
-        assert (
-            verify_init_data(bad, bot_token=_BOT_TOKEN, max_age_seconds=_TTL)
-            == "hash_mismatch"
-        )
+        assert verify_init_data(bad, bot_token=_BOT_TOKEN, max_age_seconds=_TTL) == "hash_mismatch"
 
 
 class TestURLEncoding:

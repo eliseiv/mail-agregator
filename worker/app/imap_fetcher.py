@@ -252,11 +252,12 @@ def _fetch_iter(
 ) -> Iterator[imap_tools.MailMessage]:
     if not uids:
         return iter([])
-    return mailbox.fetch(
+    result: Iterator[imap_tools.MailMessage] = mailbox.fetch(
         AND(uid=",".join(uids)),
         mark_seen=False,
         bulk=True,
     )
+    return result
 
 
 def _chunks(seq: list[str], size: int) -> Iterator[list[str]]:

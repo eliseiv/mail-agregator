@@ -45,10 +45,8 @@ from shared.models import (
     TelegramLink,
     TelegramNotification,
     User,
-    UserSettings,
 )
 from shared.redis_client import get_redis
-
 from tests.integration.telegram.conftest import FakeSendResult
 
 pytestmark = pytest.mark.integration
@@ -101,9 +99,7 @@ class TestDispatchOk:
             from_name="From Name",
         )
         await tag_message_for_user(super_admin_user.id, msg.id, "VIP")
-        fake_send_notification.push(
-            FakeSendResult(kind="ok", telegram_message_id=98765)
-        )
+        fake_send_notification.push(FakeSendResult(kind="ok", telegram_message_id=98765))
 
         await _dispatch(_payload_for(msg.id), db_engine)
 
@@ -122,9 +118,7 @@ class TestDispatchOk:
         async with factory() as ses:
             row = (
                 await ses.execute(
-                    select(TelegramNotification).where(
-                        TelegramNotification.message_id == msg.id
-                    )
+                    select(TelegramNotification).where(TelegramNotification.message_id == msg.id)
                 )
             ).scalar_one()
             assert row.user_id == super_admin_user.id
@@ -165,9 +159,7 @@ class TestDispatchDead:
             # Link is dead-marked.
             link = (
                 await ses.execute(
-                    select(TelegramLink).where(
-                        TelegramLink.telegram_user_id == tg_id
-                    )
+                    select(TelegramLink).where(TelegramLink.telegram_user_id == tg_id)
                 )
             ).scalar_one()
             assert link.dead_at is not None
@@ -175,9 +167,7 @@ class TestDispatchDead:
             # ``telegram_notifications`` row exists, but sent_at is NULL (no delivery).
             row = (
                 await ses.execute(
-                    select(TelegramNotification).where(
-                        TelegramNotification.message_id == msg.id
-                    )
+                    select(TelegramNotification).where(TelegramNotification.message_id == msg.id)
                 )
             ).scalar_one()
             assert row.sent_at is None
@@ -187,9 +177,7 @@ class TestDispatchDead:
             audits = (
                 (
                     await ses.execute(
-                        select(AdminAudit).where(
-                            AdminAudit.action == "telegram_link_dead_marked"
-                        )
+                        select(AdminAudit).where(AdminAudit.action == "telegram_link_dead_marked")
                     )
                 )
                 .scalars()
@@ -222,9 +210,7 @@ class TestDispatchRetryAfter:
         await tag_message_for_user(super_admin_user.id, msg.id, "tag")
         # First call → 429; the dispatcher should release the claim and
         # re-enqueue. We push a single 'retry_after' outcome.
-        fake_send_notification.push(
-            FakeSendResult(kind="retry_after", retry_after_sec=2)
-        )
+        fake_send_notification.push(FakeSendResult(kind="retry_after", retry_after_sec=2))
 
         # Queue must be empty initially.
         r = get_redis()
@@ -237,14 +223,10 @@ class TestDispatchRetryAfter:
         async with factory() as ses:
             row = (
                 await ses.execute(
-                    select(TelegramNotification).where(
-                        TelegramNotification.message_id == msg.id
-                    )
+                    select(TelegramNotification).where(TelegramNotification.message_id == msg.id)
                 )
             ).scalar_one_or_none()
-            assert row is None, (
-                f"row should be rolled back on retry_after, got {row}"
-            )
+            assert row is None, f"row should be rolled back on retry_after, got {row}"
 
         # The message_id was re-enqueued with source='recovery'.
         items = await r.lrange(TG_NOTIFY_QUEUE_KEY, 0, -1)
@@ -288,9 +270,7 @@ class TestIdempotency:
 
         # Second dispatch — try_reserve returns None, no send.
         await _dispatch(_payload_for(msg.id), db_engine)
-        assert len(fake_send_notification.calls) == 1, (
-            "second dispatch must not call Bot API"
-        )
+        assert len(fake_send_notification.calls) == 1, "second dispatch must not call Bot API"
 
         factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
         async with factory() as ses:
@@ -335,17 +315,13 @@ class TestRecipientResolver:
         await make_link(110402, member.id)
 
         # Mail account belongs to the leader/group.
-        acc = await create_mail_account(
-            leader.id, "leader@example.com", group_id=group.id
-        )
+        acc = await create_mail_account(leader.id, "leader@example.com", group_id=group.id)
         msg = await create_message(acc.id, uid=110401)
         # Both super_admin and member have their own tag on the message.
         await tag_message_for_user(super_admin_user.id, msg.id, "admin-tag")
         await tag_message_for_user(member.id, msg.id, "member-tag")
 
-        fake_send_notification.push(
-            FakeSendResult(kind="ok", telegram_message_id=1)
-        )
+        fake_send_notification.push(FakeSendResult(kind="ok", telegram_message_id=1))
 
         await _dispatch(_payload_for(msg.id), db_engine)
 
@@ -372,16 +348,12 @@ class TestRecipientResolver:
         await make_link(110501, member_with.id)
         await make_link(110502, member_without.id)
 
-        acc = await create_mail_account(
-            leader.id, "leader2@example.com", group_id=group.id
-        )
+        acc = await create_mail_account(leader.id, "leader2@example.com", group_id=group.id)
         msg = await create_message(acc.id, uid=110501)
         await tag_message_for_user(member_with.id, msg.id, "tag")
         # member_without has NO tag on this message.
 
-        fake_send_notification.push(
-            FakeSendResult(kind="ok", telegram_message_id=1)
-        )
+        fake_send_notification.push(FakeSendResult(kind="ok", telegram_message_id=1))
         await _dispatch(_payload_for(msg.id), db_engine)
 
         chat_ids = {call["chat_id"] for call in fake_send_notification.calls}
@@ -405,15 +377,11 @@ class TestRecipientResolver:
         member = await create_member(group.id, "no_link_member")
         # No telegram_links row at all → not a recipient.
 
-        acc = await create_mail_account(
-            leader.id, "leader3@example.com", group_id=group.id
-        )
+        acc = await create_mail_account(leader.id, "leader3@example.com", group_id=group.id)
         msg = await create_message(acc.id, uid=110601)
         await tag_message_for_user(member.id, msg.id, "tag")
 
-        fake_send_notification.push(
-            FakeSendResult(kind="ok", telegram_message_id=1)
-        )
+        fake_send_notification.push(FakeSendResult(kind="ok", telegram_message_id=1))
         await _dispatch(_payload_for(msg.id), db_engine)
 
         # Nobody was contacted.
@@ -444,15 +412,11 @@ class TestRecipientResolver:
                 user_id=member.id, enabled=False
             )
 
-        acc = await create_mail_account(
-            leader.id, "leader4@example.com", group_id=group.id
-        )
+        acc = await create_mail_account(leader.id, "leader4@example.com", group_id=group.id)
         msg = await create_message(acc.id, uid=110701)
         await tag_message_for_user(member.id, msg.id, "tag")
 
-        fake_send_notification.push(
-            FakeSendResult(kind="ok", telegram_message_id=1)
-        )
+        fake_send_notification.push(FakeSendResult(kind="ok", telegram_message_id=1))
         await _dispatch(_payload_for(msg.id), db_engine)
 
         # Member opted-out → no call made.
@@ -543,9 +507,7 @@ class TestSyncCycleResilience:
         try/except.
         """
         # Build a tagged message that WOULD be eligible for enqueue.
-        acc = await create_mail_account(
-            super_admin_user.id, "resilient@example.com"
-        )
+        acc = await create_mail_account(super_admin_user.id, "resilient@example.com")
         msg = await create_message(acc.id, uid=140001)
         await tag_message_for_user(super_admin_user.id, msg.id, "tag")
 

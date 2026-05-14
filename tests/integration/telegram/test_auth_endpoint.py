@@ -22,7 +22,6 @@ import httpx
 import pytest
 
 from shared.redis_client import get_redis
-
 from tests.integration.telegram.conftest import make_init_data
 
 pytestmark = pytest.mark.integration
@@ -138,9 +137,7 @@ class TestFailureModes:
         # Either 400 validation_error or 422 — our pipeline maps to 400.
         assert resp.status_code in (400, 422), resp.text
 
-    async def test_missing_init_data_field_returns_400(
-        self, client: httpx.AsyncClient
-    ) -> None:
+    async def test_missing_init_data_field_returns_400(self, client: httpx.AsyncClient) -> None:
         resp = await client.post("/api/telegram/auth", json={"wrong_key": "x"})
         assert resp.status_code in (400, 422), resp.text
 
@@ -151,9 +148,7 @@ class TestFailureModes:
 
 
 class TestRateLimits:
-    async def test_rate_limit_per_ip_after_30_requests(
-        self, client: httpx.AsyncClient
-    ) -> None:
+    async def test_rate_limit_per_ip_after_30_requests(self, client: httpx.AsyncClient) -> None:
         # ``LIMIT_TG_AUTH_IP`` is 30 / min. The 31st request from the same
         # IP must come back as 429.
         statuses: list[int] = []
@@ -189,9 +184,7 @@ class TestRateLimits:
                 break
         assert 429 in statuses, f"never hit 429 — statuses: {statuses}"
 
-    async def test_429_includes_retry_after(
-        self, client: httpx.AsyncClient
-    ) -> None:
+    async def test_429_includes_retry_after(self, client: httpx.AsyncClient) -> None:
         # Exhaust the IP limit then check headers on the 429 response.
         for i in range(35):
             raw = make_init_data(telegram_user_id=80200 + i, tamper_hash=True)
