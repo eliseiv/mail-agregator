@@ -95,7 +95,13 @@ class MessageService:
         """
         if scope.is_super_admin:
             if group_id is None:
-                return None
+                # Round-18: when two teams added the same mailbox, the system
+                # has multiple mail_account.id rows with identical email,
+                # each polled independently by the worker -> duplicate
+                # messages. For the unscoped super-admin view we collapse
+                # to one canonical mail_account.id per LOWER(email), so the
+                # Inbox no longer shows duplicates.
+                return await self._accounts.list_canonical_account_ids()
             return await self._accounts.list_account_ids_in_group(group_id)
         if group_id is not None and group_id != scope.group_id:
             raise ForbiddenError("user_not_in_group_scope")

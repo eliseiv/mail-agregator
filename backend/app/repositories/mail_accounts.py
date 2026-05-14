@@ -136,6 +136,17 @@ class MailAccountsRepo:
         stmt = select(MailAccount.id).where(MailAccount.group_id == group_id)
         return [int(r[0]) for r in (await self._s.execute(stmt)).all()]
 
+    async def list_canonical_account_ids(self) -> list[int]:
+        """One canonical ``mail_accounts.id`` per ``LOWER(email)`` (round-18).
+
+        Used by super-admin "all teams" views to hide duplicate IMAP polls
+        when two teams independently added the same mailbox. We keep the
+        oldest row (``MIN(id)``) as canonical — deterministic and stable
+        across requests.
+        """
+        stmt = select(func.min(MailAccount.id)).group_by(func.lower(MailAccount.email))
+        return [int(r[0]) for r in (await self._s.execute(stmt)).all()]
+
     async def attach_orphans_to_group(self, *, user_id: int, group_id: int) -> None:
         """Backfill ``mail_accounts.group_id`` for the user's orphan accounts.
 

@@ -106,6 +106,19 @@ class MailAccountService:
         # remain visible to their owner via the user_id condition.
         if scope.is_super_admin:
             rows = await self._repo.list_all()
+            # Round-18: collapse duplicates by lower(email). Two teams may
+            # add the same mailbox independently — super-admin sees ONE row
+            # per email (canonical = lowest mail_account.id). Team views
+            # are naturally scoped by group_id, so they only see their own.
+            seen: set[str] = set()
+            deduped: list[MailAccount] = []
+            for a in sorted(rows, key=lambda r: r.id):
+                key = a.email.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(a)
+            rows = deduped
         else:
             rows = await self._repo.list_for_group_or_owner(
                 group_id=scope.group_id, owner_user_id=scope.user_id
@@ -201,21 +214,11 @@ class MailAccountService:
     ) -> MailAccountDTO:
         target_user_id = await self._resolve_target_user_id(scope, payload.target_user_id)
 
-        # Bug fix round-16: global email uniqueness. Adding the same address
-        # in two teams creates duplicate IMAP polls -> duplicate messages
-        # rows -> duplicate Inbox entries and duplicate auto-tags. We run
-        # this check BEFORE the IMAP/SMTP probe to fail fast and avoid
-        # exposing creds against a server we won't end up using.
-        existing_any = await self._repo.find_any_by_email(payload.email)
-        if existing_any is not None:
-            raise ConflictError(
-                "Эта почта уже добавлена в системе. Обратитесь к администратору, "
-                "чтобы перенести её в нужную команду.",
-                field="email",
-            )
-
-        # Per-user duplicate guard kept as defence-in-depth — the global
-        # check above already covers this strict subset.
+        # Round-18: revert the global guard. Two teams MAY add the same
+        # mailbox independently — each gets its own credentials and its own
+        # ``mail_account.id``. Duplicates are hidden later at read-time by
+        # ``list_for_scope`` / message visibility (super-admin sees the
+        # canonical row per email; teams see only their own).
         existing = await self._repo.find_by_user_email(target_user_id, payload.email)
         if existing is not None:
             raise ConflictError("Email already added", field="email")
