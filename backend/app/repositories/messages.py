@@ -171,10 +171,52 @@ class MessagesRepo:
     async def is_tag_owned(self, *, tag_id: int, user_id: int) -> bool:
         """Return True iff the tag exists and belongs to ``user_id``.
 
-        Used to gate ``GET /api/messages?tag_id=X``: foreign / unknown
-        tags must surface as 404 (per ADR-0017 §9 — never leak existence).
+        Kept for legacy callers (tag CRUD). For ``GET /api/messages?tag_id=X``
+        use :meth:`is_tag_visible_to_scope` — round-20 widens the gate so
+        the Inbox filter accepts team-member tags too.
         """
         stmt = select(exists().where(Tag.id == tag_id, Tag.user_id == user_id))
+        return bool((await self._s.execute(stmt)).scalar_one())
+
+    async def is_tag_visible_to_scope(
+        self,
+        *,
+        tag_id: int,
+        is_super_admin: bool,
+        user_id: int,
+        user_group_id: int | None,
+    ) -> bool:
+        """Return True iff ``tag_id`` exists and is visible to the caller.
+
+        Visibility rules (round-20, mirrors mail_accounts dedup logic):
+        - super-admin: any tag in the system;
+        - non-super-admin: tag.user_id == self OR tag belongs to a user
+          in the same team (``users.group_id``).
+
+        Foreign / unknown tags still surface as 404 in the API layer.
+        """
+        from shared.models import User
+
+        if is_super_admin:
+            # Any tag visible.
+            stmt = select(exists().where(Tag.id == tag_id))
+        elif user_group_id is None:
+            # Caller has no team — only own tags.
+            stmt = select(exists().where(Tag.id == tag_id, Tag.user_id == user_id))
+        else:
+            # Own tags OR tags of any team-member.
+            stmt = select(
+                exists()
+                .where(
+                    Tag.id == tag_id,
+                    or_(
+                        Tag.user_id == user_id,
+                        Tag.user_id.in_(
+                            select(User.id).where(User.group_id == user_group_id)
+                        ),
+                    ),
+                )
+            )
         return bool((await self._s.execute(stmt)).scalar_one())
 
     async def list_attachments_bulk(self, message_ids: list[int]) -> dict[int, list[Attachment]]:

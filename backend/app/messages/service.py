@@ -127,10 +127,17 @@ class MessageService:
         if cursor:
             cursor_date, cursor_id = _decode_cursor(cursor)
 
-        # Tag ownership: per-user — owner of the tag is the caller, not
-        # the mailbox owner. ADR-0019 §7.4.
-        if tag_id is not None and not await self._repo.is_tag_owned(
-            tag_id=tag_id, user_id=scope.user_id
+        # Round-20: widen tag-filter visibility — super_admin may filter
+        # by any tag in the system; team members may filter by any tag
+        # belonging to themselves OR another user of the same team. The
+        # previous per-user gate ``is_tag_owned`` rejected team-member
+        # tags surfaced by the cascade dropdown and returned an empty
+        # Inbox.
+        if tag_id is not None and not await self._repo.is_tag_visible_to_scope(
+            tag_id=tag_id,
+            is_super_admin=scope.is_super_admin,
+            user_id=scope.user_id,
+            user_group_id=scope.group_id,
         ):
             raise NotFoundError()
 
