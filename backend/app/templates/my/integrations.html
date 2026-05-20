@@ -10,7 +10,7 @@
                                                  без ``?group_id=``).
      - ``secret_revealed`` : str | None        — одноразовый показ plaintext-секрета,
                                                  stash'нутого через Redis key
-                                                 ``webhook_secret_reveal:<session_token>``
+                                                 ``webhook_secret_reveal:{session_token}``
                                                  после POST/rotate-secret. Шаблон обязан
                                                  показать его один раз — повторный GET
                                                  этого же URL уже не получит секрета
@@ -37,8 +37,6 @@
 
   <p class="integrations__lede">
     Настройте outbound-webhook для своей команды.
-    При получении письма с тегом мы отправим <code>POST</code> на указанный URL
-    с подписью <code>X-Webhook-Secret</code>.
   </p>
 
   {% if error_message %}
@@ -68,8 +66,7 @@
     <div class="integrations-card integrations-card--empty">
       <h2 class="integrations-card__title">Webhook ещё не настроен</h2>
       <p class="integrations-card__hint">
-        Введите HTTPS-URL приёмника. Только публичные адреса — локальные
-        (<code>localhost</code>, <code>127.0.0.1</code>, приватные CIDR) запрещены.
+        Введите HTTP адрес
       </p>
 
       <form
@@ -92,7 +89,7 @@
             placeholder="https://example.com/webhook"
             autocomplete="off"
             inputmode="url">
-          <p class="field__hint">Только <code>https://</code>. Максимум 2048 символов.</p>
+          <p class="field__hint">Только <code>https://</code>.</p>
         </div>
         <div class="form-actions">
           <button type="submit" class="btn btn--primary">+ Создать webhook</button>
@@ -330,10 +327,11 @@
         </button>
       </form>
     </dialog>
-    {# No-JS fallback: visible card with the secret (the <dialog> above renders
-       inline without a backdrop in browsers that don't support showModal, but
-       it can also be `display:none`. We expose a deterministic visible block
-       so the secret is reachable even without JS or `<dialog>` support. #}
+    {# No-JS fallback: visible card with the secret (the dialog element above
+       renders inline without a backdrop in browsers that don't support
+       showModal, but it can also be display:none. We expose a deterministic
+       visible block so the secret is reachable even without JS or native
+       dialog support. #}
     <noscript>
       <div class="integrations-secret-reveal integrations-secret-reveal--fallback" role="alert">
         <h2 class="dialog__title">Сохраните секрет</h2>
