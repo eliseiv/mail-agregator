@@ -38,6 +38,8 @@ from worker.app.cleanup import retention_cleanup
 from worker.app.sync_cycle import force_sync_dispatch, sync_cycle
 from worker.app.tg_notify_dispatch import tg_notify_dispatch
 from worker.app.tg_notify_recovery import tg_notify_recovery_scan
+from worker.app.webhook_dispatch import webhook_dispatch
+from worker.app.webhook_recovery import webhook_recovery_scan
 
 log = get_logger(__name__)
 
@@ -108,6 +110,30 @@ async def _safe_tg_notify_recovery() -> None:
     except Exception as exc:
         log.error(
             "tg_notify_recovery_unhandled",
+            detail=str(exc)[:300],
+            exc_info=True,
+        )
+
+
+async def _safe_webhook_dispatch() -> None:
+    """Wrapper for the outbound-webhook dispatcher (ADR-0023 §3.3)."""
+    try:
+        await webhook_dispatch()
+    except Exception as exc:
+        log.error(
+            "webhook_dispatch_unhandled",
+            detail=str(exc)[:300],
+            exc_info=True,
+        )
+
+
+async def _safe_webhook_recovery() -> None:
+    """Wrapper for the outbound-webhook recovery scan (ADR-0023 §3.5)."""
+    try:
+        await webhook_recovery_scan()
+    except Exception as exc:
+        log.error(
+            "webhook_recovery_unhandled",
             detail=str(exc)[:300],
             exc_info=True,
         )
@@ -184,6 +210,24 @@ async def main() -> None:
         max_instances=1,
         misfire_grace_time=600,
     )
+    # ADR-0023 §3.3: outbound-webhook dispatcher (drains Redis queue).
+    scheduler.add_job(
+        _safe_webhook_dispatch,
+        trigger=IntervalTrigger(seconds=settings.WEBHOOK_DISPATCH_INTERVAL_SECONDS),
+        id="webhook_dispatch",
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=30,
+    )
+    # ADR-0023 §3.5: recovery scan (re-enqueues lost webhook deliveries).
+    scheduler.add_job(
+        _safe_webhook_recovery,
+        trigger=IntervalTrigger(seconds=settings.WEBHOOK_RECOVERY_INTERVAL_SECONDS),
+        id="webhook_recovery",
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=600,
+    )
 
     # Touch once immediately so the health-check works even before the first
     # 30-second tick.
@@ -197,6 +241,8 @@ async def main() -> None:
         max_concurrent_imap=settings.MAX_CONCURRENT_IMAP,
         tg_notify_dispatch_seconds=settings.TG_NOTIFY_DISPATCH_INTERVAL_SECONDS,
         tg_notify_recovery_seconds=settings.TG_NOTIFY_RECOVERY_INTERVAL_SECONDS,
+        webhook_dispatch_seconds=settings.WEBHOOK_DISPATCH_INTERVAL_SECONDS,
+        webhook_recovery_seconds=settings.WEBHOOK_RECOVERY_INTERVAL_SECONDS,
     )
 
     # Optional: kick off one sync immediately on boot, so we don't wait the

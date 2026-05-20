@@ -2203,3 +2203,425 @@ body.tg-app .main {
 body.tg-app .footer {
   display: none;
 }
+
+/* ---------- 21. Integrations (ADR-0023, 04-api-contracts.md §4b) ---------
+   Outbound-webhook configuration page (/my/integrations). One config card per
+   team — empty-state card for "not configured", populated card with status
+   badges + edit / toggle / test / rotate / delete actions for "configured".
+   Mobile-first; @media (max-width: 640px) below stacks action buttons full-
+   width. Telegram WebApp tweaks live in the body.tg-app.page--integrations
+   block at the bottom of this section. */
+
+.integrations__toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+  flex-wrap: wrap;
+}
+.integrations__title {
+  margin: 0;
+  font-size: var(--font-size-xl);
+  letter-spacing: -0.02em;
+}
+.integrations__lede {
+  color: var(--color-text-muted);
+  margin: 0 0 var(--space-5);
+  max-width: 60ch;
+  line-height: var(--line-height-base);
+}
+.integrations__lede code {
+  font-family: var(--font-family-mono);
+  font-size: 0.92em;
+  background: var(--color-bg-hover);
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+}
+.integrations__error {
+  padding: var(--space-3) var(--space-4);
+  background: var(--color-error-bg);
+  color: var(--color-danger);
+  border: 1px solid var(--color-danger);
+  border-radius: var(--radius-md);
+  margin-bottom: var(--space-5);
+  word-break: break-word;
+}
+
+.integrations-empty {
+  padding: var(--space-7) var(--space-5);
+  text-align: center;
+  border: 1px dashed var(--color-border-strong);
+  border-radius: var(--radius-lg);
+  color: var(--color-text-muted);
+  background: var(--color-bg);
+}
+.integrations-empty__title {
+  margin: 0 0 var(--space-3);
+  font-size: var(--font-size-lg);
+  color: var(--color-text);
+  letter-spacing: -0.015em;
+}
+.integrations-empty code {
+  font-family: var(--font-family-mono);
+  font-size: 0.92em;
+  background: var(--color-bg-hover);
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  color: var(--color-text);
+}
+
+.integrations-card {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-5) var(--space-5);
+  background: var(--color-bg);
+  box-shadow: var(--shadow-xs);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+.integrations-card--empty {
+  border-style: dashed;
+  background: var(--color-bg-subtle);
+}
+.integrations-card--dead {
+  border-color: var(--color-danger);
+  background: var(--color-danger-soft);
+}
+.integrations-card__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  margin: 0;
+}
+.integrations-card__title {
+  margin: 0;
+  font-size: var(--font-size-lg);
+  letter-spacing: -0.015em;
+}
+.integrations-card__hint {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+}
+.integrations-card__hint code {
+  font-family: var(--font-family-mono);
+  background: var(--color-bg-hover);
+  padding: 1px 5px;
+  border-radius: var(--radius-sm);
+  font-size: 0.92em;
+}
+.integrations-card__status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.integrations-card__dead {
+  background: var(--color-bg);
+  border: 1px solid var(--color-danger);
+  border-radius: var(--radius-md);
+  padding: var(--space-3) var(--space-4);
+  color: var(--color-text);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.integrations-card__dead p {
+  margin: 0;
+}
+.integrations-card__dead code {
+  font-family: var(--font-family-mono);
+  background: var(--color-bg-hover);
+  padding: 1px 5px;
+  border-radius: var(--radius-sm);
+}
+
+/* Status badges — match the visual weight of the tag-chip / role badge. */
+.integrations-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 2px var(--space-3);
+  border-radius: var(--radius-full);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  line-height: 1.4;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+.integrations-badge--ok {
+  color: var(--color-success);
+  background: var(--color-success-soft);
+  border-color: rgba(21, 128, 61, 0.25);
+}
+.integrations-badge--off {
+  color: var(--color-text-muted);
+  background: var(--color-bg-hover);
+  border-color: var(--color-border);
+}
+.integrations-badge--warn {
+  color: var(--color-warning);
+  background: var(--color-warning-soft);
+  border-color: rgba(180, 83, 9, 0.25);
+}
+.integrations-badge--dead {
+  color: var(--color-danger);
+  background: var(--color-danger-soft);
+  border-color: rgba(220, 38, 38, 0.35);
+}
+
+/* Meta-info dl — URL / created / last_fired / failures / last_error. */
+.integrations-card__meta {
+  display: grid;
+  grid-template-columns: minmax(180px, max-content) 1fr;
+  gap: var(--space-2) var(--space-5);
+  margin: 0;
+}
+.integrations-meta__row {
+  display: contents;
+}
+.integrations-meta__label {
+  font-weight: 600;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+  margin: 0;
+}
+.integrations-meta__value {
+  margin: 0;
+  font-size: var(--font-size-sm);
+  color: var(--color-text);
+  word-break: break-word;
+  min-width: 0;
+}
+.integrations-meta__muted { color: var(--color-text-faint); }
+.integrations-meta__bad   { color: var(--color-danger); font-weight: 600; }
+.integrations-meta__url {
+  font-family: var(--font-family-mono);
+  font-size: 0.92em;
+  background: var(--color-bg-hover);
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  word-break: break-all;
+  display: inline-block;
+  max-width: 100%;
+}
+.integrations-meta__error {
+  display: inline-block;
+  max-width: 60ch;
+  color: var(--color-danger);
+  font-family: var(--font-family-mono);
+  font-size: 0.92em;
+  background: var(--color-bg);
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-danger);
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+/* Inline edit-URL form — keeps the input + button on one row above 640px. */
+.integrations-form {
+  margin: 0;
+}
+.integrations-form--inline {
+  border-top: 1px solid var(--color-border);
+  padding-top: var(--space-4);
+  margin-top: 0;
+}
+
+/* The is_active toggle row. */
+.integrations-toggle {
+  border-top: 1px solid var(--color-border);
+  padding-top: var(--space-4);
+  margin: 0;
+}
+.integrations-toggle__label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+  cursor: pointer;
+  user-select: none;
+  font-size: var(--font-size-sm);
+  color: var(--color-text);
+}
+.integrations-toggle__checkbox {
+  width: 20px;
+  height: 20px;
+  accent-color: var(--color-primary);
+  cursor: pointer;
+}
+.integrations-toggle__checkbox:disabled {
+  cursor: progress;
+  opacity: 0.6;
+}
+.integrations-toggle__text {
+  font-weight: 500;
+}
+
+/* Action button row (test / rotate / delete). */
+.integrations-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  border-top: 1px solid var(--color-border);
+  padding-top: var(--space-4);
+  margin: 0;
+}
+
+/* Secret-reveal modal. Uses the shared .dialog backdrop styles (section 14). */
+.integrations-secret-reveal {
+  width: min(34rem, calc(100vw - 2rem));
+}
+.integrations-secret-reveal__warning {
+  background: var(--color-warning-soft);
+  color: var(--color-warning);
+  border: 1px solid rgba(180, 83, 9, 0.35);
+  border-radius: var(--radius-md);
+  padding: var(--space-3) var(--space-4);
+  margin: 0 0 var(--space-4);
+  font-size: var(--font-size-sm);
+  line-height: var(--line-height-base);
+}
+.integrations-secret-reveal__warning strong { font-weight: 700; }
+.integrations-secret-reveal__row {
+  display: flex;
+  gap: var(--space-2);
+  align-items: stretch;
+  margin: var(--space-2) 0 var(--space-2);
+  flex-wrap: wrap;
+}
+.integrations-secret-reveal__input {
+  flex: 1 1 240px;
+  min-width: 0;
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-sm);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-subtle);
+  color: var(--color-text);
+}
+.integrations-secret-reveal__input:focus {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 1px;
+}
+.integrations-secret-reveal__pre {
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-sm);
+  background: var(--color-bg-subtle);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+  padding: var(--space-3);
+  margin: var(--space-3) 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.integrations-secret-reveal--fallback {
+  margin-top: var(--space-5);
+  border: 1px solid var(--color-warning);
+  background: var(--color-warning-soft);
+  border-radius: var(--radius-lg);
+  padding: var(--space-5);
+}
+
+/* ---------- 21a. Mobile (<=640px) tweaks ---------- */
+@media (max-width: 640px) {
+  .integrations-card {
+    padding: var(--space-4);
+    gap: var(--space-4);
+  }
+  .integrations-card__header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .integrations-card__meta {
+    grid-template-columns: 1fr;
+    gap: var(--space-1) 0;
+  }
+  .integrations-meta__row {
+    display: block;
+    padding-bottom: var(--space-3);
+    border-bottom: 1px dashed var(--color-border);
+  }
+  .integrations-meta__row:last-child {
+    border-bottom: 0;
+    padding-bottom: 0;
+  }
+  .integrations-meta__label {
+    font-size: var(--font-size-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    display: block;
+    margin-bottom: 2px;
+  }
+  .integrations-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .integrations-actions .inline-form,
+  .integrations-actions .inline-form .btn {
+    width: 100%;
+  }
+  .integrations-form .form-actions .btn,
+  .integrations-card__dead .inline-form .btn {
+    width: 100%;
+  }
+  .integrations-secret-reveal__row {
+    flex-direction: column;
+  }
+  .integrations-secret-reveal__row .btn { width: 100%; }
+}
+
+/* ---------- 21b. Telegram WebApp variant ---------- */
+body.tg-app.page--integrations .integrations-card {
+  padding: var(--space-4);
+  gap: var(--space-4);
+}
+body.tg-app.page--integrations .integrations__lede {
+  font-size: var(--font-size-sm);
+}
+body.tg-app.page--integrations .integrations-card__meta {
+  grid-template-columns: 1fr;
+  gap: var(--space-1) 0;
+}
+body.tg-app.page--integrations .integrations-meta__row {
+  display: block;
+  padding-bottom: var(--space-3);
+  border-bottom: 1px dashed var(--color-border);
+}
+body.tg-app.page--integrations .integrations-meta__row:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+body.tg-app.page--integrations .integrations-meta__label {
+  font-size: var(--font-size-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  display: block;
+  margin-bottom: 2px;
+}
+body.tg-app.page--integrations .integrations-actions {
+  flex-direction: column;
+  align-items: stretch;
+}
+body.tg-app.page--integrations .integrations-actions .inline-form,
+body.tg-app.page--integrations .integrations-actions .inline-form .btn,
+body.tg-app.page--integrations .integrations-form .form-actions .btn,
+body.tg-app.page--integrations .integrations-card__dead .inline-form .btn {
+  width: 100%;
+}
+body.tg-app.page--integrations .integrations-secret-reveal {
+  width: calc(100vw - 2rem);
+}
+body.tg-app.page--integrations .integrations-secret-reveal__row {
+  flex-direction: column;
+}
+body.tg-app.page--integrations .integrations-secret-reveal__row .btn {
+  width: 100%;
+}

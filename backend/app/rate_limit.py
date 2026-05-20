@@ -86,6 +86,18 @@ LIMIT_TAGS_APPLY = Limit(name="tags_apply", capacity=5, window_seconds=60 * 60)
 # - per tg_user_id:   10 / min  (post-HMAC — covers replay of valid init_data).
 LIMIT_TG_AUTH_IP = Limit(name="tg_auth_ip", capacity=30, window_seconds=60)
 LIMIT_TG_AUTH_USER = Limit(name="tg_auth_user", capacity=10, window_seconds=60)
+# Outbound webhooks (ADR-0023 §5). All four limits are keyed per
+# ``webhook_id`` except ``LIMIT_WEBHOOK_CREATE`` which is keyed per
+# ``group_id`` (anti-spam for accidentally re-creating after delete).
+LIMIT_WEBHOOK_CREATE = Limit(name="webhook_create", capacity=10, window_seconds=60 * 60)
+LIMIT_WEBHOOK_UPDATE = Limit(name="webhook_update", capacity=30, window_seconds=60 * 60)
+LIMIT_WEBHOOK_DELETE = Limit(name="webhook_delete", capacity=10, window_seconds=60 * 60)
+LIMIT_WEBHOOK_ROTATE = Limit(name="webhook_rotate", capacity=5, window_seconds=60 * 60)
+# ``LIMIT_WEBHOOK_TEST.capacity`` is overridden at consume-time by
+# ``settings.WEBHOOK_TEST_LIMIT`` so operators can tune the cap without a
+# redeploy of the codebase. The static value here is a sensible fallback
+# only if the settings lookup is unavailable for some reason.
+LIMIT_WEBHOOK_TEST = Limit(name="webhook_test", capacity=10, window_seconds=60 * 60)
 
 
 async def consume(limit: Limit, key: str) -> None:

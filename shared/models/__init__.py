@@ -22,6 +22,7 @@ from shared.models.user import (
     User,
 )
 from shared.models.user_settings import UserSettings
+from shared.models.webhook import Webhook, WebhookDelivery
 
 __all__ = [
     "ALL_ROLES",
@@ -42,4 +43,6 @@ __all__ = [
     "TelegramNotification",
     "User",
     "UserSettings",
+    "Webhook",
+    "WebhookDelivery",
 ]

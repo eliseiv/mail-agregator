@@ -66,7 +66,7 @@
 | mypy | **1.10** | Static type-check |
 | pre-commit | **3.7** | (опционально) hooks |
 
-Минимальный coverage gate: **75%** на core (`backend/app/services`, `backend/app/repositories`, `worker/`). Тестовая стратегия и обязательный набор инвариантов — в [`05-modules.md`](./05-modules.md) (раздел "17. QA / тесты — обязательный набор для backend/worker"). Если потребуется отдельный документ test-strategy — заведёт QA-агент по согласованию с архитектором.
+Минимальный coverage gate: **75%** на core (`backend/app/services`, `backend/app/repositories`, `worker/`). Тестовая стратегия и обязательный набор инвариантов — в [`05-modules.md`](./05-modules.md) (раздел "20. QA / тесты — обязательный набор для backend/worker"). Если потребуется отдельный документ test-strategy — заведёт QA-агент по согласованию с архитектором.
 
 ---
 

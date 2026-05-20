@@ -31,7 +31,9 @@ __all__ = [
     "InvalidTag",
     "MailPasswordCipher",
     "decrypt_mail_password",
+    "decrypt_webhook_secret",
     "encrypt_mail_password",
+    "encrypt_webhook_secret",
 ]
 
 VERSION_CURRENT = 0x01
@@ -39,12 +41,22 @@ VERSION_PREV = 0x00
 IV_LEN = 12
 HEADER_LEN = 1 + IV_LEN  # version + iv
 AAD_PREFIX = b"mail_account_password|"
+# ADR-0023 §4.1: webhook secrets reuse the same AES-256-GCM primitive but
+# bind AAD to ``webhook_id`` so an attacker with DB access cannot swap
+# ciphertexts between two webhook rows (decrypt fails with ``InvalidTag``).
+WEBHOOK_SECRET_AAD_PREFIX = b"webhook_secret|"
 
 
 def _aad_for(mail_account_id: int) -> bytes:
     if not mail_account_id or mail_account_id <= 0:
         raise ValueError("mail_account_id must be a positive integer for AAD")
     return AAD_PREFIX + str(mail_account_id).encode("ascii")
+
+
+def _webhook_aad(webhook_id: int) -> bytes:
+    if not webhook_id or webhook_id <= 0:
+        raise ValueError("webhook_id must be a positive integer for AAD")
+    return WEBHOOK_SECRET_AAD_PREFIX + str(webhook_id).encode("ascii")
 
 
 class MailPasswordCipher:
@@ -72,22 +84,40 @@ class MailPasswordCipher:
         )
 
     def encrypt(self, plaintext: str, mail_account_id: int) -> bytes:
+        return self._encrypt_with_aad(plaintext, _aad_for(mail_account_id))
+
+    def decrypt(self, blob: bytes, mail_account_id: int) -> str:
+        return self._decrypt_with_aad(blob, _aad_for(mail_account_id))
+
+    def encrypt_webhook_secret(self, plaintext: str, webhook_id: int) -> bytes:
+        """Encrypt a webhook secret (ADR-0023 §4.1).
+
+        Uses the same envelope as :meth:`encrypt` but binds AAD to
+        ``webhook_id`` via :data:`WEBHOOK_SECRET_AAD_PREFIX`.
+        """
+        return self._encrypt_with_aad(plaintext, _webhook_aad(webhook_id))
+
+    def decrypt_webhook_secret(self, blob: bytes, webhook_id: int) -> str:
+        """Decrypt a webhook secret (ADR-0023 §4.1)."""
+        return self._decrypt_with_aad(blob, _webhook_aad(webhook_id))
+
+    # --- Internal AAD-parameterised primitives -----------------------------
+
+    def _encrypt_with_aad(self, plaintext: str, aad: bytes) -> bytes:
         if plaintext is None:
             raise ValueError("plaintext must not be None")
         if not isinstance(plaintext, str):
             raise TypeError("plaintext must be str")
-        aad = _aad_for(mail_account_id)
         iv = os.urandom(IV_LEN)
         ct = self._current.encrypt(iv, plaintext.encode("utf-8"), aad)
         return bytes([VERSION_CURRENT]) + iv + ct
 
-    def decrypt(self, blob: bytes, mail_account_id: int) -> str:
+    def _decrypt_with_aad(self, blob: bytes, aad: bytes) -> str:
         if not blob or len(blob) < HEADER_LEN + 16:  # 16 = GCM tag
             raise InvalidTag("blob too short")
         version = blob[0]
         iv = blob[1:HEADER_LEN]
         ct = blob[HEADER_LEN:]
-        aad = _aad_for(mail_account_id)
 
         if version == VERSION_CURRENT:
             cipher = self._current
@@ -120,3 +150,20 @@ def decrypt_mail_password(blob: bytes, mail_account_id: int) -> str:
     the row id, the blob is corrupted, or the wrong key is configured.
     """
     return MailPasswordCipher.from_settings().decrypt(blob, mail_account_id)
+
+
+def encrypt_webhook_secret(plaintext: str, webhook_id: int) -> bytes:
+    """Encrypt a webhook secret (ADR-0023 §4.1).
+
+    AAD binds the ciphertext to ``webhook_id`` so a DB attacker cannot
+    move a row's blob to another webhook.
+    """
+    return MailPasswordCipher.from_settings().encrypt_webhook_secret(plaintext, webhook_id)
+
+
+def decrypt_webhook_secret(blob: bytes, webhook_id: int) -> str:
+    """Decrypt a webhook secret blob (ADR-0023 §4.1).
+
+    Raises :class:`cryptography.exceptions.InvalidTag` on mismatch.
+    """
+    return MailPasswordCipher.from_settings().decrypt_webhook_secret(blob, webhook_id)

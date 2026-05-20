@@ -41,9 +41,11 @@
           {% if request.state.session.role == 'super_admin' %}
             <a class="topnav__link" href="/admin">Пользователи</a>
             <a class="topnav__link" href="/admin/groups">Команды</a>
+            <a class="topnav__link" href="/my/integrations">Интеграции</a>
           {% elif request.state.session.role == 'group_leader' %}
             <a class="topnav__link" href="/my/members">Участники</a>
             <a class="topnav__link" href="/admin/groups">Моя команда</a>
+            <a class="topnav__link" href="/my/integrations">Интеграции</a>
           {% endif %}
         </nav>
         <div class="topbar__user">
@@ -104,11 +106,21 @@
          {% if request.url.path.startswith('/admin') %}aria-current="page"{% endif %}>
         <span class="bottom-nav__label">Админ</span>
       </a>
+      <a href="/my/integrations"
+         class="bottom-nav__item{% if request.url.path.startswith('/my/integrations') %} bottom-nav__item--active{% endif %}"
+         {% if request.url.path.startswith('/my/integrations') %}aria-current="page"{% endif %}>
+        <span class="bottom-nav__label">Интеграции</span>
+      </a>
       {% elif request.state.session.role == 'group_leader' %}
       <a href="/my/members"
          class="bottom-nav__item{% if request.url.path.startswith('/my/members') or request.url.path.startswith('/admin/groups') %} bottom-nav__item--active{% endif %}"
          {% if request.url.path.startswith('/my/members') or request.url.path.startswith('/admin/groups') %}aria-current="page"{% endif %}>
         <span class="bottom-nav__label">Команда</span>
+      </a>
+      <a href="/my/integrations"
+         class="bottom-nav__item{% if request.url.path.startswith('/my/integrations') %} bottom-nav__item--active{% endif %}"
+         {% if request.url.path.startswith('/my/integrations') %}aria-current="page"{% endif %}>
+        <span class="bottom-nav__label">Интеграции</span>
       </a>
       {% endif %}
     </nav>

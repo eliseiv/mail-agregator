@@ -160,6 +160,15 @@ class TagApplyTooManyError(DomainError):
     code = "tag_apply_too_many"
 
 
+class WebhookUrlPrivateIpError(DomainError):
+    """Outbound webhook URL would target a private/loopback/link-local
+    address — ADR-0023 §4.3 SSRF protection.
+    """
+
+    status_code = 400
+    code = "webhook_url_private_ip"
+
+
 # --- Helpers ----------------------------------------------------------------
 
 

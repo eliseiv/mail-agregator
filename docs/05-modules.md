@@ -72,6 +72,13 @@ backend/
       auth_service.py      # TelegramAuthService: validate_init_data, try_sso, link_pending, revoke_for_user, mark_link_dead
       schemas.py           # TelegramUpdate, TelegramAuthRequest, TelegramAuthResponse, ValidatedTelegramUser
       notify_format.py     # format_notification(acc_label, from_label, tag_names) -> HTML-строка
+    webhooks/              # ADR-0023 — outbound webhooks per группа
+      __init__.py
+      router.py            # GET /my/integrations, GET/POST/PATCH/DELETE /api/webhooks/me, /rotate-secret, /test
+      service.py           # WebhooksService.create_for_scope/get_for_scope/update_for_scope/delete_for_scope/rotate_secret/send_test
+      dispatch_service.py  # WebhookDispatchService.enqueue_message_ids, dispatch_one_payload — копируется по паттерну telegram/auth_service+notify_format
+      schemas.py           # WebhookCreate, WebhookUpdate, WebhookDTO (no secret), WebhookCreatedDTO (with one-shot secret), TestResultDTO
+      payload.py           # build_message_tagged_payload(ctx, team_tags, webhook_id, delivery_id) — формирование dict для json.dumps
     audit/
       service.py
     models/                # SQLAlchemy ORM
@@ -88,6 +95,7 @@ backend/
       telegram_link.py      # ADR-0022 — TelegramLink ORM
       telegram_notification.py  # ADR-0022 — TelegramNotification ORM
       user_settings.py      # ADR-0022 — UserSettings ORM
+      webhook.py            # ADR-0023 — Webhook + WebhookDelivery ORM
     repositories/
       users.py
       groups.py             # GroupsRepo — ADR-0019
@@ -99,9 +107,11 @@ backend/
       telegram_links.py     # ADR-0022 — TelegramLinksRepo (get_active_*, upsert, revoke_for_user, mark_dead)
       telegram_notifications.py  # ADR-0022 — TelegramNotificationsRepo (try_claim, mark_sent, rollback, list_recipients_for_message, list_tags_for_recipient)
       user_settings.py      # ADR-0022 — UserSettingsRepo (get, upsert)
+      webhooks.py           # ADR-0023 — WebhooksRepo (get_by_group_id, reserve_id, insert_with_explicit_id, update_*, set_active, delete, mark_dead/success, bump_failures, touch_last_error, find_active_for_message)
+      webhook_deliveries.py # ADR-0023 — WebhookDeliveriesRepo (try_reserve, mark_sent, mark_failed, rollback, list_tags_for_team, list_missing_for_recovery)
     templates/             # Jinja2 — все на русском, см. ADR-0021
-      base.html              # включает Log out button (восстановлен после редизайна)
-      _macros.html           # csrf_input, flash_messages, error_text(code) — RU mapping (ADR-0021); tag_chip
+      base.html              # включает Log out button (восстановлен после редизайна) + ссылка «Интеграции» для group_leader/super_admin (ADR-0023)
+      _macros.html           # csrf_input, flash_messages, error_text(code) — RU mapping (ADR-0021); tag_chip; secret_reveal_block (ADR-0023, one-shot show plaintext)
       login.html
       set_password.html
       inbox.html             # колонки display_name, owner; group filter (super_admin)
@@ -115,6 +125,7 @@ backend/
       admin/groups/form.html # ADR-0019 — create/edit группы
       tags/list.html
       tags/form.html
+      my/integrations.html   # ADR-0023 — webhook config UI: URL form, status (last_fired_at/last_error/consecutive_failures/dead), кнопки Save/Rotate/Test/Delete
     static/
       css/main.css
       js/app.js
@@ -130,6 +141,7 @@ backend/
       002_add_tags.py            # ADR-0017
       003_groups_and_roles.py    # ADR-0019 + ADR-0020 — см. 03-data-model.md секция Миграции
       004_telegram_sso_and_notifications.py  # ADR-0022 — telegram_links, telegram_notifications, users_settings
+      005_outbound_webhooks.py   # ADR-0023 — webhooks, webhook_deliveries
   tests/
     unit/
     integration/
@@ -137,7 +149,7 @@ backend/
 worker/
   app/
     __init__.py
-    main.py                # APScheduler entrypoint (jobs: sync_cycle, force_sync_dispatch, retention_cleanup, tg_notify_dispatch, tg_notify_recovery_scan)
+    main.py                # APScheduler entrypoint (jobs: sync_cycle, force_sync_dispatch, retention_cleanup, tg_notify_dispatch, tg_notify_recovery_scan, webhook_dispatch, webhook_recovery_scan)
     config.py              # shared with backend (через общий пакет, см. ниже)
     sync_cycle.py
     cleanup.py
@@ -145,6 +157,8 @@ worker/
     smtp_appender.py       # IMAP APPEND wrapper
     tg_notify_dispatch.py  # ADR-0022 — диспатчер Telegram-нотификаций (каждые 5 сек)
     tg_notify_recovery.py  # ADR-0022 — recovery_scan (каждый час)
+    webhook_dispatch.py    # ADR-0023 — диспатчер outbound webhooks (каждые 5 сек)
+    webhook_recovery.py    # ADR-0023 — recovery_scan для webhooks (каждый час)
   tests/
 shared/                    # общий пакет, импортируется и api, и worker
   __init__.py
@@ -1183,6 +1197,7 @@ async def sync_one_account(account: MailAccount) -> AccountSyncResult
 - ON CONFLICT (`mail_account_id`, `uidvalidity`, `uid`) DO NOTHING.
 - **Apply tags (ADR-0017):** если INSERT messages вернул `RETURNING id` (т.е. это была новая запись, не дубль), в той же транзакции выполняется `tags_service.apply_tags_to_message(message_id, user_id)` (использует SQL `APPLY_TAGS_TO_MESSAGE` из `app/tags/sql.py`). Все условия — один SQL-запрос, ON CONFLICT DO NOTHING. Падение apply откатывает всю транзакцию (включая INSERT messages) → message будет пере-обработан при следующем sync. `user_id` берётся из `mail_accounts.user_id` (resolve один раз перед циклом save_message). При ON CONFLICT (письмо уже было) apply пропускается — повторно теги не применяются.
 - **Enqueue notification (ADR-0022 §2.1):** ПОСЛЕ COMMIT транзакции save_message (а не внутри неё — чтобы доставка не зависела от транзакционной видимости), если `apply_tags_to_message` вернул `applied_count > 0`, добавить `message_id` в локальный аккумулятор `notify_ids`. После завершения цикла обработки одного account'а (т.е. в `sync_one_account` после `mailbox.logout()`) выполнить **один** `LPUSH tg_notify_queue val1 val2 …` всеми накопленными ID. Padение LPUSH (Redis down) — ловится try/except + log warn `event=tg_notify_enqueue_failed`; **не** прерывает sync_cycle. Recovery_scan (см. 14.1) подберёт упущенные.
+- **Enqueue outbound webhook (ADR-0023 §3.1):** **параллельно и независимо** от TG-блока выше. Тот же `notify_ids` (один источник истины — письма с `applied_count > 0`) передаётся в `WebhookDispatchService(s).enqueue_message_ids(notify_ids)`, который делает pre-filter (отбрасывает ids, у которых владеющая группа не имеет активного webhook'а) и один batched `LPUSH webhook_dispatch_queue val1 val2 …`. Падение этого блока ловится своим try/except + log warn `event=webhook_enqueue_failed`; **не** валит ни sync_cycle, ни TG-доставку. Recovery_scan webhook'ов (см. 14.2) подберёт упущенные с тем же 24-часовым окном.
 
 ### Обработка ошибок (per-account)
 | Ошибка | Действие |
@@ -1309,6 +1324,115 @@ async def dispatch_one(message_id: int) -> DispatchOneResult
 - mark_dead не каскадно валит другие линковки (UPDATE WHERE user_id=:uid, не глобальный).
 - sync_cycle никогда не падает из-за ошибок Bot API/Redis на этом пути (изоляция через try/except в LPUSH).
 - Bot API token не появляется в логах (redact-list).
+
+---
+
+## 14.2. worker — webhook_dispatch + webhook_recovery_scan
+
+Источник истины — [ADR-0023](./adr/ADR-0023-outbound-webhooks.md) §3.
+
+### Назначение
+- `webhook_dispatch` — каждые `WEBHOOK_DISPATCH_INTERVAL_SECONDS=5` сек драйнит Redis `webhook_dispatch_queue` (LIST), доставляет webhook receiver'у HTTP POST, обеспечивает идемпотентность через `webhook_deliveries`. Обрабатывает 4xx/5xx/timeout/network с разной семантикой (см. §3.4 ADR-0023).
+- `webhook_recovery_scan` — раз в `WEBHOOK_RECOVERY_INTERVAL_SECONDS=3600` сек сканирует messages последних `WEBHOOK_RECOVERY_WINDOW_HOURS=24` ч с `message_tags`, у которых для соответствующего активного webhook'а нет успешной/mark_failed `webhook_deliveries` row → LPUSH'ит их в очередь.
+
+Эти job'ы — параллель `tg_notify_dispatch` / `tg_notify_recovery_scan` (см. §14.1). Изоляция полная: падение webhook-канала не влияет на TG, и наоборот.
+
+### Публичный API
+```python
+async def webhook_dispatch() -> None        # APScheduler interval=5s; max_instances=1, coalesce=True
+async def webhook_recovery_scan() -> None   # APScheduler interval=1h; max_instances=1, coalesce=True
+async def dispatch_one_payload(message_id: int) -> DispatchOneResult
+```
+
+### Зависимости
+- redis (LPOP с count, LPUSH).
+- repositories: `webhooks` (find_active_for_message, mark_dead, mark_success, bump_failures, touch_last_error), `webhook_deliveries` (try_reserve, mark_sent, mark_failed, rollback, list_tags_for_team, list_missing_for_recovery).
+- `backend/app/webhooks/dispatch_service.py:dispatch_one_payload`.
+- `backend/app/webhooks/payload.py:build_message_tagged_payload`.
+- `shared/crypto.py:decrypt_webhook_secret` (AAD=webhook_id).
+- `httpx.AsyncClient` (общий instance с `follow_redirects=False`, `timeout=WEBHOOK_HTTP_TIMEOUT_SECONDS=10`).
+- audit (для mark_dead).
+
+### Алгоритм webhook_dispatch
+
+```text
+1. items = await redis.lpop("webhook_dispatch_queue", count=WEBHOOK_BATCH_SIZE)  # default 30
+2. if not items: return
+3. for raw in items:
+     message_id = json.loads(raw)["message_id"]
+     await dispatch_one_payload(message_id)
+4. log event=webhook_dispatch_finish с per-cycle stats (sent, skipped_idempotent, marked_dead, mark_failed, rolled_back, no_recipient)
+```
+
+### Алгоритм dispatch_one_payload
+
+См. полный алгоритм в ADR-0023 §3.4. Сводно:
+
+```text
+1. ctx = SELECT ... FROM messages JOIN mail_accounts JOIN groups WHERE m.id=:mid
+   if not ctx: log warn "webhook_dispatch_message_missing" and return
+2. recipient = WebhooksRepo.find_active_for_message(mail_account_id, group_id, message_id)
+   # SQL ADR-0023 §3.2: WHERE w.is_active AND w.dead_at IS NULL AND m.internal_date >= w.created_at
+   #                    AND EXISTS(message_tags JOIN tags WHERE user принадлежит группе ИЛИ super_admin)
+   if recipient is None: return
+3. delivery_id = WebhookDeliveriesRepo.try_reserve(recipient.webhook_id, message_id)
+   if delivery_id is None: return  # уже доставлено (UNIQUE)
+4. team_tags = WebhookDeliveriesRepo.list_tags_for_team(message_id, recipient.group_id)
+   if not team_tags: rollback; return  # defensive
+5. secret_plaintext = decrypt_webhook_secret(recipient.secret_encrypted, recipient.webhook_id)
+   except InvalidTag: rollback; mark_dead(reason='secret_decrypt_failed'); audit; return
+6. payload = build_message_tagged_payload(ctx, team_tags, recipient.webhook_id, delivery_id)
+7. headers = {X-Webhook-Secret, X-Webhook-Event, X-Webhook-Delivery-Id, User-Agent, Content-Type}
+8. POST через httpx (timeout=10, follow_redirects=False)
+   - network/timeout: rollback + touch_last_error; recovery_scan через час
+   - 410:           mark_failed + mark_dead(reason='410_gone') + audit; return
+   - 4xx (≠408/429): mark_failed + bump_failures; if ≥10: mark_dead(reason='consecutive_4xx') + audit
+   - 408/429/5xx:   rollback + touch_last_error (no counter); recovery_scan через час
+   - 2xx:           mark_sent + mark_success
+```
+
+### Алгоритм webhook_recovery_scan
+
+```text
+1. threshold = now() - interval 'WEBHOOK_RECOVERY_WINDOW_HOURS hours'
+2. ids = SELECT m.id FROM messages m JOIN mail_accounts ma ON ma.id = m.mail_account_id
+         WHERE m.fetched_at > :threshold
+           AND EXISTS (SELECT 1 FROM message_tags mt WHERE mt.message_id = m.id)
+           AND EXISTS (SELECT 1 FROM webhooks w
+                        WHERE w.group_id = ma.group_id
+                          AND w.is_active = TRUE
+                          AND w.dead_at IS NULL
+                          AND m.internal_date >= w.created_at)
+           AND NOT EXISTS (SELECT 1 FROM webhook_deliveries wd
+                            JOIN webhooks w ON w.id = wd.webhook_id
+                            WHERE wd.message_id = m.id
+                              AND w.group_id = ma.group_id
+                              AND wd.sent_at IS NOT NULL)
+         ORDER BY m.id LIMIT 5000
+3. if not ids: return
+4. await redis.lpush("webhook_dispatch_queue", *[json.dumps({"message_id": i}) for i in ids])
+5. log event=webhook_recovery_scan_finish count=len(ids)
+```
+
+`webhook_recovery_scan` уважает фильтр «не флудим историей» (`m.internal_date >= w.created_at`) симметрично §3.2 ADR-0023 — recovery не «оживляет» письма, которые пришли до создания webhook'а.
+
+### Edge cases
+- Redis недоступен в момент LPOP — APScheduler следующий тик повторит. Exception → APScheduler логирует и продолжает по расписанию (через `_safe_webhook_dispatch` wrapper).
+- Receiver медленный, но в итоге отвечает в окне 10s — нормальное 2xx.
+- Receiver вернул 3xx (redirect) — backend не следует, трактует как failed (4xx); `consecutive_failures += 1`. См. §4.3 ADR-0023.
+- Receiver вернул 2xx без body — `mark_sent` с `response_excerpt = ""`; нормально.
+- `mail_accounts.group_id` сменился (round-10 patch) — recipient SQL пересчитывается на каждый dispatch_one_payload (нет cache); webhook новой группы получит письмо, если оно подпадает под фильтр (`m.internal_date >= w.created_at`).
+- Webhook удалён (`DELETE FROM webhooks`) после LPUSH — recipient SQL вернёт None → `dispatch_one_payload` тихо завершается; webhook_deliveries не создаётся (CASCADE уже всё удалил).
+- `InvalidTag` при decrypt → выставляется `dead_at` (вариант "compromise/key rotation"); audit. Лидер видит status='dead' на `/my/integrations`. Если это последствие ротации `MAIL_ENCRYPTION_KEY` (см. ADR-0005) — backend-агент при реализации `mas-cli reencrypt` должен включить таблицу `webhooks.secret_encrypted` в список re-encrypted blob'ов.
+- Многократный recovery_scan в течение часа (если предыдущий job завис) — `coalesce=True` гарантирует пропуск дублирующих тиков.
+
+### Инварианты
+- Идемпотентность: повторный `dispatch_one_payload(message_id)` для уже доставленного message → `try_reserve` вернёт None → пропуск.
+- `mark_dead` не каскадно валит другие webhook'и (UPDATE WHERE id=:wid).
+- sync_cycle никогда не падает из-за ошибок receiver'а/Redis на этом пути (изоляция через try/except в LPUSH; см. §14).
+- `X-Webhook-Secret` plaintext **не** появляется в логах ни на одном уровне (redact-list по ключам `secret`, `X-Webhook-Secret`, `secret_plaintext`).
+- Recovery_scan не «оживляет» письма, пришедшие до создания webhook'а (фильтр `m.internal_date >= w.created_at`).
+- Receiver-side `response_excerpt` усечён до 500 байт; гарантирует ограниченный размер строки в БД даже при receiver'е, возвращающем большой body.
 
 ---
 
@@ -1847,7 +1971,348 @@ class TelegramUpdate(BaseModel):
 
 ---
 
-## 19. QA / тесты — обязательный набор для backend/worker
+## 19. webhooks (модуль)
+
+Источник истины — [ADR-0023](./adr/ADR-0023-outbound-webhooks.md). Outbound HTTP-webhook — один на команду (`UNIQUE(group_id)`). Триггер — письма с тегами в любом из ящиков команды (фильтр `m.internal_date >= w.created_at`). Auth для исходящих POST — static `X-Webhook-Secret` header.
+
+### Назначение
+1. **CRUD-конфигурация** — лидер/super_admin настраивает URL receiver'а, видит статус доставки, ротирует secret, удаляет webhook.
+2. **Dispatch pipeline** — после COMMIT новых писем sync_cycle LPUSH'ит ids в очередь; worker-job (см. модуль 14.2) drainит и доставляет.
+3. **Изоляция от TG** (ADR-0022) — отдельный domain, отдельный queue, отдельный диспатчер, отдельные таблицы.
+
+### Публичный API
+- HTTP routes (см. `04-api-contracts.md` §4b):
+  - `GET /my/integrations` (HTML).
+  - `GET /api/webhooks/me`
+  - `POST /api/webhooks/me` (one-shot secret reveal)
+  - `PATCH /api/webhooks/me`
+  - `DELETE /api/webhooks/me`
+  - `POST /api/webhooks/me/rotate-secret` (one-shot secret reveal)
+  - `POST /api/webhooks/me/test`
+  - Sibling form-fallback: `POST /api/webhooks/me/delete` + `_method=DELETE` (ADR-0015).
+
+- Service (`backend/app/webhooks/service.py`):
+```python
+class WebhooksService:
+    async def create_for_scope(scope: VisibilityScope, url: str) -> WebhookCreatedDTO
+        # 1. resolve target group_id (scope.group_id для group_leader; ?group_id= для super_admin)
+        # 2. validate_url(url): https://, max 2048, SSRF (DNS-резолв против приватных CIDR)
+        # 3. secret_plaintext = secrets.token_urlsafe(32)
+        # 4. webhook_id = WebhooksRepo.reserve_id()  # nextval('webhooks_id_seq')
+        # 5. secret_encrypted = encrypt_webhook_secret(secret_plaintext, webhook_id)
+        # 6. WebhooksRepo.insert_with_explicit_id(webhook_id, group_id, url, secret_encrypted)
+        # 7. AuditWriter.log(action='webhook_created', ...)
+        # 8. return WebhookCreatedDTO с plaintext secret
+
+    async def get_for_scope(scope: VisibilityScope, group_id: int | None = None) -> WebhookDTO
+        # 404 if нет webhook'а у группы
+
+    async def update_for_scope(scope: VisibilityScope, *, url: str | None, is_active: bool | None) -> WebhookDTO
+        # is_active=True после dead → set_active() = UPDATE is_active=true, dead_at=NULL, consecutive_failures=0, last_error=NULL
+
+    async def delete_for_scope(scope: VisibilityScope) -> None
+
+    async def rotate_secret(scope: VisibilityScope) -> WebhookCreatedDTO
+        # Тот же webhook_id, новый secret_plaintext, новый secret_encrypted (AAD=тот же webhook_id)
+
+    async def send_test(scope: VisibilityScope) -> TestResultDTO
+        # Sync POST с payload {"event": "test", "timestamp": now, "webhook_id": ..., "team": {...}}
+        # Не пишет webhook_deliveries; не трогает counters/dead_at/last_error.
+        # Returns {response_code, response_excerpt, duration_ms}
+```
+
+- DispatchService (`backend/app/webhooks/dispatch_service.py`):
+```python
+class WebhookDispatchService:
+    async def enqueue_message_ids(message_ids: list[int]) -> int
+        # 1. pre-filter SELECT: оставить только ids, у которых владеющая группа имеет активный (is_active AND dead_at IS NULL) webhook
+        #    + m.internal_date >= w.created_at (history-filter)
+        # 2. batched LPUSH webhook_dispatch_queue val1 val2 ...
+        # Returns count pushed.
+
+    async def dispatch_one_payload(message_id: int) -> DispatchOneResult
+        # Алгоритм ADR-0023 §3.4. Возвращает Literal['sent', 'skipped_idempotent', 'rolled_back', 'marked_dead', 'mark_failed', 'no_recipient']
+```
+
+- Repository (`backend/app/repositories/webhooks.py`):
+```python
+@dataclass(frozen=True)
+class WebhookRecipient:
+    webhook_id: int
+    group_id: int
+    url: str
+    secret_encrypted: bytes
+
+class WebhooksRepo:
+    async def get_by_group_id(group_id: int) -> Webhook | None
+    async def reserve_id() -> int                                              # SELECT nextval('webhooks_id_seq')
+    async def insert_with_explicit_id(id_: int, group_id: int, url: str, secret_encrypted: bytes) -> Webhook
+    async def update_url(webhook_id: int, url: str) -> Webhook
+    async def update_secret(webhook_id: int, secret_encrypted: bytes) -> Webhook
+    async def set_active(webhook_id: int, is_active: bool) -> Webhook          # is_active=True сбрасывает dead_at + counters
+    async def delete(webhook_id: int) -> None
+    async def mark_dead(webhook_id: int, reason: str) -> None
+    async def mark_success(webhook_id: int) -> None                            # last_fired_at=now, consec=0, last_error=NULL
+    async def bump_failures_and_set_last_error(webhook_id: int, last_error: str) -> int  # returns new consecutive_failures count
+    async def touch_last_error(webhook_id: int, last_error: str) -> None       # без инкремента counter
+    async def find_active_for_message(mail_account_id: int, group_id: int, message_id: int) -> WebhookRecipient | None
+        # SQL ADR-0023 §3.2 — WHERE is_active, dead_at IS NULL, m.internal_date >= w.created_at, EXISTS(tags)
+```
+
+- Repository (`backend/app/repositories/webhook_deliveries.py`):
+```python
+class WebhookDeliveriesRepo:
+    async def try_reserve(webhook_id: int, message_id: int) -> int | None
+        # INSERT INTO webhook_deliveries (webhook_id, message_id) VALUES (:wid, :mid)
+        # ON CONFLICT (webhook_id, message_id) DO NOTHING RETURNING id
+    async def mark_sent(delivery_id: int, status: int, excerpt: str) -> None    # sent_at=now, response_code, response_excerpt
+    async def mark_failed(delivery_id: int, status: int, excerpt: str) -> None  # тоже sent_at=now + response_code/excerpt; маркер «отказались навсегда»
+    async def rollback(delivery_id: int) -> None                                # DELETE WHERE id=…; используется для transient errors
+    async def list_tags_for_team(message_id: int, group_id: int) -> list[TagDTO]
+        # SELECT DISTINCT t.id, t.name, t.color FROM message_tags JOIN tags JOIN users
+        # WHERE mt.message_id=:mid AND (u.role='super_admin' OR u.group_id=:gid) ORDER BY t.name
+    async def list_missing_for_recovery(threshold_at: datetime, limit: int = 5000) -> list[int]
+        # SQL ADR-0023 §3.5 — окно 24ч, с history-filter, без успешной/mark_failed delivery
+```
+
+- Schemas (`backend/app/webhooks/schemas.py`):
+```python
+class WebhookCreate(BaseModel):
+    url: HttpUrl                  # принудительно scheme; backend дополнительно валидирует SSRF после lexical-check
+
+class WebhookUpdate(BaseModel):
+    url: HttpUrl | None = None
+    is_active: bool | None = None
+
+class WebhookDTO(BaseModel):                                                    # для GET / PATCH / DELETE response — БЕЗ secret
+    id: int
+    group_id: int
+    url: str
+    is_active: bool
+    last_fired_at: datetime | None
+    last_error: str | None
+    dead_at: datetime | None
+    consecutive_failures: int
+    created_at: datetime
+    updated_at: datetime
+
+class WebhookCreatedDTO(WebhookDTO):                                            # POST + rotate-secret only
+    secret: str                                                                  # plaintext, one-time-show
+
+class TestResultDTO(BaseModel):
+    response_code: int
+    response_excerpt: str
+    duration_ms: int
+```
+
+- Payload builder (`backend/app/webhooks/payload.py`):
+```python
+def build_message_tagged_payload(
+    *,
+    ctx: MessageContext,                                                         # m.id, subject, from_addr, from_name, body_text, body_truncated, internal_date, mail_account fields, group fields
+    team_tags: list[TagDTO],                                                     # DISTINCT по группе
+    webhook_id: int,
+    delivery_id: int,
+) -> dict[str, Any]:
+    """Returns dict для json.dumps. body_text усечён до 16384 chars.
+    Структура — см. ADR-0023 §2.9.
+    """
+```
+
+### Зависимости
+- repositories: `webhooks`, `webhook_deliveries`, `messages` (для context при dispatch), `mail_accounts` (group_id resolve), `tags`/`message_tags` (для team_tags).
+- crypto: `encrypt_webhook_secret(plaintext, webhook_id)` / `decrypt_webhook_secret(blob, webhook_id)` — переиспользует `MailPasswordCipher` с AAD=`b"webhook_secret|" + str(webhook_id)`.
+- audit: новые actions `webhook_created`, `webhook_updated`, `webhook_deleted`, `webhook_secret_rotated`, `webhook_dead_marked`.
+- redis: ключ `webhook_dispatch_queue` (LIST; LPUSH со стороны sync_cycle + recovery_scan, LPOP со стороны worker `webhook_dispatch`).
+- httpx (общий async client для POST к external URL; `follow_redirects=False`, `timeout=WEBHOOK_HTTP_TIMEOUT_SECONDS=10`).
+- rate_limit: `LIMIT_WEBHOOK_TEST` (10/h per webhook_id) и аналоги для CRUD (см. ADR-0023 §5).
+
+### Состояния webhook (FSM)
+
+```
+[normal]  ── 2xx ─────────────────────→ [normal] (last_fired_at=now, consec=0, last_error=NULL)
+[normal]  ── 4xx (non-408/429/410) ──→ [normal] (consec += 1, last_error)
+[normal]  ── consec >= 10 ────────────→ [dead]   (dead_at=now, audit webhook_dead_marked)
+[normal]  ── 410 Gone ───────────────→ [dead]   (dead_at=now, immediate, audit)
+[normal]  ── InvalidTag (decrypt) ───→ [dead]   (dead_at=now, audit; ротация ключа?)
+[normal]  ── 5xx/408/429/network ────→ [normal] (last_error, no counter; recovery_scan retry)
+[dead]    ── PATCH is_active=true ───→ [normal] (dead_at=NULL, consec=0, last_error=NULL)
+[dead]    ── POST /test ─────────────→ [dead]   (test НЕ меняет state)
+[inactive]── PATCH is_active=false ──→ [inactive] (диспатчер пропускает; consec не меняется)
+```
+
+`webhook_dispatch` фильтрует `WHERE is_active=true AND dead_at IS NULL` — `dead`/`inactive` пропускаются.
+
+### Алгоритм CRUD endpoint'ов (handler-side)
+
+```text
+group_id resolution (dependency):
+  - if scope.role == 'group_leader':
+      if request.query.group_id IS NOT NULL → 400 validation_error
+      effective_group_id = scope.group_id
+  - if scope.role == 'super_admin':
+      if request.query.group_id IS NULL → 400 validation_error 'group_id required for super_admin'
+      effective_group_id = request.query.group_id
+  - else (group_member): 403 forbidden
+```
+
+### SQL helpers (`backend/app/webhooks/sql.py` — опционально, на усмотрение backend-агента)
+
+Готовый текст параметризованных запросов; используется repository'ями без дублирования. Источник истины — ADR-0023 §3.2 + §3.5.
+
+```python
+FIND_ACTIVE_WEBHOOK_FOR_MESSAGE = """
+SELECT
+    w.id AS webhook_id,
+    w.group_id,
+    w.url,
+    w.secret_encrypted
+FROM webhooks w
+JOIN messages m ON m.id = :mid
+JOIN mail_accounts ma ON ma.id = m.mail_account_id
+WHERE w.group_id = ma.group_id
+  AND w.is_active = TRUE
+  AND w.dead_at IS NULL
+  AND m.internal_date >= w.created_at
+  AND EXISTS (
+      SELECT 1
+      FROM message_tags mt
+      JOIN tags t ON t.id = mt.tag_id
+      JOIN users u ON u.id = t.user_id
+      WHERE mt.message_id = m.id
+        AND (u.role = 'super_admin' OR u.group_id = ma.group_id)
+  )
+LIMIT 1
+"""
+
+LIST_TAGS_FOR_TEAM = """
+SELECT DISTINCT t.id, t.name, t.color
+FROM message_tags mt
+JOIN tags t ON t.id = mt.tag_id
+JOIN users u ON u.id = t.user_id
+WHERE mt.message_id = :mid
+  AND (u.role = 'super_admin' OR u.group_id = :gid)
+ORDER BY t.name
+"""
+
+RECOVERY_SCAN = """
+SELECT m.id
+FROM messages m
+JOIN mail_accounts ma ON ma.id = m.mail_account_id
+WHERE m.fetched_at > :threshold
+  AND EXISTS (SELECT 1 FROM message_tags mt WHERE mt.message_id = m.id)
+  AND EXISTS (
+      SELECT 1 FROM webhooks w
+      WHERE w.group_id = ma.group_id
+        AND w.is_active = TRUE
+        AND w.dead_at IS NULL
+        AND m.internal_date >= w.created_at
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM webhook_deliveries wd
+      JOIN webhooks w ON w.id = wd.webhook_id
+      WHERE wd.message_id = m.id
+        AND w.group_id = ma.group_id
+        AND wd.sent_at IS NOT NULL
+  )
+ORDER BY m.id
+LIMIT 5000
+"""
+```
+
+### Edge cases
+- Создание webhook'а: race с другим запросом того же group_id → один из POST вернёт 409 `webhook_already_exists` (UNIQUE constraint).
+- URL валиден при create, но позже DNS начал резолвить в приватный CIDR (cache poisoning) → dispatcher не повторяет SSRF-check на каждый POST (это было бы дорого); это accepted risk. SSRF-check выполняется только при create/update URL.
+- Receiver возвращает 200, но в body содержится сообщение об ошибке (semantic error). По протоколу webhook'а — это успех (HTTP 2xx); receiver должен сам решать через возврат 4xx.
+- Receiver возвращает 2xx с TLS-ошибкой между нами и nginx (например, expired cert на receiver-стороне) → `httpx.ConnectError` или `SSLError` → транзитная ошибка (rollback + last_error); recovery_scan через час подбирает.
+- В момент POST receiver зависает на >10s → `httpx.TimeoutException` → rollback + last_error; не блокирует диспатчер (один POST в цикле, остальные ждут следующего тика).
+- `body_text` содержит non-UTF-8 байты → mock-тест: всё хранится в Postgres TEXT, прошло энкодинг при INSERT messages; payload форматируется через `json.dumps(ensure_ascii=False)` — UTF-8 в исходящем POST. Receiver на стороне должен поддерживать UTF-8 (стандарт).
+- `tag.color` имеет non-RGB значение (legacy data) — не должно случаться (CHECK constraint в `tags.color`), но defensive: payload включает as-is; receiver-side decides.
+- Race между `DELETE /api/webhooks/me` и `dispatch_one_payload(message_id)` для in-flight item — `find_active_for_message` после DELETE вернёт None → диспатчер тихо завершает (no_recipient). Если delete случился ПОСЛЕ `try_reserve` — row уже в `webhook_deliveries` (без `sent_at`); CASCADE при DELETE webhooks её снесёт; POST уже отправлен или в полёте — receiver получит, нашей системы это не касается.
+
+### Тестируемые инварианты
+- `WebhooksService.create_for_scope(scope, url=...)` для `group_leader` → webhook у scope.group_id; для `super_admin(?group_id=)` → webhook у запрошенной группы; для `group_member` → 403.
+- `WebhooksService.get_for_scope` для `super_admin` без `group_id` → 400 validation_error.
+- `get_by_group_id` возвращает None, если не настроен (для 404 в API).
+- Decrypt secret с правильным `webhook_id` → plaintext; с другим `webhook_id` → `InvalidTag` (AAD binding test).
+- `find_active_for_message`: возвращает None для (a) inactive webhook (b) dead_at IS NOT NULL (c) `m.internal_date < w.created_at` (history-filter) (d) нет тегов у пользователей группы на этом сообщении.
+- `try_reserve` идемпотентен: повторный вызов с теми же `(webhook_id, message_id)` → None.
+- Создание webhook'а с `url='http://...'` (не https) → ValidationError (Pydantic + DB CHECK).
+- Создание с `url='https://localhost'` → 400 `webhook_url_private_ip` (lexical reject).
+- Создание с `url='https://internal-host'`, DNS резолвится в `10.0.0.1` → 400 `webhook_url_private_ip`.
+- POST на receiver с 200 → `mark_sent`, `mark_success` (last_fired_at, consec=0).
+- POST с 410 → `mark_failed` + `mark_dead(reason='410_gone')` + audit.
+- POST с 404 × 10 раз → `mark_failed` × 10; на 10-м `bump_failures` возвращает 10 → `mark_dead(reason='consecutive_4xx')`.
+- POST с 500 → `rollback`; `consecutive_failures` НЕ инкрементится; row отсутствует.
+- POST с timeout → `rollback`; recovery_scan через час восстанавливает в очередь.
+- `PATCH {is_active: true}` на dead webhook → `dead_at=NULL, consecutive_failures=0, last_error=NULL`.
+- `POST /api/webhooks/me/test` → sync POST с `event="test"`; `webhook_deliveries` row НЕ создан; `consecutive_failures`/`dead_at`/`last_error` не тронуты.
+- Rotate secret: новый secret в response, старый decrypt с тем же `webhook_id` уже не работает после COMMIT.
+- Audit log: создание/update/delete/rotate/dead-mark пишут соответствующие action'ы с `actor_user_id` = инициатор (или leader_user_id для system-mark-dead) и `target_user_id` = leader группы.
+- `DELETE /api/admin/groups/{id}` → каскадно удалены `webhooks` + `webhook_deliveries` (если группа была пустая и super_admin её удалил).
+- Лидер открывает `/my/integrations` без настроенного webhook'а → форма create.
+- Лидер открывает `/my/integrations` с настроенным → форма edit + status block.
+- Group_member пытается открыть `/my/integrations` → `302 /` (не имеет права).
+- Логирование: `secret`, `X-Webhook-Secret`, `secret_plaintext` не появляются в structlog (redact-test).
+
+### Content negotiation (no-JS fallback)
+
+Whitelist endpoints для webhooks-роутера (см. `04-api-contracts.md` §4b + ADR-0015):
+- `POST /api/webhooks/me` (create);
+- `PATCH /api/webhooks/me` (update) — также `POST /api/webhooks/me` + `_method=PATCH`;
+- `DELETE /api/webhooks/me` (canonical) — также `POST /api/webhooks/me/delete` + `_method=DELETE`;
+- `POST /api/webhooks/me/rotate-secret`;
+- `POST /api/webhooks/me/test`.
+
+Регистрация в `MethodOverrideMiddleware.WHITELIST_PATHS` (см. модуль 13):
+```python
+WHITELIST_PATHS = [
+    # ... существующие ...
+    r"^/api/webhooks/me$",                          # PATCH через _method override
+    r"^/api/webhooks/me/delete$",                   # DELETE form-fallback
+]
+```
+
+Парсинг form-полей:
+- `url` — строка (вкладывается в Pydantic `HttpUrl` после получения).
+- `is_active` — чекбокс (`on`/`true`/`1` → true; отсутствие — backend интерпретирует как «не менять» для PATCH-семантики; явно `is_active=0`/`false` → false).
+
+### Frontend (тонкий клиент)
+
+Шаблон `templates/my/integrations.html`:
+- Server-rendered; никакого нового JS-файла на MVP (всё через form-fallback).
+- Структура:
+  - Header «Интеграции» (внутри `base.html` layout).
+  - Если у scope.group нет webhook'а — секция `[Создать webhook]` с form `POST /api/webhooks/me` (поле `url`).
+  - Если есть:
+    - `<dl>` со status'ом: URL, is_active, last_fired_at (или «—»), last_error (или «—»), consecutive_failures, dead-indicator.
+    - Форма `PATCH` (URL input + is_active checkbox + Save) — sibling-form `POST /api/webhooks/me` с `_method=PATCH`.
+    - Кнопки: `[Rotate secret]` (`POST /api/webhooks/me/rotate-secret`), `[Test webhook]` (`POST /api/webhooks/me/test`), `[Delete]` (`POST /api/webhooks/me/delete` с `_method=DELETE`).
+  - Секция `secret_reveal` — если в `flashes` есть `[secret_reveal]` (один-shot после create/rotate) → блок с `<code>` plaintext + кнопка `[Скрыть]` (POST на noop endpoint, server-side очищает flash).
+- Все user-facing тексты — на русском (ADR-0021); error-codes маппятся через `_macros.html → error_text(code)`.
+- Bottom-nav (см. §16 frontend) дополняется пунктом «Интеграции» (link to `/my/integrations`) для `group_leader` и `super_admin`; для `group_member` пункт скрыт. Если bottom-nav заполнена под завязку (5 пунктов уже) — frontend-агент решает: либо вынести «Интеграции» во вложенное меню, либо заменить «Теги» на dropdown с «Теги / Интеграции».
+
+### Интеграция с другими модулями
+- **groups** — `webhooks.group_id FK → groups(id) ON DELETE CASCADE`; при DELETE группы → каскадно удалится webhook + webhook_deliveries.
+- **auth** — не модифицируется; webhook-flow не использует `telegram_links` / SSO; обычная cookie-сессия + scope.role.
+- **admin** — `AdminService.delete_user` не трогает webhook'и (они привязаны к группе, не user'у). При удалении лидера у группы остаётся webhook; новый лидер видит state и может ротировать secret / обновить URL.
+- **audit** — расширение `ALLOWED_ACTIONS` на 5 новых action'ов (см. `06-security.md` §8 + `03-data-model.md` `admin_audit.action`).
+- **crypto** — переиспользуется `MailPasswordCipher` с новым AAD-префиксом `b"webhook_secret|"`; `mas-cli reencrypt` (см. ADR-0005 ротация ключа) обрабатывает `webhooks.secret_encrypted` наравне с `mail_accounts.encrypted_password` (backend-агент при реализации добавляет `webhooks` в список таблиц reencrypt-скрипта).
+- **redis** — новый ключ `webhook_dispatch_queue` (LIST; не путать с `tg_notify_queue`). Очистка не нужна — recovery_scan восстанавливает потерянное; persisted state в `webhook_deliveries`.
+- **БД** — две новые таблицы (см. `03-data-model.md`): `webhooks`, `webhook_deliveries`. Каскады описаны в data-model.
+- **middlewares** — все `/api/webhooks/me/*` под CSRF; rate-limit slowapi (см. ADR-0023 §5).
+- **worker.sync_cycle** (см. модуль 14) — параллельно с TG-блоком после успешного COMMIT INSERT messages + apply_tags выполняется аналогичный `WebhookDispatchService.enqueue_message_ids(notified_message_ids)` под try/except.
+- **worker.webhook_dispatch** (см. модуль 14.2) — drainит `webhook_dispatch_queue` каждые 5 сек, POST к external URL с обработкой 4xx/5xx/timeout.
+- **worker.webhook_recovery_scan** (см. модуль 14.2) — раз в час сканирует messages последних 24ч с тегами без успешной delivery → LPUSH back to queue.
+
+### Пагинация / объёмы
+- `GET /api/webhooks/me` — один объект (UNIQUE по group_id).
+- `webhook_deliveries` — без UI-листинга в MVP (super_admin может через psql). Объём ≤ 75 000 строк на пике (см. `03-data-model.md`).
+- Recovery_scan SQL — `LIMIT 5000` (см. модуль 14.2).
+
+---
+
+## 20. QA / тесты — обязательный набор для backend/worker
 
 Это не отдельный модуль кода, а сводный список тестов, которые QA-агент обязан реализовать. Backend-агент покрывает unit-тестами доменные функции, QA-агент — integration/e2e.
 
@@ -1861,6 +2326,7 @@ class TelegramUpdate(BaseModel):
 - providers.suggest_provider_defaults: правильные дефолты для всех 11 доменов.
 - tags (ADR-0017): `ensure_builtin_tags` идемпотентен; per-user изоляция (cross-user — нет утечек); DELETE builtin → `CannotDeleteBuiltinTagError`; UNIQUE `(user_id, name)` — race на create возвращает 409.
 - telegram (ADR-0018): `POST /api/telegram/webhook/<wrong>` → 403; правильный secret + `/start` → 200 и Bot API получил `sendMessage` с inline-keyboard и web_app.url; правильный secret + `/help` или произвольный текст или body без `message` → 200 без вызова Bot API; `TELEGRAM_BOT_TOKEN` отсутствует во всех логах (redact-test).
+- webhooks (ADR-0023): `encrypt_webhook_secret`/`decrypt_webhook_secret` round-trip с `webhook_id` AAD; decrypt с другим `webhook_id` → `InvalidTag`; URL validation (https only, lexical localhost reject, SSRF DNS-резолв с приватными CIDR → 400); idempotency `try_reserve` (повторный вызов → None); `find_active_for_message` отсеивает inactive/dead/history-filter; `secret` plaintext отсутствует во всех логах (redact-test); FSM transitions (4xx×10 → dead, 410 → dead, 5xx → rollback, 2xx → success); `POST /test` не пишет `webhook_deliveries`.
 
 ### Integration (с реальными Postgres/Redis/MinIO в test-compose)
 - POST mail-account с замоканным IMAP/SMTP (через mock-server) — успех/fail; шифрование сохраняется/расшифровывается.
@@ -1870,10 +2336,11 @@ class TelegramUpdate(BaseModel):
 - Admin delete user — каскад до MinIO (объекты удалены).
 - Force sync — маркер обработан в течение следующего тика.
 - Tags: первый login создаёт 4 builtin-тега; повторный login не дублирует. Sync с письмом subject="DPLA report" → автоматически прицепляется builtin "DPLA.PLA". Создание custom тега с `apply_to_existing=true` — новые linkы появились в `message_tags`. DELETE message → CASCADE удаляет `message_tags` (нет orphan). DELETE user → CASCADE удаляет `tags`/`tag_rules`/`message_tags`.
+- Webhooks (ADR-0023): создание webhook → audit `webhook_created`, response с plaintext secret; GET без secret. Письмо с тегом → POST на receiver (mock httpx) с правильным payload + `X-Webhook-Secret` + `X-Webhook-Delivery-Id`. Идемпотентность: повторный sync_cycle того же message — POST НЕ повторяется. Receiver 5xx → row отсутствует (rollback), recovery_scan через час → LPUSH back, POST повторён. Receiver 4xx × 10 → `dead_at`, audit. Receiver 410 → немедленный `dead_at`. `DELETE /api/admin/groups/{id}` → CASCADE удаляет webhooks + webhook_deliveries. DELETE message (retention) → CASCADE удаляет webhook_deliveries. История: сообщение `internal_date < webhook.created_at` НЕ доставляется (фильтр). Опт-out по группе через `is_active=false` — POST НЕ выполняется. Cross-group isolation: webhook команды A не получает POST для письма в команде B.
 
 ### E2E (через httpx + Browser-less)
 - Полный flow: admin создаёт user -> user logs in -> set password -> add account -> sync (триггер вручную) -> читает inbox -> отвечает -> sent_messages инкрементится.
 
 ### Coverage
-- Минимум 75% по модулям 1–11, 14, 15, 17, 18.
+- Минимум 75% по модулям 1–11, 14, 14.1, 14.2, 15, 17, 18, 19.
 - Никаких `# pragma: no cover` без обоснования в комментарии.

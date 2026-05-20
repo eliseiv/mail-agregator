@@ -135,6 +135,26 @@
 | D | Очередь `tg_notify_queue` забивается при outage Bot API | Backoff на 429; transient/5xx → re-LPUSH (max 1 in-place retry, дальше — следующий тик). Recovery_scan покрывает потерянные. Bot API quota (~30 msg/sec) выше нашего ожидаемого rate (~5 msg/sec пик). |
 | E | Получатель видит уведомление о письме, которое не должен видеть | Recipient SQL построен поверх той же `VisibilityScope` модели, что и UI — никаких асимметрий. Полный SQL — ADR-0022 §2.2. |
 
+### 1.10 Outbound webhooks для команд (ADR-0023)
+
+| Угроза | Описание | Митигация |
+| --- | --- | --- |
+| S | Spoof receiver'а (атакующий imitate'ит наш URL) | Не применимо — мы инициируем POST, получатель статичен (URL зафиксирован лидером). Атакующий мог бы поднять receiver, если получит URL, но без `X-Webhook-Secret` валидация не пройдёт; secret меняется через rotate. |
+| S | Receiver получает POST от non-нас (replay / атакующего с украденным secret) | Static-secret схема не защищает от replay в полной мере — это accepted risk MVP (см. ADR-0023 «Alternatives 2: HMAC-signature отклонён» и Q-WH-1). Mitigation: secret хранится в env receiver'а (его ответственность); ротация при подозрении через `POST /api/webhooks/me/rotate-secret`. Если потребуется replay-resistance — отдельный ADR с HMAC-signature + timestamp. |
+| T | Подмена payload в полёте | TLS до receiver'а (URL обязан быть `https://`); httpx валидирует cert. |
+| T | Подмена URL злоумышленником с украденной сессией лидера | Cookie-based session + CSRF — те же гарантии, что для других endpoint'ов. Аудит `webhook_updated` фиксирует изменение URL. |
+| R | Скрытие создания/удаления/ротации/dead-mark | Новые actions в `admin_audit`: `webhook_created`, `webhook_updated`, `webhook_deleted`, `webhook_secret_rotated`, `webhook_dead_marked`. Все super_admin видит в `/admin/audit`. |
+| I | Утечка secret через логи | `secret_plaintext`, `X-Webhook-Secret`, `secret` — в structlog redact-list (рядом с `MAIL_ENCRYPTION_KEY`, `TELEGRAM_BOT_TOKEN`). |
+| I | Утечка secret через response_excerpt receiver'а | Receiver может в response body вернуть echo своих headers (вкл. наш `X-Webhook-Secret`). Мы храним только первые 500 байт `resp.text`; backend-агент при mark_sent/mark_failed применяет redact на excerpt (поиск substring `X-Webhook-Secret:` и замена value на `<redacted>`). |
+| I | Утечка БД → расшифровка secret_encrypted | Без `MAIL_ENCRYPTION_KEY` blob бесполезен; AAD по `webhook_id` дополнительно блокирует перестановку blob между webhook'ами. См. §2 ниже. |
+| I | Утечка через webhook payload (receiver видит письмо без права) | Receiver — внешняя система; лидер сам выбирает receiver. По дизайну ADR-0023 webhook принадлежит **команде**, и payload содержит данные, видимые этой команде (через `VisibilityScope` на `mail_accounts.group_id`). Если receiver — недоверенный сторонний сервис, ответственность лидера: настройка собственной фильтрации на стороне receiver. |
+| D | DOS receiver'а массовым потоком POST'ов | `WEBHOOK_BATCH_SIZE=30` за тик (~6 POST/sec пик при full batch). Если receiver медленный — наши таймауты 10s ограничивают cycle. Recovery_scan не флудит — `LIMIT 5000`, `WHERE NOT EXISTS` фильтрует уже доставленные. |
+| D | Receiver падает массово (5xx storm) | Через 24 ч окно recovery_scan перестаёт пытаться (письмо устаревает); `dead_at` ставится только при последовательных 4xx (`≥ 10`) или 410, не при 5xx. Лидер должен починить receiver — наши логи показывают `last_error`. |
+| D | Нагрузка БД на recovery_scan | `LIMIT 5000` + индексы по `webhook_deliveries(message_id)` + `messages(fetched_at)` + EXISTS-проверки. Тик раз в час — нагрузка ничтожна. |
+| E | SSRF: лидер указывает `https://localhost:<port>` или `https://10.x.y.z` → сканирование внутренней сети | Lexical reject `localhost`/`127.0.0.1`/`0.0.0.0`/`[::1]`; DNS-резолв всех A/AAAA + проверка на приватные CIDR (см. §4 ниже). При попадании → `400 webhook_url_private_ip` на CRUD. В диспатчере на момент POST — accepted risk (DNS cache poisoning), `dead_at` если decrypt failed по любой причине. `httpx.AsyncClient(follow_redirects=False)` — 3xx → треатируется как failed, не следует за redirect (защита от Location: внутренняя сеть). |
+| E | Чужой лидер настроил webhook на чужую команду | Невозможно: `scope.group_id` строго фиксируется на сессии (`group_leader`) или явно через `?group_id=` (только `super_admin`). `group_member` отвечен 403 на всех endpoint'ах. |
+| E | Compromise `MAIL_ENCRYPTION_KEY` → расшифровка всех secret'ов всех webhook'ов | Те же последствия, что для `mail_accounts.encrypted_password` (ADR-0005). Ротация ключа через `mas-cli reencrypt` обрабатывает `webhooks.secret_encrypted` наравне; после ротации **обязательная массовая rotate-secret** через `POST /api/webhooks/me/rotate-secret` (потому что receiver'ам поставляется plaintext-secret, который мог утечь вместе с ключом). Backend-агент при реализации `mas-cli reencrypt` добавляет `webhooks` в список обрабатываемых таблиц. |
+
 ---
 
 ## 2. Шифрование почтовых паролей (схема)
@@ -166,6 +186,40 @@ Decrypt:
 **AAD-привязка** к `mail_account_id`: атакующий, даже имея БД, не сможет переставить blob между записями (расшифровка упадёт на InvalidTag).
 
 **Невозможность INSERT без id**: используется `nextval('mail_accounts_id_seq')` для предсказания id, шифрование с этим id, INSERT с явным id (см. модуль `crypto` в `05-modules.md`).
+
+### 2.1 Outbound webhook secret storage (ADR-0023)
+
+`webhooks.secret_encrypted` использует **тот же примитив** AES-256-GCM (`shared/crypto.py::MailPasswordCipher`) с **другим AAD-префиксом** для domain-separation:
+
+```
+plaintext (UTF-8 string, 44 chars = secrets.token_urlsafe(32))
+   │
+   ├── key  = base64decode(env.MAIL_ENCRYPTION_KEY)        # тот же 32-byte ключ; общий с mail-passwords
+   ├── iv   = os.urandom(12)                                # 96 bits
+   ├── aad  = b"webhook_secret|" + str(webhook_id).encode("ascii")
+   ▼
+ciphertext + tag = AESGCM(key).encrypt(iv, plaintext.encode("utf-8"), aad)
+   │
+   ▼
+blob = b"\x01" || iv (12B) || ciphertext_with_tag (variable)
+```
+
+**Domain separation через AAD:** prefix `b"webhook_secret|"` отличается от `b"mail_account_password|"` (см. §2 выше) → атакующий, имеющий доступ к БД, **не может** взять blob из `mail_accounts.encrypted_password` и подставить в `webhooks.secret_encrypted` — расшифровка упадёт на `InvalidTag`, потому что AAD не совпадает. Аналогично — нельзя переставить blob между двумя webhook'ами (AAD биндинг по `webhook_id`).
+
+**Невозможность INSERT без id**: `nextval('webhooks_id_seq')` → шифрование с этим id в AAD → INSERT с явным id (тот же паттерн, что у `mail_accounts`).
+
+**One-time-show в API response:**
+- `POST /api/webhooks/me` и `POST /api/webhooks/me/rotate-secret` возвращают `secret` plaintext **только** в response этого конкретного запроса (поле `secret`).
+- Никакого `GET`-эндпоинта, отдающего plaintext-secret, **нет**.
+- HTML-страница `/my/integrations` показывает plaintext **один раз** через one-shot flash-сообщение категории `secret_reveal` (cleared при следующем GET).
+- Plaintext secret попадает в structlog redact-list по ключам `secret`, `secret_plaintext`, `X-Webhook-Secret` — никогда не логируется.
+
+**Ротация:**
+- Лидер может в любой момент сделать `POST /api/webhooks/me/rotate-secret` — генерируется новый `secret_plaintext`, шифруется с тем же `webhook_id` (новый IV → новый blob), UPDATE row. Старый secret немедленно недействителен; receiver обязан получить новый и обновить своё хранилище.
+- Rate-limit: 5/час per webhook_id (защита от accidental DoS на receiver-side rotation logic).
+- Двойного secret (старый ещё валиден M минут) в MVP **нет** (см. ADR-0023 Q-WH-1 / TD-019).
+
+**Ротация мастер-ключа `MAIL_ENCRYPTION_KEY`** (см. §10 ниже): `mas-cli reencrypt` обрабатывает blob'ы обеих таблиц (`mail_accounts.encrypted_password` + `webhooks.secret_encrypted`) — общий механизм `version_byte` (0x00 = старый ключ, 0x01 = новый). После ротации **обязательная массовая `POST /api/webhooks/me/rotate-secret`** через UI, потому что plaintext-secret уже передан receiver'у и считается потенциально скомпрометированным.
 
 ---
 
@@ -203,6 +257,24 @@ salt_len    = 16
 Reason: предотвращение использования сервиса как SSRF-зонда внутренней сети (например, попытка подключиться к `127.0.0.1:6379` Redis).
 
 Исключение для dev-режима (`APP_ENV=dev`): private IPs разрешены (нужно для теста с локальным mock-сервером IMAP).
+
+### 4.1 SSRF-защита для outbound webhook URL (ADR-0023)
+
+Тот же helper, что в §4 выше, применяется к URL'у webhook'а в трёх точках:
+
+1. **`POST /api/webhooks/me` / `PATCH /api/webhooks/me`** (CRUD): валидация URL до сохранения.
+2. **`POST /api/webhooks/me/test`**: дополнительный resolve перед каждым тестом (URL мог поменяться между create и test через cache).
+3. **`worker.webhook_dispatch.dispatch_one_payload`**: SSRF-check не повторяется на каждом POST (это было бы дорого; accepted risk DNS cache poisoning между created и dispatch). Защита от redirect через `httpx.AsyncClient(follow_redirects=False)` — Location header в 3xx игнорируется (3xx трактуется как failed).
+
+Дополнительная **лексическая** проверка (до DNS):
+- `host == 'localhost' | '127.0.0.1' | '0.0.0.0' | '[::1]'` → `400 webhook_url_private_ip`.
+- `scheme != 'https'` → `400 validation_error` (DB CHECK constraint duplicate-guard).
+
+При попадании при DNS-резолве в запрещённую сеть → `400 webhook_url_private_ip`.
+
+В диспатчере при `InvalidTag` (decrypt secret failed по любой причине, включая ротацию ключа) → `dead_at = now()` + audit `webhook_dead_marked` `reason='secret_decrypt_failed'`. Это не SSRF, но обработано симметрично — diagnostic для лидера в UI.
+
+Исключение для dev-режима (`APP_ENV=dev`): то же, что в §4 — private IPs разрешены для тестов с локальным mock-receiver'ом.
 
 ---
 
@@ -272,6 +344,13 @@ CSP запрещает inline JS — все скрипты только из `/s
 **Дополнительно (ADR-0022):**
 - `POST /api/telegram/auth` — двухуровневый rate-limit: `30/min per IP` (slowapi) **+** `10/min per telegram_user_id` (применяется ПОСЛЕ успешной HMAC-валидации, чтобы не открывать enumeration через rate-limit timing).
 
+**Дополнительно (ADR-0023):**
+- `POST /api/webhooks/me` — `10/час per group_id` (защита от accidental замусоривания UNIQUE-conflict'ами).
+- `PATCH /api/webhooks/me` — `30/час per webhook_id`.
+- `DELETE /api/webhooks/me` — `10/час per webhook_id`.
+- `POST /api/webhooks/me/rotate-secret` — `5/час per webhook_id` (защита от accidental DoS на receiver-side rotation logic).
+- `POST /api/webhooks/me/test` — `10/час per webhook_id` (env `WEBHOOK_TEST_LIMIT=10`; защита от использования теста как ad-hoc HTTP probe).
+
 ---
 
 ## 8. Audit log
@@ -284,6 +363,7 @@ CSP запрещает inline JS — все скрипты только из `/s
 - Authentication-related: `lockout_triggered`.
 - System: `account_auto_disabled` (worker отключил аккаунт за 3 fail).
 - **Telegram (ADR-0022):** `telegram_link_created` (`details.replaced: bool, telegram_user_id`), `telegram_link_revoked` (`details.telegram_user_id, reason`), `telegram_link_dead_marked` (`details.telegram_user_id, reason='bot_api_403'\|...`), `telegram_link_collision` (`details.existing_telegram_user_id, attempted_telegram_user_id`). `actor_user_id` = сам пользователь (user-инициированное действие) — допустимо в этой таблице, хотя исторически она для super_admin actions; решение: расширяем семантику (см. ADR-0022 §1.4), `target_user_id` = тот же user.
+- **Outbound webhooks (ADR-0023):** `webhook_created` (`actor = инициатор, target_user_id = leader группы, details = {group_id, webhook_id, url}`), `webhook_updated` (`details = {webhook_id, changed_fields: [...], previous_dead_at}`), `webhook_deleted` (`details = {webhook_id, group_id, url}`), `webhook_secret_rotated` (`details = {webhook_id}`), `webhook_dead_marked` (`actor = leader_user_id (system action на его команде), target_user_id = leader_user_id, details = {webhook_id, reason: '410_gone'\|'consecutive_4xx'\|'secret_decrypt_failed'}`). При каскадном удалении группы (`DELETE /api/admin/groups/{id}`) отдельный `webhook_deleted` **не** пишется — каскад покрыт audit'ом `group_delete`.
 - **Не пишутся в audit**: действия `group_leader` и `group_member` (создание mail-аккаунтов, отправка писем, теги). Для них достаточно structlog application-логов (см. ADR-0019 §9).
 - Доступен через `/admin/audit` UI и `GET /api/admin/audit` (только super_admin).
 - Бессрочное хранение.

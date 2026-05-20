@@ -1,0 +1,350 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m with context %}
+
+{# /my/integrations — outbound webhook configuration (ADR-0023, 04-api-contracts.md §4b,
+   05-modules.md §19).
+
+   Backend контракт — контекст, который передаёт ``webhooks/router.py:integrations_page``:
+     - ``webhook``         : WebhookDTO | None — текущий webhook команды (None, если ещё
+                                                 не создан или вызывающий — super_admin
+                                                 без ``?group_id=``).
+     - ``secret_revealed`` : str | None        — одноразовый показ plaintext-секрета,
+                                                 stash'нутого через Redis key
+                                                 ``webhook_secret_reveal:<session_token>``
+                                                 после POST/rotate-secret. Шаблон обязан
+                                                 показать его один раз — повторный GET
+                                                 этого же URL уже не получит секрета
+                                                 (он удалён `_consume_secret_reveal`).
+     - ``error_message``   : str | None        — non-fatal сообщение от service-слоя
+                                                 (например, если GET наткнулся на
+                                                 не-404 DomainError).
+     - ``group_id_param``  : int | None        — `?group_id=` query (для super_admin).
+     - ``csrf_token``      : str               — обязателен для всех state-changing форм.
+     - ``session``         : SessionData       — для base.html topnav.
+
+   No-JS fallback: все формы — обычные POST с ``_method=PATCH``/``DELETE`` override
+   (ADR-0015). JS-апгрейд через ``/static/js/integrations.js`` интерсептит submit и
+   делает fetch для лучшего UX, но базовая функциональность работает без JS. #}
+
+{% block title %}Интеграции &middot; Mail Aggregator{% endblock %}
+{% block body_class %}integrations{% endblock %}
+
+{% block content %}
+<section class="integrations" aria-labelledby="integrations-heading">
+  <header class="integrations__toolbar">
+    <h1 id="integrations-heading" class="integrations__title">Интеграции</h1>
+  </header>
+
+  <p class="integrations__lede">
+    Настройте outbound-webhook для своей команды.
+    При получении письма с тегом мы отправим <code>POST</code> на указанный URL
+    с подписью <code>X-Webhook-Secret</code>.
+  </p>
+
+  {% if error_message %}
+    <div class="integrations__error" role="alert">
+      <strong>Ошибка:</strong> {{ error_message | e }}
+    </div>
+  {% endif %}
+
+  {# ---------- Super-admin без выбранной команды ---------- #}
+  {% if session and session.role == 'super_admin' and group_id_param is none %}
+    <div class="integrations-empty" role="status">
+      <h2 class="integrations-empty__title">Выберите команду</h2>
+      <p>
+        Вы вошли как супер-админ. Для просмотра и редактирования webhook'а команды
+        откройте эту страницу с параметром <code>?group_id=&lt;id&gt;</code>.
+      </p>
+      <p>
+        Например: <code>/my/integrations?group_id=1</code>.
+      </p>
+      <p>
+        Список команд: <a href="/admin/groups" class="link">Управление командами</a>.
+      </p>
+    </div>
+
+  {# ---------- Состояние 1: webhook ещё не создан ---------- #}
+  {% elif not webhook %}
+    <div class="integrations-card integrations-card--empty">
+      <h2 class="integrations-card__title">Webhook ещё не настроен</h2>
+      <p class="integrations-card__hint">
+        Введите HTTPS-URL приёмника. Только публичные адреса — локальные
+        (<code>localhost</code>, <code>127.0.0.1</code>, приватные CIDR) запрещены.
+      </p>
+
+      <form
+        method="POST"
+        action="/api/webhooks/me{% if group_id_param %}?group_id={{ group_id_param }}{% endif %}"
+        class="form integrations-form"
+        data-webhook-create-form>
+        {{ m.csrf_input() }}
+        <div class="field">
+          <label class="field__label" for="webhook-url-create">URL приёмника</label>
+          <input
+            class="field__input"
+            type="url"
+            id="webhook-url-create"
+            name="url"
+            required
+            minlength="9"
+            maxlength="2048"
+            pattern="https://.+"
+            placeholder="https://example.com/webhook"
+            autocomplete="off"
+            inputmode="url">
+          <p class="field__hint">Только <code>https://</code>. Максимум 2048 символов.</p>
+        </div>
+        <div class="form-actions">
+          <button type="submit" class="btn btn--primary">+ Создать webhook</button>
+        </div>
+      </form>
+    </div>
+
+  {# ---------- Состояние 2: webhook создан ---------- #}
+  {% else %}
+    {%- set dead = webhook.dead_at is not none -%}
+    {%- set paused = (not dead) and (webhook.consecutive_failures or 0) >= 5 -%}
+    {%- set inactive = not webhook.is_active -%}
+
+    <div class="integrations-card{% if dead %} integrations-card--dead{% endif %}">
+      <header class="integrations-card__header">
+        <h2 class="integrations-card__title">Webhook команды</h2>
+        <div class="integrations-card__status" role="status">
+          {% if dead %}
+            <span class="integrations-badge integrations-badge--dead" title="Webhook помечен мёртвым после 10 неудачных доставок">
+              Помечен мёртвым
+            </span>
+          {% elif inactive %}
+            <span class="integrations-badge integrations-badge--off">Отключён</span>
+          {% elif paused %}
+            <span class="integrations-badge integrations-badge--warn"
+                  title="{{ webhook.consecutive_failures }} последовательных ошибок — на грани отключения">
+              Приостановлен ({{ webhook.consecutive_failures }} ошибок)
+            </span>
+          {% else %}
+            <span class="integrations-badge integrations-badge--ok">Активен</span>
+          {% endif %}
+        </div>
+      </header>
+
+      {% if dead %}
+        <div class="integrations-card__dead" role="alert">
+          <p>
+            <strong>Webhook автоматически отключён</strong> после 10 неудачных доставок подряд.
+            Проверьте URL приёмника и убедитесь, что он отвечает <code>2xx</code> на тестовый запрос,
+            затем нажмите «Возобновить».
+          </p>
+          <form
+            method="POST"
+            action="/api/webhooks/me{% if group_id_param %}?group_id={{ group_id_param }}{% endif %}"
+            class="inline-form"
+            data-webhook-update-form>
+            {{ m.csrf_input() }}
+            <input type="hidden" name="_method" value="PATCH">
+            <input type="hidden" name="is_active" value="true">
+            <input type="hidden" name="is_active_present" value="1">
+            <button type="submit" class="btn btn--primary">Возобновить</button>
+          </form>
+        </div>
+      {% endif %}
+
+      <dl class="integrations-card__meta">
+        <div class="integrations-meta__row">
+          <dt class="integrations-meta__label">URL</dt>
+          <dd class="integrations-meta__value">
+            <code class="integrations-meta__url">{{ webhook.url | e }}</code>
+          </dd>
+        </div>
+        <div class="integrations-meta__row">
+          <dt class="integrations-meta__label">Создан</dt>
+          <dd class="integrations-meta__value">{{ m.time_tag_short(webhook.created_at) }}</dd>
+        </div>
+        <div class="integrations-meta__row">
+          <dt class="integrations-meta__label">Последняя отправка</dt>
+          <dd class="integrations-meta__value">
+            {% if webhook.last_fired_at %}
+              {{ m.time_tag_short(webhook.last_fired_at) }}
+            {% else %}
+              <span class="integrations-meta__muted">никогда</span>
+            {% endif %}
+          </dd>
+        </div>
+        <div class="integrations-meta__row">
+          <dt class="integrations-meta__label">Последовательных ошибок</dt>
+          <dd class="integrations-meta__value">
+            <span class="{% if (webhook.consecutive_failures or 0) > 0 %}integrations-meta__bad{% endif %}">
+              {{ webhook.consecutive_failures or 0 }}
+            </span>
+          </dd>
+        </div>
+        {% if webhook.last_error %}
+        <div class="integrations-meta__row">
+          <dt class="integrations-meta__label">Последняя ошибка</dt>
+          <dd class="integrations-meta__value">
+            <span class="integrations-meta__error" title="{{ webhook.last_error | e }}">
+              {{ webhook.last_error | e }}
+            </span>
+          </dd>
+        </div>
+        {% endif %}
+        {% if dead %}
+        <div class="integrations-meta__row">
+          <dt class="integrations-meta__label">Помечен мёртвым</dt>
+          <dd class="integrations-meta__value">{{ m.time_tag_short(webhook.dead_at) }}</dd>
+        </div>
+        {% endif %}
+      </dl>
+
+      {# ---------- Edit URL ---------- #}
+      <form
+        method="POST"
+        action="/api/webhooks/me{% if group_id_param %}?group_id={{ group_id_param }}{% endif %}"
+        class="form integrations-form integrations-form--inline"
+        data-webhook-update-form>
+        {{ m.csrf_input() }}
+        <input type="hidden" name="_method" value="PATCH">
+        <div class="field">
+          <label class="field__label" for="webhook-url-edit">URL приёмника</label>
+          <input
+            class="field__input"
+            type="url"
+            id="webhook-url-edit"
+            name="url"
+            required
+            minlength="9"
+            maxlength="2048"
+            pattern="https://.+"
+            value="{{ webhook.url | e }}"
+            autocomplete="off"
+            inputmode="url">
+          <p class="field__hint">Смена URL не ротирует secret.</p>
+        </div>
+        <div class="form-actions">
+          <button type="submit" class="btn btn--primary">Сохранить URL</button>
+        </div>
+      </form>
+
+      {# ---------- Toggle active ---------- #}
+      <form
+        method="POST"
+        action="/api/webhooks/me{% if group_id_param %}?group_id={{ group_id_param }}{% endif %}"
+        class="integrations-toggle"
+        data-webhook-toggle-form>
+        {{ m.csrf_input() }}
+        <input type="hidden" name="_method" value="PATCH">
+        {# `is_active_present` lets the backend distinguish "not submitted" from
+           "submitted unchecked" — see backend/app/webhooks/router.py:_form_bool_or_none. #}
+        <input type="hidden" name="is_active_present" value="1">
+        <label class="integrations-toggle__label" for="webhook-active-toggle">
+          <input
+            type="checkbox"
+            class="integrations-toggle__checkbox"
+            id="webhook-active-toggle"
+            name="is_active"
+            value="true"
+            data-webhook-toggle-active
+            {% if webhook.is_active %}checked{% endif %}>
+          <span class="integrations-toggle__text">Включён (диспатчер отправляет события)</span>
+        </label>
+        {# No-JS fallback: form submit-button (hidden when JS is on). #}
+        <noscript>
+          <button type="submit" class="btn btn--secondary btn--small">Применить</button>
+        </noscript>
+      </form>
+
+      {# ---------- Action buttons ---------- #}
+      <div class="integrations-actions">
+        <form
+          method="POST"
+          action="/api/webhooks/me/test{% if group_id_param %}?group_id={{ group_id_param }}{% endif %}"
+          class="inline-form"
+          data-webhook-test-form>
+          {{ m.csrf_input() }}
+          <button type="submit" class="btn btn--secondary">Отправить тест</button>
+        </form>
+
+        <form
+          method="POST"
+          action="/api/webhooks/me/rotate-secret{% if group_id_param %}?group_id={{ group_id_param }}{% endif %}"
+          class="inline-form"
+          data-webhook-rotate-form
+          data-confirm="Сменить secret? Старый секрет немедленно перестанет работать — приёмник нужно будет обновить.">
+          {{ m.csrf_input() }}
+          <button type="submit" class="btn btn--secondary">Сменить secret</button>
+        </form>
+
+        <form
+          method="POST"
+          action="/api/webhooks/me/delete{% if group_id_param %}?group_id={{ group_id_param }}{% endif %}"
+          class="inline-form"
+          data-webhook-delete-form
+          data-confirm="Удалить webhook? Команда перестанет получать события. Все недоставленные записи будут удалены (CASCADE).">
+          {{ m.csrf_input() }}
+          <input type="hidden" name="_method" value="DELETE">
+          <button type="submit" class="btn btn--danger">Удалить webhook</button>
+        </form>
+      </div>
+    </div>
+  {% endif %}
+
+  {# ---------- Secret reveal modal ---------- #}
+  {% if secret_revealed %}
+    <dialog
+      class="dialog integrations-secret-reveal"
+      id="dialog-secret-reveal"
+      data-secret-reveal-dialog
+      data-autoopen="1"
+      aria-labelledby="secret-reveal-title">
+      <h2 class="dialog__title" id="secret-reveal-title">Сохраните секрет</h2>
+      <div class="integrations-secret-reveal__warning" role="alert">
+        Этот секрет показан <strong>один раз</strong>. После закрытия окна получить
+        его повторно нельзя — придётся выполнить ротацию.
+      </div>
+      <label class="field__label" for="secret-reveal-value">Plaintext secret</label>
+      <div class="integrations-secret-reveal__row">
+        <input
+          type="text"
+          id="secret-reveal-value"
+          class="integrations-secret-reveal__input"
+          value="{{ secret_revealed | e }}"
+          readonly
+          spellcheck="false"
+          autocomplete="off"
+          aria-describedby="secret-reveal-help"
+          data-secret-value>
+        <button
+          type="button"
+          class="btn btn--secondary"
+          data-secret-copy>
+          Скопировать
+        </button>
+      </div>
+      <p class="field__hint" id="secret-reveal-help">
+        Передайте этот секрет приёмнику. Мы отправляем его в заголовке
+        <code>X-Webhook-Secret</code> при каждом запросе — приёмник обязан проверять
+        строгое равенство.
+      </p>
+      <form method="dialog" class="form-actions">
+        <button type="submit" class="btn btn--primary" data-secret-reveal-close>
+          Понятно, я сохранил
+        </button>
+      </form>
+    </dialog>
+    {# No-JS fallback: visible card with the secret (the <dialog> above renders
+       inline without a backdrop in browsers that don't support showModal, but
+       it can also be `display:none`. We expose a deterministic visible block
+       so the secret is reachable even without JS or `<dialog>` support. #}
+    <noscript>
+      <div class="integrations-secret-reveal integrations-secret-reveal--fallback" role="alert">
+        <h2 class="dialog__title">Сохраните секрет</h2>
+        <p>Этот секрет показан один раз. Сохраните его сейчас.</p>
+        <pre class="integrations-secret-reveal__pre">{{ secret_revealed | e }}</pre>
+      </div>
+    </noscript>
+  {% endif %}
+</section>
+{% endblock %}
+
+{% block extra_js %}
+<script src="/static/js/integrations.js?v={{ static_v }}"></script>
+{% endblock %}

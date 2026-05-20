@@ -14,7 +14,8 @@ from backend.app.repositories.audit import AuditRepo
 
 # Closed enum from ``docs/03-data-model.md`` table ``admin_audit`` +
 # ADR-0019 §9 (group / role lifecycle actions) +
-# ADR-0022 §1.4 (Telegram SSO + notification lifecycle).
+# ADR-0022 §1.4 (Telegram SSO + notification lifecycle) +
+# ADR-0023 §G (outbound-webhook lifecycle).
 ALLOWED_ACTIONS: Final[frozenset[str]] = frozenset(
     {
         "admin_login",
@@ -35,6 +36,12 @@ ALLOWED_ACTIONS: Final[frozenset[str]] = frozenset(
         "telegram_link_revoked",
         "telegram_link_dead_marked",
         "telegram_link_collision",
+        # ADR-0023 §G — outbound webhook lifecycle.
+        "webhook_created",
+        "webhook_updated",
+        "webhook_deleted",
+        "webhook_secret_rotated",
+        "webhook_dead_marked",
     }
 )
 

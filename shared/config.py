@@ -118,6 +118,25 @@ class Settings(BaseSettings):
     # Per-tick recovery LPUSH batch size.
     TG_NOTIFY_RECOVERY_BATCH_SIZE: int = Field(default=200, ge=1, le=10_000)
 
+    # --- Outbound webhooks dispatcher (ADR-0023 §3 + §5) ------------------
+    # How often ``webhook_dispatch`` drains the Redis queue.
+    WEBHOOK_DISPATCH_INTERVAL_SECONDS: int = Field(default=5, ge=1, le=600)
+    # ``webhook_recovery_scan`` cadence — finds tagged messages without a
+    # successful ``webhook_deliveries`` row in the lookback window.
+    WEBHOOK_RECOVERY_INTERVAL_SECONDS: int = Field(default=3600, ge=60, le=86_400)
+    # Lookback window for the recovery scan.
+    WEBHOOK_RECOVERY_WINDOW_HOURS: int = Field(default=24, ge=1, le=720)
+    # Per-tick LPOP batch size (caps throughput per dispatcher tick).
+    WEBHOOK_BATCH_SIZE: int = Field(default=30, ge=1, le=500)
+    # Per-tick recovery LPUSH batch size.
+    WEBHOOK_RECOVERY_BATCH_SIZE: int = Field(default=200, ge=1, le=10_000)
+    # Total httpx timeout (connect+read+write) for outbound POST.
+    WEBHOOK_HTTP_TIMEOUT_SECONDS: int = Field(default=10, ge=1, le=120)
+    # Mark dead after this many consecutive non-retriable 4xx responses.
+    WEBHOOK_MAX_FAILURES_BEFORE_DEAD: int = Field(default=10, ge=1, le=1000)
+    # POST ``/api/webhooks/me/test`` rate-limit (per webhook, per hour).
+    WEBHOOK_TEST_LIMIT: int = Field(default=10, ge=1, le=1000)
+
     @field_validator("MAIL_ENCRYPTION_KEY")
     @classmethod
     def _validate_master_key(cls, v: str) -> str:

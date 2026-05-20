@@ -40,6 +40,7 @@
 | **Display name (user)** | `users.display_name TEXT NULL` — человекочитаемое имя пользователя для UI (Алиса Иванова). Опционально; UI fallback на `username`. См. [ADR-0019](./adr/ADR-0019-groups-and-roles.md) §2. |
 | **Mail account nickname** | `mail_accounts.display_name TEXT NULL` — короткий ярлык для ящика (например, «Apple Test 1»). Опциональный; UI fallback на `email`. Помогает быстро ориентироваться в общих группах ящиков. См. [ADR-0020](./adr/ADR-0020-mail-account-nickname.md). |
 | **Visibility scope** | dataclass `(user_id, role, group_id)`, инкапсулирующий, какие mail-accounts и messages видит текущий пользователь. Создаётся в FastAPI dependency, пробрасывается в Service-методы для построения SQL WHERE-фильтра. См. [ADR-0019](./adr/ADR-0019-groups-and-roles.md) §7. |
+| **Outbound webhook** | HTTP POST на пользовательский URL команды при появлении нового письма с тегом в любом из её ящиков. Один webhook на группу (`webhooks.group_id UNIQUE`). Auth — static `X-Webhook-Secret` header. Конфигурируется лидером команды; super_admin может создать для любой команды. См. [ADR-0023](./adr/ADR-0023-outbound-webhooks.md). |
 
 ## Принципы
 
@@ -67,5 +68,9 @@
 | Q-001-1 | [ADR-0022](./adr/ADR-0022-telegram-sso-and-notifications.md) §1.4 | Anti-replay set для `init_data` сверх TTL (`tg_seen:{auth_date}:{hash[:8]}` в Redis 5min)? | open — отложено в `100-known-tech-debt.md` (TD-018); реализовать при появлении реального риска. |
 | Q-002-1 | [ADR-0022](./adr/ADR-0022-telegram-sso-and-notifications.md) §2.7 | UI toggle для opt-out push-нотификаций — где разместить (Settings page / admin)? | open — backend endpoint `PATCH /api/me/settings` готов; frontend-агенту решить в следующем sprint. |
 | ~~Q-003-1~~ | [ADR-0022](./adr/ADR-0022-telegram-sso-and-notifications.md) §1.3 | Persistent SSO в `complete_set_password` flow? | closed by ADR-0022 — да, читаем `mas_tg_pending` cookie и создаём линковку. |
+| Q-WH-1 | [ADR-0023](./adr/ADR-0023-outbound-webhooks.md) §2.5 | Двойной secret при rotate (старый valid M минут) для grace-period на receiver-side? | open — отложено в `100-known-tech-debt.md` (TD-019); MVP — instant cut. |
+| Q-WH-2 | [ADR-0023](./adr/ADR-0023-outbound-webhooks.md) «Consequences» | UI для super_admin — список всех webhook'ов всех команд? | open — super_admin использует `?group_id=` per request или psql. Full UI — следующая итерация. |
+| Q-WH-3 | [ADR-0023](./adr/ADR-0023-outbound-webhooks.md) §2.9 | Включать ли список attachments (id, filename, size) в payload (без bytes)? | open — receiver получает через наш API. Если будет запрос — non-breaking add `attachments: [...]`. |
+| ~~Q-WH-4~~ | [ADR-0023](./adr/ADR-0023-outbound-webhooks.md) §4.1 | Обрабатывает ли `mas-cli reencrypt` `webhooks.secret_encrypted`? | closed by ADR-0023 — да, общий `version_byte` механизм; backend-агент добавляет таблицу `webhooks` в список re-encrypt. |
 
-Следующий свободный `NNN`: **004**.
+Следующий свободный `NNN`: **004**. (`Q-WH-*` — domain-specific префикс для webhook'ов, по аналогии с потенциальными доменными префиксами в будущем.)

@@ -20,10 +20,13 @@ erDiagram
     users ||--o| telegram_links : "linked_to (0..1)"
     users ||--o{ telegram_notifications : "received_by"
     users ||--o| users_settings : "has (0..1)"
+    groups ||--o| webhooks : "has outbound (0..1)"
+    webhooks ||--o{ webhook_deliveries : "delivered"
     mail_accounts ||--o{ messages : "stores"
     messages ||--o{ attachments : "has"
     messages ||--o{ message_tags : "tagged_with"
     messages ||--o{ telegram_notifications : "notified_for"
+    messages ||--o{ webhook_deliveries : "webhook_pushed"
     tags ||--o{ tag_rules : "matches_via"
     tags ||--o{ message_tags : "applied_to"
     sent_messages ||--o{ sent_attachments : "has"
@@ -191,6 +194,30 @@ erDiagram
         bigint user_id PK "FK ON DELETE CASCADE"
         boolean tg_notifications_enabled "default true"
         timestamptz updated_at
+    }
+
+    webhooks {
+        bigint id PK
+        bigint group_id FK "UNIQUE; ON DELETE CASCADE"
+        text url "https only; 1..2048"
+        bytea secret_encrypted "AES-GCM, AAD=webhook_id"
+        boolean is_active "default true"
+        int consecutive_failures "default 0"
+        timestamptz dead_at "nullable"
+        timestamptz last_fired_at "nullable"
+        text last_error "nullable; <=500 chars"
+        timestamptz created_at
+        timestamptz updated_at
+    }
+
+    webhook_deliveries {
+        bigint id PK
+        bigint webhook_id FK "ON DELETE CASCADE"
+        bigint message_id FK "ON DELETE CASCADE"
+        timestamptz sent_at "nullable; null=claimed-but-not-completed"
+        int response_code "nullable"
+        text response_excerpt "nullable; <=500 chars"
+        timestamptz created_at
     }
 ```
 
@@ -406,7 +433,7 @@ erDiagram
 | --- | --- | --- | --- |
 | `id` | BIGSERIAL | PK | |
 | `actor_user_id` | BIGINT | NOT NULL | id супер-админа. **БЕЗ FK** (запись должна жить даже если случайно удалили админа из БД; см. seed-логику). |
-| `action` | TEXT | NOT NULL | Enum-string: `admin_login`, `admin_logout`, `create_user`, `reset_password`, `delete_user`, `lockout_triggered`, `account_auto_disabled`, **`group_create`**, **`group_delete`**, **`group_rename`**, **`user_role_change`**, **`user_group_change`** (новые из ADR-0019 §9), **`telegram_link_created`**, **`telegram_link_revoked`**, **`telegram_link_dead_marked`**, **`telegram_link_collision`** (новые из ADR-0022). |
+| `action` | TEXT | NOT NULL | Enum-string: `admin_login`, `admin_logout`, `create_user`, `reset_password`, `delete_user`, `lockout_triggered`, `account_auto_disabled`, **`group_create`**, **`group_delete`**, **`group_rename`**, **`user_role_change`**, **`user_group_change`** (новые из ADR-0019 §9), **`telegram_link_created`**, **`telegram_link_revoked`**, **`telegram_link_dead_marked`**, **`telegram_link_collision`** (новые из ADR-0022), **`webhook_created`**, **`webhook_updated`**, **`webhook_deleted`**, **`webhook_secret_rotated`**, **`webhook_dead_marked`** (новые из ADR-0023). |
 | `target_user_id` | BIGINT | NULL | id затронутого пользователя (для user-actions). |
 | `target_username` | TEXT | NULL | snapshot username на случай delete. |
 | `details` | JSONB | NULL | Произвольная структурированная информация (например, для `account_auto_disabled` — `{mail_account_id, reason}`). |
@@ -561,6 +588,65 @@ Many-to-many линки тегов и сообщений. Создаются wor
 
 ---
 
+### `webhooks`
+
+Источник истины — [ADR-0023](./adr/ADR-0023-outbound-webhooks.md) §1.1. Outbound HTTP-webhook **одна на команду** (`UNIQUE(group_id)`); срабатывает при появлении нового письма с тегом в одном из ящиков команды. Лидер команды настраивает свой webhook (без участия super_admin'а); super_admin может работать с любым через `?group_id=`.
+
+| Колонка | Тип | Constraints | Описание |
+| --- | --- | --- | --- |
+| `id` | BIGSERIAL | PRIMARY KEY | Также используется как AAD-биндинг для `secret_encrypted` (AES-256-GCM, AAD=`b"webhook_secret\|" + str(id)`). |
+| `group_id` | BIGINT | NOT NULL, UNIQUE, FK → `groups(id)` ON DELETE CASCADE | Одна группа — максимум один webhook. CASCADE → при удалении группы webhook + все его `webhook_deliveries` удаляются автоматически (через дополнительный CASCADE на `webhook_deliveries.webhook_id`). |
+| `url` | TEXT | NOT NULL, CHECK length 9..2048, CHECK `url LIKE 'https://%'` | HTTPS only. Лексическая проверка (`https://`) — на уровне БД; SSRF-валидация (запрет приватных CIDR) — на уровне backend (см. `06-security.md` §4). |
+| `secret_encrypted` | BYTEA | NOT NULL | Plaintext secret (`secrets.token_urlsafe(32)`) зашифрован через `MailPasswordCipher` (AES-256-GCM, `version_byte`+IV+CT+tag; ADR-0005) с AAD=`b"webhook_secret\|" + str(webhook.id)`. Расшифровка с другим `webhook_id` → `InvalidTag`. Один-shot-show в API response при создании/ротации. |
+| `is_active` | BOOLEAN | NOT NULL DEFAULT TRUE | Лидер может временно отключить через `PATCH /api/webhooks/me {"is_active": false}`. Диспатчер пропускает inactive (`WHERE is_active=true`). |
+| `consecutive_failures` | INT | NOT NULL DEFAULT 0 | Счётчик подряд идущих non-retriable failures (4xx кроме 408/429). Сбрасывается на 0 при первом 2xx или при `PATCH is_active=true` после dead. |
+| `dead_at` | TIMESTAMPTZ | NULL | `!= NULL` → диспатчер пропускает. Выставляется при: (а) `consecutive_failures >= WEBHOOK_MAX_FAILURES_BEFORE_DEAD=10`; (б) HTTP 410 Gone (немедленно); (в) `InvalidTag` при decrypt secret'а (compromise/key rotation issue). Сбрасывается на NULL через `PATCH is_active=true`. |
+| `last_fired_at` | TIMESTAMPTZ | NULL | Время последнего успешного 2xx (для UI status). |
+| `last_error` | TEXT | NULL | Усечённый до 500 байт текст последней ошибки (`HTTP 500: ...` / `network: TimeoutException` / `consecutive_4xx`). Без секретов; backend гарантирует через redact. |
+| `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | Используется в фильтре «не флудим историей» (`m.internal_date >= w.created_at`) — симметрично round-13 для TG-нотификаций. |
+| `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | Обновляется триггером `BEFORE UPDATE ON webhooks`. |
+
+**Constraints:**
+- `webhooks_url_https_check`: CHECK `url LIKE 'https://%'`.
+- `webhooks_url_length_check`: CHECK `char_length(url) BETWEEN 9 AND 2048` (минимум 9 = длина `https://x`).
+- UNIQUE `(group_id)`.
+
+**Индексы:**
+- `webhooks_active_idx` на `(is_active) WHERE is_active = TRUE` — partial; для диспатчера / recovery_scan (фильтр `is_active`).
+- UNIQUE на `group_id` обслуживает lookup при dispatch (один из шагов SQL §3.2 ADR-0023).
+
+**Триггер:** `BEFORE UPDATE ON webhooks` — `NEW.updated_at = now()`.
+
+**Объём:** ≤ 5 команд × 1 webhook = ≤ 5 строк.
+
+---
+
+### `webhook_deliveries`
+
+Источник истины — [ADR-0023](./adr/ADR-0023-outbound-webhooks.md) §1.2. Реестр доставленных webhook-событий per `(webhook_id, message_id)`. Создаётся диспатчером перед `POST` (`INSERT … ON CONFLICT (webhook_id, message_id) DO NOTHING RETURNING id`); если RETURNING пустой — доставка пропускается (уже было).
+
+| Колонка | Тип | Constraints | Описание |
+| --- | --- | --- | --- |
+| `id` | BIGSERIAL | PRIMARY KEY | Используется как `X-Webhook-Delivery-Id` header в исходящем POST'е (receiver видит для отслеживания). |
+| `webhook_id` | BIGINT | NOT NULL, FK → `webhooks(id)` ON DELETE CASCADE | При удалении webhook'а — всё его реестр доставок уходит. |
+| `message_id` | BIGINT | NOT NULL, FK → `messages(id)` ON DELETE CASCADE | При retention cleanup `messages` (ADR-0011) — реестр доставок чистится автоматически. Симметрично `telegram_notifications`. |
+| `sent_at` | TIMESTAMPTZ | NULL | NULL → row claim'ed диспатчером, но POST ещё не завершён (или провалился до COMMIT с `mark_failed`). `mark_sent` и `mark_failed` оба ставят `sent_at = now()`; `rollback` делает DELETE (для transient ошибок 5xx/408/429/network). |
+| `response_code` | INT | NULL | HTTP-статус от receiver (2xx, 4xx, etc.). NULL если был `rollback` (но при `rollback` row физически удаляется, так что NULL только в окне race до `mark_sent`/`mark_failed`). |
+| `response_excerpt` | TEXT | NULL | Первые 500 байт `resp.text` от receiver. NULL = transient до mark. |
+| `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | |
+
+**Constraints:**
+- UNIQUE `(webhook_id, message_id)` (constraint `webhook_deliveries_unique`) — идемпотентность доставки. Гарантирует, что повторный sync_cycle того же `message_id` не приведёт к double-POST.
+
+**Индексы:**
+- UNIQUE-индекс `(webhook_id, message_id)` — также служит для `try_reserve` SQL.
+- `webhook_deliveries_webhook_id_idx` на `(webhook_id)` — для будущего audit «сколько раз сработал webhook X».
+- `webhook_deliveries_message_id_idx` на `(message_id)` — для recovery_scan LEFT JOIN.
+
+**Объём:** оценка ≤ 5 команд × ≤ 100 ящиков (общий пул) × ~5 писем-с-тегами/день × 30 дней retention = **~75 000 строк max**. С CASCADE от `messages` (retention 30d, ADR-0011) — автоматическая очистка вместе с письмами.
+
+---
+
 ### Заполнение builtin-тегов
 
 Builtin-теги создаются **не через миграцию**, а через **post-login hook** в `auth.AuthService` — при первом успешном login пользователя или завершении set-password flow (см. ADR-0017 §6 и `05-modules.md` модуль `auth`). Реализация — в `backend/app/tags/builtin.py` (статичный список из 4 объектов).
@@ -602,10 +688,11 @@ BUILTIN_TAGS = [
 | Удаление чего | Что каскадно удаляется (Postgres ON DELETE CASCADE) | Что чистится приложением |
 | --- | --- | --- |
 | `users(id)` | `mail_accounts`, `sent_messages`, `sent_attachments`, `messages` (через `mail_accounts → messages → attachments`), `attachments`, `tags`, `tag_rules` (через `tags`), `message_tags` (через `tags` и `messages`), **`telegram_links`** (ADR-0022), **`telegram_notifications`** (ADR-0022), **`users_settings`** (ADR-0022) | Объекты MinIO по префиксу `{user_id}/`; все session keys (Redis); запись в `admin_audit` (action=delete_user). **Защита от удаления лидера** — `groups.leader_user_id ON DELETE RESTRICT` (см. ADR-0019 §3): нельзя удалить user'а, пока он лидер; super-admin сначала удаляет группу. |
-| `mail_accounts(id)` | `messages`, `attachments`, `sent_messages` (FK from_account_id), `message_tags` (через `messages`), **`telegram_notifications`** (через `messages`) | Объекты MinIO по префиксу `{user_id}/{mail_account_id}/` |
-| `messages(id)` (retention) | `attachments`, `message_tags`, **`telegram_notifications`** (ADR-0022) | Объекты MinIO по prefix `{user_id}/{mail_account_id}/{uid}/` |
+| `mail_accounts(id)` | `messages`, `attachments`, `sent_messages` (FK from_account_id), `message_tags` (через `messages`), **`telegram_notifications`** (через `messages`), **`webhook_deliveries`** (через `messages`, ADR-0023) | Объекты MinIO по префиксу `{user_id}/{mail_account_id}/` |
+| `messages(id)` (retention) | `attachments`, `message_tags`, **`telegram_notifications`** (ADR-0022), **`webhook_deliveries`** (ADR-0023) | Объекты MinIO по prefix `{user_id}/{mail_account_id}/{uid}/` |
 | `tags(id)` (user delete tag) | `tag_rules`, `message_tags` | — |
-| `groups(id)` (super-admin delete group) | `users.group_id` → SET NULL (FK ON DELETE SET NULL — см. ADR-0019 §4) | Backend ОБЯЗАН в той же транзакции: проверить, что в группе нет участников (`SELECT 1 FROM users WHERE group_id = :group_id`) и нет лидера (тот же group). Если есть — `400 group_has_members`. Super-admin сначала переназначает участников / переводит лидера, потом удаляет группу. SET NULL остаётся как safety-net для прямого DDL обхода. |
+| `groups(id)` (super-admin delete group) | `users.group_id` → SET NULL (FK ON DELETE SET NULL — см. ADR-0019 §4), **`webhooks`** (FK ON DELETE CASCADE, ADR-0023) → каскадно **`webhook_deliveries`** | Backend ОБЯЗАН в той же транзакции: проверить, что в группе нет участников (`SELECT 1 FROM users WHERE group_id = :group_id`) и нет лидера (тот же group). Если есть — `400 group_has_members`. Super-admin сначала переназначает участников / переводит лидера, потом удаляет группу. SET NULL для `users.group_id` остаётся как safety-net для прямого DDL обхода. Webhook каскад намеренно `CASCADE` (а не `RESTRICT`) — webhook привязан к группе, а не к её участникам; удаление группы должно унести и её исходящий канал. |
+| `webhooks(id)` (DELETE /api/webhooks/me) | **`webhook_deliveries`** (FK ON DELETE CASCADE, ADR-0023) | — |
 
 Приложение перед каждым DELETE собирает список s3_key заранее (одним SELECT) и удаляет объекты MinIO, потом DELETE из БД. Транзакционности между MinIO и Postgres нет; в случае сбоя возможны "осиротевшие" объекты — это допустимо (cleanup `orphan_scan` в backlog).
 
@@ -681,3 +768,10 @@ BUILTIN_TAGS = [
      - `telegram_links` — после первого успешного `POST /api/telegram/auth` + login flow.
      - `telegram_notifications` — после первого письма с тегами у user'а с активной `telegram_links` записью.
      - `users_settings` — после первого `PATCH /api/me/settings`.
+- **Миграция `005_outbound_webhooks`** (ADR-0023):
+  1. `CREATE TABLE webhooks` (DDL — см. секцию `webhooks` выше) + CHECK-constraints (`https://` + length 9..2048) + partial index `webhooks_active_idx` + триггер `BEFORE UPDATE`.
+  2. `CREATE TABLE webhook_deliveries` (DDL — см. секцию `webhook_deliveries` выше) + UNIQUE `(webhook_id, message_id)` + два индекса.
+  3. Никакой data-миграции — обе таблицы стартуют пустыми. Первые записи появятся:
+     - `webhooks` — после первого `POST /api/webhooks/me` от лидера команды (или super_admin'а).
+     - `webhook_deliveries` — после первого письма с тегом в команде, где настроен webhook (триггер симметричен ADR-0022, см. `worker.sync_cycle.save_message`).
+  4. Backend-агент дополнительно расширяет `ALLOWED_ACTIONS` в `backend/app/audit/service.py` на 5 новых action'ов: `webhook_created`, `webhook_updated`, `webhook_deleted`, `webhook_secret_rotated`, `webhook_dead_marked` (см. таблицу `admin_audit` выше).

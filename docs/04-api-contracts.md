@@ -75,6 +75,8 @@
 | 403 | `user_not_in_group_scope` | Лидер пытается выполнить действие на пользователя/аккаунт вне своей группы. |
 | 401 | `invalid_init_data` | `POST /api/telegram/auth`: HMAC-подпись Telegram `init_data` некорректна. См. [ADR-0022](./adr/ADR-0022-telegram-sso-and-notifications.md) §1.2. |
 | 401 | `init_data_expired` | `POST /api/telegram/auth`: `auth_date` в `init_data` старше 5 минут. |
+| 400 | `webhook_url_private_ip` | `POST/PATCH /api/webhooks/me`: URL резолвится в приватный CIDR / localhost. SSRF-защита. См. [ADR-0023](./adr/ADR-0023-outbound-webhooks.md) §4.3. |
+| 409 | `webhook_already_exists` | `POST /api/webhooks/me`: у группы уже есть webhook (`UNIQUE(group_id)`). Используется `PATCH` для update или `DELETE` + `POST` для пересоздания. |
 
 ---
 
@@ -106,6 +108,11 @@
 | `PATCH /api/admin/groups/{id}` (rename) | `POST /api/admin/groups/{id}` + form-поле `_method=PATCH` |
 | `DELETE /api/admin/groups/{id}` | `POST /api/admin/groups/{id}/delete` + form-поле `_method=DELETE` |
 | `PATCH /api/admin/users/{id}` (role/group/display_name) | `POST /api/admin/users/{id}` + form-поле `_method=PATCH` |
+| `POST /api/webhooks/me` (create) | (тот же путь и метод) |
+| `PATCH /api/webhooks/me` (edit) | `POST /api/webhooks/me` + form-поле `_method=PATCH` |
+| `DELETE /api/webhooks/me` | `POST /api/webhooks/me/delete` + form-поле `_method=DELETE` |
+| `POST /api/webhooks/me/rotate-secret` | (тот же путь и метод) |
+| `POST /api/webhooks/me/test` | (тот же путь и метод) |
 
 Любые остальные роуты не принимают `_method` — `POST` с этим полем на не-whitelist-роуте даёт `400 method_override_not_allowed`.
 
@@ -149,6 +156,11 @@ CSRF-проверка для override-запросов **обязательна*
 | `PATCH /api/admin/groups/{id}` | `/admin/groups` | "Группа переименована" |
 | `DELETE /api/admin/groups/{id}` | `/admin/groups` | "Группа удалена" |
 | `PATCH /api/admin/users/{id}` | `/admin` | "Пользователь обновлён" |
+| `POST /api/webhooks/me` | `/my/integrations` | "Webhook создан" + one-shot flash `[secret_reveal]` с plaintext |
+| `PATCH /api/webhooks/me` | `/my/integrations` | "Webhook обновлён" |
+| `DELETE /api/webhooks/me` | `/my/integrations` | "Webhook удалён" |
+| `POST /api/webhooks/me/rotate-secret` | `/my/integrations` | one-shot flash `[secret_reveal]` с новым plaintext |
+| `POST /api/webhooks/me/test` | `/my/integrations` | "Тест выполнен: HTTP {code}, {duration_ms} мс" |
 
 ### Multi-value поля (form-encoded)
 
@@ -826,6 +838,246 @@ curl -F "url=https://postapp.store/api/telegram/webhook/${TELEGRAM_WEBHOOK_SECRE
 
 ---
 
+## 4b. Outbound webhooks (ADR-0023)
+
+Источник истины — [ADR-0023](./adr/ADR-0023-outbound-webhooks.md). Outbound HTTP-webhook одна на команду (`UNIQUE(group_id)`). Триггер — письма с тегами в любом из ящиков команды (фильтр `m.internal_date >= w.created_at`, симметричный TG-нотификациям). Auth — static `X-Webhook-Secret` header. Доставка через worker (см. `05-modules.md` модуль 19 + 14.2).
+
+### Авторизация всех endpoint'ов
+
+- `group_leader` — управляет webhook'ом своей группы (`scope.group_id`). Передача `?group_id=` **запрещена** (если попытается — `400 validation_error` `field=group_id`).
+- `super_admin` — управляет webhook'ом любой группы; **обязан** передать `?group_id=<id>` в каждом запросе.
+- `group_member` — `403 forbidden` на всех endpoint'ах.
+
+Все state-changing endpoints — под CSRF (ADR-0010).
+
+### `GET /my/integrations`
+
+| | |
+| --- | --- |
+| Доступ | `group_leader` или `super_admin`. Group_member → `302 /` (без права видеть). |
+| 200 | HTML render `templates/my/integrations.html`: URL input, статус (last_fired_at, last_error, consecutive_failures, dead-indicator), кнопки Save / Rotate / Test / Delete. |
+| Note | Server-side flash-сообщения категории `secret_reveal` показываются один раз после `POST /api/webhooks/me` или `POST /api/webhooks/me/rotate-secret` (one-shot). |
+
+### `GET /api/webhooks/me`
+
+| | |
+| --- | --- |
+| Query | `group_id?: int` — обязателен для super_admin; для group_leader запрещён. |
+| 200 | `{id, group_id, url, is_active, last_fired_at, last_error, dead_at, consecutive_failures, created_at, updated_at}` — **БЕЗ `secret`**. |
+| 404 | `not_found` — у группы webhook не настроен. |
+| 403 | `forbidden`. |
+
+### `POST /api/webhooks/me`
+
+| | |
+| --- | --- |
+| Запрос | JSON `{url: str}` (1..2048, `https://`); либо form-encoded (см. ниже). |
+| Query | `group_id?: int` — для super_admin. |
+| Валидация | URL `https://...`; max 2048; lexical reject `https://localhost\|127.0.0.1\|0.0.0.0\|[::1]`; DNS-резолв всех A/AAAA — запрет приватных CIDR (см. `06-security.md` §4); HTTP/2 unsupported — не критично, httpx auto-fallback. |
+| Поведение | Backend: (1) `secret_plaintext = secrets.token_urlsafe(32)`; (2) `nextval('webhooks_id_seq')` → `webhook_id`; (3) `secret_encrypted = encrypt_webhook_secret(secret_plaintext, webhook_id)` (AAD=webhook_id); (4) INSERT с явным id. |
+| Rate-limit | 10/час per `group_id`. |
+| 201 | `{id, group_id, url, secret: "<plaintext>", is_active: true, last_fired_at: null, last_error: null, dead_at: null, consecutive_failures: 0, created_at, updated_at}` — **`secret` показан ОДИН РАЗ**. |
+| 409 | `webhook_already_exists` (UNIQUE `group_id`). |
+| 400 | `validation_error` / `webhook_url_private_ip`. |
+| 403 | `forbidden`. |
+| Audit | `webhook_created` (`details = {group_id, webhook_id, url}`). |
+
+Sample request (JSON):
+```http
+POST /api/webhooks/me HTTP/1.1
+Content-Type: application/json
+Cookie: mas_session=...; mas_csrf=...
+X-CSRF-Token: ...
+
+{"url": "https://hooks.example.com/incoming/abc"}
+```
+
+Sample response:
+```json
+HTTP/1.1 201 Created
+Content-Type: application/json
+
+{
+  "id": 7,
+  "group_id": 5,
+  "url": "https://hooks.example.com/incoming/abc",
+  "secret": "Rt9_fJ-2kV...44chars",
+  "is_active": true,
+  "last_fired_at": null,
+  "last_error": null,
+  "dead_at": null,
+  "consecutive_failures": 0,
+  "created_at": "2026-05-20T12:00:00Z",
+  "updated_at": "2026-05-20T12:00:00Z"
+}
+```
+
+##### Form-encoded request (no-JS)
+```
+POST /api/webhooks/me HTTP/1.1
+Content-Type: application/x-www-form-urlencoded
+Cookie: mas_session=...; mas_csrf=...
+
+url=https%3A%2F%2Fhooks.example.com%2Fincoming%2Fabc&csrf_token=...
+```
+
+##### Form-encoded response
+- Success: `303 See Other`, `Location: /my/integrations`, flash `[secret_reveal]` = `"Сохраните секрет: <plaintext>"` (one-shot, после next GET очищается).
+- Validation error: re-render `my/integrations.html` с error-context.
+
+### `PATCH /api/webhooks/me`
+
+| | |
+| --- | --- |
+| Запрос | JSON `{url?: str, is_active?: bool}` (любое подмножество). |
+| Query | `group_id?: int` для super_admin. |
+| Поведение | (a) `url` — та же валидация. Смена URL не ротирует secret. (b) `is_active=true` после dead → `dead_at=NULL, consecutive_failures=0, last_error=NULL`. (c) `is_active=false` — диспатчер пропускает. |
+| Rate-limit | 30/час per `webhook_id`. |
+| 200 | объект как в `GET` (без secret). |
+| 400 | `validation_error` / `webhook_url_private_ip`. |
+| 404 | `not_found`. |
+| 403 | `forbidden`. |
+| Audit | `webhook_updated` (`details = {webhook_id, changed_fields: [...], previous_dead_at: ts\|null}`). |
+
+##### Form-encoded request (no-JS) — через method override:
+```
+POST /api/webhooks/me HTTP/1.1
+Content-Type: application/x-www-form-urlencoded
+
+_method=PATCH&url=https%3A%2F%2Fhooks.example.com%2Fv2&csrf_token=...
+```
+(чекбокс `is_active`: `on`/`true`/`1` → true; отсутствие — backend интерпретирует как «не менять», т.к. это PATCH с подмножеством полей. Чтобы явно установить false — отдельная hidden-форма `is_active=0`/`is_active=false`.)
+
+##### Form-encoded response
+- Success: `303`, `Location: /my/integrations`, flash="Webhook обновлён".
+
+### `DELETE /api/webhooks/me`
+
+| | |
+| --- | --- |
+| Query | `group_id?: int` для super_admin. |
+| Поведение | `DELETE FROM webhooks WHERE id=:wid` → CASCADE удалит `webhook_deliveries`. In-flight dispatch завершается естественно (диспатчер при следующем `dispatch_one_payload` не найдёт webhook'а — `recipient is None` → return). |
+| Rate-limit | 10/час per `webhook_id`. |
+| 204 | success. |
+| 404 | `not_found`. |
+| 403 | `forbidden`. |
+| Audit | `webhook_deleted` (`details = {webhook_id, group_id, url}`). |
+
+##### Form-encoded request (no-JS) — через sibling-роут:
+```
+POST /api/webhooks/me/delete HTTP/1.1
+Content-Type: application/x-www-form-urlencoded
+
+_method=DELETE&csrf_token=...
+```
+
+##### Form-encoded response
+- Success: `303`, `Location: /my/integrations`, flash="Webhook удалён".
+
+### `POST /api/webhooks/me/rotate-secret`
+
+| | |
+| --- | --- |
+| Запрос | пустое тело + CSRF. |
+| Query | `group_id?: int` для super_admin. |
+| Поведение | (1) Новый `secret_plaintext = secrets.token_urlsafe(32)`; (2) шифрование с тем же `webhook_id` AAD; (3) UPDATE `secret_encrypted = <new>, updated_at = now()`. Старый secret немедленно недействителен. |
+| Rate-limit | 5/час per `webhook_id`. |
+| 200 | `{id, group_id, url, secret: "<new-plaintext>", is_active, ...}` — secret one-time-show. |
+| 404 | `not_found`. |
+| 403 | `forbidden`. |
+| Audit | `webhook_secret_rotated` (`details = {webhook_id}`). |
+
+##### Form-encoded
+- Request: `POST /api/webhooks/me/rotate-secret`, form-body `csrf_token=...`.
+- Success response: `303 See Other`, `Location: /my/integrations`, flash `[secret_reveal]` с новым plaintext.
+
+### `POST /api/webhooks/me/test`
+
+| | |
+| --- | --- |
+| Запрос | пустое тело + CSRF. |
+| Query | `group_id?: int` для super_admin. |
+| Поведение | Синхронно (внутри request) делает один POST на webhook URL с фиксированным payload `event="test"`. **НЕ** пишет `webhook_deliveries`; **НЕ** трогает `consecutive_failures`/`dead_at`/`last_error`. Это диагностика. |
+| Rate-limit | 10/час per `webhook_id` (env `WEBHOOK_TEST_LIMIT`). |
+| 200 | `{response_code: int, response_excerpt: str, duration_ms: int}` — даже при receiver 5xx (это диагностика). |
+| 502 | `upstream_error` — DNS-резолв fail / timeout 10s / network unreachable. `details: {reason}`. |
+| 404 | `not_found`. |
+| 403 | `forbidden`. |
+| 429 | `rate_limited` + `Retry-After`. |
+
+Sample test-payload (исходящий POST от нас → receiver):
+```json
+{
+  "event": "test",
+  "timestamp": "2026-05-20T12:00:00.000Z",
+  "webhook_id": 7,
+  "team": {"id": 5, "name": "Команда A"}
+}
+```
+
+##### Form-encoded request:
+```
+POST /api/webhooks/me/test HTTP/1.1
+Content-Type: application/x-www-form-urlencoded
+
+csrf_token=...
+```
+
+##### Form-encoded response
+- Success: `303`, `Location: /my/integrations`, flash="Тест выполнен: HTTP {response_code}, {duration_ms} мс".
+- Upstream error: re-render с flash-error.
+
+### Исходящий POST (от нас → target webhook) при `event="message_tagged"`
+
+| Заголовок | Значение |
+| --- | --- |
+| `Content-Type` | `application/json; charset=utf-8` |
+| `X-Webhook-Secret` | `<plaintext-secret>` (расшифровка `secret_encrypted` с AAD=`webhook_id`) |
+| `User-Agent` | `mas-webhook/1.0` |
+| `X-Webhook-Event` | `message_tagged` или `test` |
+| `X-Webhook-Delivery-Id` | `<webhook_deliveries.id>` (для `message_tagged`) |
+
+`httpx.AsyncClient(timeout=10.0, follow_redirects=False)`. 3xx трактуются как failed (см. ADR-0023 §4.3 SSRF / redirect-policy).
+
+Payload (`event="message_tagged"`):
+```json
+{
+  "event": "message_tagged",
+  "timestamp": "2026-05-20T12:00:00.000Z",
+  "webhook_id": 7,
+  "team": {"id": 5, "name": "Команда A"},
+  "message": {
+    "id": 12345,
+    "internal_date": "2026-05-20T11:55:00Z",
+    "from_addr": "sender@example.com",
+    "from_name": "Sender Name",
+    "subject": "Тема письма",
+    "body_text": "Plain-text content, truncated to first 16384 chars",
+    "body_truncated": false,
+    "mail_account": {
+      "id": 7,
+      "email": "support@example.com",
+      "display_name": "Support"
+    },
+    "tags": [
+      {"id": 7, "name": "Urgent", "color": "#dc2626"}
+    ]
+  }
+}
+```
+
+`tags[]` агрегируется по **всей команде** (DISTINCT теги всех users группы на этом сообщении; super_admin теги тоже учитываются — см. ADR-0023 §3.2 SQL). Один webhook = один POST = одна команда. Attachments **не включаются** в payload (receiver получает через наш API). `body_text` truncated до 16 KiB.
+
+### Связанные изменения flow
+
+| Endpoint | Изменение от base-логики |
+| --- | --- |
+| `DELETE /api/admin/groups/{id}` (ADR-0019) | Каскад: `webhooks` (FK ON DELETE CASCADE) → каскадно `webhook_deliveries`. Отдельный audit `webhook_deleted` **не** пишется — каскад покрыт `group_delete` (симметрично `telegram_links` каскаду при `delete_user`). |
+| `DELETE /api/admin/users/{id}` | **Не** трогает webhook'и (они привязаны к группе, не user'у). При удалении лидера, у которого `consecutive_failures > 0`, статус webhook'а сохраняется — после переназначения лидера новый лидер видит state как-есть. |
+| Sync_cycle COMMIT с `applied_count > 0` | Параллельно с TG-блоком (см. ADR-0022 §2.1) выполняется аналогичный try/except LPUSH в `webhook_dispatch_queue`. Падение LPUSH не валит sync_cycle. См. ADR-0023 §3.1 + `05-modules.md` модуль 14. |
+
+---
+
 ## 5. Health & ops
 
 ### `GET /healthz`
@@ -931,5 +1183,13 @@ FastAPI автогенерит OpenAPI 3.1. UI:
 | POST | `/api/telegram/webhook/{secret}` | secret in URL + header | exempt | 60/min per IP | — | Telegram bot webhook (launcher only — `/start` отдаёт WebApp button); см. ADR-0018 |
 | POST | `/api/telegram/auth` | initData HMAC | exempt | 30/min per IP + 10/min per tg_user_id | — | Persistent SSO: validate Telegram WebApp initData, выпустить session либо pending-cookie; см. ADR-0022 |
 | PATCH | `/api/me/settings` | user | yes | — | — | user preferences (tg_notifications_enabled); см. ADR-0022 |
+| GET | `/my/integrations` | group_leader \| super_admin | — | — | — | webhook config page (ADR-0023) |
+| GET | `/api/webhooks/me` | group_leader \| super_admin | — | — | — | get webhook config (no secret) |
+| POST | `/api/webhooks/me` | group_leader \| super_admin | yes | 10/h per group | yes | create webhook + one-shot secret reveal |
+| PATCH | `/api/webhooks/me` | group_leader \| super_admin | yes | 30/h per webhook | yes | update url / is_active; через override |
+| DELETE | `/api/webhooks/me` | group_leader \| super_admin | yes | 10/h per webhook | yes | delete (canonical) |
+| POST | `/api/webhooks/me/delete` | group_leader \| super_admin | yes | 10/h per webhook | yes | form-fallback delete (`_method=DELETE`) |
+| POST | `/api/webhooks/me/rotate-secret` | group_leader \| super_admin | yes | 5/h per webhook | yes | rotate secret + reveal one-shot |
+| POST | `/api/webhooks/me/test` | group_leader \| super_admin | yes | 10/h per webhook | yes | synchronous test POST to receiver |
 | GET | `/healthz` | none | — | — | — | liveness |
 | GET | `/readyz` | none | — | — | — | readiness |

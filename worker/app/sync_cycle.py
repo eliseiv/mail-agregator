@@ -327,6 +327,26 @@ async def sync_one_account(
                 count=len(notified_message_ids),
             )
 
+        # ADR-0023 §3.1: enqueue outbound-webhook deliveries for the same
+        # message_ids. Independent try/except — a webhook-enqueue failure
+        # must not affect the TG channel and vice versa.
+        try:
+            from backend.app.webhooks.dispatch_service import WebhookDispatchService
+
+            async with make_session() as s:
+                pushed = await WebhookDispatchService(s).enqueue_message_ids(notified_message_ids)
+            cycle_log.info(
+                "webhook_enqueued",
+                count=pushed,
+                mail_account_id=account.id,
+            )
+        except Exception as exc:
+            cycle_log.warning(
+                "webhook_enqueue_failed",
+                detail=str(exc)[:200],
+                count=len(notified_message_ids),
+            )
+
     cycle_log.info(
         "sync_account_finish",
         new_messages=new_count,
