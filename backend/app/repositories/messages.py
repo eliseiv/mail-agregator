@@ -206,14 +206,11 @@ class MessagesRepo:
         else:
             # Own tags OR tags of any team-member.
             stmt = select(
-                exists()
-                .where(
+                exists().where(
                     Tag.id == tag_id,
                     or_(
                         Tag.user_id == user_id,
-                        Tag.user_id.in_(
-                            select(User.id).where(User.group_id == user_group_id)
-                        ),
+                        Tag.user_id.in_(select(User.id).where(User.group_id == user_group_id)),
                     ),
                 )
             )
