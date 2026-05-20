@@ -217,7 +217,20 @@ class MessageService:
         assert owner_user is not None
         atts_map = await self._repo.list_attachments_bulk([msg.id])
         atts: list[Attachment] = atts_map.get(msg.id, [])
-        tags = await self._tags.list_for_message(msg.id)
+        # Round-21 (bug #2): mirror the list_for_scope dedup so the admin
+        # message detail (and any downstream consumer of MessageDetail.tags)
+        # gets one chip per (name, color). Round-15 auto-tagging creates a
+        # sibling ``tags`` row per team-member of the mailbox owner, so the
+        # raw repo result lists the same logical tag N times.
+        raw_tags = await self._tags.list_for_message(msg.id)
+        seen_tag_keys: set[tuple[str, str]] = set()
+        tags: list[Tag] = []
+        for t in raw_tags:
+            key = (t.name, t.color)
+            if key in seen_tag_keys:
+                continue
+            seen_tag_keys.add(key)
+            tags.append(t)
         return MessageDetail(
             id=msg.id,
             mail_account_id=msg.mail_account_id,

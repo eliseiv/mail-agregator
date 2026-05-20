@@ -228,7 +228,17 @@ class TelegramNotifyService:
             # someone deleted the tags between the two queries. Skip
             # silently rather than send a notification with no context.
             return
-        tag_names = [t.name for t in message_tags]
+        # Round-21 (bug #2): collapse sibling tags by (name, color) — the
+        # auto-tagging worker creates one ``tags`` row per team-member,
+        # but the notification text should show each logical tag once.
+        seen_tag_keys: set[tuple[str, str]] = set()
+        tag_names: list[str] = []
+        for t in message_tags:
+            key = (t.name, t.color)
+            if key in seen_tag_keys:
+                continue
+            seen_tag_keys.add(key)
+            tag_names.append(t.name)
 
         acc_label = account.display_name or account.email
         from_label = message.from_name or message.from_addr

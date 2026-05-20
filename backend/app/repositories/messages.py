@@ -80,12 +80,20 @@ class MessagesRepo:
         if account_id is not None:
             stmt = stmt.where(Message.mail_account_id == account_id)
         if tag_id is not None:
-            stmt = stmt.join(
-                MessageTag,
-                and_(
-                    MessageTag.message_id == Message.id,
-                    MessageTag.tag_id == tag_id,
-                ),
+            # Round-21 (bug #1): the cascade-dropdown collapses tags by
+            # (name, color) but the worker creates one ``tags`` row per
+            # team-member (auto-tagging applies team-wide). Filtering by a
+            # single ``tag.id`` would miss messages tagged via a sibling
+            # row of another team-member, leaving the Inbox empty. We
+            # therefore widen the filter to "any tag whose (name, color)
+            # equals the selected tag's (name, color)" — the cascade
+            # dropdown contract.
+            name_sub = select(Tag.name).where(Tag.id == tag_id).scalar_subquery()
+            color_sub = select(Tag.color).where(Tag.id == tag_id).scalar_subquery()
+            stmt = (
+                stmt.join(MessageTag, MessageTag.message_id == Message.id)
+                .join(Tag, Tag.id == MessageTag.tag_id)
+                .where(Tag.name == name_sub, Tag.color == color_sub)
             )
         if unread is True:
             stmt = stmt.where(Message.is_read.is_(False))
@@ -102,6 +110,11 @@ class MessagesRepo:
                     ),
                 )
             )
+        # The (name, color) widening may join multiple message_tags rows per
+        # message (one per team-member's sibling tag); collapse via DISTINCT
+        # so the inbox keeps one item per ``messages.id``.
+        if tag_id is not None:
+            stmt = stmt.distinct()
         stmt = stmt.order_by(Message.internal_date.desc(), Message.id.desc()).limit(limit)
         rows = (await self._s.execute(stmt)).all()
         return [(row[0], row[1]) for row in rows]
@@ -135,12 +148,17 @@ class MessagesRepo:
         if account_id is not None:
             stmt = stmt.where(Message.mail_account_id == account_id)
         if tag_id is not None:
-            stmt = stmt.join(
-                MessageTag,
-                and_(
-                    MessageTag.message_id == Message.id,
-                    MessageTag.tag_id == tag_id,
-                ),
+            # Round-21 (bug #1): widen by (name, color) of ``tag_id`` so the
+            # filter catches the team-member sibling tags created by the
+            # team-wide auto-tagging. See :meth:`list_for_user` for the
+            # detailed rationale and the cascade-dropdown contract this
+            # mirrors.
+            name_sub = select(Tag.name).where(Tag.id == tag_id).scalar_subquery()
+            color_sub = select(Tag.color).where(Tag.id == tag_id).scalar_subquery()
+            stmt = (
+                stmt.join(MessageTag, MessageTag.message_id == Message.id)
+                .join(Tag, Tag.id == MessageTag.tag_id)
+                .where(Tag.name == name_sub, Tag.color == color_sub)
             )
         if unread is True:
             stmt = stmt.where(Message.is_read.is_(False))
@@ -156,6 +174,11 @@ class MessagesRepo:
                     ),
                 )
             )
+        # See :meth:`list_for_user`: the widened tag join can fan messages
+        # out across multiple sibling tag rows; DISTINCT keeps one row per
+        # ``messages.id``.
+        if tag_id is not None:
+            stmt = stmt.distinct()
         stmt = stmt.order_by(Message.internal_date.desc(), Message.id.desc()).limit(limit)
         rows = (await self._s.execute(stmt)).all()
         return [(row[0], row[1]) for row in rows]

@@ -39,9 +39,12 @@
           <a class="topnav__link" href="/accounts">Почты</a>
           <a class="topnav__link" href="/tags">Теги</a>
           {% if request.state.session.role == 'super_admin' %}
+            {# Round-21 (bug #4): super_admin nav no longer surfaces
+               "Интеграции" — the page itself remains reachable via the
+               direct URL for debugging, but day-to-day super_admin work
+               is purely administrative. #}
             <a class="topnav__link" href="/admin">Пользователи</a>
             <a class="topnav__link" href="/admin/groups">Команды</a>
-            <a class="topnav__link" href="/my/integrations">Интеграции</a>
           {% elif request.state.session.role == 'group_leader' %}
             <a class="topnav__link" href="/my/members">Участники</a>
             <a class="topnav__link" href="/admin/groups">Моя команда</a>
@@ -101,15 +104,12 @@
         <span class="bottom-nav__label">Теги</span>
       </a>
       {% if request.state.session.role == 'super_admin' %}
+      {# Round-21 (bug #4): same removal as topnav — super_admin's bottom
+         nav is admin-only; "Интеграции" stays accessible by URL only. #}
       <a href="/admin"
          class="bottom-nav__item{% if request.url.path.startswith('/admin') %} bottom-nav__item--active{% endif %}"
          {% if request.url.path.startswith('/admin') %}aria-current="page"{% endif %}>
         <span class="bottom-nav__label">Админ</span>
-      </a>
-      <a href="/my/integrations"
-         class="bottom-nav__item{% if request.url.path.startswith('/my/integrations') %} bottom-nav__item--active{% endif %}"
-         {% if request.url.path.startswith('/my/integrations') %}aria-current="page"{% endif %}>
-        <span class="bottom-nav__label">Интеграции</span>
       </a>
       {% elif request.state.session.role == 'group_leader' %}
       <a href="/my/members"
