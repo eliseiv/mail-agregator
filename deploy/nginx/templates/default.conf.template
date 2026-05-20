@@ -87,10 +87,31 @@ server {
         try_files $uri =404;
     }
 
+    # ---- Dynamic upstream re-resolution -----------------------------------
+    # Default nginx behaviour resolves a ``proxy_pass`` hostname ONCE at
+    # config-load time. When the ``api`` container is recreated during
+    # deploy it gets a new IP on the docker network, and nginx keeps
+    # talking to the old (now dead) IP → ``502 Bad Gateway`` until somebody
+    # ``nginx -s reload``s manually.
+    #
+    # Fix: assign the upstream URL to a ``set $var`` and use the variable
+    # in ``proxy_pass``. With a variable nginx re-resolves the hostname
+    # at request time, honouring the per-location resolver's TTL.
+    # ``127.0.0.11`` is the embedded docker DNS — visible to every
+    # container on user-defined bridge networks. ``valid=10s`` caps the
+    # re-resolve cost; ``ipv6=off`` avoids the AAAA lookup we don't use.
+    # We declare the docker resolver per-location (NOT at server level) so
+    # the OCSP stapling resolver above (1.1.1.1 + 8.8.8.8) is preserved.
+    # See nginx ticket #1011 and docs/07-deployment.md sec.6.
+    set $mas_upstream       http://api:8080;
+
     # Static assets — slightly longer browser cache. Backend serves them
     # from /static/* through the same FastAPI process, so we still proxy.
     location ^~ /static/ {
-        proxy_pass               http://api:8080;
+        resolver                127.0.0.11 valid=10s ipv6=off;
+        resolver_timeout        2s;
+
+        proxy_pass               $mas_upstream;
         proxy_set_header Host    $host;
         proxy_set_header X-Real-IP        $remote_addr;
         proxy_set_header X-Forwarded-For  $proxy_add_x_forwarded_for;
@@ -106,7 +127,10 @@ server {
 
     # Everything else — reverse-proxy to the api container on the docker net.
     location / {
-        proxy_pass               http://api:8080;
+        resolver                127.0.0.11 valid=10s ipv6=off;
+        resolver_timeout        2s;
+
+        proxy_pass               $mas_upstream;
 
         # X-Forwarded-* headers — the app reads these for cookie Secure
         # decisions, audit-log client IP, and absolute-URL building.
