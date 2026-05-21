@@ -150,6 +150,21 @@ jobs:
           # Recreate exactly the services that ship our code.
           docker compose --profile prod up -d --remove-orphans api worker
 
+          # Recreate nginx AFTER api/worker so two things happen, fixing the
+          # recurring "502 Bad Gateway after deploy" for good:
+          #   1. nginx re-renders default.conf from the template at start
+          #      (envsubst only runs on container start) — picking up the
+          #      per-request resolver added in deploy/nginx/templates.
+          #   2. nginx re-resolves the api container's brand-new IP. Without
+          #      this, nginx keeps proxying to the previous (now-dead) api IP
+          #      because the api container was just recreated above.
+          # --force-recreate guarantees the restart even though the nginx
+          # image/env didn't change (compose otherwise skips it). The blip is
+          # well under a second; once the resolver-enabled config is live,
+          # future api recreations no longer need this — but we keep it as a
+          # belt-and-braces step that is cheap and idempotent.
+          docker compose --profile prod up -d --force-recreate nginx
+
           # Smoke-test: poll healthcheck for up to 90s.
           attempts=18
           until docker inspect --format='{{.State.Health.Status}}' mas-api 2>/dev/null | grep -q healthy; do
