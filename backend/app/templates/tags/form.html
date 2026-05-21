@@ -110,12 +110,36 @@
       </div>
     </fieldset>
 
+    {# Match mode: how the tag's rules combine. Submitted with the main form
+       (create POST and edit PATCH both read ``match_mode`` — tags/router.py).
+       Default ``any``. ``form.match_mode`` is always present in context. #}
+    <fieldset class="form-section">
+      <legend class="form-section__legend">Когда ставить тег</legend>
+      <div class="radio-group">
+        <label class="radio">
+          <input type="radio" name="match_mode" value="any"
+                 {% if (form.match_mode if form is defined else 'any') == 'any' %}checked{% endif %}>
+          <span>Любое из правил (достаточно одного совпадения)</span>
+        </label>
+        <label class="radio">
+          <input type="radio" name="match_mode" value="all"
+                 {% if (form.match_mode if form is defined else 'any') == 'all' %}checked{% endif %}>
+          <span>Все правила (тег ставится только если совпали все условия)</span>
+        </label>
+      </div>
+      <p class="field__hint">
+        «Любое» — например тег с правилами «DPLA» и «PLA» сработает на любое из слов.
+        «Все» — например тег с правилами «cancel» и «subscription» сработает только
+        если в письме есть оба слова.
+      </p>
+    </fieldset>
+
     {% if not is_edit %}
       {# Initial rules (only on create form). 5 pre-rendered rows for no-JS
          users; JS lets you add/remove. Backend skips rows where both type
          and pattern are empty. #}
       <fieldset class="form-section tag-rules-fieldset">
-        <legend class="form-section__legend">Условия (срабатывает любое)</legend>
+        <legend class="form-section__legend">Условия</legend>
 
         <div class="tag-rules" data-rules-container>
           {# Render submitted rules first (after a validation error round-trip),

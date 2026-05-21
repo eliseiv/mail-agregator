@@ -39,6 +39,11 @@ class Tag(Base):
     )
     name: Mapped[str] = mapped_column(Text, nullable=False)
     color: Mapped[str] = mapped_column(Text, nullable=False)
+    # Per-tag rule combination mode: ``'any'`` (OR — tag attaches when any
+    # rule matches, the backward-compatible default) or ``'all'`` (AND — tag
+    # attaches only when every rule matches). See migration 20260521_015 and
+    # ``backend/app/tags/sql.py`` for the matching SQL.
+    match_mode: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'any'"))
     is_builtin: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("now()")
@@ -56,6 +61,10 @@ class Tag(Base):
         CheckConstraint(
             r"color ~ '^#[0-9A-Fa-f]{6}$'",
             name="ck_tags_color_hex",
+        ),
+        CheckConstraint(
+            "match_mode IN ('any', 'all')",
+            name="ck_tags_match_mode",
         ),
         Index("ix_tags_user_id", "user_id"),
     )

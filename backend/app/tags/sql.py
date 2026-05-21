@@ -53,6 +53,21 @@ because every metacharacter is escaped first, so the ReDoS argument of
 ADR-0017 §4 / Alternatives A2 still holds. This changes the semantics of
 ``*_contains`` from substring to whole-word — see ADR-0017 update note and
 ``docs/100-known-tech-debt.md`` (round-23).
+
+round-24 (per-tag match mode — migration 20260521_015): each tag now
+carries ``tags.match_mode`` ∈ {``'any'``, ``'all'``}. ``'any'`` (the
+default, backward-compatible) keeps the original OR semantics — the tag
+attaches when *any* one rule matches. ``'all'`` requires the tag to have
+at least one rule and that *every* rule match; we express AND as "the tag
+has >=1 rule AND no rule fails to match" (``EXISTS(rule)`` +
+``NOT EXISTS(rule WHERE NOT predicate)``). The ``<predicate(r)>`` block is
+intentionally duplicated between the ``EXISTS`` (any) and ``NOT EXISTS``
+(all) branches — SQL has no easy way to factor it out of two correlated
+subqueries, and the duplication keeps the whole-word escaping identical in
+both. In :data:`APPLY_TAGS_TO_MESSAGE` the mode is read from the ``t``
+alias (``t.match_mode``); in :data:`APPLY_TAG_TO_EXISTING` there is no tag
+alias in scope, so it is read via the scalar subquery
+``(SELECT match_mode FROM tags WHERE id = :tag_id)``.
 """
 
 from __future__ import annotations
@@ -81,14 +96,31 @@ WHERE (
         u.id = ma.user_id
         OR (ma.group_id IS NOT NULL AND u.group_id = ma.group_id)
     )
-  AND EXISTS (
-    SELECT 1 FROM tag_rules r WHERE r.tag_id = t.id AND (
-        (r.type = 'subject_contains' AND :subject ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
-        (r.type = 'body_contains'    AND :body    ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
-        (r.type = 'sender_contains'  AND :sender  ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
-        (r.type = 'sender_exact'     AND LOWER(:sender) = LOWER(r.pattern))
+  AND (
+        -- match_mode = 'any' (OR, default): at least one rule of the tag matches.
+        (t.match_mode = 'any' AND EXISTS (
+            SELECT 1 FROM tag_rules r WHERE r.tag_id = t.id AND (
+                (r.type = 'subject_contains' AND :subject ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
+                (r.type = 'body_contains'    AND :body    ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
+                (r.type = 'sender_contains'  AND :sender  ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
+                (r.type = 'sender_exact'     AND LOWER(:sender) = LOWER(r.pattern))
+            )
+        ))
+        OR
+        -- match_mode = 'all' (AND): the tag has >=1 rule AND no rule fails to
+        -- match (i.e. there is no rule for which the predicate is false).
+        (t.match_mode = 'all'
+            AND EXISTS (SELECT 1 FROM tag_rules r WHERE r.tag_id = t.id)
+            AND NOT EXISTS (
+                SELECT 1 FROM tag_rules r WHERE r.tag_id = t.id AND NOT (
+                    (r.type = 'subject_contains' AND :subject ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
+                    (r.type = 'body_contains'    AND :body    ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
+                    (r.type = 'sender_contains'  AND :sender  ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
+                    (r.type = 'sender_exact'     AND LOWER(:sender) = LOWER(r.pattern))
+                )
+            )
+        )
     )
-  )
 ON CONFLICT (message_id, tag_id) DO NOTHING
 """
 
@@ -112,13 +144,29 @@ WHERE (
         ma.user_id = :user_id
         OR (:user_group_id IS NOT NULL AND ma.group_id = :user_group_id)
     )
-  AND EXISTS (
-    SELECT 1 FROM tag_rules r WHERE r.tag_id = :tag_id AND (
-        (r.type = 'subject_contains' AND m.subject   ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
-        (r.type = 'body_contains'    AND m.body_text ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
-        (r.type = 'sender_contains'  AND m.from_addr ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
-        (r.type = 'sender_exact'     AND LOWER(m.from_addr) = LOWER(r.pattern))
+  AND (
+        -- match_mode = 'any' (OR, default): at least one rule of the tag matches.
+        ((SELECT match_mode FROM tags WHERE id = :tag_id) = 'any' AND EXISTS (
+            SELECT 1 FROM tag_rules r WHERE r.tag_id = :tag_id AND (
+                (r.type = 'subject_contains' AND m.subject   ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
+                (r.type = 'body_contains'    AND m.body_text ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
+                (r.type = 'sender_contains'  AND m.from_addr ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
+                (r.type = 'sender_exact'     AND LOWER(m.from_addr) = LOWER(r.pattern))
+            )
+        ))
+        OR
+        -- match_mode = 'all' (AND): the tag has >=1 rule AND no rule fails to match.
+        ((SELECT match_mode FROM tags WHERE id = :tag_id) = 'all'
+            AND EXISTS (SELECT 1 FROM tag_rules r WHERE r.tag_id = :tag_id)
+            AND NOT EXISTS (
+                SELECT 1 FROM tag_rules r WHERE r.tag_id = :tag_id AND NOT (
+                    (r.type = 'subject_contains' AND m.subject   ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
+                    (r.type = 'body_contains'    AND m.body_text ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
+                    (r.type = 'sender_contains'  AND m.from_addr ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
+                    (r.type = 'sender_exact'     AND LOWER(m.from_addr) = LOWER(r.pattern))
+                )
+            )
+        )
     )
-  )
 ON CONFLICT (message_id, tag_id) DO NOTHING
 """

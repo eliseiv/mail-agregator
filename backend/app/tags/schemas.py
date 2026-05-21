@@ -52,6 +52,15 @@ RuleType = Literal[
     "sender_exact",
 ]
 
+# Per-tag rule combination mode (migration 20260521_015): ``'any'`` (OR,
+# default) attaches the tag when any rule matches; ``'all'`` (AND) only when
+# every rule matches. Mirrors the DB CHECK constraint ``ck_tags_match_mode``.
+MatchMode = Literal["any", "all"]
+
+ALLOWED_MATCH_MODES: Final[frozenset[str]] = frozenset({"any", "all"})
+
+DEFAULT_MATCH_MODE: Final[str] = "any"
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -122,6 +131,7 @@ class TagDTO(BaseModel):
     id: int
     name: str
     color: str
+    match_mode: MatchMode
     is_builtin: bool
     rules: list[RuleDTO]
     created_at: datetime
@@ -131,6 +141,8 @@ class TagDTO(BaseModel):
 class TagCreateRequest(BaseModel):
     name: Annotated[str, Field(min_length=1, max_length=64)]
     color: str
+    # 'any' (OR, default — backward-compatible) or 'all' (AND).
+    match_mode: MatchMode = "any"
     # Up to 32 rules per tag — same limit as form-encoded shape (see ADR-0017).
     rules: Annotated[list[RuleSpec], Field(default_factory=list, max_length=32)]
     apply_to_existing: bool = False
@@ -154,6 +166,7 @@ class TagUpdateRequest(BaseModel):
 
     name: Annotated[str | None, Field(default=None, min_length=1, max_length=64)] = None
     color: str | None = None
+    match_mode: MatchMode | None = None
 
     @field_validator("name")
     @classmethod

@@ -42,19 +42,42 @@ class TagsRepo:
 
     # --- Writes ------------------------------------------------------------
 
-    async def create(self, *, user_id: int, name: str, color: str, is_builtin: bool) -> Tag:
-        tag = Tag(user_id=user_id, name=name, color=color, is_builtin=is_builtin)
+    async def create(
+        self,
+        *,
+        user_id: int,
+        name: str,
+        color: str,
+        is_builtin: bool,
+        match_mode: str = "any",
+    ) -> Tag:
+        tag = Tag(
+            user_id=user_id,
+            name=name,
+            color=color,
+            is_builtin=is_builtin,
+            match_mode=match_mode,
+        )
         self._s.add(tag)
         await self._s.flush()
         await self._s.refresh(tag)
         return tag
 
-    async def update_meta(self, *, tag_id: int, name: str | None, color: str | None) -> None:
+    async def update_meta(
+        self,
+        *,
+        tag_id: int,
+        name: str | None,
+        color: str | None,
+        match_mode: str | None = None,
+    ) -> None:
         values: dict[str, object] = {}
         if name is not None:
             values["name"] = name
         if color is not None:
             values["color"] = color
+        if match_mode is not None:
+            values["match_mode"] = match_mode
         if not values:
             return
         # Touch updated_at explicitly so the trigger isn't relied upon when the

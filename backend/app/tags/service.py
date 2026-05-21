@@ -76,6 +76,7 @@ def _to_tag_dto(tag: Tag, rules: list[TagRule]) -> TagDTO:
         id=tag.id,
         name=tag.name,
         color=tag.color,
+        match_mode=tag.match_mode,  # type: ignore[arg-type]
         is_builtin=tag.is_builtin,
         rules=[_to_rule_dto(r) for r in rules],
         created_at=tag.created_at,
@@ -130,6 +131,7 @@ class TagsService:
         user_id: int,
         name: str,
         color: str,
+        match_mode: str,
         rules: list[RuleSpec],
         apply_to_existing: bool,
     ) -> tuple[TagDTO, int]:
@@ -160,7 +162,13 @@ class TagsService:
                 )
 
         try:
-            tag = await self._tags.create(user_id=user_id, name=name, color=color, is_builtin=False)
+            tag = await self._tags.create(
+                user_id=user_id,
+                name=name,
+                color=color,
+                is_builtin=False,
+                match_mode=match_mode,
+            )
         except IntegrityError as exc:
             raise ConflictError("A tag with this name already exists", field="name") from exc
 
@@ -187,16 +195,19 @@ class TagsService:
         tag_id: int,
         name: str | None,
         color: str | None,
+        match_mode: str | None = None,
     ) -> TagDTO:
         tag = await self._tags.get_owned(user_id, tag_id)
         if tag is None:
             raise NotFoundError()
-        if name is None and color is None:
+        if name is None and color is None and match_mode is None:
             # No-op; just return the current state.
             rules = await self._rules.list_for_tag(tag_id)
             return _to_tag_dto(tag, rules)
         try:
-            await self._tags.update_meta(tag_id=tag_id, name=name, color=color)
+            await self._tags.update_meta(
+                tag_id=tag_id, name=name, color=color, match_mode=match_mode
+            )
         except IntegrityError as exc:
             raise ConflictError("A tag with this name already exists", field="name") from exc
 

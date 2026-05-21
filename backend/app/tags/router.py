@@ -139,10 +139,23 @@ def _parse_rules_from_form(form: object) -> list[RuleSpec]:
     return out
 
 
+def _form_match_mode(form: object, *, default: str = "any") -> str:
+    """Read ``match_mode`` from a form, defaulting to ``'any'``.
+
+    Anything outside the ``{'any', 'all'}`` whitelist (including the empty
+    string when the field is absent) collapses to the default — the radio in
+    the UI only emits these two values, and Pydantic re-validates against the
+    ``MatchMode`` literal downstream as defence-in-depth.
+    """
+    raw = _form_str(form, "match_mode").strip().lower()
+    return raw if raw in {"any", "all"} else default
+
+
 async def _parse_create_form(request: Request) -> TagCreateRequest:
     form = await request.form()
     name = _form_str(form, "name")
     color = _form_str(form, "color")
+    match_mode = _form_match_mode(form)
     rules = _parse_rules_from_form(form)
     apply_to_existing = _form_bool(form, "apply_to_existing", default=False)
     try:
@@ -150,6 +163,7 @@ async def _parse_create_form(request: Request) -> TagCreateRequest:
             {
                 "name": name,
                 "color": color,
+                "match_mode": match_mode,
                 "rules": [r.model_dump() for r in rules],
                 "apply_to_existing": apply_to_existing,
             }
@@ -162,11 +176,14 @@ async def _parse_update_form(request: Request) -> TagUpdateRequest:
     form = await request.form()
     name_raw = _form_str(form, "name").strip()
     color_raw = _form_str(form, "color").strip()
+    match_mode_raw = _form_str(form, "match_mode").strip().lower()
     payload: dict[str, str | None] = {}
     if name_raw:
         payload["name"] = name_raw
     if color_raw:
         payload["color"] = color_raw
+    if match_mode_raw in {"any", "all"}:
+        payload["match_mode"] = match_mode_raw
     try:
         return TagUpdateRequest.model_validate(payload)
     except PydanticValidationError as exc:
@@ -184,6 +201,7 @@ async def _form_values_for_rerender(request: Request) -> dict[str, object]:
     return {
         "name": _form_str(form, "name"),
         "color": _form_str(form, "color"),
+        "match_mode": _form_match_mode(form),
         "rules": paired,
         "apply_to_existing": _form_bool(form, "apply_to_existing", default=False),
     }
@@ -229,6 +247,7 @@ async def create_tag(
                 user_id=user_id,
                 name=payload.name,
                 color=payload.color,
+                match_mode=payload.match_mode,
                 rules=payload.rules,
                 apply_to_existing=payload.apply_to_existing,
             )
@@ -306,6 +325,7 @@ async def update_tag(
                 tag_id=tag_id,
                 name=payload.name,
                 color=payload.color,
+                match_mode=payload.match_mode,
             )
     except DomainError as exc:
         if is_form:
@@ -561,6 +581,7 @@ async def tags_new_page(request: Request, user: CurrentUser) -> Response:
             "form": {
                 "name": "",
                 "color": "",
+                "match_mode": "any",
                 "rules": [],
                 "apply_to_existing": False,
             },
@@ -589,6 +610,7 @@ async def tags_edit_page(
             "form": {
                 "name": tag.name,
                 "color": tag.color,
+                "match_mode": tag.match_mode,
                 "rules": [{"type": r.type, "pattern": r.pattern} for r in tag.rules],
                 "apply_to_existing": False,
             },
