@@ -68,6 +68,23 @@ both. In :data:`APPLY_TAGS_TO_MESSAGE` the mode is read from the ``t``
 alias (``t.match_mode``); in :data:`APPLY_TAG_TO_EXISTING` there is no tag
 alias in scope, so it is read via the scalar subquery
 ``(SELECT match_mode FROM tags WHERE id = :tag_id)``.
+
+round-25 (sender_contains matches sender display-name too): the
+``sender_contains`` rule type now matches when the (whole-word,
+case-sensitive) pattern is found in **either** the sender email
+(``from_addr`` / ``:sender``) **or** the sender display-name
+(``from_name`` / ``:sender_name``). Apple's App Store Connect mail arrives
+from a generic address such as ``no_reply@email.apple.com`` while the
+display-name is the meaningful ``App Store Connect`` — a
+``sender_contains: App Store Connect`` rule would never fire against the
+address alone. The name side is wrapped in ``COALESCE(..., '')`` because
+``from_name`` is nullable (a NULL ``~`` always yields NULL → the row is
+dropped, so we coalesce to an empty string which simply never matches).
+``sender_exact`` is deliberately left as an email-only exact match — it
+exists for precise address routing (e.g. ``AppStoreNotices@apple.com``)
+where the display-name is irrelevant. The same whole-word escaping applies
+to the name side; both branches in each of the ``any``/``all`` predicates
+carry the additional name comparison.
 """
 
 from __future__ import annotations
@@ -102,7 +119,10 @@ WHERE (
             SELECT 1 FROM tag_rules r WHERE r.tag_id = t.id AND (
                 (r.type = 'subject_contains' AND :subject ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
                 (r.type = 'body_contains'    AND :body    ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
-                (r.type = 'sender_contains'  AND :sender  ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
+                (r.type = 'sender_contains'  AND (
+                    :sender ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')
+                    OR COALESCE(:sender_name, '') ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')
+                )) OR
                 (r.type = 'sender_exact'     AND LOWER(:sender) = LOWER(r.pattern))
             )
         ))
@@ -115,7 +135,10 @@ WHERE (
                 SELECT 1 FROM tag_rules r WHERE r.tag_id = t.id AND NOT (
                     (r.type = 'subject_contains' AND :subject ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
                     (r.type = 'body_contains'    AND :body    ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
-                    (r.type = 'sender_contains'  AND :sender  ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
+                    (r.type = 'sender_contains'  AND (
+                        :sender ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')
+                        OR COALESCE(:sender_name, '') ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')
+                    )) OR
                     (r.type = 'sender_exact'     AND LOWER(:sender) = LOWER(r.pattern))
                 )
             )
@@ -150,7 +173,10 @@ WHERE (
             SELECT 1 FROM tag_rules r WHERE r.tag_id = :tag_id AND (
                 (r.type = 'subject_contains' AND m.subject   ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
                 (r.type = 'body_contains'    AND m.body_text ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
-                (r.type = 'sender_contains'  AND m.from_addr ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
+                (r.type = 'sender_contains'  AND (
+                    m.from_addr ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')
+                    OR COALESCE(m.from_name, '') ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')
+                )) OR
                 (r.type = 'sender_exact'     AND LOWER(m.from_addr) = LOWER(r.pattern))
             )
         ))
@@ -162,7 +188,10 @@ WHERE (
                 SELECT 1 FROM tag_rules r WHERE r.tag_id = :tag_id AND NOT (
                     (r.type = 'subject_contains' AND m.subject   ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
                     (r.type = 'body_contains'    AND m.body_text ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
-                    (r.type = 'sender_contains'  AND m.from_addr ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
+                    (r.type = 'sender_contains'  AND (
+                        m.from_addr ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')
+                        OR COALESCE(m.from_name, '') ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')
+                    )) OR
                     (r.type = 'sender_exact'     AND LOWER(m.from_addr) = LOWER(r.pattern))
                 )
             )

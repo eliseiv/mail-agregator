@@ -54,6 +54,8 @@ class _MessageLike(Protocol):
     def body_text(self) -> str: ...
     @property
     def from_addr(self) -> str: ...
+    @property
+    def from_name(self) -> str | None: ...
 
 
 log = get_logger(__name__)
@@ -284,6 +286,9 @@ class TagsService:
                 "subject": message.subject or "",
                 "body": message.body_text or "",
                 "sender": message.from_addr,
+                # round-25: sender_contains also matches the display-name.
+                # Nullable — the SQL COALESCEs NULL to '' (never matches).
+                "sender_name": message.from_name,
             },
         )
         # ``Result.rowcount`` exists on the cursor backend used by asyncpg;
@@ -292,7 +297,7 @@ class TagsService:
         return int(rowcount or 0)
 
     async def ensure_builtin_tags(self, *, user_id: int) -> int:
-        """Create the four builtin tags for ``user_id`` if missing.
+        """Create the builtin-tag catalogue for ``user_id`` if missing.
 
         Idempotent (ADR-0017 §6). Returns the number of tags created in
         this call (0 if the user already had any builtin row).
@@ -300,6 +305,14 @@ class TagsService:
         Race-safe: a concurrent invocation that wins the ``has_any_builtin``
         race will hit the ``UNIQUE(user_id, name)`` constraint on INSERT;
         we treat that as success and short-circuit.
+
+        round-25: each spec now carries a ``match_mode`` (``'any'``/``'all'``)
+        that is persisted on the tag — see :mod:`backend.app.tags.builtin`.
+        Because the catalogue was reworked, migration
+        ``20260521_016_rebuild_builtin_tags`` DELETEs every existing builtin
+        row so that the next login re-runs this method and recreates the new
+        catalogue (the ``has_any_builtin`` short-circuit would otherwise keep
+        the stale set forever).
         """
         if await self._tags.has_any_builtin(user_id):
             log.debug("builtin_tags_unchanged", user_id=user_id)
@@ -316,6 +329,7 @@ class TagsService:
                     name=spec["name"],
                     color=color,
                     is_builtin=True,
+                    match_mode=spec["match_mode"],
                 )
                 rule_pairs = [(r["type"], r["pattern"]) for r in spec["rules"]]
                 await self._rules.add_many(tag_id=tag.id, rules=rule_pairs)
