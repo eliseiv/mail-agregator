@@ -104,6 +104,5 @@ CLAUDE.md
 # since ruff respects .gitignore by default — see CI `ruff check .`).
 # ---------------------------------------------------------------------------
 smoke_test.py
-_rt_*.sql
-_rt_*.txt
+_rt_*
 *.jpg

@@ -136,6 +136,7 @@ class TagsService:
         match_mode: str,
         rules: list[RuleSpec],
         apply_to_existing: bool,
+        is_super_admin: bool,
     ) -> tuple[TagDTO, int]:
         """Create a custom tag plus its rules; optionally apply to existing.
 
@@ -155,7 +156,7 @@ class TagsService:
         if apply_to_existing:
             user_group_id = await self._resolve_user_group_id(user_id)
             count = await self._links.count_messages_visible(
-                user_id=user_id, user_group_id=user_group_id
+                user_id=user_id, user_group_id=user_group_id, is_super_admin=is_super_admin
             )
             if count > APPLY_TO_EXISTING_LIMIT:
                 raise TagApplyTooManyError(
@@ -183,7 +184,10 @@ class TagsService:
         applied = 0
         if apply_to_existing and rules:
             applied = await self._apply_tag_to_existing(
-                user_id=user_id, user_group_id=user_group_id, tag_id=tag.id
+                user_id=user_id,
+                user_group_id=user_group_id,
+                tag_id=tag.id,
+                is_super_admin=is_super_admin,
             )
 
         # Reload rules so the response shape carries DB-assigned ids/timestamps.
@@ -246,13 +250,13 @@ class TagsService:
             raise NotFoundError()
         await self._rules.delete(rule_id)
 
-    async def apply_to_existing(self, *, user_id: int, tag_id: int) -> int:
+    async def apply_to_existing(self, *, user_id: int, tag_id: int, is_super_admin: bool) -> int:
         tag = await self._tags.get_owned(user_id, tag_id)
         if tag is None:
             raise NotFoundError()
         user_group_id = await self._resolve_user_group_id(user_id)
         count = await self._links.count_messages_visible(
-            user_id=user_id, user_group_id=user_group_id
+            user_id=user_id, user_group_id=user_group_id, is_super_admin=is_super_admin
         )
         if count > APPLY_TO_EXISTING_LIMIT:
             raise TagApplyTooManyError(
@@ -260,7 +264,10 @@ class TagsService:
                 details={"limit": APPLY_TO_EXISTING_LIMIT, "actual": count},
             )
         return await self._apply_tag_to_existing(
-            user_id=user_id, user_group_id=user_group_id, tag_id=tag_id
+            user_id=user_id,
+            user_group_id=user_group_id,
+            tag_id=tag_id,
+            is_super_admin=is_super_admin,
         )
 
     # --- Worker hooks ------------------------------------------------------
@@ -344,7 +351,7 @@ class TagsService:
     # --- Internal helpers --------------------------------------------------
 
     async def _apply_tag_to_existing(
-        self, *, user_id: int, user_group_id: int | None, tag_id: int
+        self, *, user_id: int, user_group_id: int | None, tag_id: int, is_super_admin: bool
     ) -> int:
         """Bulk INSERT ``message_tags`` for every visible matching message.
 
@@ -352,10 +359,19 @@ class TagsService:
         personal accounts plus the user's team accounts. Pass
         ``user_group_id=None`` for users without a group — the SQL then
         narrows to personal accounts only.
+
+        round-26: when ``is_super_admin=True`` the apply reaches EVERY
+        message in the system (the SQL visibility filter short-circuits to
+        TRUE), matching the super-admin read scope.
         """
         result = await self._db.execute(
             text(APPLY_TAG_TO_EXISTING),
-            {"tag_id": tag_id, "user_id": user_id, "user_group_id": user_group_id},
+            {
+                "tag_id": tag_id,
+                "user_id": user_id,
+                "user_group_id": user_group_id,
+                "is_super_admin": is_super_admin,
+            },
         )
         rowcount = getattr(result, "rowcount", 0)
         return int(rowcount or 0)

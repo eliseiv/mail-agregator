@@ -20,7 +20,7 @@ from fastapi import APIRouter, Path, Request, Response, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import ValidationError as PydanticValidationError
 
-from backend.app.deps import CurrentUser, DbSession, is_form_request
+from backend.app.deps import CurrentScope, CurrentUser, DbSession, is_form_request
 from backend.app.exceptions import (
     DomainError,
     ValidationError,
@@ -226,6 +226,7 @@ async def create_tag(
     request: Request,
     db: DbSession,
     user: CurrentUser,
+    scope: CurrentScope,
 ) -> Response:
     """Create a new tag. Accepts JSON or form-encoded (ADR-0015)."""
     user_id = user.id
@@ -250,6 +251,7 @@ async def create_tag(
                 match_mode=payload.match_mode,
                 rules=payload.rules,
                 apply_to_existing=payload.apply_to_existing,
+                is_super_admin=scope.is_super_admin,
             )
     except DomainError as exc:
         if is_form:
@@ -530,6 +532,7 @@ async def apply_to_existing(
     request: Request,
     db: DbSession,
     user: CurrentUser,
+    scope: CurrentScope,
     tag_id: int = Path(..., ge=1),
 ) -> Response:
     user_id = user.id
@@ -537,7 +540,9 @@ async def apply_to_existing(
     is_form = is_form_request(request)
     try:
         async with db.begin():
-            applied = await TagsService(db).apply_to_existing(user_id=user_id, tag_id=tag_id)
+            applied = await TagsService(db).apply_to_existing(
+                user_id=user_id, tag_id=tag_id, is_super_admin=scope.is_super_admin
+            )
     except DomainError as exc:
         if is_form:
             await flash(request, "error", exc.message)

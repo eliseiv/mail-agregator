@@ -16,8 +16,12 @@ Two queries (both honour the round-10 team-visibility model — see
   Visibility = personal accounts (``ma.user_id = :user_id``) plus the
   owner's team accounts (``ma.group_id = :user_group_id``). For a user
   without a group, pass ``:user_group_id = NULL`` and the second branch
-  short-circuits. Called from ``POST /api/tags`` (when
-  ``apply_to_existing=true``) and ``POST /api/tags/{id}/apply-to-existing``.
+  short-circuits. round-26: a super-admin (``:is_super_admin = TRUE``)
+  applies to EVERY message in the system — the flag forces the visibility
+  filter to TRUE for all rows, matching the super-admin read scope
+  (``MessageService.visible_user_ids`` → None). Called from
+  ``POST /api/tags`` (when ``apply_to_existing=true``) and
+  ``POST /api/tags/{id}/apply-to-existing``.
 
 Both queries are idempotent (``ON CONFLICT (message_id, tag_id) DO NOTHING``).
 
@@ -151,10 +155,12 @@ ON CONFLICT (message_id, tag_id) DO NOTHING
 # Visibility filter mirrors ``MailAccountsRepo.list_account_ids_visible``:
 # personal accounts (``ma.user_id = :user_id``) OR the caller's team
 # accounts (``ma.group_id = :user_group_id``, only when the caller has a
-# group). For super-admins / users without a group we pass NULL and the
-# second branch evaluates to FALSE — the apply stays scoped to their own
-# accounts, which matches existing super-admin UX (admins typically do not
-# own team accounts).
+# group). round-26: a super-admin passes ``:is_super_admin = TRUE`` which
+# forces the whole filter to TRUE so the apply reaches EVERY message in the
+# system — matching the super-admin read scope (super-admin sees all
+# messages via ``MessageService.visible_user_ids`` → None). For
+# group_leader / group_member the flag is FALSE and the original
+# personal+team scoping applies unchanged.
 # round-23: ``*_contains`` is whole-word, case-SENSITIVE (``~`` + ``\y``
 # boundaries) over a regex-escaped pattern (literal match). The user
 # controls case via the pattern they type. See module docstring.
@@ -164,7 +170,14 @@ SELECT m.id, :tag_id
 FROM messages m
 JOIN mail_accounts ma ON ma.id = m.mail_account_id
 WHERE (
-        ma.user_id = :user_id
+        -- round-26 (super-admin full reach): a super-admin applies the tag to
+        -- EVERY message in the system, not just their own/team accounts. The
+        -- ``:is_super_admin`` flag short-circuits the visibility filter to TRUE
+        -- for all rows. CAST is required (same reason as ``:user_group_id``
+        -- below): asyncpg cannot infer a prepared-statement type for a bare
+        -- parameter, so we pin it to BOOLEAN to avoid AmbiguousParameterError.
+        CAST(:is_super_admin AS BOOLEAN)
+        OR ma.user_id = :user_id
         -- CAST is required: ``:user_group_id`` is NULL for super-admin / users
         -- without a group, and asyncpg cannot infer a prepared-statement type
         -- for a parameter that only appears in ``IS NOT NULL`` →

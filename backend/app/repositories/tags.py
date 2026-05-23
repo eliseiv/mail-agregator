@@ -178,7 +178,9 @@ class MessageTagsRepo:
             out[int(mid)].append(tag)
         return out
 
-    async def count_messages_visible(self, *, user_id: int, user_group_id: int | None) -> int:
+    async def count_messages_visible(
+        self, *, user_id: int, user_group_id: int | None, is_super_admin: bool
+    ) -> int:
         """Total messages visible to ``user_id`` under the round-10 model.
 
         Visibility = personal accounts (``ma.user_id = user_id``) OR
@@ -186,12 +188,22 @@ class MessageTagsRepo:
         ``user_group_id=None`` for callers without a group; the second
         branch is then omitted and only personal accounts count.
 
+        round-26: when ``is_super_admin=True`` the count covers EVERY
+        message in the system (no account join / filter), mirroring the
+        super-admin reach of :data:`APPLY_TAG_TO_EXISTING`. This keeps the
+        runaway guard honest — a super-admin on a >100k-message system hits
+        :class:`TagApplyTooManyError` (the intended protection against a
+        giant synchronous scan).
+
         Used by the ``apply_to_existing`` path to enforce the 100k limit
         guard documented in ADR-0017 §7. Must mirror the visibility scope
         of :data:`APPLY_TAG_TO_EXISTING` to avoid under-counting (which
         would let an apply call write more rows than the guard accounted
         for).
         """
+        if is_super_admin:
+            stmt = select(func.count()).select_from(Message)
+            return int((await self._s.execute(stmt)).scalar_one())
         if user_group_id is None:
             cond = MailAccount.user_id == user_id
         else:
