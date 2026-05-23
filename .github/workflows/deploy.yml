@@ -147,7 +147,26 @@ jobs:
           # certbot are included if they're already running on this host.
           docker compose --profile prod pull api worker
 
-          # Recreate exactly the services that ship our code.
+          # Run DB migrations EXPLICITLY before bringing up api/worker.
+          #
+          # Why an explicit step (not just depends_on): on a `up -d` that does
+          # NOT recreate the postgres dependency, compose may take a no-recreate
+          # path where the mas-migrations init-container's
+          # `service_completed_successfully` dependency is not re-triggered — so
+          # the new api/worker code could start against an un-migrated schema.
+          # `run --rm mas-migrations` removes that latent gap: migrations always
+          # run, on a fresh one-shot container, before the new code boots.
+          #
+          # Fault-tolerant: REMOTE_SCRIPT runs under `set -euo pipefail`, so a
+          # non-zero alembic exit aborts the whole deploy (no silent skip,
+          # api/worker stay on the previous version). Idempotent: `alembic
+          # upgrade head` is a no-op when the DB is already at head.
+          # mas-migrations has no `profiles:` key → it is in the default profile
+          # and is therefore selectable under `--profile prod run`.
+          docker compose --profile prod run --rm mas-migrations
+
+          # Recreate exactly the services that ship our code (now that the
+          # schema is at head — new code never starts on an old schema).
           docker compose --profile prod up -d --remove-orphans api worker
 
           # Recreate nginx AFTER api/worker so two things happen, fixing the

@@ -318,11 +318,11 @@ docker compose logs -f api worker
 Порядок при первом старте:
 1. `minio` поднимается и проходит healthcheck.
 2. `minio-bootstrap` (init-контейнер) создаёт bucket `mail-attachments`, политику `mas-app` и service account из `MINIO_APP_*`. Завершается с exit 0.
-3. `api` ждёт `minio-bootstrap: service_completed_successfully`, `postgres: service_healthy`, `redis: service_healthy`, затем стартует:
-   - Alembic migrations автоматически применяются (entrypoint script).
-   - `seed_super_admin` отрабатывает идемпотентно (upsert пароля, см. модуль `auth` в `05-modules.md`).
+3. `mas-migrations` (one-shot init-контейнер) запускается с `command: ["alembic","upgrade","head"]`, накатывает схему и завершается с exit 0. У `api`/`worker` **нет** entrypoint-скрипта, который сам накатывает Alembic, — миграции применяет **только** этот init-контейнер. `api` и `worker` `depends_on` его `service_completed_successfully`, поэтому ни один из них не стартует против схемы-без-миграций (см. `deploy/README.md` секция «Upgrade»). Образ `api` по-прежнему содержит `alembic` как CLI — но это лишь инструмент, который вызывает init-контейнер, а не автоматический startup-hook.
+4. `api` ждёт `minio-bootstrap: service_completed_successfully`, `postgres: service_healthy`, `redis: service_healthy`, `mas-migrations: service_completed_successfully`, затем стартует:
+   - `seed_super_admin` отрабатывает идемпотентно (upsert пароля, см. модуль `auth` в `05-modules.md`). Выполняется как startup-hook внутри `api` уже после миграций — гарантировано dependency-цепочкой на `mas-migrations`.
    - `Storage.ensure_bucket` — defensive проверка `head_bucket`; bucket уже создан init-контейнером, шаг возвращается мгновенно.
-4. `worker` стартует с теми же зависимостями.
+5. `worker` стартует с теми же зависимостями.
 
 UI доступен на `https://${SERVER_DOMAIN}/login`. Полный operator-runbook по подъёму свежего prod-сервера (DNS, firewall, GH secrets, GHCR auth, бэкапы) — `docs/SERVER-SETUP.md`.
 
@@ -330,17 +330,28 @@ UI доступен на `https://${SERVER_DOMAIN}/login`. Полный operator
 
 Автоматический путь — push в `main`, CI собирает и пушит образы в GHCR, `deploy.yml` забирает их на сервер. См. `docs/SERVER-SETUP.md` Часть E.
 
-Ручной путь (если CI/workflow недоступны):
+Порядок деплоя на сервере (тот же, что выполняет `deploy.yml` через SSH — миграции вызываются **явно** перед стартом нового кода):
 
 ```bash
 cd /opt/mail-aggregator
-git pull origin main
+git checkout <sha>
+# правка IMAGE_TAG / IMAGE_REGISTRY в .env под целевой sha
+sed -i "s|^IMAGE_TAG=.*|IMAGE_TAG=<sha>|" .env
+# 1. подтянуть новые образы api/worker
 docker compose --profile prod pull api worker
+# 2. ЯВНО накатить миграции one-shot init-контейнером ДО старта нового кода
+docker compose --profile prod run --rm mas-migrations
+# 3. перезапустить api/worker уже на новой схеме
 docker compose --profile prod up -d --remove-orphans api worker
+# 4. nginx — пере-создать (подхватить возможные изменения конфига/шаблонов)
+docker compose --profile prod up -d --force-recreate nginx
+# 5. healthcheck-гейт: дождаться, пока mas-api станет healthy
 docker compose ps
 ```
 
-Migrations применяются автоматически (init-контейнер `mas-migrations`). **Важно**: писать migrations совместимо снизу-вверх (online schema changes; не блокирующие). Если миграция требует downtime — devops согласовывает окно.
+**Почему миграции вызываются явно `docker compose run --rm mas-migrations` ПЕРЕД `up -d api worker`:** у `api`/`worker` нет entrypoint-скрипта, который накатывает Alembic; миграции применяет только init-контейнер `mas-migrations`. При обычном `up` Compose дождался бы `mas-migrations: service_completed_successfully`, но явный шаг делает порядок детерминированным и проверяемым в логах деплоя — новый код гарантированно не стартует на старой схеме.
+
+**Инвариант миграций — forward-only / online-совместимые** (no table-locking ALTERs; см. migration policy в `deploy/README.md` секция «Upgrade»). Поэтому короткое окно «схема впереди кода» (миграция уже накатилась, а `up -d api worker` ещё не отработал или упал) **безопасно**: старый запущенный код продолжает работать на новой online-совместимой схеме, а downgrade в проде не выполняется — фикс всегда write-forward новой миграцией. Если миграция требует downtime (несовместимое изменение) — devops согласовывает окно отдельно.
 
 ### Откат
 
@@ -417,7 +428,7 @@ docker run --rm -v mas_minio_data:/data -v /backups/minio:/out alpine tar czf /o
 - Триггер: push в `main` после CI green ИЛИ ручной `workflow_dispatch` (можно передать sha для отката на known-good).
 - Шаги:
   1. `wait-for-ci` job дожидается зелёного `Build images (api)` и `Build images (worker)` на этой sha (через `lewagon/wait-on-check-action`).
-  2. `deploy` job: `appleboy/ssh-action` SSH'ится на `$DEPLOY_HOST` под `$DEPLOY_USER`, на сервере: `git checkout <sha>`, перезаписывает `IMAGE_TAG`/`IMAGE_REGISTRY` в `.env`, `docker compose --profile prod pull api worker`, `docker compose --profile prod up -d api worker`, ждёт healthy 90s.
+  2. `deploy` job: `appleboy/ssh-action` SSH'ится на `$DEPLOY_HOST` под `$DEPLOY_USER`, на сервере выполняет (в этом порядке): `git checkout <sha>` → перезаписывает `IMAGE_TAG`/`IMAGE_REGISTRY` в `.env` → `docker compose --profile prod pull api worker` → **`docker compose --profile prod run --rm mas-migrations`** (явный шаг миграций перед стартом нового кода) → `docker compose --profile prod up -d --remove-orphans api worker` → `docker compose --profile prod up -d --force-recreate nginx` → healthcheck-гейт: ждёт, пока `mas-api` станет healthy (90s). Явный вызов `mas-migrations` гарантирует, что api/worker не стартуют на старой схеме (у них нет entrypoint-миграций — см. секция 7 «Обновление (deploy)» и `deploy/README.md`).
 - Required GH Secrets: `DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_KEY` (full PEM private key), `DEPLOY_PATH` (обычно `/opt/mail-aggregator`).
 - На сервере должен быть выполнен `docker login ghcr.io` под пользователем `$DEPLOY_USER` (одноразово, см. `docs/SERVER-SETUP.md` Часть A шаг 9).
 - Concurrency lock `deploy-prod` запрещает параллельные deploy'и разных sha.
@@ -489,7 +500,25 @@ docker run --rm -v mas_minio_data:/data -v /backups/minio:/out alpine tar czf /o
 - Старая активная сессия супер-админа остаётся валидной (Redis TTL не тронут). Если нужно её прибить — `docker compose exec redis redis-cli DEL session:<token>` или просто `FLUSHDB` (это сбросит ВСЕ сессии всех пользователей).
 - Если новый пароль не удовлетворяет правилам силы пароля для обычного пользователя — это допустимо, валидация на этапе seed не применяется. Но рекомендуется выбирать пароль не короче 16 символов (без max-ограничения сверху).
 
-### 11.2 Безопасность сервера
+### 11.2 Post-deploy: раскатка обновлённого builtin-каталога тегов
+
+**Касается деплоя, который меняет builtin-каталог тегов** (`backend/app/tags/builtin.py` — состав тегов или их правил, например добавление тега «Реджект» с `match_mode='all'` или новых App Store Connect-правил).
+
+Builtin-теги материализуются **не** при seed, а функцией `TagsService.ensure_builtin_tags(user_id)` — post-login hook в `auth.AuthService` (см. ADR-0017 §6, `03-data-model.md` секция «Заполнение builtin-тегов»). `ensure_builtin_tags` идемпотентна по принципу «есть хотя бы один builtin → return»: для пользователя, у которого builtin-теги уже существуют, она делает return и **не** переписывает правила существующих тегов. Поэтому сам по себе новый код после деплоя не обновит каталог у пользователей, которые уже логинились раньше, — без дополнительного шага у них останутся старые правила.
+
+Для этого существует **штатный forward-only механизм**, а не ручной data-fix. При изменении состава/правил builtin к деплою прикладывается **forward-only rebuild-миграция**, которая сбрасывает существующие builtin-теги, после чего `ensure_builtin_tags` пересоздаёт новый каталог на следующем логине **каждого** пользователя:
+
+- Референсный пример — `migrations/versions/20260521_016_rebuild_builtin_tags.py`: `DELETE FROM tags WHERE is_builtin = true` (FK `ON DELETE CASCADE` от `tag_rules` и `message_tags` снимает связанные правила и применённые метки — это намеренно, старые правила устарели). После DELETE у каждого пользователя `has_any_builtin=false`, и `ensure_builtin_tags` на его следующем логине пересоздаёт актуальный каталог.
+- Эта миграция применяется **автоматически** init-контейнером `mas-migrations` в рамках деплоя — тем самым явным шагом `docker compose --profile prod run --rm mas-migrations` (см. секцию 9, dependency-цепочка `api → mas-migrations: service_completed_successfully`).
+- Миграции forward-only: для отката никогда не используется `alembic downgrade` — вместо отката пишется новая forward-fix миграция (migration policy — `deploy/README.md`, «Migration policy: forward-only»).
+
+Процедура после деплоя нового builtin-каталога:
+1. Убедиться, что деплой прошёл и rebuild-миграция применена (новый `IMAGE_TAG` запущен, `mas-migrations` завершился `service_completed_successfully`, `mas-api` healthy).
+2. **super_admin перелогинивается** (logout → login). Это достаточный шаг, чтобы **немедленно** материализовать новый каталог для свежего пользователя или сразу после rebuild-миграции, не дожидаясь естественного релогина: на следующем login hook `ensure_builtin_tags` отработает на актуальной (новой) версии каталога.
+
+> **Важно:** перелогин материализует каталог только тогда, когда у пользователя `has_any_builtin=false` — то есть для свежего пользователя (первый login) либо для существующего пользователя **после** rebuild-миграции, обнулившей его builtin-теги. Если builtin-теги уже есть и rebuild-миграция не применялась, `ensure_builtin_tags` увидит `has_any_builtin=true`, сделает return и не тронет старые правила. Поэтому раскатка нового builtin-каталога на уже существующих пользователей делается rebuild-миграцией (референс — `016`, применяется автоматически `mas-migrations`), а релогин — для свежих пользователей или для немедленной материализации после миграции. Для исторических писем после rebuild пользователь нажимает «Применить к существующим» на нужном теге (новое авто-тегирование на входящую почту работает сразу).
+
+### 11.3 Безопасность сервера
 
 - Только SSH (key-based) и 80/443 (nginx) открыты наружу.
 - MinIO console (`:9001`) — закрыт firewall'ом, доступ только через VPN или SSH-tunnel.
