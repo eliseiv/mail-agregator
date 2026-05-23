@@ -128,6 +128,41 @@ exists for precise address routing (e.g. ``AppStoreNotices@apple.com``)
 where the display-name is irrelevant. The same whole-word escaping applies
 to the name side; both branches in each of the ``any``/``all`` predicates
 carry the additional name comparison.
+
+round-29 (``body_contains`` matches ``body_text`` AND text from ``body_html``;
+ADR-0017 §4.3): a message is stored in two bodies — ``body_text`` (the
+``text/plain`` part, or ``html2text(html)`` when no plain part) and
+``body_html`` (the raw ``text/html`` part as received). **The UI renders
+``body_html``**, so the user reads the HTML version with their eyes. Apple's
+MIME mail carries **different text** in the two parts: a "reject" mail had
+``body_text`` = "During our review, we noticed an issue with your
+submission." (does NOT contain the «Реджект» pattern) while ``body_html``
+= "We noticed an issue with your submission that requires your attention."
+(DOES contain it). Pre-round-29 ``body_contains`` matched ``body_text``
+only, so the tag never attached to a mail in which the user plainly *sees*
+the trigger phrase. Fix: the ``body_contains`` arm now matches if the
+pattern is found in ``body_text`` **OR** in the tag-stripped ``body_html``::
+
+    norm(body_text)                            ~ boundary(norm(escaped_pattern))
+    OR norm(strip_tags(COALESCE(body_html,''))) ~ boundary(norm(escaped_pattern))
+
+where ``strip_tags(x) = regexp_replace(x, '<[^>]+>', ' ', 'g')`` (each HTML
+tag → a space, applied **before** ``norm()`` so the runs of spaces it
+creates at tag seams get collapsed — otherwise a multi-word pattern would
+not match across the ``</p><p>`` boundary). ``body_html`` is wrapped in
+``COALESCE(…, '')`` because the column is nullable (NULL ``~`` → NULL → the
+row drops; an empty string simply never matches). **Only ``body_contains``
+is affected** — ``subject_contains`` stays on ``subject``, ``sender_*`` on
+``from_addr``/``from_name`` (HTML lives only in the body). In
+:data:`APPLY_TAGS_TO_MESSAGE` the HTML side is a new bind
+``COALESCE(CAST(:body_html AS TEXT), '')`` (CAST against
+``AmbiguousParameterError``, same reason as ``:sender_name``); in
+:data:`APPLY_TAG_TO_EXISTING` it reads the ``m.body_html`` column directly
+(no bind). **Limitation (TD-024):** ``strip_tags`` removes only ``<…>``
+tags, it does **not** decode HTML entities (``&amp;``/``&#39;``/``&nbsp;``),
+so a pattern matching a phrase that contains entities is missed on the HTML
+side. The current Apple phrase is entity-free, so the fix works; the general
+case is tracked as TD-024.
 """
 
 from __future__ import annotations
@@ -168,7 +203,10 @@ WHERE (
         (t.match_mode = 'any' AND EXISTS (
             SELECT 1 FROM tag_rules r WHERE r.tag_id = t.id AND (
                 (r.type = 'subject_contains' AND regexp_replace(translate(:subject, chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')) OR
-                (r.type = 'body_contains'    AND regexp_replace(translate(:body,    chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')) OR
+                (r.type = 'body_contains'    AND (
+                    regexp_replace(translate(:body, chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')
+                    OR regexp_replace(translate(regexp_replace(COALESCE(CAST(:body_html AS TEXT), ''), '<[^>]+>', ' ', 'g'), chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')
+                )) OR
                 (r.type = 'sender_contains'  AND (
                     regexp_replace(translate(:sender, chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')
                     OR regexp_replace(translate(COALESCE(CAST(:sender_name AS TEXT), ''), chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')
@@ -184,7 +222,10 @@ WHERE (
             AND NOT EXISTS (
                 SELECT 1 FROM tag_rules r WHERE r.tag_id = t.id AND NOT (
                     (r.type = 'subject_contains' AND regexp_replace(translate(:subject, chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')) OR
-                    (r.type = 'body_contains'    AND regexp_replace(translate(:body,    chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')) OR
+                    (r.type = 'body_contains'    AND (
+                        regexp_replace(translate(:body, chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')
+                        OR regexp_replace(translate(regexp_replace(COALESCE(CAST(:body_html AS TEXT), ''), '<[^>]+>', ' ', 'g'), chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')
+                    )) OR
                     (r.type = 'sender_contains'  AND (
                         regexp_replace(translate(:sender, chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')
                         OR regexp_replace(translate(COALESCE(CAST(:sender_name AS TEXT), ''), chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')
@@ -236,7 +277,10 @@ WHERE (
         ((SELECT match_mode FROM tags WHERE id = :tag_id) = 'any' AND EXISTS (
             SELECT 1 FROM tag_rules r WHERE r.tag_id = :tag_id AND (
                 (r.type = 'subject_contains' AND regexp_replace(translate(m.subject,   chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')) OR
-                (r.type = 'body_contains'    AND regexp_replace(translate(m.body_text, chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')) OR
+                (r.type = 'body_contains'    AND (
+                    regexp_replace(translate(m.body_text, chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')
+                    OR regexp_replace(translate(regexp_replace(COALESCE(m.body_html, ''), '<[^>]+>', ' ', 'g'), chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')
+                )) OR
                 (r.type = 'sender_contains'  AND (
                     regexp_replace(translate(m.from_addr, chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')
                     OR regexp_replace(translate(COALESCE(m.from_name, ''), chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')
@@ -251,7 +295,10 @@ WHERE (
             AND NOT EXISTS (
                 SELECT 1 FROM tag_rules r WHERE r.tag_id = :tag_id AND NOT (
                     (r.type = 'subject_contains' AND regexp_replace(translate(m.subject,   chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')) OR
-                    (r.type = 'body_contains'    AND regexp_replace(translate(m.body_text, chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')) OR
+                    (r.type = 'body_contains'    AND (
+                        regexp_replace(translate(m.body_text, chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')
+                        OR regexp_replace(translate(regexp_replace(COALESCE(m.body_html, ''), '<[^>]+>', ' ', 'g'), chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')
+                    )) OR
                     (r.type = 'sender_contains'  AND (
                         regexp_replace(translate(m.from_addr, chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')
                         OR regexp_replace(translate(COALESCE(m.from_name, ''), chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')

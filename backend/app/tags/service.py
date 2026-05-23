@@ -53,6 +53,8 @@ class _MessageLike(Protocol):
     @property
     def body_text(self) -> str: ...
     @property
+    def body_html(self) -> str | None: ...
+    @property
     def from_addr(self) -> str: ...
     @property
     def from_name(self) -> str | None: ...
@@ -292,6 +294,10 @@ class TagsService:
                 "mail_account_id": mail_account_id,
                 "subject": message.subject or "",
                 "body": message.body_text or "",
+                # round-29 (ADR-0017 §4.3): body_contains also matches the
+                # tag-stripped HTML body the UI renders. Nullable — the SQL
+                # COALESCEs NULL to '' (an empty string never matches).
+                "body_html": message.body_html,
                 "sender": message.from_addr,
                 # round-25: sender_contains also matches the display-name.
                 # Nullable — the SQL COALESCEs NULL to '' (never matches).

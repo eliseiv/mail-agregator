@@ -350,7 +350,8 @@ erDiagram
 | `cc_addrs` | TEXT | NULL | |
 | `subject` | TEXT | NULL | |
 | `internal_date` | TIMESTAMPTZ | NOT NULL | INTERNALDATE. |
-| `body_text` | TEXT | NOT NULL DEFAULT '' | Plain-text тело (см. ADR-0012). Max 1 MiB. |
+| `body_text` | TEXT | NOT NULL DEFAULT '' | Plain-text тело (`text/plain`-часть либо `html2text(html)`, см. ADR-0012). Max 1 MiB. **Tag-matching `body_contains` читает И это поле, И `body_html` (см. `body_html` ниже + ADR-0017 §4.3).** |
+| `body_html` | TEXT | NULL | Сырой HTML из `text/html`-части письма (как пришёл). Migration `20260513_011`. **UI рендерит именно это поле** (`message_view.html`). Может расходиться по тексту с `body_text` (MIME plain≠html — реальный Apple-кейс). Поэтому `body_contains` матчит дополнительно по `strip_tags(body_html)` (ADR-0017 §4.3). |
 | `body_truncated` | BOOLEAN | NOT NULL DEFAULT false | |
 | `body_present` | BOOLEAN | NOT NULL DEFAULT true | false если ни text/plain, ни text/html не было. |
 | `is_read` | BOOLEAN | NOT NULL DEFAULT false | Локальный флаг, не синкается обратно в IMAP. |

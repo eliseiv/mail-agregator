@@ -128,6 +128,7 @@ class Seeder:
         mail_account_id: int,
         subject: str | None = "Subject",
         body_text: str = "body",
+        body_html: str | None = None,
         from_addr: str = "sender@x.com",
         from_name: str | None = None,
         internal_date: datetime | None = None,
@@ -143,6 +144,9 @@ class Seeder:
             subject=subject,
             internal_date=internal_date or datetime.now(UTC),
             body_text=body_text,
+            # round-29 (ADR-0017 §4.3): the raw text/html body the UI renders.
+            # Nullable in the schema; APPLY_TAG_TO_EXISTING reads m.body_html.
+            body_html=body_html,
         )
         self.s.add(m)
         await self.s.flush()
@@ -198,6 +202,10 @@ class Seeder:
                 "mail_account_id": mail_account_id,
                 "subject": message.subject or "",
                 "body": message.body_text or "",
+                # round-29 (ADR-0017 §4.3): the worker hook binds the raw HTML
+                # body (nullable) so body_contains also matches the text the UI
+                # renders. Mirrors backend.app.tags.service.apply_tags_to_message.
+                "body_html": message.body_html,
                 "sender": message.from_addr,
                 "sender_name": message.from_name,
             },

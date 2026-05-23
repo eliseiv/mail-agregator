@@ -1518,7 +1518,7 @@ class TagsService:
     async def delete_rule(user_id: int, tag_id: int, rule_id: int) -> None
     async def apply_to_existing(user_id: int, tag_id: int) -> int          # returns applied_count
     async def ensure_builtin_tags(user_id: int) -> None                    # idempotent; called from auth post-login hook
-    async def apply_tags_to_message(*, message: _MessageLike, mail_account_id: int) -> int  # worker hook; навешивает теги ВСЕХ видящих письмо пользователей (owner + одногруппники + super_admin), см. ADR-0017 §5/§5.1
+    async def apply_tags_to_message(*, message: _MessageLike, mail_account_id: int) -> int  # worker hook; навешивает теги ВСЕХ видящих письмо пользователей (owner + одногруппники + super_admin), см. ADR-0017 §5/§5.1. round-29: message несёт body_text И body_html (_MessageLike.body_html) — body_contains матчит оба, см. §4.3
 ```
 
 - Repository (в `repositories/tags.py`):
@@ -1577,6 +1577,13 @@ norm(value) ~ ( '(^|[^[:alnum:]_])' || norm(escaped_pattern) || '([^[:alnum:]_]|
   `\n`, прогоны пробелов и U+00A0 внутри предложений — без нормализации
   многословные паттерны не матчатся. nbsp переводится **явно** (Postgres `\s` его
   не ловит в этой локали). См. ADR-0017 §4.2.
+- **`body_contains` матчит И `body_text`, И текст из `body_html`** (round-29):
+  `norm(body_text) ~ boundary(...) OR norm(strip_tags(COALESCE(body_html,''))) ~ boundary(...)`,
+  где `strip_tags(x)=regexp_replace(x,'<[^>]+>',' ','g')`. Причина: MIME-письма
+  Apple несут разный текст в `text/plain` (`body_text`) и `text/html`
+  (`body_html`, его рендерит UI) — паттерн виден глазами в HTML-версии, но
+  отсутствует в `body_text`. См. ADR-0017 §4.3. Только тело получает html-ветку
+  (subject/sender — без неё).
 - `sender_exact` — `LOWER(value) = LOWER(r.pattern)` (без нормализации/границ).
 - `match_mode='any'` → `EXISTS(rule matches)`; `match_mode='all'` → `EXISTS(≥1 rule) AND NOT EXISTS(rule fails)` (round-24).
 - `sender_contains` матчит и `from_addr`, и `COALESCE(from_name,'')` (round-25).
@@ -1592,9 +1599,16 @@ JOIN mail_accounts ma ON ma.id = :mail_account_id
 WHERE ( u.id = ma.user_id
         OR (ma.group_id IS NOT NULL AND u.group_id = ma.group_id)
         OR u.role = 'super_admin' )          -- round-28: super_admin видит все письма
-  AND ( <match_mode 'any'/'all' с *_contains-предикатами вида norm(value) ~ boundary(norm(escaped_pattern)) > )
+  AND ( <match_mode 'any'/'all';
+          subject/sender: norm(value) ~ boundary(norm(escaped_pattern));
+          body_contains: norm(:body) ~ boundary(...) OR norm(strip_tags(COALESCE(:body_html,''))) ~ boundary(...)  -- round-29, §4.3
+        > )
 ON CONFLICT (message_id, tag_id) DO NOTHING
 """
+# round-29: :body_html — новый bind, передаётся воркером из fmsg.body_html
+# (см. _TagInputMessage.body_html в sync_cycle.py); html-ветка чинит письма,
+# где text/plain≠text/html (Apple). В APPLY_TAG_TO_EXISTING вместо bind —
+# m.body_html из колонки.
 
 APPLY_TAG_TO_EXISTING = """
 INSERT INTO message_tags (message_id, tag_id)
@@ -1604,7 +1618,9 @@ JOIN mail_accounts ma ON ma.id = m.mail_account_id
 WHERE ( CAST(:is_super_admin AS BOOLEAN)      -- round-26: super_admin → все письма
         OR ma.user_id = :user_id
         OR (CAST(:user_group_id AS BIGINT) IS NOT NULL AND ma.group_id = CAST(:user_group_id AS BIGINT)) )
-  AND ( <тот же match_mode + *_contains блок > )
+  AND ( <тот же match_mode + *_contains блок;
+          body_contains: norm(m.body_text) ~ boundary(...) OR norm(strip_tags(COALESCE(m.body_html,''))) ~ boundary(...) -- round-29, §4.3
+        > )
 ON CONFLICT (message_id, tag_id) DO NOTHING
 """
 ```

@@ -39,6 +39,7 @@ async def _run_both(
     seed: Seeder,
     *,
     body: str = "body",
+    body_html: str | None = None,
     subject: str | None = "Subject",
     from_addr: str = "sender@x.com",
     from_name: str | None = None,
@@ -48,6 +49,10 @@ async def _run_both(
     """Seed a super-admin + account + message + tag, then run both queries
     on two *separate* messages so the ON CONFLICT clause never hides a
     second-query miss. Returns ``(matched_via_worker, matched_via_existing)``.
+
+    ``body_html`` (round-29, ADR-0017 §4.3) is threaded into both messages
+    and bound through both production queries (worker hook binds :body_html;
+    apply-to-existing reads m.body_html). Defaults to NULL (legacy rows).
     """
     sa = await seed.super_admin()
     acc = await seed.mail_account(user_id=sa.id, group_id=None, email="sa@x.com")
@@ -57,6 +62,7 @@ async def _run_both(
         mail_account_id=acc.id,
         subject=subject,
         body_text=body,
+        body_html=body_html,
         from_addr=from_addr,
         from_name=from_name,
     )
@@ -69,6 +75,7 @@ async def _run_both(
         mail_account_id=acc.id,
         subject=subject,
         body_text=body,
+        body_html=body_html,
         from_addr=from_addr,
         from_name=from_name,
     )

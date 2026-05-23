@@ -62,15 +62,21 @@ class _TagInputMessage:
     """Minimal message-shaped tuple passed to ``TagsService.apply_tags_to_message``.
 
     The service expects a ``Message``-shaped object with ``id``, ``subject``,
-    ``body_text``, ``from_addr`` and ``from_name``. Constructing a real ORM
-    ``Message`` here would require extra round-trips (we already have the
-    values from ``FetchedMessage`` + ``inserted_id``); a tiny dataclass keeps
-    the call clean and avoids a SELECT round-trip.
+    ``body_text``, ``body_html``, ``from_addr`` and ``from_name``.
+    Constructing a real ORM ``Message`` here would require extra round-trips
+    (we already have the values from ``FetchedMessage`` + ``inserted_id``); a
+    tiny dataclass keeps the call clean and avoids a SELECT round-trip.
+
+    round-29 (ADR-0017 §4.3): ``body_html`` is carried so the worker hook can
+    match ``body_contains`` against the tag-stripped HTML body the UI renders
+    (Apple ships different text in text/plain vs text/html). It is the same
+    raw HTML written to ``messages.body_html`` by ``insert_message_idempotent``.
     """
 
     id: int
     subject: str | None
     body_text: str
+    body_html: str | None
     from_addr: str
     from_name: str | None
 
@@ -280,6 +286,7 @@ async def sync_one_account(
                         id=inserted_id,
                         subject=fmsg.subject,
                         body_text=fmsg.body_text,
+                        body_html=fmsg.body_html,
                         from_addr=fmsg.from_addr,
                         from_name=fmsg.from_name,
                     ),
