@@ -25,38 +25,77 @@ Two queries (both honour the round-10 team-visibility model — see
 
 Both queries are idempotent (``ON CONFLICT (message_id, tag_id) DO NOTHING``).
 
-round-23 (whole-word, case-sensitive matching): the three ``*_contains``
-rule types (``subject_contains`` / ``body_contains`` / ``sender_contains``)
-previously used substring ``ILIKE '%' || pattern || '%'`` (substring,
-case-insensitive). That falsely matched a pattern as a *substring* of a
-larger word — e.g. builtin pattern ``PLA`` matched "ex**pla**ining",
-"tem**pla**te", "dis**pla**y", attaching the ``DPLA.PLA`` tag where it must
-not. We now match on **whole words, case-SENSITIVELY** using the POSIX
-case-sensitive regex operator ``~`` with ``\y`` word boundaries on both
-sides::
+whole-word, case-sensitive, normalised matching (ADR-0017 §4/§4.1/§4.2):
+the three ``*_contains`` rule types (``subject_contains`` /
+``body_contains`` / ``sender_contains``) match on **whole words,
+case-SENSITIVELY**, over **whitespace-normalised** text, using the POSIX
+case-sensitive regex operator ``~`` (``~*`` is NOT used). Each predicate
+arm has the canonical form::
 
-    :body ~ ('\y' || <escaped_pattern> || '\y')
+    norm(value) ~ ('(^|[^[:alnum:]_])' || norm(escaped_pattern) || '([^[:alnum:]_]|$)')
+
+where::
+
+    escaped_pattern = regexp_replace(pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g')
+    norm(x)         = regexp_replace(translate(x, chr(160), ' '), '\s+', ' ', 'g')
+
+**Word boundaries — explicit boundary classes, NOT ``\y`` (round-27 fix,
+ADR-0017 §4.1).** The boundary is "start-of-string **or** a
+non-alphanumeric-and-non-``_`` char" on the left and "a
+non-alphanumeric-and-non-``_`` char **or** end-of-string" on the right. An
+earlier revision (round-23) wrapped the pattern in ``\y … \y``
+(word-boundary). That was a bug: ``\y`` is the transition between a *word*
+and a *non-word* char, so a pattern that **begins or ends with
+punctuation** never matched — after a trailing ``.``/``!`` comes
+whitespace/end-of-string, both sides non-word → no boundary → no match.
+This broke real user tags such as ``body_contains = "We noticed an issue
+… requires your attention."`` (trailing dot) and ``"Congratulations!"``
+(trailing ``!``); under ``match_mode='all'`` a single non-matching rule
+drops the whole tag. The explicit boundary classes keep the exact same
+whole-word guarantee for alphanumeric patterns (``PLA`` inside ``DPLA``
+does not match as a word; ``pla`` ≠ ``PLA``) **and** work correctly for
+punctuation-bounded patterns — the (escaped) punctuation char of the
+pattern is itself non-word, while the boundary class inspects the
+neighbour *outside* the pattern.
+
+**Whitespace normalisation — MANDATORY (round-27, ADR-0017 §4.2).** Real
+``messages.body_text`` (built from ``text/plain`` or ``html2text(html)``
+in ``worker/app/imap_fetcher.py``) carries hard line breaks, runs of 2+
+spaces (table/wrapper artefacts) and non-breaking spaces U+00A0 *inside*
+one logical sentence. Without normalisation, multi-word patterns silently
+fail to match. ``norm(x)`` first ``translate``s U+00A0 (``chr(160)``) to a
+regular space, **then** collapses any whitespace run to a single space.
+Order matters: in this deployment's locale Postgres ``\s`` /
+``[[:space:]]`` do **not** treat U+00A0 as whitespace, so nbsp must be
+translated explicitly **before** the ``\s+`` collapse. ``norm()`` is
+applied to **both** sides of the comparison — to the value
+(``subject`` / ``body_text`` / ``from_addr`` / ``COALESCE(from_name,'')``
+and the corresponding binds) **and** to the already-escaped pattern
+(``\\`` is not whitespace, so applying ``norm()`` after escaping is safe —
+no conflict). Zero-width chars (U+200B/U+FEFF) are stripped upstream in
+``strip_invisible_padding`` and never reach here.
 
 Case-sensitivity is deliberate: the **user controls the case** by what they
 type into the pattern. If a rule pattern is ``DPLA`` (caps), only an exact
 capitalised whole-word ``DPLA`` in the text matches — e.g. ``Program
 Licence Agreement ("DPLA")`` matches, but a lowercase ``dpla`` does not.
 This gives a double safeguard against false positives: wrong case (e.g.
-``pla`` ≠ ``PLA``) *and* substring-inside-a-word (``\y`` boundaries) are
+``pla`` ≠ ``PLA``) *and* substring-inside-a-word (boundary classes) are
 both rejected.
 
 The user pattern is escaped with ``regexp_replace`` so every regex
 metacharacter is treated literally (e.g. the ``.`` in ``DPLA.PLA`` matches a
 literal dot, not "any char"). ``sender_exact`` is unchanged
 (``LOWER(...) = LOWER(...)`` — email/domain matching is de-facto
-case-insensitive, so it stays so on purpose).
+case-insensitive and the address is a single token without internal
+whitespace, so it gets neither ``norm()`` nor boundary classes).
 
 This is bounded-linear in practice (anchored literal alternations over a
-fixed pattern) — no user-supplied regex structure reaches the engine
-because every metacharacter is escaped first, so the ReDoS argument of
-ADR-0017 §4 / Alternatives A2 still holds. This changes the semantics of
-``*_contains`` from substring to whole-word — see ADR-0017 update note and
-``docs/100-known-tech-debt.md`` (round-23).
+fixed pattern, plus our own fixed boundary classes and ``\s+``) — no
+user-supplied regex structure reaches the engine because every
+metacharacter is escaped first, so the ReDoS argument of ADR-0017 §4 /
+Alternatives A2 still holds. See ADR-0017 §4 and
+``docs/100-known-tech-debt.md`` (round-23 / TD-022).
 
 round-24 (per-tag match mode — migration 20260521_015): each tag now
 carries ``tags.match_mode`` ∈ {``'any'``, ``'all'``}. ``'any'`` (the
@@ -101,12 +140,18 @@ from typing import Final
 #
 # Visibility join: a tag belongs to user ``t.user_id``; that user sees the
 # new message iff either they own the mail account OR (ma.group_id IS NOT
-# NULL AND u.group_id = ma.group_id). Both sides of the OR are needed
-# because team accounts retain their original ``group_id`` even when the
-# owner is moved to a different group (round-10 production patch).
-# round-23: ``*_contains`` is whole-word, case-SENSITIVE (``~`` + ``\y``
-# boundaries) over a regex-escaped pattern (literal match). The user
-# controls case via the pattern they type. See module docstring.
+# NULL AND u.group_id = ma.group_id) OR they are a super_admin (round-28).
+# The first two OR-arms are both needed because team accounts retain their
+# original ``group_id`` even when the owner is moved to a different group
+# (round-10 production patch). round-28 (ADR-0017 §5.1) adds ``OR u.role =
+# 'super_admin'`` so a super_admin's personal tags attach to EVERY message
+# in the system → their TG-notifications fire (recipient SQL already has a
+# super_admin branch). This is symmetric to round-26 in APPLY_TAG_TO_EXISTING.
+# The webhook channel stays isolated from these tags (see ADR-0023 §3.2).
+# round-27: ``*_contains`` is whole-word, case-SENSITIVE (``~`` + explicit
+# boundary classes) over a whitespace-normalised, regex-escaped pattern
+# (literal match). The user controls case via the pattern they type. See
+# module docstring.
 APPLY_TAGS_TO_MESSAGE: Final[str] = r"""
 INSERT INTO message_tags (message_id, tag_id)
 SELECT :message_id, t.id
@@ -116,16 +161,17 @@ JOIN mail_accounts ma ON ma.id = :mail_account_id
 WHERE (
         u.id = ma.user_id
         OR (ma.group_id IS NOT NULL AND u.group_id = ma.group_id)
+        OR u.role = 'super_admin'
     )
   AND (
         -- match_mode = 'any' (OR, default): at least one rule of the tag matches.
         (t.match_mode = 'any' AND EXISTS (
             SELECT 1 FROM tag_rules r WHERE r.tag_id = t.id AND (
-                (r.type = 'subject_contains' AND :subject ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
-                (r.type = 'body_contains'    AND :body    ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
+                (r.type = 'subject_contains' AND regexp_replace(translate(:subject, chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')) OR
+                (r.type = 'body_contains'    AND regexp_replace(translate(:body,    chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')) OR
                 (r.type = 'sender_contains'  AND (
-                    :sender ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')
-                    OR COALESCE(CAST(:sender_name AS TEXT), '') ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')
+                    regexp_replace(translate(:sender, chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')
+                    OR regexp_replace(translate(COALESCE(CAST(:sender_name AS TEXT), ''), chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')
                 )) OR
                 (r.type = 'sender_exact'     AND LOWER(:sender) = LOWER(r.pattern))
             )
@@ -137,11 +183,11 @@ WHERE (
             AND EXISTS (SELECT 1 FROM tag_rules r WHERE r.tag_id = t.id)
             AND NOT EXISTS (
                 SELECT 1 FROM tag_rules r WHERE r.tag_id = t.id AND NOT (
-                    (r.type = 'subject_contains' AND :subject ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
-                    (r.type = 'body_contains'    AND :body    ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
+                    (r.type = 'subject_contains' AND regexp_replace(translate(:subject, chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')) OR
+                    (r.type = 'body_contains'    AND regexp_replace(translate(:body,    chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')) OR
                     (r.type = 'sender_contains'  AND (
-                        :sender ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')
-                        OR COALESCE(CAST(:sender_name AS TEXT), '') ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')
+                        regexp_replace(translate(:sender, chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')
+                        OR regexp_replace(translate(COALESCE(CAST(:sender_name AS TEXT), ''), chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')
                     )) OR
                     (r.type = 'sender_exact'     AND LOWER(:sender) = LOWER(r.pattern))
                 )
@@ -161,9 +207,10 @@ ON CONFLICT (message_id, tag_id) DO NOTHING
 # messages via ``MessageService.visible_user_ids`` → None). For
 # group_leader / group_member the flag is FALSE and the original
 # personal+team scoping applies unchanged.
-# round-23: ``*_contains`` is whole-word, case-SENSITIVE (``~`` + ``\y``
-# boundaries) over a regex-escaped pattern (literal match). The user
-# controls case via the pattern they type. See module docstring.
+# round-27: ``*_contains`` is whole-word, case-SENSITIVE (``~`` + explicit
+# boundary classes) over a whitespace-normalised, regex-escaped pattern
+# (literal match). The user controls case via the pattern they type. See
+# module docstring.
 APPLY_TAG_TO_EXISTING: Final[str] = r"""
 INSERT INTO message_tags (message_id, tag_id)
 SELECT m.id, :tag_id
@@ -188,11 +235,11 @@ WHERE (
         -- match_mode = 'any' (OR, default): at least one rule of the tag matches.
         ((SELECT match_mode FROM tags WHERE id = :tag_id) = 'any' AND EXISTS (
             SELECT 1 FROM tag_rules r WHERE r.tag_id = :tag_id AND (
-                (r.type = 'subject_contains' AND m.subject   ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
-                (r.type = 'body_contains'    AND m.body_text ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
+                (r.type = 'subject_contains' AND regexp_replace(translate(m.subject,   chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')) OR
+                (r.type = 'body_contains'    AND regexp_replace(translate(m.body_text, chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')) OR
                 (r.type = 'sender_contains'  AND (
-                    m.from_addr ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')
-                    OR COALESCE(m.from_name, '') ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')
+                    regexp_replace(translate(m.from_addr, chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')
+                    OR regexp_replace(translate(COALESCE(m.from_name, ''), chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')
                 )) OR
                 (r.type = 'sender_exact'     AND LOWER(m.from_addr) = LOWER(r.pattern))
             )
@@ -203,11 +250,11 @@ WHERE (
             AND EXISTS (SELECT 1 FROM tag_rules r WHERE r.tag_id = :tag_id)
             AND NOT EXISTS (
                 SELECT 1 FROM tag_rules r WHERE r.tag_id = :tag_id AND NOT (
-                    (r.type = 'subject_contains' AND m.subject   ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
-                    (r.type = 'body_contains'    AND m.body_text ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
+                    (r.type = 'subject_contains' AND regexp_replace(translate(m.subject,   chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')) OR
+                    (r.type = 'body_contains'    AND regexp_replace(translate(m.body_text, chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')) OR
                     (r.type = 'sender_contains'  AND (
-                        m.from_addr ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')
-                        OR COALESCE(m.from_name, '') ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')
+                        regexp_replace(translate(m.from_addr, chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')
+                        OR regexp_replace(translate(COALESCE(m.from_name, ''), chr(160), ' '), '\s+', ' ', 'g') ~ ('(^|[^[:alnum:]_])' || regexp_replace(translate(regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g'), chr(160), ' '), '\s+', ' ', 'g') || '([^[:alnum:]_]|$)')
                     )) OR
                     (r.type = 'sender_exact'     AND LOWER(m.from_addr) = LOWER(r.pattern))
                 )

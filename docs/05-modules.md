@@ -1518,7 +1518,7 @@ class TagsService:
     async def delete_rule(user_id: int, tag_id: int, rule_id: int) -> None
     async def apply_to_existing(user_id: int, tag_id: int) -> int          # returns applied_count
     async def ensure_builtin_tags(user_id: int) -> None                    # idempotent; called from auth post-login hook
-    async def apply_tags_to_message(message_id: int, user_id: int) -> int  # called from worker.save_message
+    async def apply_tags_to_message(*, message: _MessageLike, mail_account_id: int) -> int  # worker hook; навешивает теги ВСЕХ видящих письмо пользователей (owner + одногруппники + super_admin), см. ADR-0017 §5/§5.1
 ```
 
 - Repository (в `repositories/tags.py`):
@@ -1555,20 +1555,44 @@ class MessageTagsRepo:
 
 Готовый текст параметризованных запросов; используется service'ом и worker'ом без дублирования. Источник истины — ADR-0017 §5/§7.
 
+> **Источник истины — ADR-0017 §4/§5/§7 + `backend/app/tags/sql.py`.** Ниже —
+> упрощённый псевдокод; точный SQL (экранирование, граничные классы,
+> нормализация) живёт в `sql.py`. Старый ILIKE-вариант снят round-23.
+
+Семантика `*_contains` (subject/body/sender): **whole-word, case-SENSITIVE**,
+по **нормализованному** тексту. Каждое плечо имеет форму:
+
+```
+norm(value) ~ ( '(^|[^[:alnum:]_])' || norm(escaped_pattern) || '([^[:alnum:]_]|$)' )
+
+где:
+  escaped_pattern = regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g')
+  norm(x)         = regexp_replace( translate(x, chr(160), ' '), '\s+', ' ', 'g' )
+```
+
+- Граничные классы `(^|[^[:alnum:]_]) … ([^[:alnum:]_]|$)` — а **не** `\y`:
+  `\y` не матчил паттерны, обрамлённые пунктуацией (`Congratulations!`,
+  `…attention.`) — round-27 fix. См. ADR-0017 §4.1.
+- `norm()` обязателен: реальные `body_text` (из `html2text`/`text-plain`) содержат
+  `\n`, прогоны пробелов и U+00A0 внутри предложений — без нормализации
+  многословные паттерны не матчатся. nbsp переводится **явно** (Postgres `\s` его
+  не ловит в этой локали). См. ADR-0017 §4.2.
+- `sender_exact` — `LOWER(value) = LOWER(r.pattern)` (без нормализации/границ).
+- `match_mode='any'` → `EXISTS(rule matches)`; `match_mode='all'` → `EXISTS(≥1 rule) AND NOT EXISTS(rule fails)` (round-24).
+- `sender_contains` матчит и `from_addr`, и `COALESCE(from_name,'')` (round-25).
+
 ```python
+# Упрощённо (точный текст — backend/app/tags/sql.py):
 APPLY_TAGS_TO_MESSAGE = """
 INSERT INTO message_tags (message_id, tag_id)
 SELECT :message_id, t.id
 FROM tags t
-WHERE t.user_id = :user_id
-  AND EXISTS (
-    SELECT 1 FROM tag_rules r WHERE r.tag_id = t.id AND (
-        (r.type = 'subject_contains' AND :subject  ILIKE '%' || r.pattern || '%') OR
-        (r.type = 'body_contains'    AND :body     ILIKE '%' || r.pattern || '%') OR
-        (r.type = 'sender_contains'  AND :sender   ILIKE '%' || r.pattern || '%') OR
-        (r.type = 'sender_exact'     AND LOWER(:sender) = LOWER(r.pattern))
-    )
-  )
+JOIN users u ON u.id = t.user_id
+JOIN mail_accounts ma ON ma.id = :mail_account_id
+WHERE ( u.id = ma.user_id
+        OR (ma.group_id IS NOT NULL AND u.group_id = ma.group_id)
+        OR u.role = 'super_admin' )          -- round-28: super_admin видит все письма
+  AND ( <match_mode 'any'/'all' с *_contains-предикатами вида norm(value) ~ boundary(norm(escaped_pattern)) > )
 ON CONFLICT (message_id, tag_id) DO NOTHING
 """
 
@@ -1577,26 +1601,29 @@ INSERT INTO message_tags (message_id, tag_id)
 SELECT m.id, :tag_id
 FROM messages m
 JOIN mail_accounts ma ON ma.id = m.mail_account_id
-WHERE ma.user_id = :user_id
-  AND EXISTS (
-    SELECT 1 FROM tag_rules r WHERE r.tag_id = :tag_id AND (
-        (r.type = 'subject_contains' AND m.subject   ILIKE '%' || r.pattern || '%') OR
-        (r.type = 'body_contains'    AND m.body_text ILIKE '%' || r.pattern || '%') OR
-        (r.type = 'sender_contains'  AND m.from_addr ILIKE '%' || r.pattern || '%') OR
-        (r.type = 'sender_exact'     AND LOWER(m.from_addr) = LOWER(r.pattern))
-    )
-  )
+WHERE ( CAST(:is_super_admin AS BOOLEAN)      -- round-26: super_admin → все письма
+        OR ma.user_id = :user_id
+        OR (CAST(:user_group_id AS BIGINT) IS NOT NULL AND ma.group_id = CAST(:user_group_id AS BIGINT)) )
+  AND ( <тот же match_mode + *_contains блок > )
 ON CONFLICT (message_id, tag_id) DO NOTHING
 """
 ```
 
-В `apply_tags_to_message` параметры `:subject`, `:body`, `:sender`, `:user_id`, `:message_id` — backend передаёт значениями из объекта `Message` (вытащить можно как из переданного объекта, так и SELECT'ом по message_id). Альтернатива — внутри SQL JOIN'нуть `messages m ON m.id = :message_id` (одинаково по производительности).
+В `apply_tags_to_message` backend передаёт `:message_id`, `:mail_account_id`,
+`:subject`, `:body`, `:sender`, `:sender_name` (round-25, nullable) из объекта
+`Message` (`backend/app/tags/service.py`); нормализация выполняется внутри SQL,
+backend передаёт сырые значения. В `APPLY_TAG_TO_EXISTING` `:is_super_admin`
+(BOOLEAN) и `:user_group_id` (BIGINT, NULL для super_admin/без группы) приводятся
+`CAST`-ом — asyncpg не выводит тип для параметра, встречающегося только в
+`IS NOT NULL` / форсящего фильтр.
 
 ### Edge cases
 - Создание тега: race с другим запросом того же пользователя (две одновременные POST /api/tags с одинаковым name) → один из POST вернёт 409 (UNIQUE constraint).
 - `apply_to_existing` при пустом массиве rules — INSERT не вернёт строк, `applied_count=0`. Это валидное состояние (пользователь хочет создать пустой тег и потом добавить rules).
 - DELETE rule после того как rule сработал → существующие `message_tags` остаются (см. note в `04-api-contracts.md`).
-- Pattern с `%` или `_` — рабочие как ILIKE-wildcards; намеренно (см. ADR-0017 §4).
+- Pattern с `%` или `_` — **литеральные символы** (экранируются, не wildcard) с round-23; см. ADR-0017 §4 / TD-012 (снят).
+- Pattern, обрамлённый пунктуацией (`Congratulations!`, `…attention.`) — матчится корректно благодаря граничным классам (round-27 fix; `\y` ломал такие); см. ADR-0017 §4.1.
+- Многословный pattern (`We noticed an issue …`) — матчится несмотря на `\n`/прогоны пробелов/U+00A0 в теле, т.к. обе стороны проходят `norm()`; см. ADR-0017 §4.2.
 - `apply_to_existing=true` при число messages > 100 000 → `tag_apply_too_many` (422). Перед heavy SQL делаем `count_messages_for_user(user_id)`; см. ADR-0017 §7.
 - `ensure_builtin_tags` race (одновременно два login одного user'а): первый создаст builtin, второй увидит `has_any_builtin=true` и сделает return. Если ровно одновременно оба прошли проверку и пытаются INSERT — UNIQUE `(user_id, name)` гарантирует, что второй получит IntegrityError; ловим его и treat as success (idempotent retry-safe).
 
@@ -1606,9 +1633,15 @@ ON CONFLICT (message_id, tag_id) DO NOTHING
 - DELETE builtin → `CannotDeleteBuiltinTagError` (преобразуется в 400 `cannot_delete_builtin_tag`).
 - `ensure_builtin_tags` вызванный дважды → только 4 builtin тега (idempotent).
 - `apply_tags_to_message` для сообщения, у которого subject="DPLA report" и user имеет builtin "DPLA.PLA" → `message_tags` содержит link.
-- `apply_tags_to_message` для message чужого пользователя (manual SQL test) → нет линков (защита через `t.user_id = :user_id`).
-- Pattern с `'` (одинарная кавычка) → корректно параметризован (нет SQL injection); тест: pattern=`O'Brien` сработает на subject `Hello, O'Brien!`.
-- ILIKE case-insensitive: pattern `Apple Inc`, subject `notification from APPLE INC.` → match.
+- `apply_tags_to_message` навешивает теги только видящих письмо пользователей (owner ящика, одногруппники по `ma.group_id`, super_admin — round-28). Тег обычного пользователя B не цепляется к письму чужой команды A (нет ветки видимости) — manual SQL test.
+- super_admin (round-28): его персональный тег цепляется к письму ЛЮБОЙ команды (строка в `message_tags`) → срабатывает **TG**-уведомление (`telegram_notifications.list_recipients_for_message`, ADR-0022 §2.2 — джойн тега per-recipient `t.user_id=u.id` + ветка `u.role='super_admin'`).
+- super_admin-тег НЕ протекает в **inbox** чужой команды: inbox показывает теги владельца ящика (`JOIN message_tags mt → tags t ON t.user_id = ma.user_id`, см. §10 «Tag-aware fields» / ADR-0019 §7.4). super_admin не владелец чужого ящика → его строка `message_tags` существует, но JOIN по `t.user_id=ma.user_id` её отсекает.
+- super_admin-тег НЕ протекает в **webhook** чужой команды: `FIND_ACTIVE_WEBHOOK_FOR_MESSAGE` EXISTS и `LIST_TAGS_FOR_TEAM` (см. §19) фильтруют `(u.group_id=ma.group_id OR u.id=ma.user_id)` — без `u.role='super_admin'`. Письмо с ТОЛЬКО super_admin-тегом webhook чужой команды не триггерит; `name`/`color` super_admin-тега в её payload не уходят (ADR-0023 §3.2, ADR-0017 §5.1 «Webhook-вектор»).
+- Pattern с `'` (одинарная кавычка) → корректно параметризован (нет SQL injection); тест: pattern=`O'Brien` сработает на subject `Hello, O'Brien!` (граница перед `O` — пробел, после `Brien` — `!`).
+- **Case-SENSITIVE** (round-23): pattern `Apple Inc` НЕ матчит `APPLE INC.` (регистр контролирует пользователь); pattern `DPLA` ловит `DPLA`, но не `dpla`/`pla`.
+- **Whole-word** (round-23): pattern `PLA` не матчит «tem**pla**te» (подстрока внутри слова).
+- **Punctuation-bounded** (round-27): pattern `Congratulations!` матчит тело с `… holder,   Congratulations! Your …` (несмотря на `!` на конце и тройной пробел перед — норм. + граничные классы).
+- **match_mode='all'** (round-24): тег с двумя rules навешивается, только если оба сработали; ни один несработавший rule не должен молча снимать тег из-за `\y`/whitespace-бага.
 
 ### Content negotiation (no-JS fallback)
 
@@ -2069,10 +2102,11 @@ class WebhookDeliveriesRepo:
     async def mark_failed(delivery_id: int, status: int, excerpt: str) -> None  # тоже sent_at=now + response_code/excerpt; маркер «отказались навсегда»
     async def rollback(delivery_id: int) -> None                                # DELETE WHERE id=…; используется для transient errors
     async def list_tags_for_team(message_id: int, group_id: int) -> list[TagDTO]
-        # SELECT DISTINCT t.id, t.name, t.color FROM message_tags JOIN tags JOIN users
-        # WHERE mt.message_id=:mid AND (u.role='super_admin' OR u.group_id=:gid) ORDER BY t.name
+        # SELECT DISTINCT t.id, t.name, t.color FROM message_tags JOIN tags JOIN users JOIN mail_accounts (по :mid)
+        # WHERE mt.message_id=:mid AND (u.group_id=:gid OR u.id=ma.user_id) ORDER BY t.name
+        # round-28: НЕ включает super_admin-теги (изоляция webhook от персональных тегов super_admin; ADR-0023 §3.2)
     async def list_missing_for_recovery(threshold_at: datetime, limit: int = 5000) -> list[int]
-        # SQL ADR-0023 §3.5 — окно 24ч, с history-filter, без успешной/mark_failed delivery
+        # SQL ADR-0023 §3.5 — окно 24ч, с history-filter, team-scoped tag-EXISTS (без super_admin; round-28), без успешной/mark_failed delivery
 ```
 
 - Schemas (`backend/app/webhooks/schemas.py`):
@@ -2180,7 +2214,12 @@ WHERE w.group_id = ma.group_id
       JOIN tags t ON t.id = mt.tag_id
       JOIN users u ON u.id = t.user_id
       WHERE mt.message_id = m.id
-        AND (u.role = 'super_admin' OR u.group_id = ma.group_id)
+        AND (u.group_id = ma.group_id OR u.id = ma.user_id)
+        -- round-28: НЕ `u.role='super_admin'`. Персональные теги super_admin
+        -- навешиваются на чужие письма ради TG-уведомлений (ADR-0017 §5.1), но
+        -- webhook команды ими триггериться НЕ должен — иначе письмо с ТОЛЬКО
+        -- super_admin-тегом ложно сработает у webhook'а чужой команды. См.
+        -- ADR-0023 §3.2 «Изоляция от персональных тегов super_admin».
   )
 LIMIT 1
 """
@@ -2190,8 +2229,13 @@ SELECT DISTINCT t.id, t.name, t.color
 FROM message_tags mt
 JOIN tags t ON t.id = mt.tag_id
 JOIN users u ON u.id = t.user_id
+JOIN mail_accounts ma ON ma.id = (
+    SELECT m_inner.mail_account_id FROM messages m_inner WHERE m_inner.id = :mid
+)
 WHERE mt.message_id = :mid
-  AND (u.role = 'super_admin' OR u.group_id = :gid)
+  AND (u.group_id = :gid OR u.id = ma.user_id)
+  -- round-28: НЕ `u.role='super_admin'`. name/color персонального тега super_admin
+  -- не должны утекать во внешний payload чужой команды. См. ADR-0023 §3.2.
 ORDER BY t.name
 """
 
@@ -2200,7 +2244,16 @@ SELECT m.id
 FROM messages m
 JOIN mail_accounts ma ON ma.id = m.mail_account_id
 WHERE m.fetched_at > :threshold
-  AND EXISTS (SELECT 1 FROM message_tags mt WHERE mt.message_id = m.id)
+  AND EXISTS (
+      SELECT 1 FROM message_tags mt
+      JOIN tags t ON t.id = mt.tag_id
+      JOIN users u ON u.id = t.user_id
+      WHERE mt.message_id = m.id
+        AND (u.group_id = ma.group_id OR u.id = ma.user_id)
+        -- round-28: тот же team-scoped предикат, что в FIND_ACTIVE_WEBHOOK_FOR_MESSAGE.
+        -- Без него письмо с ТОЛЬКО super_admin-тегом проходило бы pre-filter,
+        -- ре-энкьюилось каждый час 24ч и тихо отбрасывалось в dispatch (churn).
+  )
   AND EXISTS (
       SELECT 1 FROM webhooks w
       WHERE w.group_id = ma.group_id
@@ -2236,6 +2289,8 @@ LIMIT 5000
 - `get_by_group_id` возвращает None, если не настроен (для 404 в API).
 - Decrypt secret с правильным `webhook_id` → plaintext; с другим `webhook_id` → `InvalidTag` (AAD binding test).
 - `find_active_for_message`: возвращает None для (a) inactive webhook (b) dead_at IS NOT NULL (c) `m.internal_date < w.created_at` (history-filter) (d) нет тегов у пользователей группы на этом сообщении.
+- **Изоляция super_admin (round-28):** письмо чужой команды A, на котором есть **только** персональный тег super_admin (и ни одного тега членов команды A / владельца ящика) → `find_active_for_message` для webhook'а команды A возвращает **None** (EXISTS не сработал, т.к. предикат `(u.group_id=ma.group_id OR u.id=ma.user_id)` super_admin-тег не учитывает). manual SQL test.
+- **Изоляция super_admin в payload (round-28):** `list_tags_for_team(message_id, group_id)` для письма, где есть тег члена команды **и** персональный тег super_admin → возвращает **только** тег члена команды; `name`/`color` super_admin-тега в результат не попадают. manual SQL test.
 - `try_reserve` идемпотентен: повторный вызов с теми же `(webhook_id, message_id)` → None.
 - Создание webhook'а с `url='http://...'` (не https) → ValidationError (Pydantic + DB CHECK).
 - Создание с `url='https://localhost'` → 400 `webhook_url_private_ip` (lexical reject).

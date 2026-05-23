@@ -95,8 +95,10 @@ class WebhooksRepo:
         - the message's ``internal_date`` is older than the webhook's
           ``created_at`` (history-flood filter, symmetric to round-13
           for TG-notifications);
-        - the message has no tags applied (by anyone visible to the
-          team — i.e. group members or a super-admin).
+        - the message has no team tag applied (by a group member or the
+          mailbox owner). round-28: a super_admin's personal tag does NOT
+          count here — the webhook channel is isolated from super_admin
+          tags (ADR-0023 §3.2).
         """
         stmt = text(
             """
@@ -119,9 +121,17 @@ class WebhooksRepo:
                        JOIN   users u ON u.id = t.user_id
                        WHERE  mt.message_id = m.id
                          AND  (
-                                 u.role = 'super_admin'
-                                 OR u.group_id = ma.group_id
+                                 u.group_id = ma.group_id
+                                 OR u.id = ma.user_id
                               )
+                         -- round-28: NO ``u.role = 'super_admin'`` branch.
+                         -- super_admin's personal tags are attached to other
+                         -- teams' messages for TG-notifications (ADR-0017
+                         -- §5.1), but a team webhook must NOT be triggered by
+                         -- them — otherwise a message tagged ONLY by a
+                         -- super_admin tag would falsely fire another team's
+                         -- webhook. See ADR-0023 §3.2 "Изоляция от персональных
+                         -- тегов super_admin".
                    )
             LIMIT 1
             """
@@ -365,8 +375,18 @@ class WebhookDeliveriesRepo:
             FROM   message_tags mt
             JOIN   tags t ON t.id = mt.tag_id
             JOIN   users u ON u.id = t.user_id
+            JOIN   mail_accounts ma ON ma.id = (
+                       SELECT m_inner.mail_account_id
+                       FROM   messages m_inner
+                       WHERE  m_inner.id = :message_id
+                   )
             WHERE  mt.message_id = :message_id
-              AND  (u.role = 'super_admin' OR u.group_id = :group_id)
+              AND  (u.group_id = :group_id OR u.id = ma.user_id)
+              -- round-28: NO ``u.role = 'super_admin'``. The name/color of a
+              -- super_admin's personal tag must not leak into another team's
+              -- external payload. The ``u.id = ma.user_id`` arm keeps the
+              -- mailbox owner's tags even if the owner is outside the group
+              -- (defensive). See ADR-0023 §3.2.
             ORDER  BY t.name
             """
         )
@@ -383,7 +403,8 @@ class WebhookDeliveriesRepo:
 
         - were fetched within the lookback window
           (``WEBHOOK_RECOVERY_WINDOW_HOURS``);
-        - have at least one tag applied;
+        - have at least one **team** tag applied (group member or mailbox
+          owner — NOT a super_admin personal tag; round-28, ADR-0023 §3.2);
         - belong to a team whose webhook is active and not dead;
         - have NO ``webhook_deliveries`` row at all (the dispatcher hadn't
           claimed them yet — either because the worker crashed between
@@ -403,7 +424,16 @@ class WebhookDeliveriesRepo:
             WHERE  m.fetched_at > :cutoff
               AND  EXISTS (
                        SELECT 1 FROM message_tags mt
+                       JOIN   tags t ON t.id = mt.tag_id
+                       JOIN   users u ON u.id = t.user_id
                        WHERE  mt.message_id = m.id
+                         AND  (u.group_id = ma.group_id OR u.id = ma.user_id)
+                       -- round-28: same team-scoped predicate as
+                       -- ``find_active_for_message``. Without it, a message
+                       -- tagged ONLY by a super_admin personal tag would pass
+                       -- this pre-filter, get re-enqueued hourly for 24h and
+                       -- be silently dropped in dispatch (churn). See
+                       -- ADR-0023 §3.5 / §3.2.
                    )
               AND  EXISTS (
                        SELECT 1 FROM webhooks w

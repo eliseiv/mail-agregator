@@ -487,7 +487,7 @@ erDiagram
 | `id` | BIGSERIAL | PK | |
 | `tag_id` | BIGINT | NOT NULL, FK → `tags(id)` ON DELETE CASCADE | |
 | `type` | TEXT | NOT NULL | Enum-string: `subject_contains` \| `body_contains` \| `sender_contains` \| `sender_exact`. CHECK constraint. |
-| `pattern` | TEXT | NOT NULL | Подстрока (для `*_contains`) или полный email (для `sender_exact`). 1..256 символов. |
+| `pattern` | TEXT | NOT NULL | Слово/фраза для whole-word **case-sensitive** матча (для `*_contains` — экранируется, граничные классы, нормализация пробелов; см. ADR-0017 §4) или полный email (для `sender_exact`, case-insensitive). 1..256 символов. |
 | `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | |
 
 **Constraints:**
