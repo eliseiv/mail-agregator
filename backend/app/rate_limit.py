@@ -78,9 +78,12 @@ LIMIT_ACCOUNT_SYNC = Limit(name="acc_sync", capacity=5, window_seconds=60 * 60)
 LIMIT_MESSAGE_SEND = Limit(name="msg_send", capacity=30, window_seconds=60 * 60)
 LIMIT_ADMIN_WRITE = Limit(name="admin_write", capacity=50, window_seconds=60 * 60)
 # Tags (ADR-0017): writes (create/edit/delete tag, add/remove rule) — 30/h.
-# ``apply_to_existing`` is a heavier path and gets its own 5/h limit per user.
+# ``apply_to_existing`` is a heavier path and gets its own 50/h limit per user.
+# Raised 5/h -> 50/h: bulk onboarding and repeated re-applies (debug / re-tagging)
+# need headroom; the runaway-guard (>100k messages -> 422, ADR-0017 §7) still
+# protects against expensive full-table scans regardless of this cap.
 LIMIT_TAGS_WRITE = Limit(name="tags_write", capacity=30, window_seconds=60 * 60)
-LIMIT_TAGS_APPLY = Limit(name="tags_apply", capacity=5, window_seconds=60 * 60)
+LIMIT_TAGS_APPLY = Limit(name="tags_apply", capacity=50, window_seconds=60 * 60)
 # Telegram persistent SSO (ADR-0022 §1.2):
 # - per IP:           30 / min  (front line — covers HMAC-fail flooding).
 # - per tg_user_id:   10 / min  (post-HMAC — covers replay of valid init_data).

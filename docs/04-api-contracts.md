@@ -534,7 +534,7 @@ _method=DELETE&csrf_token=...
 
 #### `POST /api/tags/{id}/apply-to-existing`
 | Поведение | Synchronously запускает bulk INSERT в `message_tags` для всех messages пользователя, попадающих под текущие rules тега (см. ADR-0017 §7). |
-| Rate-limit | 5 / час per user (защита от abuse тяжёлой операции). |
+| Rate-limit | 50 / час per user (защита от abuse частыми запросами; тяжёлые сканы дополнительно отсекаются runaway-guard `tag_apply_too_many` при >100 000 messages, см. ADR-0017 §7). |
 | 200 | `{applied_count: int}` — число новых линков (т.е. без учёта тех, что уже были, ON CONFLICT DO NOTHING). |
 | 404 | если tag не принадлежит пользователю. |
 | 422 | `tag_apply_too_many` если у пользователя > 100 000 messages. |
@@ -1159,7 +1159,7 @@ FastAPI автогенерит OpenAPI 3.1. UI:
 | POST | `/api/tags/{id}/rules` | user | yes | 30/h | yes | add rule |
 | DELETE | `/api/tags/{id}/rules/{rule_id}` | user | yes | 30/h | yes | delete rule (canonical) |
 | POST | `/api/tags/{id}/rules/{rule_id}/delete` | user | yes | 30/h | yes | form-fallback delete (`_method=DELETE`) |
-| POST | `/api/tags/{id}/apply-to-existing` | user | yes | 5/h per user | yes | bulk apply tag to existing messages |
+| POST | `/api/tags/{id}/apply-to-existing` | user | yes | 50/h per user | yes | bulk apply tag to existing messages |
 | GET | `/admin` | super_admin | — | — | — | admin dashboard |
 | GET | `/admin/audit` | super_admin | — | — | — | audit page |
 | GET | `/admin/groups` | super_admin | — | — | — | groups list page (ADR-0019) |
