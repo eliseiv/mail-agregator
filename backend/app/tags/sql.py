@@ -121,7 +121,7 @@ WHERE (
                 (r.type = 'body_contains'    AND :body    ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
                 (r.type = 'sender_contains'  AND (
                     :sender ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')
-                    OR COALESCE(:sender_name, '') ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')
+                    OR COALESCE(CAST(:sender_name AS TEXT), '') ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')
                 )) OR
                 (r.type = 'sender_exact'     AND LOWER(:sender) = LOWER(r.pattern))
             )
@@ -137,7 +137,7 @@ WHERE (
                     (r.type = 'body_contains'    AND :body    ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')) OR
                     (r.type = 'sender_contains'  AND (
                         :sender ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')
-                        OR COALESCE(:sender_name, '') ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')
+                        OR COALESCE(CAST(:sender_name AS TEXT), '') ~ ('\y' || regexp_replace(r.pattern, '([\^$.|?*+()\[\]{}\\])', '\\\1', 'g') || '\y')
                     )) OR
                     (r.type = 'sender_exact'     AND LOWER(:sender) = LOWER(r.pattern))
                 )
@@ -165,7 +165,11 @@ FROM messages m
 JOIN mail_accounts ma ON ma.id = m.mail_account_id
 WHERE (
         ma.user_id = :user_id
-        OR (:user_group_id IS NOT NULL AND ma.group_id = :user_group_id)
+        -- CAST is required: ``:user_group_id`` is NULL for super-admin / users
+        -- without a group, and asyncpg cannot infer a prepared-statement type
+        -- for a parameter that only appears in ``IS NOT NULL`` →
+        -- AmbiguousParameterError. Pinning it to BIGINT resolves the type.
+        OR (CAST(:user_group_id AS BIGINT) IS NOT NULL AND ma.group_id = CAST(:user_group_id AS BIGINT))
     )
   AND (
         -- match_mode = 'any' (OR, default): at least one rule of the tag matches.
