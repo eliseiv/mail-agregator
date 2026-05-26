@@ -28,7 +28,30 @@ from sqlalchemy import delete, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from shared.config import get_settings
 from shared.models import TelegramNotification
+
+# ADR-0022 §2.2 / §2.8: tag predicate fragment, appended to the recipient
+# SQL only when TG_NOTIFY_ALL_MESSAGES is off (historical "tagged-only"
+# behaviour). When the flag is on (default) the fragment is the empty string
+# — a message without any tag is still a valid notification target.
+_TAG_PREDICATE_SQL = """
+              AND  EXISTS (
+                       SELECT 1
+                       FROM   message_tags mt
+                       WHERE  mt.message_id = m.id
+                   )"""
+
+
+def _tag_predicate() -> str:
+    """Return the conditional ``<TAG_PREDICATE>`` fragment (ADR-0022 §2.2).
+
+    Structural SQL substitution (not a bind parameter): empty string when
+    ``TG_NOTIFY_ALL_MESSAGES`` is on, the ``EXISTS(message_tags)`` block when
+    off. Read from the lru-cached settings so a flag flip needs only a worker
+    restart, not a redeploy.
+    """
+    return "" if get_settings().TG_NOTIFY_ALL_MESSAGES else _TAG_PREDICATE_SQL
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,9 +146,12 @@ class TelegramNotificationsRepo:
         (a) can see the message under visibility rules (super_admin /
             same group / explicit owner — same as ADR-0019 §7);
         (b) have an active ``telegram_links`` row;
-        (c) the message has **at least one** tag applied (any tag, any
-            user) — auto-tagging tags only the mailbox owner, but every
-            group-mate should also be notified;
+        (c) the message satisfies the conditional tag predicate
+            (round-31): when ``TG_NOTIFY_ALL_MESSAGES`` is on (default) the
+            predicate is **absent** — every visible message is eligible,
+            tagged or not; when off, the message must have **at least one**
+            tag applied (any tag, any user) — auto-tagging tags only the
+            mailbox owner, but every group-mate should also be notified;
         (d) are not opted-out via ``users_settings``;
         (e) the message arrived *at or after* the moment the user linked
             their Telegram account (``m.internal_date >= tl.created_at``).
@@ -135,9 +161,15 @@ class TelegramNotificationsRepo:
         Round-12 (bug A): the previous SQL required the recipient to own
         a tag on the message via ``JOIN tags t ON t.user_id = u.id`` —
         which excluded every group member whose leader tagged the
-        message. We now require only "the message has any tag at all"
+        message. We then required only "the message has any tag at all"
         via ``EXISTS (... message_tags ...)``; the per-user filter is
         gone.
+
+        Round-31 (notify about ALL messages): that ``EXISTS(message_tags)``
+        block is now **conditional** on ``TG_NOTIFY_ALL_MESSAGES`` (see
+        :func:`_tag_predicate`). The visibility / active-link / first-link
+        (``m.internal_date >= tl.created_at``) / opt-out invariants are
+        unchanged in both modes — only the tag predicate toggles.
 
         Round-13 (first-link backfill bug): on first link the user has
         no ``telegram_notifications`` rows, so the recovery scan picked
@@ -151,7 +183,7 @@ class TelegramNotificationsRepo:
         mail also stays silent for first-time linkers.
         """
         stmt = text(
-            """
+            f"""
             SELECT DISTINCT
                    u.id              AS user_id,
                    tl.telegram_user_id AS telegram_user_id,
@@ -170,13 +202,10 @@ class TelegramNotificationsRepo:
                    AND m.internal_date >= tl.created_at
             LEFT JOIN users_settings us ON us.user_id = u.id
             WHERE  m.id = :message_id
-              AND  COALESCE(us.tg_notifications_enabled, true) = true
-              AND  EXISTS (
-                       SELECT 1
-                       FROM   message_tags mt
-                       WHERE  mt.message_id = m.id
-                   )
+              AND  COALESCE(us.tg_notifications_enabled, true) = true{_tag_predicate()}
             """
+            # The f-string only interpolates ``_tag_predicate()`` — a fixed
+            # internal SQL constant, never user input. No injection surface.
         )
         result = await self._s.execute(stmt, {"message_id": message_id})
         return [
@@ -215,32 +244,62 @@ class TelegramNotificationsRepo:
         ]
 
     async def list_missing_for_recovery(self, *, window_hours: int, limit: int) -> list[int]:
-        """SQL from ADR-0022 §2.8.
+        """SQL from ADR-0022 §2.8 (round-33: per-recipient gap fix).
 
-        Returns ``message_id`` values that have tags but no
-        ``telegram_notifications`` row at all yet (no recipient was claimed
-        — usually because the worker crashed between LPUSH and LPOP).
+        Returns ``DISTINCT message_id`` values that still have a **visible,
+        linked recipient without a** ``telegram_notifications`` row by
+        ``(message_id, user_id)`` within the lookback window.
+
+        Round-33 (CRITICAL fix): the previous query matched per-message
+        (``NOT EXISTS (tn WHERE tn.message_id = m.id)``), which masked a
+        partial-delivery hole — if recipient A was delivered (row created)
+        but recipient B was throttled (§2.9, ``continue`` without
+        ``try_reserve``, no row), the per-message ``NOT EXISTS`` returned
+        FALSE because of A's row, so the message was never re-enqueued and B
+        lost the notification forever. The query now reuses the **same
+        recipient logic as §2.2** (visibility super_admin/group/owner; active
+        ``telegram_links`` with ``m.internal_date >= tl.created_at``; opt-out
+        via ``users_settings``; conditional tag predicate under
+        ``TG_NOTIFY_ALL_MESSAGES``) bound to ``m.id``, under a per-recipient
+        ``NOT EXISTS (tn WHERE tn.message_id = m.id AND tn.user_id = u.id)``.
+
+        ``DISTINCT m.id`` collapses multiple undelivered recipients of the
+        same message to a single re-enqueue (dispatch resolves all recipients
+        itself; already-delivered ones are skipped by ``try_reserve``).
 
         The 24h window is a deliberate cap: older messages are skipped to
-        avoid spamming users about stale mail.
+        avoid spamming users about stale mail (TD-027 documents the sustained
+        throttle edge case).
         """
         cutoff = datetime.now(UTC) - timedelta(hours=window_hours)
         stmt = text(
-            """
-            SELECT m.id
+            f"""
+            SELECT DISTINCT m.id
             FROM   messages m
-            WHERE  m.fetched_at > :cutoff
-              AND  EXISTS (
-                       SELECT 1 FROM message_tags mt
-                       WHERE  mt.message_id = m.id
+            JOIN   mail_accounts ma ON ma.id = m.mail_account_id
+            JOIN   users u
+                   ON (
+                       u.role = 'super_admin'
+                       OR (ma.group_id IS NOT NULL AND u.group_id = ma.group_id)
+                       OR u.id = ma.user_id
                    )
+            JOIN   telegram_links tl
+                   ON tl.user_id = u.id
+                   AND tl.dead_at IS NULL
+                   AND m.internal_date >= tl.created_at
+            LEFT JOIN users_settings us ON us.user_id = u.id
+            WHERE  m.fetched_at > :cutoff
+              AND  COALESCE(us.tg_notifications_enabled, true) = true{_tag_predicate()}
               AND  NOT EXISTS (
                        SELECT 1 FROM telegram_notifications tn
                        WHERE  tn.message_id = m.id
+                         AND  tn.user_id    = u.id
                    )
             ORDER  BY m.id
             LIMIT  :limit
             """
+            # The f-string only interpolates ``_tag_predicate()`` — a fixed
+            # internal SQL constant, never user input. No injection surface.
         )
         result = await self._s.execute(stmt, {"cutoff": cutoff, "limit": int(limit)})
         return [int(row.id) for row in result]

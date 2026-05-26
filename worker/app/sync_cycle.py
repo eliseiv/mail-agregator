@@ -120,6 +120,10 @@ async def sync_one_account(
     + ``attachments`` + uploads attachment blobs to MinIO.
     """
     storage = get_storage()
+    # ADR-0022 §2.1 (round-31): TG_NOTIFY_ALL_MESSAGES gates whether every
+    # inserted message is enqueued for Telegram notification or only tagged
+    # ones. lru-cached; one read per account-sync is cheap.
+    settings = get_settings()
     cycle_log = log.bind(mail_account_id=account.id, user_id=account.user_id)
     cycle_log.info("sync_account_start")
 
@@ -293,7 +297,10 @@ async def sync_one_account(
                     mail_account_id=account.id,
                 )
                 tags_applied_total += applied
-                if applied > 0:
+                # ADR-0022 §2.1 (round-31): enqueue EVERY inserted message
+                # when TG_NOTIFY_ALL_MESSAGES is on (default); otherwise keep
+                # the historical "only tagged" behaviour (applied > 0).
+                if settings.TG_NOTIFY_ALL_MESSAGES or applied > 0:
                     notified_message_ids.append(inserted_id)
             except Exception as exc:
                 # Don't lose the message; just record that we couldn't
@@ -316,8 +323,10 @@ async def sync_one_account(
             last_uidvalidity=box.uidvalidity,
         )
 
-    # ADR-0022 §2.1: enqueue Telegram-notifications for messages that got
-    # at least one tag. LPUSH after COMMIT so a recipient SQL inside the
+    # ADR-0022 §2.1 (round-31): enqueue Telegram-notifications for the
+    # collected message_ids — every inserted message when
+    # TG_NOTIFY_ALL_MESSAGES is on (default), else only those that got at
+    # least one tag. LPUSH after COMMIT so a recipient SQL inside the
     # dispatcher can see the committed rows. We swallow any failure here
     # — a Redis outage must NEVER abort the sync cycle.
     if notified_message_ids:

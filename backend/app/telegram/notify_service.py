@@ -25,6 +25,7 @@ from typing import Final, cast
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.app.rate_limit import LIMIT_TG_SEND_PER_CHAT, Limit, try_consume
 from backend.app.repositories.mail_accounts import MailAccountsRepo
 from backend.app.repositories.telegram_notifications import (
     NotifyRecipient,
@@ -39,6 +40,7 @@ from backend.app.telegram.sso_service import (
     TG_NOTIFY_QUEUE_KEY,
     TelegramSSOService,
 )
+from shared.config import get_settings
 from shared.logging import get_logger
 from shared.redis_client import get_redis
 
@@ -160,12 +162,21 @@ class TelegramNotifyService:
            :class:`TelegramNotificationsRepo`.
         4. Resolve the tag list **once** per message (round-12 bug A:
            used to be per-recipient; group members had no tags of their
-           own and were silently dropped).
+           own and were silently dropped). Round-31: the tag list MAY be
+           empty (notify-about-all messages) — there is **no** early return
+           on empty tags; the notification still ships without a tag line.
         5. For each recipient:
-           a. ``try_reserve`` — if the row already existed, skip silently.
-           b. Format the text using the message-level tag list.
-           c. Call :func:`send_notification`.
-           d. Handle the outcome:
+           a. Round-31 per-chat throttle (§2.9): non-blocking
+              ``try_consume(LIMIT_TG_SEND_PER_CHAT, chat_id)`` **before**
+              ``try_reserve``. If the per-chat budget is exhausted →
+              ``continue`` (do NOT reserve a row, do NOT re-enqueue). The
+              recovery scan (hourly, §2.8) picks the message up later — this
+              avoids the busy-loop a hot re-enqueue would cause under a
+              sustained ``inflow > cap``.
+           b. ``try_reserve`` — if the row already existed, skip silently.
+           c. Format the text using the message-level tag list.
+           d. Call :func:`send_notification`.
+           e. Handle the outcome:
               - ``ok`` → ``mark_sent`` with ``telegram_message_id``.
               - ``dead`` → mark the link dead + keep the row (no retry).
               - ``retry_after`` → leave the row claimed; re-enqueue the
@@ -222,12 +233,9 @@ class TelegramNotifyService:
         message_tags = await self._notifications.list_tags_for_message(
             message_id=payload.message_id
         )
-        if not message_tags:
-            # Defence-in-depth: recipient SQL already filters on "any tag
-            # exists", so this branch is only reached on a race where
-            # someone deleted the tags between the two queries. Skip
-            # silently rather than send a notification with no context.
-            return
+        # Round-31 (ADR-0022 §2.5): NO early return on empty tags. With
+        # TG_NOTIFY_ALL_MESSAGES on (default) a message may legitimately have
+        # no tags — we still notify, just without the (optional) tag line.
         # Round-21 (bug #2): collapse sibling tags by (name, color) — the
         # auto-tagging worker creates one ``tags`` row per team-member,
         # but the notification text should show each logical tag once.
@@ -248,7 +256,31 @@ class TelegramNotifyService:
         needs_retry = False
         retry_sleep_seconds = 0
 
+        # Round-31 (ADR-0022 §2.9): per-chat throttle capacity is read once
+        # from lru-cached settings and applied per-recipient at consume-time
+        # (same override pattern as LIMIT_WEBHOOK_TEST) — no redeploy needed
+        # to retune ``TG_SEND_PER_CHAT_PER_MINUTE``.
+        throttle_limit = Limit(
+            name=LIMIT_TG_SEND_PER_CHAT.name,
+            capacity=get_settings().TG_SEND_PER_CHAT_PER_MINUTE,
+            window_seconds=LIMIT_TG_SEND_PER_CHAT.window_seconds,
+        )
+
         for recipient in recipients:
+            # Per-chat throttle BEFORE try_reserve (§2.9): if the per-chat
+            # budget is exhausted, skip this recipient now WITHOUT reserving a
+            # telegram_notifications row and WITHOUT a hot re-enqueue. Leaving
+            # the (message_id, user_id) row absent lets the hourly recovery
+            # scan (§2.8, per-recipient NOT EXISTS) pick this recipient up
+            # later — natural ~1h backoff, no busy-loop under sustained flood.
+            if not await try_consume(throttle_limit, key=str(recipient.telegram_user_id)):
+                log.info(
+                    "tg_notify_throttled",
+                    message_id=payload.message_id,
+                    user_id=recipient.user_id,
+                    source=payload.source,
+                )
+                continue
             outcome = await self._dispatch_one_recipient(
                 payload=payload,
                 recipient=recipient,

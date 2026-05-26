@@ -18,7 +18,7 @@ import hashlib
 import hmac
 import json
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -31,6 +31,30 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from shared.config import get_settings
 from shared.models import Group, MailAccount, Message, Tag, User
+
+# ---------------------------------------------------------------------------
+# TG_NOTIFY_ALL_MESSAGES flag control (round-31, ADR-0022 §2.1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def set_tg_notify_all(monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[[bool], None]]:
+    """Flip ``TG_NOTIFY_ALL_MESSAGES`` and reload the lru-cached settings.
+
+    The repository / dispatcher / sync_cycle all read
+    ``get_settings().TG_NOTIFY_ALL_MESSAGES`` at call time, so clearing the
+    cache after setting the env var makes the flip observable. The cache is
+    cleared again on teardown so later tests see the real env value.
+    """
+
+    def _set(value: bool) -> None:
+        monkeypatch.setenv("TG_NOTIFY_ALL_MESSAGES", "true" if value else "false")
+        get_settings.cache_clear()
+        assert get_settings().TG_NOTIFY_ALL_MESSAGES is value
+
+    yield _set
+    get_settings.cache_clear()
+
 
 # ---------------------------------------------------------------------------
 # HMAC builder — production code (init_data.py) is the reference; we mirror

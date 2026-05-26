@@ -576,7 +576,7 @@ Many-to-many линки тегов и сообщений. Создаются wor
 | Колонка | Тип | Constraints | Описание |
 | --- | --- | --- | --- |
 | `user_id` | BIGINT | PRIMARY KEY, FK → `users(id)` ON DELETE CASCADE | 1:1 с users. |
-| `tg_notifications_enabled` | BOOLEAN | NOT NULL DEFAULT TRUE | true (default) — пользователь получает push-уведомления о письмах с тегами. false — диспатчер пропускает. Default true намеренно — opt-out, не opt-in (пользователь сам отключит, если будет завален). |
+| `tg_notifications_enabled` | BOOLEAN | NOT NULL DEFAULT TRUE | true (default) — пользователь получает push-уведомления о новых письмах (round-31: по всем письмам при `TG_NOTIFY_ALL_MESSAGES=true`, либо только с тегами при `false`). false — диспатчер пропускает (фильтр в `list_recipients_for_message`). Default true намеренно — opt-out, не opt-in (пользователь сам отключит, если будет завален). |
 | `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | Обновляется триггером `BEFORE UPDATE ON users_settings`. |
 
 **Индексы:** PK на `user_id`.

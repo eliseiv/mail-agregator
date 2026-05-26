@@ -205,7 +205,20 @@ sequenceDiagram
 
 В `worker.sync_cycle.save_message` сейчас (ADR-0017): INSERT messages + attachments + apply tags — всё в одной транзакции; падение apply откатывает всю транзакцию. Этот контракт **сохраняется**.
 
-После успешного COMMIT (т.е. message INSERTed и tags applied) `save_message` собирает результат вызова `apply_tags_to_message` — он возвращает `applied_count: int`. Если `applied_count > 0` — функция (а точнее sync-cycle wrapper) добавляет в **in-memory очередь** одной итерации `(message_id, mail_account_id)` и продолжает.
+После успешного COMMIT (т.е. message INSERTed и tags applied) `save_message` собирает результат вызова `apply_tags_to_message` — он возвращает `applied_count: int`.
+
+**Round-31 (требование «уведомлять обо ВСЕХ новых письмах»):** условие постановки в очередь становится зависимым от флага `TG_NOTIFY_ALL_MESSAGES` (`shared/config.py`, default `True`):
+
+```python
+# worker/app/sync_cycle.py (~296)
+if settings.TG_NOTIFY_ALL_MESSAGES or applied > 0:
+    notified_message_ids.append(inserted_id)
+```
+
+- `TG_NOTIFY_ALL_MESSAGES=true` (default) — в очередь попадает **каждое** вставленное письмо (вне зависимости от того, навесился ли тег). Это реализует требование «Telegram-уведомления по всем новым письмам».
+- `TG_NOTIFY_ALL_MESSAGES=false` — историческое поведение: только письма, на которые навесился ≥1 тег (`applied > 0`). Откат к старому поведению — изменением одной env-переменной **без редеплоя кода** (только рестарт worker, чтобы `get_settings()` lru-cache перечитал env).
+
+Имя поля очереди исторически называется `notified_message_ids`; семантически теперь это «message_ids к постановке в tg_notify_queue». Переименование — косметика, отложено (не TD).
 
 После завершения цикла обработки одного account'а (т.е. после `mailbox.logout()`, шаг 9 алгоритма sync_one_account) sync-cycle обходит in-memory очередь и кладёт каждую пару в Redis-list `tg_notify_queue`:
 
@@ -228,46 +241,69 @@ LPUSH tg_notify_queue '{"message_id": 12345, "mail_account_id": 67}'
 
 #### 2.2. Множество получателей на сообщение
 
-Для каждого message_id, попавшего в очередь, dispatcher определяет получателей:
+Для каждого message_id, попавшего в очередь, dispatcher определяет получателей.
+
+**Round-12 (bug A):** ушли от «у получателя есть СВОЙ тег» (теги навешиваются auto-tagging только владельцу ящика, поэтому group-mates лидера не получали ничего). Текущая модель — «у письма есть ХОТЯ БЫ ОДИН тег (любой, любого user'а)» через `EXISTS (message_tags)`, без per-user join на `tags`.
+
+**Round-31 (уведомлять обо всех письмах):** блок `EXISTS (message_tags)` становится **условным от флага** `TG_NOTIFY_ALL_MESSAGES`. Реализация — подстановка предиката в Python при сборке SQL (а не SQL-параметр), т.к. это структурное изменение запроса:
+
+SQL получателей — общая часть (всегда):
 
 ```sql
--- Псевдо-SQL получателей одного сообщения (ID = :mid):
-SELECT DISTINCT u.id AS user_id, tl.telegram_user_id, ma.group_id AS message_group_id
-FROM messages m
-JOIN mail_accounts ma ON ma.id = m.mail_account_id
-JOIN users u
-  ON (
-      u.role = 'super_admin'                      -- super_admin видит всё
-      OR u.group_id = ma.group_id                 -- участники группы по mail_accounts.group_id (round-10 patch)
-      OR u.id = ma.user_id                        -- владелец аккаунта (на случай super_admin-owned аккаунта вне группы)
-  )
-JOIN telegram_links tl
-  ON tl.user_id = u.id
-  AND tl.dead_at IS NULL                          -- мёртвые линковки исключаются
-JOIN message_tags mt ON mt.message_id = m.id
-JOIN tags t ON t.id = mt.tag_id AND t.user_id = u.id   -- у получателя ЕСТЬ свой тег на этом письме
-LEFT JOIN users_settings us ON us.user_id = u.id       -- см. §2.6 opt-out
-WHERE m.id = :mid
-  AND COALESCE(us.tg_notifications_enabled, true) = true   -- default-on
-GROUP BY u.id, tl.telegram_user_id, ma.group_id;
+SELECT DISTINCT
+       u.id                AS user_id,
+       tl.telegram_user_id AS telegram_user_id,
+       ma.id               AS mail_account_id
+FROM   messages m
+JOIN   mail_accounts ma ON ma.id = m.mail_account_id
+JOIN   users u
+       ON (
+           u.role = 'super_admin'                          -- super_admin видит всё
+           OR (ma.group_id IS NOT NULL AND u.group_id = ma.group_id)  -- участники группы
+           OR u.id = ma.user_id                            -- владелец аккаунта
+       )
+JOIN   telegram_links tl
+       ON tl.user_id = u.id
+       AND tl.dead_at IS NULL                              -- мёртвые линковки исключаются
+       AND m.internal_date >= tl.created_at                -- round-13: только письма ПОСЛЕ линковки
+LEFT JOIN users_settings us ON us.user_id = u.id           -- §2.7 opt-out
+WHERE  m.id = :message_id
+  AND  COALESCE(us.tg_notifications_enabled, true) = true  -- default-on
+  /* <TAG_PREDICATE> */
 ```
 
-Затем для каждого получателя — повторный SQL для получения **именно его тегов** на этом письме (нужно для текста уведомления):
+Фрагмент `<TAG_PREDICATE>`:
+
+- `TG_NOTIFY_ALL_MESSAGES = false` (историческое поведение) — добавляется:
+  ```sql
+  AND EXISTS (SELECT 1 FROM message_tags mt WHERE mt.message_id = m.id)
+  ```
+- `TG_NOTIFY_ALL_MESSAGES = true` (default) — фрагмент **не подставляется вовсе** (пустая строка). Письмо без тегов остаётся валидным получателем.
+
+Инварианты visibility / link / opt-out (`super_admin`/`group`/`owner`, `tl.dead_at IS NULL`, `m.internal_date >= tl.created_at`, `COALESCE(us.tg_notifications_enabled,true)=true`) **сохраняются в обоих режимах** — флаг затрагивает только тег-предикат.
+
+Затем — теги письма (для текста уведомления) загружаются **один раз на сообщение** (round-12: не per-recipient — все получатели видят один набор тегов, что соответствует visibility-модели):
 
 ```sql
 SELECT t.id, t.name, t.color
-FROM message_tags mt
-JOIN tags t ON t.id = mt.tag_id
-WHERE mt.message_id = :mid AND t.user_id = :recipient_uid
-ORDER BY t.name;
+FROM   message_tags mt
+JOIN   tags t ON t.id = mt.tag_id
+WHERE  mt.message_id = :message_id
+ORDER  BY mt.tag_id;
 ```
 
-**Инварианты получателей:**
-- Получатель должен иметь активную (`dead_at IS NULL`) `telegram_links` запись.
-- У получателя должен быть **свой собственный тег** на этом сообщении (т.к. теги per-user; ADR-0017). Если у user'а X на message Y нет ни одного `message_tags` с `tag.user_id=X` — уведомление **НЕ шлём**. Прямое следствие требования «Оповещение только о сообщениях в которых присутствует тег» — тег per-user, значит и проверка тоже per-user.
-- Получатель не должен быть в opt-out (`users_settings.tg_notifications_enabled = false`; default — true).
+При `TG_NOTIFY_ALL_MESSAGES=true` этот запрос для письма без тегов вернёт пустой список — это нормальный кейс (см. §2.5: строка тегов опциональна), уведомление всё равно шлётся.
 
-**Замечание про super_admin и приватные ящики:** super_admin'у уведомления приходят про **все** письма с тегами (включая письма из ящиков чужих групп). Это согласуется с visibility-моделью (ADR-0019 §7.1 — super_admin видит всё). Если super_admin не хочет быть завален — он выключает opt-out для себя (`tg_notifications_enabled=false`).
+**Инварианты получателей:**
+- Активная (`dead_at IS NULL`) `telegram_links` запись.
+- `m.internal_date >= tl.created_at` (round-13: не флудить историей при первой линковке).
+- Не в opt-out (`users_settings.tg_notifications_enabled = false`; default true).
+- Тег-предикат — только при `TG_NOTIFY_ALL_MESSAGES=false`.
+
+**Замечание про super_admin и flood-риск:** super_admin видит **все** письма всех групп (ADR-0019 §7.1). При `TG_NOTIFY_ALL_MESSAGES=true` это означает уведомление по **каждому** входящему письму всей системы → реальный риск flood и Bot API `429`. Меры:
+1. Per-chat троттлинг (см. §2.9) — жёсткий потолок msg/min на каждый chat_id.
+2. Индивидуальный opt-out (`tg_notifications_enabled=false`) для super_admin, не желающего потока.
+3. Глобальный откат флага в `false` без редеплоя.
 
 #### 2.3. Идемпотентность доставки — таблица `telegram_notifications`
 
@@ -319,24 +355,31 @@ async def tg_notify_dispatch() -> None:
         item = json.loads(raw)
         await dispatch_one(message_id=item["message_id"])
 
-async def dispatch_one(message_id: int) -> None:
+async def dispatch_one_payload(raw: str) -> None:
     # 1. Загрузить recipients (SQL из §2.2)
-    # 2. Загрузить контекст письма (mail_account display_name|email, from_addr, from_name) — один SQL
-    # 3. Для каждого recipient:
-    #    a. INSERT INTO telegram_notifications ... ON CONFLICT DO NOTHING RETURNING id
-    #    b. if RETURNING empty -> continue
-    #    c. Сформировать текст (см. §2.5) на тегах recipient'а
-    #    d. await bot.send_notification(chat_id=tl.telegram_user_id, text=..., message_id=mid)
-    #    e. UPDATE telegram_notifications SET telegram_message_id=..., sent_at=now() WHERE id=...
-    #    f. при 403/400 -> mark telegram_links.dead_at + audit + НЕ delete row из telegram_notifications
-    #    g. при 429 -> sleep(retry_after) и retry того же recipient'а (внутри dispatch_one, max 1 retry); если 2-й 429 — leave-in-queue: LPUSH обратно в tg_notify_queue {message_id, only_for_user_id:uid}, потеряется max 5s
-    #    h. при network/5xx -> DELETE row, LPUSH обратно (full message)
+    # 2. Загрузить контекст письма (mail_account display_name|email, from_addr, from_name)
+    # 3. Загрузить теги письма ОДИН раз (round-12, §2.2). tag_names может быть [].
+    #    round-31: НЕТ раннего return при пустом tag_names — продолжаем (теги опциональны, §2.5).
+    # 4. Для каждого recipient:
+    #    a. round-31: per-chat throttle (§2.9) — try_consume(LIMIT_TG_SEND_PER_CHAT, key=chat_id).
+    #       Если False -> continue (НЕ резервируем строку, НЕ ставим флаг re-enqueue).
+    #       round-32: throttled-получателя доставит recovery_scan (NOT EXISTS notif), без hot-loop.
+    #    b. try_reserve(message_id, user_id) ON CONFLICT DO NOTHING -> id|None; None -> continue (дедуп).
+    #    c. Сформировать текст (см. §2.5) на общем tag_names.
+    #    d. await send_notification(chat_id, text, message_id).
+    #    e. ok        -> mark_sent(telegram_message_id, sent_at=now()).
+    #    f. dead(403/400) -> mark telegram_links.dead_at + audit; строку НЕ удаляем (audit-маркер).
+    #    g. retry_after  -> rollback строки; needs_retry=True.
+    #    h. transient(net/5xx) -> rollback строки; needs_retry=True.
+    # 5. if needs_retry: enqueue_recovery([message_id]) — ТОЛЬКО retry_after / transient.
+    #    round-32: throttle НЕ инициирует enqueue_recovery (busy-loop fix, §2.9) — берёт recovery_scan.
 ```
 
 **Ограничения:**
-- `NOTIFY_BATCH_SIZE = 30` — один тик обрабатывает до 30 messages × N recipients ≈ 30–150 Bot API calls. На частоте 5 сек = ~6/sec баланс — намного ниже 30 msg/sec лимита (есть запас на retry).
-- Backoff на 429: dispatcher уважает `parameters.retry_after`, спит, потом продолжает.
-- `bot.send_notification` (новый метод, не путать с существующим `send_message_with_webapp_button`) — добавляется в `backend/app/telegram/bot.py`.
+- `TG_NOTIFY_BATCH_SIZE = 30` — один тик обрабатывает до 30 messages × N recipients. На частоте 5 сек = ~6/sec по сообщениям — глобально ниже 30 msg/sec лимита Bot API.
+- Backoff на 429: на `retry_after` строка откатывается (`rollback`), весь `message_id` ре-энквьюится через `enqueue_recovery` (следующий тик повторит; идемпотентность не даст задвоить).
+- Per-chat throttle (round-31, §2.9; busy-loop fix round-32): неблокирующая проверка `try_consume` **до** `try_reserve` — при исчерпании per-chat лимита получатель пропускается (`continue`), строка НЕ резервируется и **немедленный re-enqueue НЕ делается**. Доставку throttled-писем берёт на себя `recovery_scan` (часовой backoff), а не hot-loop — иначе при устойчивом `inflow > cap` возникал бы busy-loop (см. §2.9).
+- `bot.send_notification` — метод в `backend/app/telegram/bot.py`.
 
 #### 2.5. Формат уведомления
 
@@ -346,46 +389,58 @@ async def dispatch_one(message_id: int) -> None:
 - В HTML mode легко выделять жирным (`<b>`) — нужно для имени почты и тегов.
 - Inline-keyboard поддерживается одинаково в обоих форматах.
 
-Шаблон (новый Jinja2 template **не нужен** — формирование текста в Python, т.к. это не HTML-страница, а Bot API HTML subset):
+Шаблон (новый Jinja2 template **не нужен** — формирование текста в Python, т.к. это не HTML-страница, а Bot API HTML subset).
+
+**Round-31: строка тегов — ОПЦИОНАЛЬНАЯ.** При `TG_NOTIFY_ALL_MESSAGES=true` письмо может прийти без тегов; в этом случае строка тегов **не печатается вовсе** (а не плейсхолдер «—»). Структура:
+- строка «почта» — **всегда**;
+- строка «теги» — **только если** `tag_names` непуст (singular «Тег» / plural «Теги»);
+- строка «отправитель» — **всегда**.
+
+Bug-fix #4: Telegram `parse_mode=HTML` **не** декодирует HTML-entities (`&laquo;`/`&raquo;`) — пользователь увидел бы их буквально. Используем реальные UTF-8 кавычки `«` `»`.
 
 ```python
 def format_notification(
     *,
     acc_label: str,        # display_name or email
     from_label: str,       # from_name or from_addr
-    tag_names: list[str],  # сортировано
+    tag_names: list[str],  # может быть ПУСТЫМ (письмо без тегов)
 ) -> str:
-    """
-    Возвращает HTML-строку для sendMessage parse_mode=HTML.
-    Все user-controlled значения экранируются через html.escape().
-    """
+    """HTML-строка для sendMessage parse_mode=HTML.
+    Все user-controlled значения экранируются через html.escape()."""
     acc_safe = html.escape(acc_label)
     from_safe = html.escape(from_label)
-    if len(tag_names) == 1:
-        tag_line = f'Тег &laquo;<b>{html.escape(tag_names[0])}</b>&raquo;'
-    else:
-        names = ', '.join(f'&laquo;<b>{html.escape(t)}</b>&raquo;' for t in tag_names)
-        tag_line = f'Теги {names}'
-    return (
-        f'Вы получили письмо на почту <b>{acc_safe}</b>\n'
-        f'{tag_line}\n'
-        f'Отправитель <b>{from_safe}</b>'
-    )
+    lines = [f'Вы получили письмо на почту <b>{acc_safe}</b>']
+    if tag_names:  # строка тегов опциональна
+        if len(tag_names) == 1:
+            lines.append(f'Тег «<b>{html.escape(tag_names[0])}</b>»')
+        else:
+            names = ', '.join(f'«<b>{html.escape(t)}</b>»' for t in tag_names)
+            lines.append(f'Теги {names}')
+    lines.append(f'Отправитель <b>{from_safe}</b>')
+    return '\n'.join(lines)
 ```
 
-Пример:
+Пример с тегом (3 строки):
 ```
 Вы получили письмо на почту <b>support@example.com</b>
 Тег «<b>DPLA.PLA</b>»
 Отправитель <b>sender@gmail.com</b>
 ```
 
-или (множественные теги):
+Пример с несколькими тегами (3 строки):
 ```
 Вы получили письмо на почту <b>Apple Test 1</b>
 Теги «<b>Диспут</b>», «<b>Отменить подписку</b>»
 Отправитель <b>AppStoreNotices@apple.com</b>
 ```
+
+Пример без тегов — `TG_NOTIFY_ALL_MESSAGES=true` (2 строки, строка тегов отсутствует):
+```
+Вы получили письмо на почту <b>support@example.com</b>
+Отправитель <b>sender@gmail.com</b>
+```
+
+**Следствие для dispatcher (round-31):** ранний `if not message_tags: return` в `dispatch_one_payload` (§2.4) **убирается** — при пустом списке тегов продолжаем с `tag_names=[]`. Дедуп тегов по `(name, color)` (round-21) сохраняется.
 
 **Inline keyboard:** одна кнопка `Посмотреть сообщение`. Реализация — **WebApp button** (не обычный URL), чтобы открытие происходило внутри Telegram-WebView, а не в системном браузере (UX → пользователь остаётся в Telegram):
 
@@ -434,20 +489,133 @@ API: на этой итерации **только backend-endpoint** реали
 - `PATCH /api/me/settings` body `{tg_notifications_enabled: bool}` → 200 `{tg_notifications_enabled: bool}`.
 - `GET /api/me` дополнительно возвращает `tg_notifications_enabled: bool`.
 
-#### 2.8. Recovery после crash worker или Redis
+#### 2.8. Recovery после crash worker или Redis (round-33: per-recipient gap)
 
-Если worker крашится между LPUSH (в sync_cycle) и LPOP (в dispatcher) — item теряется. Это **не критично**, потому что:
-- recovery_scan (новый APScheduler job, раз в час) выполняет:
-  ```sql
-  SELECT m.id
-  FROM messages m
-  WHERE m.fetched_at > now() - interval '24 hours'
-    AND EXISTS (SELECT 1 FROM message_tags mt WHERE mt.message_id = m.id)
-    AND NOT EXISTS (SELECT 1 FROM telegram_notifications tn WHERE tn.message_id = m.id)
-  ORDER BY m.id;
-  ```
-- Для каждого найденного message — LPUSH в `tg_notify_queue`.
-- Окно 24 часа покрывает выходные / multi-hour outages. Старше 24 часов — намеренно не нотифицируем (письмо устарело, спам по факту).
+Если worker крашится между LPUSH (в sync_cycle) и LPOP (в dispatcher) — item теряется. Кроме того, при `TG_NOTIFY_ALL_MESSAGES=true` письмо видно ≥2 получателям, и один из них может быть пропущен per-chat throttle'ом (§2.9, `continue` без `try_reserve`), в то время как другой уже доставлен. recovery должен подобрать письмо в обоих случаях.
+
+**Почему гранулярность recovery — per-recipient, а не per-message (round-33, fix CRITICAL).** Прежний recovery-SQL отбирал message_id по `NOT EXISTS (telegram_notifications WHERE tn.message_id = m.id)` — **без `user_id`**. Это создавало дыру при частичной доставке:
+- Письмо `mid` видно получателям A и B. A доставлен → строка `(mid, A)` создана. B throttled → `continue`, строка `(mid, B)` **не создана**.
+- recovery: `NOT EXISTS(tn WHERE message_id=mid)` = **FALSE** (строка A существует) → recovery **не вернёт** `mid` → B теряет уведомление **навсегда** (не «через час», не «за окном 24ч» — вообще).
+- Тот же механизм маскировал pre-existing хрупкость при крашах: до троттлинга атомарность транзакции dispatch (`s.begin()`, всё-или-ничего по message) скрывала проблему; throttled→`continue` с коммитом частичной доставки её активировал.
+
+**Решение (Опция A — recovery per-recipient, без миграции):** recovery-SQL отбирает `DISTINCT m.id`, у которых **существует видимый залинкованный получатель без строки** `telegram_notifications` по `(message_id, user_id)`. Для этого recovery переиспользует **ту же recipient-логику, что §2.2** (visibility super_admin/group/owner; JOIN активных `telegram_links` с `m.internal_date >= tl.created_at`; opt-out `COALESCE(us.tg_notifications_enabled,true)=true`; условный тег-предикат под флагом `TG_NOTIFY_ALL_MESSAGES`), но привязанную к `m.id` (а не `:message_id`) и под `NOT EXISTS (tn WHERE tn.message_id=m.id AND tn.user_id=u.id)`:
+
+```sql
+SELECT DISTINCT m.id
+FROM   messages m
+JOIN   mail_accounts ma ON ma.id = m.mail_account_id
+JOIN   users u
+       ON (
+           u.role = 'super_admin'                          -- super_admin видит всё
+           OR (ma.group_id IS NOT NULL AND u.group_id = ma.group_id)  -- участники группы
+           OR u.id = ma.user_id                            -- владелец аккаунта
+       )
+JOIN   telegram_links tl
+       ON tl.user_id = u.id
+       AND tl.dead_at IS NULL                              -- мёртвые линковки исключаются
+       AND m.internal_date >= tl.created_at                -- round-13: только письма ПОСЛЕ линковки
+LEFT JOIN users_settings us ON us.user_id = u.id           -- §2.7 opt-out
+WHERE  m.fetched_at > :cutoff                              -- now() - TG_NOTIFY_RECOVERY_WINDOW_HOURS
+  AND  COALESCE(us.tg_notifications_enabled, true) = true  -- default-on
+  /* <TAG_PREDICATE> */                                    -- тот же фрагмент, что §2.2 (условен от флага)
+  AND  NOT EXISTS (                                         -- per-recipient, НЕ per-message
+           SELECT 1 FROM telegram_notifications tn
+           WHERE  tn.message_id = m.id
+             AND  tn.user_id    = u.id
+       )
+ORDER  BY m.id
+LIMIT  :limit;
+```
+
+Фрагмент `<TAG_PREDICATE>` — **идентичен** §2.2:
+- `TG_NOTIFY_ALL_MESSAGES=true` (default) — **не подставляется** (пустая строка); recovery подхватывает любое письмо с недоставленным visible получателем.
+- `TG_NOTIFY_ALL_MESSAGES=false` — добавляется `AND EXISTS (SELECT 1 FROM message_tags mt WHERE mt.message_id = m.id)`.
+
+`DISTINCT m.id` нужен, потому что у письма может быть несколько недоставленных получателей — в очередь LPUSH'им message_id **один раз** (dispatch резолвит всех получателей сам). Для каждого найденного message — LPUSH в `tg_notify_queue` (`source=recovery`).
+
+**Эффект:**
+- throttled-получатель (нет строки `(mid, B)`) → recovery находит `mid` (есть недоставленный visible получатель B) → re-enqueue → dispatch резолвит всех: A пропускается (`try_reserve` → `None`), B снова проверяет throttle. Если поток спал — доставится; если нет — `continue`, следующий recovery (через час) повторит, пока поток не спадёт **ИЛИ** письмо не выйдет за окно 24ч (TD-027).
+- Чинит pre-existing частичную доставку при крашах worker (часть получателей закоммичена, часть нет).
+- recovery стал **visibility-aware** — больше НЕ делает лишних enqueue писем без получателей / до привязки Telegram. Это устраняет TD-025 (см. `docs/100-known-tech-debt.md` — TD-025 закрыт).
+
+**Это НЕ busy-loop:** recovery идёт раз в час (`TG_NOTIFY_RECOVERY_INTERVAL_SECONDS=3600`), а не каждые 5 сек. Backlog при устойчивом throttle рассасывается ~`capacity`/чат/час (см. анализ в §2.9). Недоставка за окном 24ч при вечном флуде — осознанный компромисс (TD-027), причина — **устойчивый throttle**, а не «маскированная частичная доставка».
+
+**Производительность.** Новый recovery-SQL раз в час делает JOIN recipient-логики (`mail_accounts`, `users`, `telegram_links`, `users_settings`) по письмам в окне `fetched_at > :cutoff` с `LIMIT :limit` (`TG_NOTIFY_RECOVERY_BATCH_SIZE`). Это приемлемо: (а) частота — 1/час, не hot-path; (б) `messages.fetched_at` индексируется (используется retention-cleanup ADR-0011); (в) `LIMIT` ограничивает worst-case строк; (г) `telegram_notifications (message_id, user_id)` имеет UNIQUE-индекс — `NOT EXISTS`-подзапрос идёт по индексу. На масштабе ≤5 users и retention 30д объём `messages` в окне 24ч мал. Если на проде вырастет — добавить partial-индекс `messages(fetched_at) WHERE …` (follow-up, не требуется сейчас).
+
+- Окно 24 часа покрывает выходные / multi-hour outages. Старше — намеренно не нотифицируем.
+
+#### 2.9. Per-chat троттлинг (round-31, защита от flood / Bot API 429)
+
+**Проблема.** С `TG_NOTIFY_ALL_MESSAGES=true` super_admin (видит все письма всей системы) и активные группы могут получать десятки писем в минуту. Telegram Bot API ограничивает доставку в один chat (ориентир ~1 msg/sec на чат, burst-терпимость небольшая); превышение → `429 retry_after`. Нужен **upstream-троттлинг per chat_id**, чтобы не упереться в Bot API rate-limit и не флудить пользователя.
+
+**Решение.** Перед каждым `sendMessage` конкретному получателю — неблокирующая проверка token-/window-bucket в Redis по ключу `chat_id`. Переиспользуем существующий `backend/app/rate_limit.py` (тот же fixed-window INCR/EXPIRE-механизм, что и для HTTP-роутов), добавив **неблокирующий** helper.
+
+Новый helper в `backend/app/rate_limit.py` (не raising, в отличие от `consume`):
+
+```python
+async def try_consume(limit: Limit, key: str) -> bool:
+    """Неблокирующая проверка fixed-window лимита.
+    Возвращает True, если в текущем окне ещё есть бюджет (счётчик инкрементирован),
+    False — если лимит исчерпан. НЕ бросает RateLimitedError.
+    Реализация идентична consume(): INCR + EXPIRE(nx); over capacity -> False.
+    Пустой key -> True (fail-open, как и consume логирует и не блокирует)."""
+```
+
+Новый предопределённый лимит:
+
+```python
+# capacity берётся из settings.TG_SEND_PER_CHAT_PER_MINUTE на consume-time
+# (как LIMIT_WEBHOOK_TEST), window_seconds=60.
+LIMIT_TG_SEND_PER_CHAT = Limit(name="tg_send", capacity=20, window_seconds=60)
+```
+
+Ключ в Redis: `rl:tg_send:<chat_id>` (формируется механизмом `rate_limit` из `name` + переданного `key=str(telegram_user_id)`).
+
+**Где встраивается.** В `dispatch_one_payload` (`backend/app/telegram/notify_service.py`), **до** `try_reserve` и до `send_notification`:
+
+```text
+for recipient in recipients:                       # dispatch_one_payload
+    # per-chat throttle ПЕРЕД try_reserve
+    if not await try_consume(LIMIT_TG_SEND_PER_CHAT(capacity=settings.TG_SEND_PER_CHAT_PER_MINUTE),
+                             key=str(recipient.telegram_user_id)):
+        # throttled: НЕ резервируем строку, НЕ делаем hot re-enqueue.
+        # Строка (message_id, user_id) НЕ появляется в telegram_notifications,
+        # поэтому recovery_scan (раз в час, §2.8) подберёт это письмо в пределах
+        # окна TG_NOTIFY_RECOVERY_WINDOW_HOURS=24 — естественный backoff ~1ч.
+        continue                                    # этого получателя пропускаем СЕЙЧАС
+    outcome = await self._dispatch_one_recipient(...)
+    ...
+if needs_retry:                                     # ТОЛЬКО retry_after / transient (см. §2.4)
+    await self.enqueue_recovery([payload.message_id])
+# throttled-получатели НЕ инициируют немедленный enqueue_recovery — их забирает recovery_scan.
+```
+
+**Ключевое решение (round-32, fix busy-loop):** throttled-получатель НЕ запускает немедленный hot re-enqueue в `tg_notify_queue`. Раньше throttle выставлял флаг `throttled` и в конце `dispatch_one_payload` целый `message_id` ре-энквьюился через `enqueue_recovery`. Это создавало **busy-loop**: на пути dispatch (`LPOP` → `dispatch_one_payload`) нет проверки возраста/счётчика попыток, поэтому при `TG_NOTIFY_ALL_MESSAGES=true` и активном super_admin (видит ВСЕ письма), если входящий поток в его chat стабильно превышает `TG_SEND_PER_CHAT_PER_MINUTE` (20/мин), throttle срабатывал бы каждый тик, и каждое неотправленное письмо ре-энквьюилось бы бесконечно → (а) неограниченный рост `tg_notify_queue`, (б) busy-loop с recipient-SQL каждые 5 сек (амплификация нагрузки на пике), (в) деградация порядка. При **постоянном** превышении окно троттла не «спадает», поэтому полагаться на «следующий тик повторит после спада окна» нельзя.
+
+**Механизм throttled → continue → recovery (round-33: per-recipient):**
+1. Throttled-получатель: `continue` без `try_reserve` → строка `(message_id, user_id)` в `telegram_notifications` **не создаётся**.
+2. В конце `dispatch_one_payload` re-enqueue инициируется **только** для `needs_retry` (retry_after / transient), НЕ для throttle.
+3. `recovery_scan` (APScheduler, раз в час, §2.8) отбирает письма, у которых есть **видимый залинкованный получатель без строки** `telegram_notifications` по `(message_id, user_id)` (per-recipient `NOT EXISTS`, recipient-логика §2.2), в пределах окна `TG_NOTIFY_RECOVERY_WINDOW_HOURS=24`. Для throttled-получателя B строка `(mid, B)` не зарезервирована → recovery подхватывает письмо **даже если другой получатель A уже доставлен** (строка `(mid, A)` существует). Это и есть исправление round-33: прежний per-message `NOT EXISTS (tn WHERE message_id=m.id)` при частичной доставке возвращал FALSE из-за строки A и терял B навсегда (см. §2.8).
+4. `recovery_scan` LPUSH'ит `message_id` обратно в `tg_notify_queue` (один раз на письмо, `DISTINCT m.id`); dispatch снова резолвит **всех** получателей. Уже доставленные пропускаются (`try_reserve` встретит существующую строку → вернёт `None`). Throttled-получатель B снова проверяется на throttle — если поток всё ещё высокий, опять `continue`, и так до тех пор, пока поток не спадёт **ИЛИ** письмо не выйдет за окно 24ч.
+
+**Анализ устойчивого backlog (inflow > per-chat cap):**
+- recovery каждый час даёт ~`TG_SEND_PER_CHAT_PER_MINUTE × 60` ≈ capacity попыток на чат за час: при каждом часовом проходе часть накопленных писем проходит throttle (пока бюджет окна не исчерпан), остальные снова `continue`. Backlog рассасывается **постепенно**, без busy-loop и без амплификации (один проход в час вместо тика каждые 5 сек).
+- Это естественный backoff ~1ч вместо 5-секундного busy-loop. Рост `tg_notify_queue` ограничен размером одного recovery-batch (`TG_NOTIFY_RECOVERY_BATCH_SIZE`), а не неограниченным hot re-enqueue.
+- **Осознанный компромисс:** при **устойчивом** `inflow > per-chat cap` письмо может выйти за окно `TG_NOTIFY_RECOVERY_WINDOW_HOURS=24` раньше, чем recovery успеет его доставить (recovery перестаёт подбирать письма старше окна). Такое письмо останется **недоставленным** в Telegram. Это приемлемо при устойчивом флуде: альтернатива (бесконечный busy-loop + неограниченный рост очереди) хуже. Зафиксировано как `docs/100-known-tech-debt.md` TD-027 (severity low, условие адресации — увеличить cap/окно или приоритетная очередь). Письмо при этом остаётся в БД и видимо в UI — теряется только TG-нотификация, не само письмо.
+
+**Решение по `retry_after` (Telegram 429): немедленный re-enqueue СОХРАНЯЕТСЯ.** Обоснование различия:
+- `retry_after` (Bot API 429) — **кратковременная, не структурная** ситуация: Telegram сам сообщает, через сколько секунд можно повторить (`parameters.retry_after`, обычно единицы секунд). Это не предсказуемый постоянный per-chat предел, а единичный всплеск; повтор на следующем тике почти наверняка пройдёт. Busy-loop здесь не возникает, потому что условие самоустраняется за секунды (а не сохраняется, как при `inflow > cap`).
+- `throttle` — **наш собственный предсказуемый per-chat лимит**: при устойчивом inflow он срабатывает детерминированно каждый тик, что и порождает busy-loop. Поэтому throttle обязан идти через recovery (часовой backoff), а НЕ через hot-loop.
+- Вывод: `needs_retry` (retry_after / transient) → немедленный `enqueue_recovery` (как раньше); `throttle` → `continue` + ожидание recovery_scan. Разные пути для разной природы задержки.
+
+Прочие детали:
+- Проверка **до** `try_reserve` — чтобы НЕ занять `(message_id, user_id)` строку, которую затем пришлось бы откатывать. Throttle = «сейчас не отправляем», строку резервировать рано; для recovery критично, чтобы строки `(message_id, user_id)` НЕ было (иначе per-recipient `NOT EXISTS` §2.8 не сработает для этого получателя и письмо не будет подобрано для него).
+- Идемпотентность через `telegram_notifications` UNIQUE `(message_id, user_id)` + `try_reserve` гарантирует, что на повторных recovery-проходах уже доставленные получатели пропускаются (их строка существует), без двойной доставки. recovery-SQL (§2.8) теперь **per-recipient** (`NOT EXISTS tn WHERE message_id=m.id AND user_id=u.id`), поэтому частично-доставленное письмо корректно подбирается ровно для недоставленных получателей.
+- Lru-cached `settings` читается один раз; capacity подставляется на consume-time (как `WEBHOOK_TEST_LIMIT`), без редеплоя кода при смене env.
+
+**Граница ответственности троттлинга:** это **per-chat** лимит. Глобальный bot-лимit (~30 msg/sec на всех чатах сразу) этим механизмом НЕ покрывается — он смягчён `TG_NOTIFY_BATCH_SIZE=30` за тик в 5 сек (~6/сек) и backoff на `429`. Глобальный явный throttle — follow-up (`docs/100-known-tech-debt.md` TD-026).
+
+**Миграций нет.** Троттлинг полностью в Redis; схема БД не меняется. Идемпотентность доставки (§2.3) сохраняется без изменений.
 
 ---
 
@@ -637,7 +805,7 @@ CSP `frame-ancestors 'none'` остаётся неизменной — Telegram 
 - `backend/app/repositories/telegram_notifications.py`:
   ```python
   class TelegramNotificationsRepo:
-      async def try_claim(message_id: int, user_id: int) -> int | None  # INSERT ... ON CONFLICT DO NOTHING RETURNING id; None если уже было
+      async def try_reserve(message_id: int, user_id: int) -> int | None  # INSERT ... ON CONFLICT DO NOTHING RETURNING id; None если уже было
       async def mark_sent(notif_id: int, telegram_message_id: int) -> None
       async def rollback(notif_id: int) -> None  # DELETE WHERE id=...
       async def list_recipients_for_message(message_id: int) -> list[NotifyRecipient]  # SQL из §2.2
@@ -712,6 +880,9 @@ CSP `frame-ancestors 'none'` остаётся неизменной — Telegram 
     - `TG_NOTIFY_RECOVERY_WINDOW_HOURS` (default 24).
     - `TG_AUTH_INIT_DATA_TTL_SEC` (default 300).
     - `TG_PENDING_COOKIE_TTL_SEC` (default 900 = 15 мин).
+  - round-31 (notify-all + троттлинг):
+    - `TG_NOTIFY_ALL_MESSAGES: bool = True` — уведомлять обо всех письмах (False = только tagged). Откат без редеплоя.
+    - `TG_SEND_PER_CHAT_PER_MINUTE: int = Field(default=20, ge=1, le=60)` — per-chat троттлинг (§2.9).
 
 ### D. Database migrations
 
@@ -767,7 +938,11 @@ async def send_notification(*, chat_id: int, text_html: str, message_id: int) ->
 | Recipient с opt-out (`tg_notifications_enabled=false`) | integration | row НЕ создан |
 | Идемпотентность: повторный sync_cycle того же message_id | integration | second notification call → ON CONFLICT, не дублирует Bot API call |
 | Bot API 403 → telegram_links.dead_at выставлен | integration | UPDATE + audit `telegram_link_dead_marked`; следующие письма НЕ шлются |
-| Bot API 429 → backoff + retry | unit/integration | retry_after уважается; на 2-й 429 — return-to-queue |
+| Bot API 429 → backoff + retry | unit/integration | retry_after уважается; на 2-й 429 — return-to-queue (немедленный re-enqueue, §2.9) |
+| Per-chat throttle сработал (try_consume=False) | integration | получатель пропущен; `telegram_notifications` строка НЕ создана; `enqueue_recovery` НЕ вызван для throttled-письма (нет hot re-enqueue, §2.9) |
+| Recovery после throttle: throttled-письмо подобрано recovery_scan | integration | recovery_scan находит письмо (per-recipient `NOT EXISTS tn WHERE message_id=m.id AND user_id=u.id`), LPUSH в очередь; на повторном dispatch при освободившемся окне notification доставлена; busy-loop отсутствует (нет re-enqueue каждые 5с) |
+| **Частичная доставка (round-33):** письмо видно A и B; A доставлен (строка `(mid,A)` есть), B throttled (строки `(mid,B)` нет) | integration | recovery_scan **возвращает** `mid` (есть visible получатель B без строки) — НЕ теряет B из-за существующей строки A; на повторном dispatch A пропущен (`try_reserve`→None), B доставлен при освободившемся окне |
+| **recovery visibility-aware (round-33, TD-025):** письмо без visible залинкованных получателей (нет линковки / opt-out / до `tl.created_at`) | integration | recovery_scan НЕ возвращает `mid` (recipient-JOIN пуст) — нет холостого enqueue |
 | Bot API 5xx / network | integration | DELETE telegram_notifications row + LPUSH back to queue; retry на следующем тике |
 | sync_cycle не падает при ошибке dispatcher'а | integration | exception в LPUSH ловится, sync_cycle завершает цикл |
 | recovery_scan находит upiazz'енное notification | integration | LPUSH добавляет в очередь, dispatcher доставляет |
@@ -792,8 +967,21 @@ async def send_notification(*, chat_id: int, text_html: str, message_id: int) ->
 - `04-api-contracts.md` — новые `POST /api/telegram/auth`, `PATCH /api/me/settings`; изменения `GET /api/me`, `POST /logout`, `POST /api/admin/users/{id}/reset`, `GET /messages/{id}`.
 - `05-modules.md` — расширение модуля 18 (`telegram`) на SSO + dispatcher + bot.send_notification; новый sub-модуль `repositories/telegram_*`, `repositories/user_settings`; изменения в `auth`, `admin`, `worker.sync_cycle`.
 - `06-security.md` — новая секция 1.9 (STRIDE для Telegram SSO); §7 — rate-limit `/api/telegram/auth`; §8 — новые audit-actions.
-- `07-deployment.md` — env vars (`TG_NOTIFY_*`, `TG_AUTH_INIT_DATA_TTL_SEC`, `TG_PENDING_COOKIE_TTL_SEC`); cleanup TD-014 (имя `TELEGRAM_BOT_TOKEN`).
+- `07-deployment.md` — env vars (`TG_NOTIFY_*`, `TG_NOTIFY_ALL_MESSAGES`, `TG_SEND_PER_CHAT_PER_MINUTE`, `TG_AUTH_INIT_DATA_TTL_SEC`, `TG_PENDING_COOKIE_TTL_SEC`); cleanup TD-014 (имя `TELEGRAM_BOT_TOKEN`).
 - `08-frontend.md` — `tg.js` расширение для SSO call; `message_view.html` — `embed_tg` flag.
-- `100-known-tech-debt.md` — закрытие TD-013 (push-notifications) + TD-014 (env var rename).
+- `100-known-tech-debt.md` — закрытие TD-013 (push-notifications) + TD-014 (env var rename); round-31 — TD-025 (recovery без visibility-джойна), TD-026 (нет глобального bot-throttle); round-32 — TD-027 (риск недоставки TG-нотификации за окном 24ч при устойчивом per-chat флуде); round-33 — TD-025 **закрыт** (recovery стал per-recipient + visibility-aware), TD-027 переформулирован (причина — устойчивый throttle).
 - ADR-0018 — `INDEX.md` помечает `partially superseded by ADR-0022`. Сам файл ADR-0018 не редактируется (иммутабельны).
+
+---
+
+## История изменений
+
+| round | Дата | Изменение |
+| --- | --- | --- |
+| round-12 (bug A) | — | Recipient-SQL и теги перешли с per-user (`t.user_id=u.id`) на «у письма есть любой тег» (`EXISTS message_tags`) + теги грузятся один раз на письмо (`list_tags_for_message`). Group-mates лидера снова получают уведомления. |
+| round-13 | — | Добавлен `m.internal_date >= tl.created_at` — не флудить историей при первой линковке. |
+| round-21 | — | Дедуп тегов в тексте по `(name, color)`. |
+| round-31 | 2026-05-26 | (1) Уведомления по ВСЕМ новым письмам под флагом `TG_NOTIFY_ALL_MESSAGES` (default true; §2.1/§2.2/§2.8 — тег-предикат стал условным). (2) Строка тегов в тексте опциональна, плейсхолдер «—» убран, ранний `if not message_tags: return` убран (§2.5). (3) Per-chat троттлинг `TG_SEND_PER_CHAT_PER_MINUTE` через неблокирующий `rate_limit.try_consume` перед `try_reserve`, re-enqueue целого message_id (§2.9). Миграций нет; идемпотентность (§2.3) без изменений. TD-025/TD-026 заведены как follow-up. |
+| round-32 | 2026-05-26 | **Busy-loop fix (§2.9).** Throttled-получатель больше НЕ инициирует немедленный hot re-enqueue в `tg_notify_queue` (`enqueue_recovery`) — он просто `continue` (строка `telegram_notifications` не резервируется), а доставку берёт штатный `recovery_scan` (раз в час, окно 24ч) через `NOT EXISTS telegram_notifications`. Это убирает busy-loop при устойчивом `inflow > per-chat cap` (раньше письмо ре-энквьюилось каждые 5с бесконечно → неограниченный рост очереди + амплификация recipient-SQL). `retry_after`/`transient` (429/5xx) по-прежнему идут через немедленный `enqueue_recovery` (кратковременная, не структурная задержка — busy-loop не возникает). Обновлены §2.4 (контракт dispatch), §2.9. Заведён TD-027 (риск недоставки TG-нотификации за окном 24ч при устойчивом флуде — осознанный компромисс, само письмо не теряется). Миграций нет. |
+| round-33 | 2026-05-26 | **CRITICAL fix: recovery per-recipient (§2.8/§2.9).** Прежний `recovery_scan` отбирал письма по per-**message** `NOT EXISTS (telegram_notifications WHERE message_id=m.id)`. При частичной доставке (письмо видно A и B; A доставлен → строка `(mid,A)` есть; B throttled → строки `(mid,B)` нет) `NOT EXISTS` возвращал FALSE из-за строки A → `mid` не подбирался → B терял уведомление **навсегда**. Это делало путь throttled→recovery (§2.9) недостижимым для частично-доставленных писем и активировало pre-existing хрупкость частичной доставки при крашах. Исправлено (Опция A, без миграции): recovery-SQL теперь переиспользует recipient-логику §2.2 (visibility/link/opt-out/`internal_date` + условный тег-предикат) и отбирает `DISTINCT m.id`, у которых есть видимый получатель без строки `(message_id,user_id)` (`NOT EXISTS tn WHERE message_id=m.id AND user_id=u.id`). Побочно: recovery стал visibility-aware → **TD-025 закрыт**; TD-027 переформулирован (причина недоставки за 24ч — устойчивый throttle, а не маскированная частичная доставка). Идемпотентность (`try_reserve`) и hot-path `retry_after`/`transient` не тронуты. Обновлены §2.8 (новый recovery-SQL), §2.9 (механизм throttled→recovery), `05-modules.md` §14.1. Миграций нет. |
 

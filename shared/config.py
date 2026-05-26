@@ -117,6 +117,16 @@ class Settings(BaseSettings):
     TG_NOTIFY_BATCH_SIZE: int = Field(default=30, ge=1, le=500)
     # Per-tick recovery LPUSH batch size.
     TG_NOTIFY_RECOVERY_BATCH_SIZE: int = Field(default=200, ge=1, le=10_000)
+    # Round-31 (ADR-0022 §2.1): notify about EVERY new message, not only
+    # tagged ones. ``true`` (default) — every inserted message is enqueued;
+    # ``false`` — historical behaviour (only messages with >=1 tag). Toggling
+    # to ``false`` reverts without a code redeploy (worker restart only, so
+    # ``get_settings()`` lru-cache re-reads env).
+    TG_NOTIFY_ALL_MESSAGES: bool = Field(default=True)
+    # Round-31 (ADR-0022 §2.9): per-chat send throttle (msg / minute / chat).
+    # Caps Telegram Bot API pressure per chat_id; over-limit recipients are
+    # skipped this tick and picked up later by the recovery scan.
+    TG_SEND_PER_CHAT_PER_MINUTE: int = Field(default=20, ge=1, le=60)
 
     # --- Outbound webhooks dispatcher (ADR-0023 §3 + §5) ------------------
     # How often ``webhook_dispatch`` drains the Redis queue.

@@ -101,6 +101,12 @@ LIMIT_WEBHOOK_ROTATE = Limit(name="webhook_rotate", capacity=5, window_seconds=6
 # redeploy of the codebase. The static value here is a sensible fallback
 # only if the settings lookup is unavailable for some reason.
 LIMIT_WEBHOOK_TEST = Limit(name="webhook_test", capacity=10, window_seconds=60 * 60)
+# Telegram per-chat send throttle (ADR-0022 §2.9). ``capacity`` is overridden
+# at consume-time from ``settings.TG_SEND_PER_CHAT_PER_MINUTE`` (same pattern as
+# ``LIMIT_WEBHOOK_TEST``) so operators can tune the cap without a code redeploy.
+# Consumed via the non-raising :func:`try_consume` (a throttled recipient is
+# skipped this tick, not rejected with an error). Key: ``rl:tg_send:<chat_id>``.
+LIMIT_TG_SEND_PER_CHAT = Limit(name="tg_send", capacity=20, window_seconds=60)
 
 
 async def consume(limit: Limit, key: str) -> None:
@@ -126,6 +132,33 @@ async def consume(limit: Limit, key: str) -> None:
             "Rate limit exceeded.",
             retry_after=max(ttl, 1) if ttl > 0 else limit.window_seconds,
         )
+
+
+async def try_consume(limit: Limit, key: str) -> bool:
+    """Non-blocking fixed-window check (ADR-0022 §2.9).
+
+    Same ``INCR`` + ``EXPIRE(nx)`` mechanics as :func:`consume`, but instead
+    of raising :class:`RateLimitedError` when the window budget is exhausted it
+    returns ``False``; ``True`` while there is still budget (the counter is
+    incremented either way). An empty ``key`` yields ``True`` (fail-open — same
+    no-enforcement posture as :func:`consume`, which logs and returns).
+
+    Used for the per-chat Telegram send throttle: a ``False`` result means the
+    recipient is skipped this tick (the recovery scan picks the message up
+    later), so it must not abort the dispatch loop.
+    """
+    if not key:
+        # No key -> can't enforce; fail-open (don't drop the send).
+        log.warning("rate_limit_no_key", limit_name=limit.name)
+        return True
+    redis = get_redis()
+    redis_key = f"rl:{limit.name}:{key}"
+    async with redis.pipeline(transaction=False) as pipe:
+        pipe.incr(redis_key)
+        pipe.expire(redis_key, limit.window_seconds, nx=True)
+        results = await pipe.execute()
+    current = int(results[0])
+    return current <= limit.capacity
 
 
 def install_rate_limiter(_app: FastAPI) -> None:

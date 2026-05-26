@@ -223,6 +223,8 @@ Healthcheck не настроен — это бесконечный sleep-цик
 | `TG_NOTIFY_BATCH_SIZE` | `30` | no | Сколько items LPOP'ит `tg_notify_dispatch` за один тик (ADR-0022 §2.4). |
 | `TG_NOTIFY_DISPATCH_INTERVAL_SEC` | `5` | no | Интервал APScheduler для `tg_notify_dispatch` (ADR-0022 §2.4). |
 | `TG_NOTIFY_RECOVERY_WINDOW_HOURS` | `24` | no | Окно (часы) для `tg_notify_recovery_scan` — не пытаемся доставить уведомления о письмах старше этого срока (ADR-0022 §2.8). |
+| `TG_NOTIFY_ALL_MESSAGES` | `true` | no | round-31: `true` — уведомлять по ВСЕМ новым письмам; `false` — только письма с ≥1 тегом (историческое поведение). Откат — смена env + рестарт `worker` (lru-cache `get_settings`), без редеплоя кода (ADR-0022 §2.1/§2.2). |
+| `TG_SEND_PER_CHAT_PER_MINUTE` | `20` | no | round-31: per-chat троттлинг доставки уведомлений (Redis `rl:tg_send:<chat_id>`, окно 60 сек). Диапазон 1..60. Защита от flood/429 при `TG_NOTIFY_ALL_MESSAGES=true` (ADR-0022 §2.9). |
 
 `TELEGRAM_BOT_TOKEN` хранится в `.env` (`chmod 600`). **Изменение от ADR-0018:** `worker` теперь использует Telegram API для доставки push-нотификаций (ADR-0022 §2) — `TELEGRAM_BOT_TOKEN` передаётся **и** в `api`, **и** в `worker` контейнеры. Маскировка в логах гарантируется redact-list'ом structlog (одинаково для обоих контейнеров).
 

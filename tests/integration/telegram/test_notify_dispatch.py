@@ -27,6 +27,10 @@ Implementation note: we drive the dispatcher directly via
 APScheduler — gives deterministic ordering with no scheduler in the loop.
 """
 
+# Some docstrings reference the Cyrillic notification labels ("Тег"/"Теги")
+# intentionally; suppress ruff's ambiguous-unicode warnings file-wide.
+# ruff: noqa: RUF001 RUF002 RUF003
+
 from __future__ import annotations
 
 import json
@@ -36,10 +40,12 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
+from backend.app.rate_limit import LIMIT_TG_SEND_PER_CHAT
 from backend.app.telegram.notify_service import (
     TG_NOTIFY_QUEUE_KEY,
     TelegramNotifyService,
 )
+from shared.config import get_settings
 from shared.models import (
     AdminAudit,
     TelegramLink,
@@ -329,36 +335,81 @@ class TestRecipientResolver:
         chat_ids = {call["chat_id"] for call in fake_send_notification.calls}
         assert chat_ids == {110401, 110402}
 
-    async def test_member_without_tag_does_not_receive(
+    @pytest.mark.parametrize("flag", [False, True])
+    async def test_member_on_untagged_message_receives_only_when_flag_on(
         self,
+        flag: bool,
         db_engine: AsyncEngine,
         client: Any,
-        super_admin_user: User,
         leader_and_group: tuple[Any, User],
         create_member: Any,
         make_link: Any,
         create_mail_account: Any,
         create_message: Any,
-        tag_message_for_user: Any,
         fake_send_notification: Any,
+        set_tg_notify_all: Any,
     ) -> None:
-        group, leader = leader_and_group
-        member_with = await create_member(group.id, "m_with_tag")
-        member_without = await create_member(group.id, "m_without_tag")
-        await make_link(110501, member_with.id)
-        await make_link(110502, member_without.id)
+        """Round-31 (ADR-0022 §2.1): the tag predicate is message-level (round-12).
 
-        acc = await create_mail_account(leader.id, "leader2@example.com", group_id=group.id)
-        msg = await create_message(acc.id, uid=110501)
-        await tag_message_for_user(member_with.id, msg.id, "tag")
-        # member_without has NO tag on this message.
+        A member who is a valid recipient of a message that carries **no tags at
+        all** is EXCLUDED under ``TG_NOTIFY_ALL_MESSAGES=false`` (historical
+        tagged-only behaviour) but INCLUDED under ``true`` (notify about all
+        messages). NOTE: the predicate is "the message has ANY tag", not a
+        per-user tag — so this fixture deliberately leaves the message untagged.
+        """
+        set_tg_notify_all(flag)
+        group, leader = leader_and_group
+        member = await create_member(group.id, f"m_untagged_{int(flag)}")
+        link_id = 110520 + int(flag)
+        await make_link(link_id, member.id)
+
+        acc = await create_mail_account(
+            leader.id, f"leader2_{int(flag)}@example.com", group_id=group.id
+        )
+        msg = await create_message(acc.id, uid=110501 + int(flag))
+        # NO tag applied to this message at all.
 
         fake_send_notification.push(FakeSendResult(kind="ok", telegram_message_id=1))
         await _dispatch(_payload_for(msg.id), db_engine)
 
         chat_ids = {call["chat_id"] for call in fake_send_notification.calls}
-        assert 110501 in chat_ids
-        assert 110502 not in chat_ids
+        if flag:
+            assert link_id in chat_ids
+        else:
+            assert link_id not in chat_ids
+
+    async def test_untagged_message_dispatches_without_tag_line_when_flag_on(
+        self,
+        db_engine: AsyncEngine,
+        client: Any,
+        super_admin_user: User,
+        make_link: Any,
+        create_mail_account: Any,
+        create_message: Any,
+        fake_send_notification: Any,
+        set_tg_notify_all: Any,
+    ) -> None:
+        """flag=true: a message with NO tags still notifies; the rendered text
+        omits the ``Тег``/``Теги`` line entirely (round-31, ADR-0022 §2.5)."""
+        set_tg_notify_all(True)
+        tg_id = 110530
+        await make_link(tg_id, super_admin_user.id)
+        acc = await create_mail_account(
+            super_admin_user.id, "notag@example.com", display_name="No Tag Box"
+        )
+        msg = await create_message(acc.id, uid=110530, from_addr="x@y.com", from_name="Sender X")
+        # No tag applied.
+        fake_send_notification.push(FakeSendResult(kind="ok", telegram_message_id=7))
+        await _dispatch(_payload_for(msg.id), db_engine)
+
+        assert len(fake_send_notification.calls) == 1
+        text_html = fake_send_notification.calls[0]["text_html"]
+        assert "No Tag Box" in text_html
+        assert "Sender X" in text_html
+        # No tag label and no em-dash placeholder.
+        assert "Тег" not in text_html
+        assert "Теги" not in text_html
+        assert "—" not in text_html
 
     async def test_member_without_link_does_not_receive(
         self,
@@ -536,3 +587,143 @@ class TestSyncCycleResilience:
         async with factory() as ses:
             with pytest.raises(RuntimeError, match="simulated redis outage"):
                 await TelegramNotifyService(ses).enqueue_message_ids([msg.id])
+
+
+# ---------------------------------------------------------------------------
+# Per-chat send throttle (ADR-0022 §2.9)
+# ---------------------------------------------------------------------------
+
+
+class TestPerChatThrottle:
+    async def _exhaust_chat_budget(self, chat_id: int, capacity: int) -> None:
+        """Pre-fill the per-chat throttle counter so the next try_consume fails.
+
+        Mirrors the production key shape ``rl:tg_send:<chat_id>`` and the
+        fixed-window INCR mechanics in :func:`try_consume`.
+        """
+        redis = get_redis()
+        key = f"rl:{LIMIT_TG_SEND_PER_CHAT.name}:{chat_id}"
+        await redis.set(key, capacity, ex=LIMIT_TG_SEND_PER_CHAT.window_seconds)
+
+    async def test_throttled_recipient_is_skipped_no_row_no_requeue(
+        self,
+        db_engine: AsyncEngine,
+        client: Any,
+        super_admin_user: User,
+        make_link: Any,
+        create_mail_account: Any,
+        create_message: Any,
+        tag_message_for_user: Any,
+        fake_send_notification: Any,
+        monkeypatch: Any,
+    ) -> None:
+        """§2.9: when the per-chat budget is exhausted the recipient is skipped
+        via ``continue`` — NO Bot API call, NO ``telegram_notifications`` row,
+        and NO ``enqueue_recovery`` (the hourly recovery scan picks it up)."""
+        # Pin the throttle capacity small + deterministic.
+        monkeypatch.setenv("TG_SEND_PER_CHAT_PER_MINUTE", "1")
+        get_settings.cache_clear()
+        assert get_settings().TG_SEND_PER_CHAT_PER_MINUTE == 1
+
+        tg_id = 150001
+        await make_link(tg_id, super_admin_user.id)
+        acc = await create_mail_account(super_admin_user.id, "throttle@example.com")
+        msg = await create_message(acc.id, uid=150001)
+        await tag_message_for_user(super_admin_user.id, msg.id, "tag")
+
+        # Exhaust the per-chat budget BEFORE dispatch (counter already at cap).
+        await self._exhaust_chat_budget(tg_id, capacity=1)
+
+        r = get_redis()
+        assert await r.llen(TG_NOTIFY_QUEUE_KEY) == 0
+
+        await _dispatch(_payload_for(msg.id), db_engine)
+
+        # No Bot API call happened (try_consume returned False → continue).
+        assert len(fake_send_notification.calls) == 0
+
+        # No telegram_notifications row was reserved for the throttled recipient.
+        factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
+        async with factory() as ses:
+            row = (
+                await ses.execute(
+                    select(TelegramNotification).where(TelegramNotification.message_id == msg.id)
+                )
+            ).scalar_one_or_none()
+            assert row is None, f"throttled recipient must NOT reserve a row, got {row}"
+
+        # No re-enqueue for a throttled recipient (recovery scan handles it).
+        assert await r.llen(TG_NOTIFY_QUEUE_KEY) == 0
+
+        get_settings.cache_clear()
+
+    async def test_within_budget_recipient_is_delivered(
+        self,
+        db_engine: AsyncEngine,
+        client: Any,
+        super_admin_user: User,
+        make_link: Any,
+        create_mail_account: Any,
+        create_message: Any,
+        tag_message_for_user: Any,
+        fake_send_notification: Any,
+        monkeypatch: Any,
+    ) -> None:
+        """Control: with budget available the same path delivers normally."""
+        monkeypatch.setenv("TG_SEND_PER_CHAT_PER_MINUTE", "5")
+        get_settings.cache_clear()
+
+        tg_id = 150101
+        await make_link(tg_id, super_admin_user.id)
+        acc = await create_mail_account(super_admin_user.id, "ok_throttle@example.com")
+        msg = await create_message(acc.id, uid=150101)
+        await tag_message_for_user(super_admin_user.id, msg.id, "tag")
+
+        fake_send_notification.push(FakeSendResult(kind="ok", telegram_message_id=9))
+        await _dispatch(_payload_for(msg.id), db_engine)
+
+        assert len(fake_send_notification.calls) == 1
+        factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
+        async with factory() as ses:
+            row = (
+                await ses.execute(
+                    select(TelegramNotification).where(TelegramNotification.message_id == msg.id)
+                )
+            ).scalar_one()
+            assert row.sent_at is not None
+
+        get_settings.cache_clear()
+
+    async def test_retry_after_does_requeue_unlike_throttle(
+        self,
+        db_engine: AsyncEngine,
+        client: Any,
+        super_admin_user: User,
+        make_link: Any,
+        create_mail_account: Any,
+        create_message: Any,
+        tag_message_for_user: Any,
+        fake_send_notification: Any,
+        monkeypatch: Any,
+    ) -> None:
+        """Contrast with throttle: a Bot API ``retry_after`` DOES re-enqueue
+        (the recipient passed the throttle but the send was rate-limited)."""
+        monkeypatch.setenv("TG_SEND_PER_CHAT_PER_MINUTE", "20")
+        get_settings.cache_clear()
+
+        tg_id = 150201
+        await make_link(tg_id, super_admin_user.id)
+        acc = await create_mail_account(super_admin_user.id, "retry_throttle@example.com")
+        msg = await create_message(acc.id, uid=150201)
+        await tag_message_for_user(super_admin_user.id, msg.id, "tag")
+
+        fake_send_notification.push(FakeSendResult(kind="retry_after", retry_after_sec=3))
+        r = get_redis()
+        assert await r.llen(TG_NOTIFY_QUEUE_KEY) == 0
+
+        await _dispatch(_payload_for(msg.id), db_engine)
+
+        # retry_after → re-enqueued (unlike a throttle skip).
+        assert await r.llen(TG_NOTIFY_QUEUE_KEY) == 1
+
+        get_settings.cache_clear()

@@ -266,3 +266,183 @@ class TestSyncOneAccount:
         )
         assert new2 == 0
         assert conflict2 == 1
+
+
+def _single_message_box(uid: int) -> Any:
+    """Build a FetchedBox carrying exactly one message (no attachments)."""
+    from datetime import UTC
+    from datetime import datetime as _dt
+
+    from worker.app.imap_fetcher import FetchedBox, FetchedMessage
+
+    return FetchedBox(
+        uidvalidity=7,
+        uidnext=uid + 1,
+        new_messages=[
+            FetchedMessage(
+                uid=uid,
+                message_id_header=f"<{uid}@x>",
+                from_addr="x@y.com",
+                from_name="X",
+                to_addrs="sync@example.com",
+                cc_addrs=None,
+                subject="hello",
+                internal_date=_dt.now(UTC),
+                body_text="hi",
+                body_html=None,
+                body_truncated=False,
+                body_present=True,
+                in_reply_to=None,
+                refs_header=None,
+                attachments=[],
+            )
+        ],
+    )
+
+
+class TestNotifyAllMessagesGate:
+    """ADR-0022 §2.1 (round-31): TG_NOTIFY_ALL_MESSAGES gates enqueue.
+
+    - flag=true:  enqueue EVERY inserted message even if 0 tags applied.
+    - flag=false: enqueue only messages that received >=1 tag.
+
+    We mock ``TagsService.apply_tags_to_message`` to return a fixed count, and
+    capture the message_ids passed to
+    ``TelegramNotifyService.enqueue_message_ids``.
+    """
+
+    def _patch_common(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        applied: int,
+        uid: int,
+    ) -> list[list[int]]:
+        """Patch fetch + tag-apply + enqueue capture. Returns the captured-arg list."""
+
+        async def _fake_to_thread(_func: Any, *_a: Any, **_k: Any) -> Any:
+            return _single_message_box(uid)
+
+        monkeypatch.setattr(asyncio, "to_thread", _fake_to_thread)
+
+        async def _fake_apply(self: Any, *, message: Any, mail_account_id: int) -> int:
+            return applied
+
+        from backend.app.tags.service import TagsService
+
+        monkeypatch.setattr(TagsService, "apply_tags_to_message", _fake_apply)
+
+        captured: list[list[int]] = []
+
+        async def _fake_enqueue(self: Any, message_ids: list[int]) -> int:
+            captured.append(list(message_ids))
+            return len(message_ids)
+
+        from backend.app.telegram.notify_service import TelegramNotifyService
+
+        monkeypatch.setattr(TelegramNotifyService, "enqueue_message_ids", _fake_enqueue)
+
+        # Also stub the webhook enqueue so it doesn't touch Redis / fail.
+        from backend.app.webhooks.dispatch_service import WebhookDispatchService
+
+        async def _fake_wh_enqueue(self: Any, message_ids: list[int]) -> int:
+            return len(message_ids)
+
+        monkeypatch.setattr(WebhookDispatchService, "enqueue_message_ids", _fake_wh_enqueue)
+
+        return captured
+
+    async def test_flag_on_enqueues_even_with_zero_tags_applied(
+        self,
+        admin_user_with_account: dict[str, Any],
+        db_engine: AsyncEngine,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from shared.config import get_settings
+
+        monkeypatch.setenv("TG_NOTIFY_ALL_MESSAGES", "true")
+        get_settings.cache_clear()
+        assert get_settings().TG_NOTIFY_ALL_MESSAGES is True
+
+        captured = self._patch_common(monkeypatch, applied=0, uid=160001)
+
+        factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
+        async with factory() as ses:
+            acc = await ses.get(MailAccount, admin_user_with_account["account_id"])
+        assert acc is not None
+
+        new_count, _ = await sc.sync_one_account(
+            acc,
+            timeout_seconds=10,
+            initial_sync_days=30,
+            max_body_bytes=1024,
+            max_att_bytes=1024,
+        )
+        assert new_count == 1
+        # Even though 0 tags were applied, the message was enqueued.
+        assert captured, "enqueue_message_ids was never called"
+        flat = [mid for batch in captured for mid in batch]
+        assert len(flat) == 1
+        get_settings.cache_clear()
+
+    async def test_flag_off_skips_enqueue_when_zero_tags_applied(
+        self,
+        admin_user_with_account: dict[str, Any],
+        db_engine: AsyncEngine,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from shared.config import get_settings
+
+        monkeypatch.setenv("TG_NOTIFY_ALL_MESSAGES", "false")
+        get_settings.cache_clear()
+        assert get_settings().TG_NOTIFY_ALL_MESSAGES is False
+
+        captured = self._patch_common(monkeypatch, applied=0, uid=160002)
+
+        factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
+        async with factory() as ses:
+            acc = await ses.get(MailAccount, admin_user_with_account["account_id"])
+        assert acc is not None
+
+        new_count, _ = await sc.sync_one_account(
+            acc,
+            timeout_seconds=10,
+            initial_sync_days=30,
+            max_body_bytes=1024,
+            max_att_bytes=1024,
+        )
+        assert new_count == 1
+        # 0 tags + flag off → no enqueue at all.
+        flat = [mid for batch in captured for mid in batch]
+        assert flat == [], f"flag-off must not enqueue untagged messages, got {flat}"
+        get_settings.cache_clear()
+
+    async def test_flag_off_enqueues_when_tags_applied(
+        self,
+        admin_user_with_account: dict[str, Any],
+        db_engine: AsyncEngine,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from shared.config import get_settings
+
+        monkeypatch.setenv("TG_NOTIFY_ALL_MESSAGES", "false")
+        get_settings.cache_clear()
+
+        captured = self._patch_common(monkeypatch, applied=2, uid=160003)
+
+        factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
+        async with factory() as ses:
+            acc = await ses.get(MailAccount, admin_user_with_account["account_id"])
+        assert acc is not None
+
+        new_count, _ = await sc.sync_one_account(
+            acc,
+            timeout_seconds=10,
+            initial_sync_days=30,
+            max_body_bytes=1024,
+            max_att_bytes=1024,
+        )
+        assert new_count == 1
+        flat = [mid for batch in captured for mid in batch]
+        assert len(flat) == 1, "flag-off with applied>0 must enqueue the message"
+        get_settings.cache_clear()

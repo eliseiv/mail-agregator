@@ -1,11 +1,18 @@
-"""ADR-0022 §2.8 — recovery scan.
+"""ADR-0022 §2.8 — recovery scan (round-33 per-recipient + round-31 flag).
 
-The recovery scan must re-enqueue ``messages`` that:
-- have at least one ``message_tags`` row,
-- have NO ``telegram_notifications`` row yet,
-- were ``fetched_at`` within the lookback window.
+The recovery scan re-enqueues ``messages`` that have a **visible, linked,
+opted-in recipient WITHOUT a** ``telegram_notifications`` row, within the
+lookback window. Round-33 made the gap per-recipient (the SQL JOINs the same
+recipient logic as §2.2 and requires an active ``telegram_links`` row with
+``internal_date >= tl.created_at``). Round-31 made the tag predicate
+conditional on ``TG_NOTIFY_ALL_MESSAGES``:
 
-Messages older than the window are skipped.
+- flag=true (default): an UNtagged message with a linked recipient is included.
+- flag=false: only messages with at least one tag are included.
+
+Messages older than the window, or fully delivered, are skipped. Because the
+scan now requires a linked recipient, every test here creates a
+``telegram_links`` row for the super-admin.
 """
 
 from __future__ import annotations
@@ -51,10 +58,13 @@ class TestRecoveryScan:
         db_engine: AsyncEngine,
         client: Any,
         super_admin_user: Any,
+        make_link: Any,
         create_mail_account: Any,
         create_message: Any,
         tag_message_for_user: Any,
     ) -> None:
+        # Round-33: recovery requires a linked recipient.
+        await make_link(130001, super_admin_user.id)
         acc = await create_mail_account(super_admin_user.id, "rec@example.com")
         msg = await create_message(acc.id, uid=130001)
         await tag_message_for_user(super_admin_user.id, msg.id, "tag")
@@ -77,10 +87,12 @@ class TestRecoveryScan:
         db_engine: AsyncEngine,
         client: Any,
         super_admin_user: Any,
+        make_link: Any,
         create_mail_account: Any,
         create_message: Any,
         tag_message_for_user: Any,
     ) -> None:
+        await make_link(130002, super_admin_user.id)
         acc = await create_mail_account(super_admin_user.id, "rec2@example.com")
         msg = await create_message(acc.id, uid=130002)
         await tag_message_for_user(super_admin_user.id, msg.id, "tag")
@@ -99,10 +111,12 @@ class TestRecoveryScan:
         db_engine: AsyncEngine,
         client: Any,
         super_admin_user: Any,
+        make_link: Any,
         create_mail_account: Any,
         create_message: Any,
         tag_message_for_user: Any,
     ) -> None:
+        await make_link(130003, super_admin_user.id)
         acc = await create_mail_account(super_admin_user.id, "rec3@example.com")
         msg = await create_message(acc.id, uid=130003)
         await tag_message_for_user(super_admin_user.id, msg.id, "tag")
@@ -117,17 +131,28 @@ class TestRecoveryScan:
         ids = await _list_recovery(db_engine)
         assert msg.id not in ids
 
-    async def test_message_without_tags_is_skipped(
+    @pytest.mark.parametrize("flag", [False, True])
+    async def test_message_without_tags_included_only_when_flag_on(
         self,
+        flag: bool,
         db_engine: AsyncEngine,
         client: Any,
         super_admin_user: Any,
+        make_link: Any,
         create_mail_account: Any,
         create_message: Any,
+        set_tg_notify_all: Any,
     ) -> None:
-        acc = await create_mail_account(super_admin_user.id, "rec4@example.com")
-        msg = await create_message(acc.id, uid=130004)
-        # No tag → recovery scan ignores.
+        """Round-31: an untagged message is skipped by recovery under
+        ``TG_NOTIFY_ALL_MESSAGES=false`` but included under ``true``."""
+        set_tg_notify_all(flag)
+        await make_link(130040 + int(flag), super_admin_user.id)
+        acc = await create_mail_account(super_admin_user.id, f"rec4_{int(flag)}@example.com")
+        msg = await create_message(acc.id, uid=130004 + int(flag))
+        # No tag applied.
 
         ids = await _list_recovery(db_engine)
-        assert msg.id not in ids
+        if flag:
+            assert msg.id in ids
+        else:
+            assert msg.id not in ids
