@@ -357,7 +357,14 @@ async def tg_notify_dispatch() -> None:
 
 async def dispatch_one_payload(raw: str) -> None:
     # 1. Загрузить recipients (SQL из §2.2)
-    # 2. Загрузить контекст письма (mail_account display_name|email, from_addr, from_name)
+    # 2. Загрузить Message (db.get(Message, message_id)) + mail_account (display_name|email).
+    #    Объект Message УЖЕ содержит subject / body_text / body_html — отдельный запрос/метод
+    #    репозитория НЕ нужен (round-34). acc_label = display_name|email; from_label = from_name|from_addr.
+    #    2b. round-34: posчитать body_preview ОДИН раз на message (не на recipient):
+    #        raw = body_text if body_text.strip() else html_to_plain(body_html)   # fallback через sanitize_telegram_html
+    #        preview = normalize_preview(raw)  # схлопнуть whitespace+nbsp+zero-width в 1 пробел, strip,
+    #                                            # обрезать до PREVIEW_LEN=120 (+'…' если длиннее), '' если пусто
+    #        Срез делается в Python, НЕ в SQL.
     # 3. Загрузить теги письма ОДИН раз (round-12, §2.2). tag_names может быть [].
     #    round-31: НЕТ раннего return при пустом tag_names — продолжаем (теги опциональны, §2.5).
     # 4. Для каждого recipient:
@@ -365,7 +372,7 @@ async def dispatch_one_payload(raw: str) -> None:
     #       Если False -> continue (НЕ резервируем строку, НЕ ставим флаг re-enqueue).
     #       round-32: throttled-получателя доставит recovery_scan (NOT EXISTS notif), без hot-loop.
     #    b. try_reserve(message_id, user_id) ON CONFLICT DO NOTHING -> id|None; None -> continue (дедуп).
-    #    c. Сформировать текст (см. §2.5) на общем tag_names.
+    #    c. Сформировать текст (§2.5) на общем tag_names + subject=message.subject + body_preview.
     #    d. await send_notification(chat_id, text, message_id).
     #    e. ok        -> mark_sent(telegram_message_id, sent_at=now()).
     #    f. dead(403/400) -> mark telegram_links.dead_at + audit; строку НЕ удаляем (audit-маркер).
@@ -398,12 +405,27 @@ async def dispatch_one_payload(raw: str) -> None:
 
 Bug-fix #4: Telegram `parse_mode=HTML` **не** декодирует HTML-entities (`&laquo;`/`&raquo;`) — пользователь увидел бы их буквально. Используем реальные UTF-8 кавычки `«` `»`.
 
+**Round-34: добавлены ТЕМА письма и ПРЕВЬЮ тела.** Уведомление теперь даёт человекочитаемый тизер до открытия письма. `format_notification` получает два новых параметра: `subject: str | None` и `body_preview: str` (уже нормализованный и обрезанный — см. ниже). Обе строки опциональны в выводе:
+
+- строка «почта» — **всегда**;
+- строка «теги» — только если `tag_names` непуст (round-31);
+- строка «отправитель» — **всегда**;
+- строка «Тема:» — **только если** `subject` непуст после `.strip()` (письма без темы → строка не печатается, плейсхолдер «(без темы)» в push **не** показываем — это шум; полный заголовок «(без темы)» остаётся в callback-ответе §2.6 при открытии письма);
+- строка «превью тела» — **только если** `body_preview` непуст (письмо без тела → строка отсутствует).
+
+`subject` обрезается до `SUBJECT_MAX = 150` символов (по границе + «…»). `body_preview` нормализуется и режется до `PREVIEW_LEN = 120` символов **в Python** (не в SQL) — см. §2.4. Длины — **константы модуля** `notify_format.py` (не env: ретюн не нужен, лишний env-флаг — overhead). Обе строки — user-controlled → обязательный `html.escape()` (как `acc`/`from`/`tag`).
+
 ```python
+PREVIEW_LEN: Final[int] = 120
+SUBJECT_MAX: Final[int] = 150
+
 def format_notification(
     *,
     acc_label: str,        # display_name or email
     from_label: str,       # from_name or from_addr
     tag_names: list[str],  # может быть ПУСТЫМ (письмо без тегов)
+    subject: str | None,   # тема письма; None/'' -> строка не печатается
+    body_preview: str,     # уже нормализованное+обрезанное превью; '' -> строка не печатается
 ) -> str:
     """HTML-строка для sendMessage parse_mode=HTML.
     Все user-controlled значения экранируются через html.escape()."""
@@ -417,28 +439,67 @@ def format_notification(
             names = ', '.join(f'«<b>{html.escape(t)}</b>»' for t in tag_names)
             lines.append(f'Теги {names}')
     lines.append(f'Отправитель <b>{from_safe}</b>')
+    subj = (subject or '').strip()
+    if subj:
+        if len(subj) > SUBJECT_MAX:
+            subj = subj[:SUBJECT_MAX].rstrip() + '…'
+        lines.append(f'Тема: <b>{html.escape(subj)}</b>')
+    if body_preview:  # body_preview уже нормализован+обрезан в notify_service
+        lines.append(html.escape(body_preview))
     return '\n'.join(lines)
 ```
 
-Пример с тегом (3 строки):
+**Нормализация превью (выполняется в `notify_service.dispatch_one_payload`, НЕ в SQL — см. §2.4):**
+- источник — `message.body_text` (plain). Если `body_text` пуст → `strip_tags(message.body_html)` через существующий `sanitize_telegram_html()` + дополнительное снятие оставшейся разметки до plain. **Обоснование выбора `body_text`:** round-29 зафиксировал, что у Apple `body_text` и `body_html` **различаются** (UI рендерит `body_html`). Для тизера в push нужен короткий человекочитаемый текст без верстки/CSS/трекинг-пикселей — `text/plain` part письма заведомо «чище» (нет тегов, нет инлайн-стилей), поэтому даёт осмысленный teaser «из коробки». `body_html` берём только как fallback, прогоняя через тот же sanitiser, что и callback (§2.6), чтобы не протёк CSS/скрипт. Несовпадение версий некритично: push — это тизер-приманка, полный «правильный» рендер (`body_html`) пользователь видит по кнопке «Посмотреть сообщение».
+- схлопнуть любой whitespace (переводы строк `\n\r`, табы, множественные пробелы, неразрывный пробел ` ` и zero-width padding) в **один** пробел; обрезать по краям;
+- срезать до `PREVIEW_LEN = 120` символов; если исходник длиннее — `[:120].rstrip() + '…'`;
+- если после нормализации строка пуста → передать `''` (строка превью не печатается).
+
+Пример с темой и телом (round-34):
+```
+Вы получили письмо на почту <b>support@example.com</b>
+Тег «<b>DPLA.PLA</b>»
+Отправитель <b>sender@gmail.com</b>
+Тема: <b>Ваш заказ #12345 отправлен</b>
+Здравствуйте! Ваш заказ был передан в службу доставки и поступит в пункт выдачи в течение 2–3 рабочих дне…
+```
+
+Пример без темы, но с телом (строка «Тема:» отсутствует):
+```
+Вы получили письмо на почту <b>Apple Test 1</b>
+Отправитель <b>AppStoreNotices@apple.com</b>
+Your subscription will renew soon. Tap to review the details and manage your plan in the App Store sett…
+```
+
+Пример с темой, но без тела (строка превью отсутствует):
+```
+Вы получили письмо на почту <b>support@example.com</b>
+Отправитель <b>sender@gmail.com</b>
+Тема: <b>(пустое уведомление)</b>
+```
+
+Пример с тегом — без темы и без тела (структура round-31, 3 строки):
 ```
 Вы получили письмо на почту <b>support@example.com</b>
 Тег «<b>DPLA.PLA</b>»
 Отправитель <b>sender@gmail.com</b>
 ```
 
-Пример с несколькими тегами (3 строки):
-```
-Вы получили письмо на почту <b>Apple Test 1</b>
-Теги «<b>Диспут</b>», «<b>Отменить подписку</b>»
-Отправитель <b>AppStoreNotices@apple.com</b>
-```
-
-Пример без тегов — `TG_NOTIFY_ALL_MESSAGES=true` (2 строки, строка тегов отсутствует):
+Пример без тегов — `TG_NOTIFY_ALL_MESSAGES=true` (строка тегов отсутствует):
 ```
 Вы получили письмо на почту <b>support@example.com</b>
 Отправитель <b>sender@gmail.com</b>
+Тема: <b>Welcome</b>
+Thanks for signing up — confirm your email to get started.
 ```
+
+**Edge-cases:**
+- пустой `subject` (`None` или `''` после strip) → строка «Тема:» опускается, плейсхолдер в push не добавляем;
+- пустое тело (`body_text` и `body_html` оба пусты / дают пустой результат после нормализации) → строка превью опускается;
+- очень длинная тема (>150) → срез `[:150].rstrip()+'…'`; очень длинное тело (>120) → срез `[:120].rstrip()+'…'`;
+- HTML/спецсимволы (`<`, `>`, `&`) и кавычки в `subject`/превью → `html.escape()` (subject и тело сохраняются как обычный текст, не как разметка);
+- многострочный `subject` (редко, но в письмах встречаются folded-заголовки) и переводы строк в теле → схлопываются в один пробел, push остаётся компактным (4096-лимит Bot API не превышается: максимум ~150+120 видимых символов + статичный текст);
+- результат `format_notification` гарантированно ≤ ~400 символов после escape → одна `sendMessage`, без chunk-логики (chunk-сплит остаётся только в callback §2.6 для полного тела).
 
 **Следствие для dispatcher (round-31):** ранний `if not message_tags: return` в `dispatch_one_payload` (§2.4) **убирается** — при пустом списке тегов продолжаем с `tag_names=[]`. Дедуп тегов по `(name, color)` (round-21) сохраняется.
 

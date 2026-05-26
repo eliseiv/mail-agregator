@@ -71,7 +71,7 @@ backend/
       bot.py               # send_message_with_webapp_button, send_notification, handle_update; httpx async к api.telegram.org
       auth_service.py      # TelegramAuthService: validate_init_data, try_sso, link_pending, revoke_for_user, mark_link_dead
       schemas.py           # TelegramUpdate, TelegramAuthRequest, TelegramAuthResponse, ValidatedTelegramUser
-      notify_format.py     # format_notification(acc_label, from_label, tag_names) -> HTML-строка
+      notify_format.py     # format_notification(acc_label, from_label, tag_names, subject, body_preview) -> HTML-строка (round-34)
     webhooks/              # ADR-0023 — outbound webhooks per группа
       __init__.py
       router.py            # GET /my/integrations, GET/POST/PATCH/DELETE /api/webhooks/me, /rotate-secret, /test
@@ -1234,7 +1234,14 @@ async def sync_one_account(account: MailAccount) -> AccountSyncResult
   - `true` (default) — уведомление по **каждому** новому письму (наличие тега НЕ требуется). `worker/sync_cycle` ставит в очередь каждый вставленный `message_id`; recipient-SQL (§2.2 ADR-0022) НЕ добавляет `EXISTS(message_tags)`.
   - `false` — историческое поведение: только письма с ≥1 тегом. `sync_cycle` ставит только `applied>0`; recipient-SQL добавляет `AND EXISTS(message_tags)`.
   - Откат — сменой env + рестарт worker (lru-cache `get_settings`), без редеплоя кода.
-- **Текст уведомления** (`notify_format.format_notification`) — строка тегов **опциональна**: «почта» (всегда) + «Тег/Теги …» (только если теги есть; singular/plural) + «Отправитель» (всегда). Без тегов — 2 строки, с тегами — 3. Плейсхолдер «—» убран.
+- **Текст уведомления** (`notify_format.format_notification`) — строки в порядке: «почта» (всегда) + «Тег/Теги …» (только если теги есть; singular/plural) + «Отправитель» (всегда) + «Тема: …» + превью тела. Плейсхолдер «—» убран.
+- **Тема + превью тела (round-34)** — `format_notification` принимает `subject: str | None` и `body_preview: str` (см. §2.5 ADR-0022):
+  - строка «Тема: <b>…</b>» печатается только если `subject` непуст после strip; тема >150 симв. обрезается (`SUBJECT_MAX=150`, `notify_format`). Пустая тема — строку не показываем (плейсхолдер «(без темы)» в push не используется; он остаётся только в callback-ответе при открытии письма).
+  - строка превью печатается только если тело непусто; обрезается до `PREVIEW_LEN=120` симв. Длины — **константы модуля** `notify_format.py`, не env.
+  - оба значения user-controlled → `html.escape()` (как acc/from/tag).
+- **Источник полей выборки (round-34)** — `dispatch_one_payload` уже грузит `Message` через `db.get(Message, message_id)`; `message.subject` / `message.body_text` / `message.body_html` берутся **из этого объекта** — отдельный запрос/метод репозитория `telegram_notifications.py` НЕ добавляется.
+- **Источник превью** — `body_text` (plain); если пуст → `body_html` через `shared.html_sanitize.sanitize_telegram_html` сведённый к plain. Обоснование: round-29 показал, что `body_text` ≠ `body_html` у Apple; для короткого тизера plain-part «чище» (нет верстки/CSS/трекинга). Нормализация (схлопывание whitespace/nbsp/zero-width в один пробел + срез 120) делается **в Python в `notify_service`**, НЕ в SQL.
+- **Edge-cases**: пустая тема → нет строки «Тема:»; пустое тело → нет строки превью; очень длинные тема/тело → срез + «…»; HTML/спецсимволы и переводы строк в теме/теле → escape + схлопывание в пробел; итоговый текст ≤ ~400 симв. → одна `sendMessage` без chunk-сплита.
 
 ### Публичный API
 ```python
@@ -1268,6 +1275,9 @@ async def tg_notify_recovery_scan() -> None   # APScheduler interval=1h; max_ins
    account = mail_accounts.get_by_id(message.mail_account_id); if None: log + return
 2. recipients = list_recipients_for_message(mid)   # SQL ADR-0022 §2.2 (тег-предикат условен от TG_NOTIFY_ALL_MESSAGES)
    if not recipients: return
+   # round-34: subject/body берутся из ЗАГРУЖЕННОГО message — отдельного запроса нет.
+   raw = message.body_text if message.body_text.strip() else html_to_plain(message.body_html)  # ADR §2.4: strip-check, не truthiness-or (body_text NOT NULL default '')
+   body_preview = normalize_preview(raw)  # схлоп ws+nbsp, срез 120, '' если пусто
 3. message_tags = list_tags_for_message(mid)        # round-12: ОДИН раз на письмо (не per-recipient)
    # round-31: НЕТ раннего return при пустом списке — теги опциональны (§2.5).
    tag_names = dedup message_tags by (name, color)   # round-21
@@ -1279,7 +1289,7 @@ async def tg_notify_recovery_scan() -> None   # APScheduler interval=1h; max_ins
                                                        # hot re-enqueue НЕ делаем — письмо подберёт recovery_scan
                                                        # (NOT EXISTS notif, окно 24ч). Иначе busy-loop при inflow>cap.
      b. notif_id = try_reserve(mid, r.user_id); if None: continue   # дедуп (уже доставлено/занято)
-     c. text_html = format_notification(acc_label, from_label, tag_names)   # tag_names может быть []
+     c. text_html = format_notification(acc_label, from_label, tag_names, subject=message.subject, body_preview=body_preview)   # round-34; tag_names/subject/preview опциональны
      d. outcome = send_notification(chat_id=r.telegram_user_id, text_html, message_id=mid)
         ok          -> mark_sent(notif_id, telegram_message_id)
         dead(403/400)-> mark_link_dead(...); строку НЕ удаляем (audit-маркер)

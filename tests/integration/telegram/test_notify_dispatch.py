@@ -590,6 +590,161 @@ class TestSyncCycleResilience:
 
 
 # ---------------------------------------------------------------------------
+# Round-34 (ADR-0022 §2.4/§2.5): subject + body preview in the dispatch text
+# ---------------------------------------------------------------------------
+
+
+class TestSubjectAndPreviewInDispatch:
+    async def test_subject_and_text_preview_present_in_notification(
+        self,
+        db_engine: AsyncEngine,
+        client: Any,
+        super_admin_user: User,
+        make_link: Any,
+        create_mail_account: Any,
+        create_message: Any,
+        tag_message_for_user: Any,
+        fake_send_notification: Any,
+    ) -> None:
+        """A message with a subject + plain body_text → the rendered push
+        contains the ``Тема:`` line and a preview taken from ``body_text``."""
+        tg_id = 160001
+        await make_link(tg_id, super_admin_user.id)
+        acc = await create_mail_account(super_admin_user.id, "subj@example.com")
+        msg = await create_message(
+            acc.id,
+            uid=160001,
+            subject="Important update",
+            body_text="This is the plain text body that should preview.",
+        )
+        await tag_message_for_user(super_admin_user.id, msg.id, "tag")
+        fake_send_notification.push(FakeSendResult(kind="ok", telegram_message_id=1))
+
+        await _dispatch(_payload_for(msg.id), db_engine)
+
+        assert len(fake_send_notification.calls) == 1
+        text_html = fake_send_notification.calls[0]["text_html"]
+        assert "Тема: <b>Important update</b>" in text_html
+        assert "This is the plain text body that should preview." in text_html
+
+    async def test_html_fallback_used_when_body_text_blank_whitespace(
+        self,
+        db_engine: AsyncEngine,
+        client: Any,
+        super_admin_user: User,
+        make_link: Any,
+        create_mail_account: Any,
+        create_message: Any,
+        tag_message_for_user: Any,
+        fake_send_notification: Any,
+    ) -> None:
+        """``body_text`` is whitespace-only (NOT NULL ``''``-style default), but
+        ``body_html`` carries real text → the preview falls back to the HTML
+        part stripped to plain. Verifies the ``.strip()`` (not truthiness) check
+        and that style/script content does not leak."""
+        tg_id = 160101
+        await make_link(tg_id, super_admin_user.id)
+        acc = await create_mail_account(super_admin_user.id, "htmlfb@example.com")
+        msg = await create_message(
+            acc.id,
+            uid=160101,
+            subject="HTML only",
+            body_text="   \n\t  ",  # whitespace-only — must NOT block fallback
+            body_html=(
+                "<style>.x{height:20px !important;}</style>"
+                "<p>Greetings from the <b>HTML</b> part &amp; more.</p>"
+            ),
+        )
+        await tag_message_for_user(super_admin_user.id, msg.id, "tag")
+        fake_send_notification.push(FakeSendResult(kind="ok", telegram_message_id=1))
+
+        await _dispatch(_payload_for(msg.id), db_engine)
+
+        text_html = fake_send_notification.calls[0]["text_html"]
+        # Preview content from the HTML body is present (entities decoded then
+        # re-escaped: ``&amp;`` → ``&`` → ``&amp;``).
+        assert "Greetings from the" in text_html
+        assert "HTML" in text_html
+        # CSS leakage must NOT appear.
+        assert "height:20px" not in text_html
+        assert "!important" not in text_html
+        # No raw markup from the body injected.
+        assert "<p>" not in text_html
+        assert "<style>" not in text_html
+
+    async def test_preview_identical_for_all_recipients(
+        self,
+        db_engine: AsyncEngine,
+        client: Any,
+        super_admin_user: User,
+        leader_and_group: tuple[Any, User],
+        create_member: Any,
+        make_link: Any,
+        create_mail_account: Any,
+        create_message: Any,
+        tag_message_for_user: Any,
+        fake_send_notification: Any,
+    ) -> None:
+        """Preview + subject are computed once per message → every recipient
+        receives byte-identical text (round-34: shared across recipients)."""
+        group, leader = leader_and_group
+        member = await create_member(group.id, "preview_member")
+        await make_link(160201, super_admin_user.id)
+        await make_link(160202, member.id)
+
+        acc = await create_mail_account(leader.id, "shared@example.com", group_id=group.id)
+        msg = await create_message(
+            acc.id,
+            uid=160201,
+            subject="Shared subject",
+            body_text="One body previewed identically for everyone.",
+        )
+        await tag_message_for_user(super_admin_user.id, msg.id, "admin-tag")
+        await tag_message_for_user(member.id, msg.id, "admin-tag")  # same (name,color)
+        fake_send_notification.push(FakeSendResult(kind="ok", telegram_message_id=1))
+
+        await _dispatch(_payload_for(msg.id), db_engine)
+
+        assert len(fake_send_notification.calls) == 2
+        texts = {call["text_html"] for call in fake_send_notification.calls}
+        assert len(texts) == 1, f"recipients got divergent text: {texts!r}"
+        the_text = texts.pop()
+        assert "Тема: <b>Shared subject</b>" in the_text
+        assert "One body previewed identically for everyone." in the_text
+
+    async def test_no_subject_no_preview_lines_when_message_blank(
+        self,
+        db_engine: AsyncEngine,
+        client: Any,
+        super_admin_user: User,
+        make_link: Any,
+        create_mail_account: Any,
+        create_message: Any,
+        tag_message_for_user: Any,
+        fake_send_notification: Any,
+    ) -> None:
+        """A message with no subject and an empty body → neither the ``Тема:``
+        line nor a preview line is emitted (both optional)."""
+        tg_id = 160301
+        await make_link(tg_id, super_admin_user.id)
+        acc = await create_mail_account(super_admin_user.id, "blank@example.com")
+        msg = await create_message(
+            acc.id,
+            uid=160301,
+            subject=None,
+            body_text="",
+            body_html=None,
+        )
+        await tag_message_for_user(super_admin_user.id, msg.id, "tag")
+        fake_send_notification.push(FakeSendResult(kind="ok", telegram_message_id=1))
+
+        await _dispatch(_payload_for(msg.id), db_engine)
+
+        text_html = fake_send_notification.calls[0]["text_html"]
+        assert "Тема:" not in text_html
+
+
+# ---------------------------------------------------------------------------
 # Per-chat send throttle (ADR-0022 §2.9)
 # ---------------------------------------------------------------------------
 

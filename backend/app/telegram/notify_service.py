@@ -35,7 +35,11 @@ from backend.app.telegram.bot import (
     SendNotificationResult,
     send_notification,
 )
-from backend.app.telegram.notify_format import format_notification
+from backend.app.telegram.notify_format import (
+    format_notification,
+    html_to_plain,
+    normalize_preview,
+)
 from backend.app.telegram.sso_service import (
     TG_NOTIFY_QUEUE_KEY,
     TelegramSSOService,
@@ -250,6 +254,22 @@ class TelegramNotifyService:
 
         acc_label = account.display_name or account.email
         from_label = message.from_name or message.from_addr
+
+        # Round-34 (ADR-0022 §2.5): compute the body preview ONCE per message
+        # (not per recipient) — all recipients see the same teaser. Source is
+        # the plain-text part; fall back to the HTML part stripped to plain.
+        # NB: use ``.strip()`` not truthiness — ``body_text`` is NOT NULL with
+        # a ``''`` server default, and a whitespace-only value must not block
+        # the HTML fallback. The slice happens in Python, never in SQL.
+        if message.body_text.strip():
+            raw_preview = message.body_text
+        else:
+            raw_preview = html_to_plain(message.body_html)
+        body_preview = normalize_preview(raw_preview)
+        # ``subject`` is passed as-is; escape + SUBJECT_MAX truncation happen
+        # inside ``format_notification``.
+        subject = message.subject
+
         # Track whether any recipient asked for a retry — if so, we need
         # to put the message back on the queue so other-or-same recipients
         # can be tried again after the back-off.
@@ -287,6 +307,8 @@ class TelegramNotifyService:
                 acc_label=acc_label,
                 from_label=from_label,
                 tag_names=tag_names,
+                subject=subject,
+                body_preview=body_preview,
             )
             if outcome is None:
                 continue
@@ -316,6 +338,8 @@ class TelegramNotifyService:
         acc_label: str,
         from_label: str,
         tag_names: list[str],
+        subject: str | None,
+        body_preview: str,
     ) -> SendNotificationResult | None:
         """Process one ``(message_id, recipient)`` pair. Returns the
         :class:`SendNotificationResult` if a Bot API call was attempted,
@@ -323,6 +347,8 @@ class TelegramNotifyService:
 
         Round-12 bug A: ``tag_names`` is now resolved once by the caller
         and shared across all recipients — see :meth:`dispatch_one_payload`.
+        Round-34: ``subject`` / ``body_preview`` are likewise computed once
+        per message by the caller and shared across recipients.
         """
         notification_id = await self._notifications.try_reserve(
             message_id=payload.message_id, user_id=recipient.user_id
@@ -335,6 +361,8 @@ class TelegramNotifyService:
             acc_label=acc_label,
             from_label=from_label,
             tag_names=tag_names,
+            subject=subject,
+            body_preview=body_preview,
         )
 
         outcome = await send_notification(

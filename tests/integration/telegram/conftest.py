@@ -355,10 +355,12 @@ async def _create_message(
     *,
     mail_account_id: int,
     uid: int,
-    subject: str = "Hello",
+    subject: str | None = "Hello",
     from_addr: str = "sender@x.com",
     from_name: str | None = "Sender Name",
     internal_date: datetime | None = None,
+    body_text: str = "body",
+    body_html: str | None = None,
 ) -> Message:
     factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
     async with factory() as ses, ses.begin():
@@ -371,7 +373,8 @@ async def _create_message(
             to_addrs="me@example.com",
             subject=subject,
             internal_date=internal_date or datetime.now(UTC),
-            body_text="body",
+            body_text=body_text,
+            body_html=body_html,
         )
         ses.add(m)
         await ses.flush()
@@ -385,10 +388,12 @@ def create_message(db_engine: AsyncEngine) -> Callable[..., Any]:
         mail_account_id: int,
         uid: int,
         *,
-        subject: str = "Hello",
+        subject: str | None = "Hello",
         from_addr: str = "sender@x.com",
         from_name: str | None = "Sender Name",
         internal_date: datetime | None = None,
+        body_text: str = "body",
+        body_html: str | None = None,
     ) -> Message:
         return await _create_message(
             db_engine,
@@ -398,6 +403,8 @@ def create_message(db_engine: AsyncEngine) -> Callable[..., Any]:
             from_addr=from_addr,
             from_name=from_name,
             internal_date=internal_date,
+            body_text=body_text,
+            body_html=body_html,
         )
 
     return _create
