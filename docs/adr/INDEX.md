@@ -27,3 +27,5 @@
 | [ADR-0021](./ADR-0021-russian-localization.md) | Полная RU-локализация UI без i18n-фреймворка | accepted | 2026-05-08 |
 | [ADR-0022](./ADR-0022-telegram-sso-and-notifications.md) | Telegram persistent SSO (initData HMAC + `telegram_links`) + push-уведомления о письмах с тегами (отменяет «без линковки» из ADR-0018, закрывает TD-013) | accepted | 2026-05-13 |
 | [ADR-0023](./ADR-0023-outbound-webhooks.md) | Outbound webhooks для команд (один webhook на `group_id`, AES-GCM secret, dispatcher по паттерну ADR-0022, фильтр «не флудим историей») | accepted | 2026-05-20 |
+| [ADR-0024](./ADR-0024-multi-telegram-links.md) | Несколько Telegram-привязок на один аккаунт (снятие `UNIQUE(telegram_links.user_id)`, ключ идемпотентности `telegram_notifications` → `(message_id, telegram_user_id)`, доставка во все живые чаты; расширяет ADR-0022) | accepted | 2026-05-27 |
+| [ADR-0025](./ADR-0025-outlook-oauth2.md) | OAuth2 (XOAUTH2) для личных Outlook (consent через сайт+OctoBrowser, IMAP/SMTP XOAUTH2 напрямую, refresh-токен AES-GCM, расширение `mail_accounts`) | accepted | 2026-05-27 |

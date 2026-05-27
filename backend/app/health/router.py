@@ -82,10 +82,10 @@ async def me(db: DbSession, user: CurrentUser) -> dict[str, object]:
         group = await GroupsRepo(db).get_by_id(user.group_id)
         if group is not None:
             group_brief = {"id": group.id, "name": group.name}
-    # ADR-0022 §2.7 — surface preferences + linkage status.
+    # ADR-0022 §2.7 + ADR-0024 — surface preferences + linkage status.
     tg_enabled = await UserSettingsRepo(db).get_tg_notifications_enabled(user.id)
-    tg_link = await TelegramLinksRepo(db).get_by_user_id(user.id)
-    telegram_linked = tg_link is not None and tg_link.dead_at is None
+    active_links = await TelegramLinksRepo(db).list_active_by_user_id(user.id)
+    telegram_links_count = len(active_links)
     return {
         "id": user.id,
         "username": user.username,
@@ -95,7 +95,11 @@ async def me(db: DbSession, user: CurrentUser) -> dict[str, object]:
         "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None,
         "mail_accounts_count": len(accounts),
         "tg_notifications_enabled": tg_enabled,
-        "telegram_linked": telegram_linked,
+        # ADR-0024: ``telegram_linked`` = at least one live link;
+        # ``telegram_links_count`` = number of live links (list via
+        # GET /api/telegram/links).
+        "telegram_linked": telegram_links_count > 0,
+        "telegram_links_count": telegram_links_count,
     }
 
 

@@ -225,8 +225,14 @@ Healthcheck не настроен — это бесконечный sleep-цик
 | `TG_NOTIFY_RECOVERY_WINDOW_HOURS` | `24` | no | Окно (часы) для `tg_notify_recovery_scan` — не пытаемся доставить уведомления о письмах старше этого срока (ADR-0022 §2.8). |
 | `TG_NOTIFY_ALL_MESSAGES` | `true` | no | round-31: `true` — уведомлять по ВСЕМ новым письмам; `false` — только письма с ≥1 тегом (историческое поведение). Откат — смена env + рестарт `worker` (lru-cache `get_settings`), без редеплоя кода (ADR-0022 §2.1/§2.2). |
 | `TG_SEND_PER_CHAT_PER_MINUTE` | `20` | no | round-31: per-chat троттлинг доставки уведомлений (Redis `rl:tg_send:<chat_id>`, окно 60 сек). Диапазон 1..60. Защита от flood/429 при `TG_NOTIFY_ALL_MESSAGES=true` (ADR-0022 §2.9). |
+| `TG_MAX_LINKS_PER_USER` | `10` | no | **ADR-0024 (Спринт A):** мягкий потолок числа активных TG-привязок на один internal user. Проверяется в `link_pending`/`POST /api/telegram/links` (`COUNT(active) < limit`); при достижении — `409 tg_link_limit`, audit `telegram_link_limit_reached`. Не DB-констрейнт. |
+| `OUTLOOK_CLIENT_ID` | (none) | yes (если OAuth enabled) | **ADR-0025 (Спринт B):** Azure App (Application/client) ID, «Personal Microsoft accounts only». |
+| `OUTLOOK_CLIENT_SECRET` | (none) | yes (если OAuth enabled) | **ADR-0025:** Azure App client secret. Маскируется в structlog redact-list рядом с `MAIL_ENCRYPTION_KEY`/`TELEGRAM_BOT_TOKEN`. |
+| `OUTLOOK_REDIRECT_URI` | (none) | yes (если OAuth enabled) | **ADR-0025:** `{APP_BASE_URL}/api/oauth/outlook/callback` — точное совпадение с зарегистрированным в Azure. |
+| `OUTLOOK_TENANT` | `consumers` | no | **ADR-0025:** tenant для authorize/token endpoints `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/...`. Для личных ящиков — `consumers`. |
+| `OUTLOOK_OAUTH_STATE_TTL_SECONDS` | `600` | no | **ADR-0025:** TTL Redis-ключа `oauth_state:{state}` (CSRF/anti-fixation state + PKCE verifier). |
 
-`TELEGRAM_BOT_TOKEN` хранится в `.env` (`chmod 600`). **Изменение от ADR-0018:** `worker` теперь использует Telegram API для доставки push-нотификаций (ADR-0022 §2) — `TELEGRAM_BOT_TOKEN` передаётся **и** в `api`, **и** в `worker` контейнеры. Маскировка в логах гарантируется redact-list'ом structlog (одинаково для обоих контейнеров).
+OAuth включён (`OUTLOOK_OAUTH_ENABLED`, derived), когда заданы `OUTLOOK_CLIENT_ID` + `OUTLOOK_CLIENT_SECRET`; иначе `/api/oauth/outlook/*` отдают `404` (route скрыт). `OUTLOOK_CLIENT_SECRET` передаётся в **api** (authorize/callback/SMTP) и **worker** (refresh перед IMAP). `TELEGRAM_BOT_TOKEN` хранится в `.env` (`chmod 600`). **Изменение от ADR-0018:** `worker` теперь использует Telegram API для доставки push-нотификаций (ADR-0022 §2) — `TELEGRAM_BOT_TOKEN` передаётся **и** в `api`, **и** в `worker` контейнеры. Маскировка в логах гарантируется redact-list'ом structlog (одинаково для обоих контейнеров).
 
 ### CI / Build
 

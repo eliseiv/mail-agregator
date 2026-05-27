@@ -89,6 +89,9 @@ LIMIT_TAGS_APPLY = Limit(name="tags_apply", capacity=50, window_seconds=60 * 60)
 # - per tg_user_id:   10 / min  (post-HMAC — covers replay of valid init_data).
 LIMIT_TG_AUTH_IP = Limit(name="tg_auth_ip", capacity=30, window_seconds=60)
 LIMIT_TG_AUTH_USER = Limit(name="tg_auth_user", capacity=10, window_seconds=60)
+# Multi-link management (ADR-0024 §4, docs/04-api-contracts.md §4b):
+# add (POST) / unlink (DELETE) a TG link while authenticated — 10/h per user.
+LIMIT_TG_LINKS_WRITE = Limit(name="tg_links_write", capacity=10, window_seconds=60 * 60)
 # Outbound webhooks (ADR-0023 §5). All four limits are keyed per
 # ``webhook_id`` except ``LIMIT_WEBHOOK_CREATE`` which is keyed per
 # ``group_id`` (anti-spam for accidentally re-creating after delete).

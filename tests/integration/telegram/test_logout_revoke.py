@@ -86,7 +86,9 @@ class TestLogoutRevokes:
             )
             assert len(revokes) == 1
             assert (revokes[0].details or {}).get("reason") == "logout"
-            assert (revokes[0].details or {}).get("telegram_user_id") == tg_id
+            # ADR-0024 §5: logout revokes ALL links and records them as a single
+            # ``telegram_user_ids`` array (not the pre-ADR-0024 scalar field).
+            assert (revokes[0].details or {}).get("telegram_user_ids") == [tg_id]
 
 
 class TestAdminResetRevokes:
@@ -165,7 +167,10 @@ class TestDeleteUserCascades:
                 TelegramNotificationsRepo,
             )
 
-            await TelegramNotificationsRepo(ses).try_reserve(message_id=msg.id, user_id=member.id)
+            # ADR-0024 §6: per-chat key — reserve the member's chat (70301).
+            await TelegramNotificationsRepo(ses).try_reserve(
+                message_id=msg.id, user_id=member.id, telegram_user_id=70301
+            )
 
         # Sanity: all the rows are there.
         async with factory() as ses:

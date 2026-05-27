@@ -9,8 +9,9 @@ Scenario:
    writes an audit row ``telegram_link_created``.
 3. A subsequent ``/api/telegram/auth`` with the SAME tg_user_id now returns
    ``linked=true`` (no further login required).
-4. Collision: tg_user_X is linked to user_A, then a second pending-redeem
-   tries to bind tg_user_Y → user_A: collision audit, link unchanged.
+4. Multi-TG (ADR-0024 §3): tg_user_X is linked to user_A, then a second
+   pending-redeem binds tg_user_Y → user_A. Both links now coexist — the
+   old ``telegram_link_collision`` behaviour is removed.
 """
 
 from __future__ import annotations
@@ -173,22 +174,25 @@ class TestPendingRedeemOnLogin:
 
 
 # ---------------------------------------------------------------------------
-# Collision (ADR-0022 §1.4)
+# Second TG via login-flow — ADR-0024 §3 (collision logic REMOVED)
 # ---------------------------------------------------------------------------
+# Pre-ADR-0024 this scenario produced a ``telegram_link_collision`` audit and
+# silently dropped the second TG (one user — one TG). ADR-0024 §3 lifts that
+# invariant: a second TG bound to the SAME user via the login-flow is now a
+# normal ``telegram_link_created`` and BOTH links coexist (multi-TG).
 
 
-class TestCollision:
-    async def test_second_tg_for_same_user_writes_collision_audit_and_skips_upsert(
+class TestSecondTgViaLoginFlow:
+    async def test_second_tg_for_same_user_is_linked_not_a_collision(
         self,
         client: httpx.AsyncClient,
         db_engine: AsyncEngine,
         make_link: Any,
     ) -> None:
-        """If tg_user_X is already linked to user_A and a NEW pending-redeem
-        attempts tg_user_Y → user_A, the implementation writes a
-        ``telegram_link_collision`` audit row and leaves the existing link
-        in place (per :meth:`TelegramSSOService.link_pending`).
-        """
+        """ADR-0024 §3: tg_user_X is already linked to user_A; a NEW
+        pending-redeem binds tg_user_Y → user_A. Expect BOTH links to exist,
+        a ``telegram_link_created`` audit for the new one, and NO
+        ``telegram_link_collision`` (deprecated, never written)."""
         s = get_settings()
         factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
         async with factory() as ses:
@@ -197,36 +201,41 @@ class TestCollision:
             ).scalar_one()
         admin_id = admin.id
         existing_tg = 92001
-        attempted_tg = 92002
-        # Pre-existing link.
+        new_tg = 92002
+        # Pre-existing link (created out-of-band).
         await make_link(existing_tg, admin_id)
 
-        # New pending for tg=92002, then login as admin.
-        raw = make_init_data(telegram_user_id=attempted_tg)
+        # New pending for tg=92002, then login as admin → redeem binds it.
+        raw = make_init_data(telegram_user_id=new_tg)
         await client.post("/api/telegram/auth", json={"init_data": raw})
         login_resp = await _login_two_step(
             client, username=s.ADMIN_LOGIN, password=s.ADMIN_PASSWORD
         )
         assert login_resp.status_code in (302, 303)
 
-        # The original link is untouched.
         async with factory() as ses:
-            link = (
-                await ses.execute(select(TelegramLink).where(TelegramLink.user_id == admin_id))
-            ).scalar_one_or_none()
-            assert link is not None
-            assert (
-                link.telegram_user_id == existing_tg
-            ), "existing link must NOT be re-bound to attempted_tg"
-            # No telegram_links row was created for attempted_tg.
-            attempted_row = (
-                await ses.execute(
-                    select(TelegramLink).where(TelegramLink.telegram_user_id == attempted_tg)
-                )
-            ).scalar_one_or_none()
-            assert attempted_row is None
+            # BOTH links now belong to admin (multi-TG).
+            links = (
+                (await ses.execute(select(TelegramLink).where(TelegramLink.user_id == admin_id)))
+                .scalars()
+                .all()
+            )
+            tg_ids = {link.telegram_user_id for link in links}
+            assert tg_ids == {existing_tg, new_tg}, f"both links expected, got {tg_ids}"
 
-            # Collision audit was written.
+            # A telegram_link_created audit exists for the new TG.
+            created = (
+                (
+                    await ses.execute(
+                        select(AdminAudit).where(AdminAudit.action == "telegram_link_created")
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert any((a.details or {}).get("telegram_user_id") == new_tg for a in created)
+
+            # The deprecated collision audit is NEVER written under ADR-0024.
             collisions = (
                 (
                     await ses.execute(
@@ -236,7 +245,4 @@ class TestCollision:
                 .scalars()
                 .all()
             )
-            assert len(collisions) == 1
-            details = collisions[0].details or {}
-            assert details.get("existing_telegram_user_id") == existing_tg
-            assert details.get("attempted_telegram_user_id") == attempted_tg
+            assert collisions == [], "telegram_link_collision is deprecated (ADR-0024 §3)"

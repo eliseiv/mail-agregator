@@ -10,11 +10,14 @@ Encapsulates the four interactions required by the auth flow:
 - :meth:`consume_pending` — read the ``mas_tg_pending`` cookie value back
   from Redis (called by :class:`AuthService` after a successful password
   verify); returns the ``telegram_user_id`` and deletes the Redis key.
-- :meth:`link_pending` — perform the atomic upsert in ``telegram_links``
-  for the resolved ``telegram_user_id`` / ``user_id`` pair plus audit.
+- :meth:`link_pending` / :meth:`link_session_add` — bind a
+  ``telegram_user_id`` to a ``user_id`` (login-flow vs authenticated
+  session-add) applying the soft limit + rebind rules of ADR-0024 §3/§4.
 - :meth:`revoke_for_user` — invoked from logout / admin reset /
-  set-password flows; deletes the ``telegram_links`` row and writes a
-  ``telegram_link_revoked`` audit entry.
+  set-password flows; deletes **all** ``telegram_links`` rows of the user
+  (ADR-0024 §5) and writes a single ``telegram_link_revoked`` audit entry.
+- :meth:`revoke_one` — unlink one specific TG (``DELETE
+  /api/telegram/links/{tg_user_id}``).
 
 The service stores no in-memory state; the Redis token namespace is
 ``tg_pending:{token}``. All cryptographic decisions (HMAC, TTL) live in
@@ -27,10 +30,13 @@ import secrets
 from dataclasses import dataclass
 from typing import Final, Literal
 
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.audit import AuditWriter
+from backend.app.exceptions import (
+    TelegramLinkLimitError,
+    TelegramLinkOwnedByOtherError,
+)
 from backend.app.repositories.telegram_links import TelegramLinksRepo
 from backend.app.telegram.init_data import (
     InitDataError,
@@ -168,66 +174,160 @@ class TelegramSSOService:
         ip: str,
         user_agent: str | None,
     ) -> None:
-        """Upsert ``telegram_links`` for ``(telegram_user_id, user_id)``.
+        """Bind ``telegram_user_id`` to ``user_id`` via the login-flow
+        (pending-cookie redeemed after a successful password verify).
 
-        On UNIQUE conflict on ``user_id`` (another Telegram account is
-        already linked to this internal user — ADR-0022 §1.4 ``one user —
-        one tg`` invariant), we write a ``telegram_link_collision`` audit
-        entry and **silently skip** the upsert. The user can resolve the
-        collision by logging out in the other Telegram client first.
+        ADR-0024 §3 replaces the old ``one user — one TG`` collision logic
+        with a soft-limit + rebind model. Because this path carries a
+        successful password proof, re-binding a TG owned by *another* user is
+        allowed (the upsert ON CONFLICT (telegram_user_id) moves it). This
+        method never raises — at the limit it audits and silently no-ops
+        (the login itself still succeeds).
         """
-        # Pre-check for UNIQUE(user_id) collision: another telegram_user_id
-        # may already be linked to this internal user.
-        existing_for_user = await self._links.get_by_user_id(user_id)
-        if existing_for_user is not None and existing_for_user.telegram_user_id != telegram_user_id:
+        await self._link(
+            telegram_user_id=telegram_user_id,
+            user_id=user_id,
+            ip=ip,
+            user_agent=user_agent,
+            allow_rebind_from_other=True,
+            via="login_flow",
+        )
+
+    async def link_session_add(
+        self,
+        *,
+        telegram_user_id: int,
+        user_id: int,
+        ip: str,
+        user_agent: str | None,
+    ) -> None:
+        """Bind ``telegram_user_id`` to the already-authenticated ``user_id``
+        (``POST /api/telegram/links`` — ADR-0024 §4).
+
+        Unlike :meth:`link_pending` there is no password proof for the *other*
+        owner, so re-binding a TG already linked to a different internal user
+        is refused with :class:`TelegramLinkOwnedByOtherError`. At the soft
+        limit raises :class:`TelegramLinkLimitError`.
+        """
+        await self._link(
+            telegram_user_id=telegram_user_id,
+            user_id=user_id,
+            ip=ip,
+            user_agent=user_agent,
+            allow_rebind_from_other=False,
+            via="session_add",
+        )
+
+    async def _link(
+        self,
+        *,
+        telegram_user_id: int,
+        user_id: int,
+        ip: str,
+        user_agent: str | None,
+        allow_rebind_from_other: bool,
+        via: str,
+    ) -> None:
+        """Shared link logic for both entry points (ADR-0024 §3/§4).
+
+        Decision table:
+
+        - existing link points at **another** user:
+          - ``allow_rebind_from_other`` (login-flow) → rebind via upsert,
+            audit ``telegram_link_rebound``;
+          - else (session-add) → raise
+            :class:`TelegramLinkOwnedByOtherError`.
+        - existing link points at **this** user → refresh via upsert, audit
+          ``telegram_link_created`` with ``replaced=true``.
+        - no existing link → enforce ``COUNT(active) <
+          TG_MAX_LINKS_PER_USER``; at the cap audit
+          ``telegram_link_limit_reached`` and (login-flow) no-op or
+          (session-add) raise :class:`TelegramLinkLimitError`; otherwise
+          create + audit ``telegram_link_created``.
+        """
+        existing = await self._links.get_by_telegram_user_id(telegram_user_id)
+
+        if existing is not None and existing.user_id != user_id:
+            if not allow_rebind_from_other:
+                raise TelegramLinkOwnedByOtherError(
+                    "This Telegram account is linked to another user"
+                )
+            await self._links.upsert(telegram_user_id=telegram_user_id, user_id=user_id)
             await self._audit.log(
                 actor_user_id=user_id,
-                action="telegram_link_collision",
+                action="telegram_link_rebound",
                 target_user_id=user_id,
                 details={
-                    "existing_telegram_user_id": existing_for_user.telegram_user_id,
-                    "attempted_telegram_user_id": telegram_user_id,
+                    "telegram_user_id": telegram_user_id,
+                    "previous_user_id": existing.user_id,
+                    "via": via,
                 },
                 ip=ip,
                 user_agent=user_agent,
             )
             log.info(
-                "telegram_link_collision",
+                "telegram_link_rebound",
                 user_id=user_id,
-                attempted_telegram_user_id=telegram_user_id,
-                existing_telegram_user_id=existing_for_user.telegram_user_id,
+                telegram_user_id=telegram_user_id,
+                previous_user_id=existing.user_id,
+                via=via,
             )
             return
 
-        try:
-            _row, replaced = await self._links.upsert(
-                telegram_user_id=telegram_user_id, user_id=user_id
-            )
-        except IntegrityError:
-            # Defence-in-depth: race between the pre-check above and the
-            # upsert (a concurrent link from another tg user to the same
-            # internal user). Treat as collision.
+        if existing is not None and existing.user_id == user_id:
+            # Same owner — refresh (clears dead_at, bumps created_at).
+            await self._links.upsert(telegram_user_id=telegram_user_id, user_id=user_id)
             await self._audit.log(
                 actor_user_id=user_id,
-                action="telegram_link_collision",
+                action="telegram_link_created",
+                target_user_id=user_id,
+                details={"telegram_user_id": telegram_user_id, "replaced": True, "via": via},
+                ip=ip,
+                user_agent=user_agent,
+            )
+            log.info(
+                "telegram_link_created",
+                user_id=user_id,
+                telegram_user_id=telegram_user_id,
+                replaced=True,
+                via=via,
+            )
+            return
+
+        # New link — enforce the soft limit (ADR-0024 §3).
+        active = await self._links.count_active_by_user_id(user_id)
+        if active >= self._settings.TG_MAX_LINKS_PER_USER:
+            await self._audit.log(
+                actor_user_id=user_id,
+                action="telegram_link_limit_reached",
                 target_user_id=user_id,
                 details={
-                    "attempted_telegram_user_id": telegram_user_id,
-                    "reason": "unique_user_id_race",
+                    "telegram_user_id": telegram_user_id,
+                    "active_links": active,
+                    "limit": self._settings.TG_MAX_LINKS_PER_USER,
+                    "via": via,
                 },
                 ip=ip,
                 user_agent=user_agent,
             )
+            log.info(
+                "telegram_link_limit_reached",
+                user_id=user_id,
+                telegram_user_id=telegram_user_id,
+                active_links=active,
+                limit=self._settings.TG_MAX_LINKS_PER_USER,
+                via=via,
+            )
+            if not allow_rebind_from_other:
+                raise TelegramLinkLimitError("Maximum number of Telegram links reached")
             return
 
+        await self._links.upsert(telegram_user_id=telegram_user_id, user_id=user_id)
         await self._audit.log(
             actor_user_id=user_id,
             action="telegram_link_created",
             target_user_id=user_id,
-            details={
-                "telegram_user_id": telegram_user_id,
-                "replaced": replaced,
-            },
+            details={"telegram_user_id": telegram_user_id, "replaced": False, "via": via},
             ip=ip,
             user_agent=user_agent,
         )
@@ -235,7 +335,8 @@ class TelegramSSOService:
             "telegram_link_created",
             user_id=user_id,
             telegram_user_id=telegram_user_id,
-            replaced=replaced,
+            replaced=False,
+            via=via,
         )
 
     # --- revoke -----------------------------------------------------------
@@ -248,20 +349,22 @@ class TelegramSSOService:
         ip: str,
         user_agent: str | None,
     ) -> None:
-        """Delete the link for ``user_id`` and audit.
+        """Delete **all** links for ``user_id`` and audit (ADR-0024 §5).
 
-        ``reason`` ends up in ``details.reason`` of the audit entry; canonical
-        values: ``"logout"``, ``"password_reset"``.
+        Used by logout / admin reset / stale-link cleanup. Writes a single
+        ``telegram_link_revoked`` entry with ``details.telegram_user_ids`` =
+        the list of removed chats. ``reason`` is canonical: ``"logout"``,
+        ``"password_reset"``, ``"link_user_missing"``.
         """
-        deleted = await self._links.delete_by_user_id(user_id)
-        if deleted is None:
+        deleted = await self._links.delete_all_by_user_id(user_id)
+        if not deleted:
             return
         await self._audit.log(
             actor_user_id=user_id,
             action="telegram_link_revoked",
             target_user_id=user_id,
             details={
-                "telegram_user_id": deleted.telegram_user_id,
+                "telegram_user_ids": deleted,
                 "reason": reason,
             },
             ip=ip,
@@ -270,9 +373,45 @@ class TelegramSSOService:
         log.info(
             "telegram_link_revoked",
             user_id=user_id,
-            telegram_user_id=deleted.telegram_user_id,
+            telegram_user_ids=deleted,
             reason=reason,
         )
+
+    async def revoke_one(
+        self,
+        *,
+        user_id: int,
+        telegram_user_id: int,
+        ip: str,
+        user_agent: str | None,
+    ) -> bool:
+        """Unlink one specific TG owned by ``user_id`` (ADR-0024 §4 —
+        ``DELETE /api/telegram/links/{tg_user_id}``).
+
+        Returns ``True`` iff a row was deleted. Idempotent — a missing row
+        (already unlinked / never owned) returns ``False`` without auditing.
+        """
+        deleted = await self._links.delete_one(user_id=user_id, telegram_user_id=telegram_user_id)
+        if not deleted:
+            return False
+        await self._audit.log(
+            actor_user_id=user_id,
+            action="telegram_link_revoked",
+            target_user_id=user_id,
+            details={
+                "telegram_user_id": telegram_user_id,
+                "reason": "user_unlink",
+            },
+            ip=ip,
+            user_agent=user_agent,
+        )
+        log.info(
+            "telegram_link_revoked",
+            user_id=user_id,
+            telegram_user_id=telegram_user_id,
+            reason="user_unlink",
+        )
+        return True
 
     # --- dead-link marker --------------------------------------------------
 

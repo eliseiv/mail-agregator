@@ -121,11 +121,13 @@ class TestRecoveryScan:
         msg = await create_message(acc.id, uid=130003)
         await tag_message_for_user(super_admin_user.id, msg.id, "tag")
 
-        # Pretend a recipient was already reserved.
+        # Pretend a recipient was already reserved (ADR-0024 §6: the key is now
+        # per-chat ``(message_id, telegram_user_id)``, so reserve the chat that
+        # the single link above resolves to — 130003).
         factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
         async with factory() as ses, ses.begin():
             await TelegramNotificationsRepo(ses).try_reserve(
-                message_id=msg.id, user_id=super_admin_user.id
+                message_id=msg.id, user_id=super_admin_user.id, telegram_user_id=130003
             )
 
         ids = await _list_recovery(db_engine)

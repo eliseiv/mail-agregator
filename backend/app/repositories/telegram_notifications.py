@@ -2,9 +2,10 @@
 
 Implements:
 
-- :meth:`try_reserve` — claim ``(message_id, user_id)`` exclusively before
-  dispatch. ON CONFLICT DO NOTHING means a returning empty result is the
-  signal "already delivered / claimed elsewhere".
+- :meth:`try_reserve` — claim ``(message_id, telegram_user_id)`` exclusively
+  before dispatch (ADR-0024 §6 — per-chat dedup). ON CONFLICT DO NOTHING
+  means a returning empty result is the signal "already delivered / claimed
+  for this chat".
 - :meth:`mark_sent` — finalise the row with ``telegram_message_id``.
 - :meth:`rollback` — delete the row if dispatch failed at the network
   layer so the retry path can re-claim.
@@ -93,16 +94,28 @@ class TelegramNotificationsRepo:
 
     # --- Writes ------------------------------------------------------------
 
-    async def try_reserve(self, *, message_id: int, user_id: int) -> int | None:
-        """Claim ``(message_id, user_id)``. Returns the row id, or None if
-        a row already existed (idempotent: don't double-deliver)."""
+    async def try_reserve(
+        self, *, message_id: int, user_id: int, telegram_user_id: int
+    ) -> int | None:
+        """Claim ``(message_id, telegram_user_id)`` for delivery to one chat.
+
+        ADR-0024 §6: the idempotency key is the **chat**, not the user — a
+        user with several links gets one row per chat. ``user_id`` is still
+        stored (audit / recovery JOIN). ON CONFLICT DO NOTHING means an empty
+        RETURNING signals "already delivered / claimed for this chat".
+        Returns the row id, or ``None`` if a row already existed.
+        """
         stmt = (
             pg_insert(TelegramNotification)
-            .values(message_id=message_id, user_id=user_id)
+            .values(
+                message_id=message_id,
+                user_id=user_id,
+                telegram_user_id=telegram_user_id,
+            )
             .on_conflict_do_nothing(
                 index_elements=[
                     TelegramNotification.message_id,
-                    TelegramNotification.user_id,
+                    TelegramNotification.telegram_user_id,
                 ]
             )
             .returning(TelegramNotification.id)
@@ -244,28 +257,35 @@ class TelegramNotificationsRepo:
         ]
 
     async def list_missing_for_recovery(self, *, window_hours: int, limit: int) -> list[int]:
-        """SQL from ADR-0022 §2.8 (round-33: per-recipient gap fix).
+        """SQL from ADR-0022 §2.8 (round-33 per-recipient; round-35 / ADR-0024
+        §7 per-chat).
 
         Returns ``DISTINCT message_id`` values that still have a **visible,
-        linked recipient without a** ``telegram_notifications`` row by
-        ``(message_id, user_id)`` within the lookback window.
+        linked chat without a** ``telegram_notifications`` row by
+        ``(message_id, telegram_user_id)`` within the lookback window.
 
-        Round-33 (CRITICAL fix): the previous query matched per-message
-        (``NOT EXISTS (tn WHERE tn.message_id = m.id)``), which masked a
-        partial-delivery hole — if recipient A was delivered (row created)
-        but recipient B was throttled (§2.9, ``continue`` without
-        ``try_reserve``, no row), the per-message ``NOT EXISTS`` returned
-        FALSE because of A's row, so the message was never re-enqueued and B
-        lost the notification forever. The query now reuses the **same
-        recipient logic as §2.2** (visibility super_admin/group/owner; active
-        ``telegram_links`` with ``m.internal_date >= tl.created_at``; opt-out
-        via ``users_settings``; conditional tag predicate under
-        ``TG_NOTIFY_ALL_MESSAGES``) bound to ``m.id``, under a per-recipient
-        ``NOT EXISTS (tn WHERE tn.message_id = m.id AND tn.user_id = u.id)``.
+        ADR-0024 §7 (per-chat): the ``UNIQUE(user_id)`` on ``telegram_links``
+        is gone, so the ``JOIN telegram_links tl`` yields one row per **live
+        chat** of each visible user. The ``NOT EXISTS`` therefore compares
+        ``tn.telegram_user_id = tl.telegram_user_id`` (not ``tn.user_id``):
+        recovery picks the message up while *any* visible chat lacks a row.
 
-        ``DISTINCT m.id`` collapses multiple undelivered recipients of the
-        same message to a single re-enqueue (dispatch resolves all recipients
-        itself; already-delivered ones are skipped by ``try_reserve``).
+        Round-33 (CRITICAL fix this builds on): a per-message
+        ``NOT EXISTS (tn WHERE tn.message_id = m.id)`` masked partial delivery
+        — if chat A was delivered but chat B throttled (§2.9: ``continue``
+        without ``try_reserve``, no row), the per-message check returned FALSE
+        and B lost the notification forever. Per-``(message_id, user_id)``
+        (round-33) then would have lost a *second* chat of the same user once
+        multi-TG landed; per-chat (round-35) fixes that.
+
+        The query reuses the **same recipient logic as §2.2** (visibility
+        super_admin/group/owner; active ``telegram_links`` with
+        ``m.internal_date >= tl.created_at``; opt-out via ``users_settings``;
+        conditional tag predicate under ``TG_NOTIFY_ALL_MESSAGES``).
+
+        ``DISTINCT m.id`` collapses multiple undelivered chats of the same
+        message to a single re-enqueue (dispatch resolves all recipients
+        itself; already-delivered chats are skipped by ``try_reserve``).
 
         The 24h window is a deliberate cap: older messages are skipped to
         avoid spamming users about stale mail (TD-027 documents the sustained
@@ -292,8 +312,8 @@ class TelegramNotificationsRepo:
               AND  COALESCE(us.tg_notifications_enabled, true) = true{_tag_predicate()}
               AND  NOT EXISTS (
                        SELECT 1 FROM telegram_notifications tn
-                       WHERE  tn.message_id = m.id
-                         AND  tn.user_id    = u.id
+                       WHERE  tn.message_id      = m.id
+                         AND  tn.telegram_user_id = tl.telegram_user_id
                    )
             ORDER  BY m.id
             LIMIT  :limit

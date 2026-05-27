@@ -105,6 +105,10 @@ class Settings(BaseSettings):
     TG_AUTH_INIT_DATA_TTL_SECONDS: int = Field(default=300, ge=30, le=86_400)
     # TTL of ``mas_tg_pending`` cookie / Redis token — 15 minutes.
     TG_PENDING_LINK_TTL_SECONDS: int = Field(default=900, ge=60, le=86_400)
+    # ADR-0024: soft cap on the number of active Telegram links one internal
+    # user may hold (personal / work / …). Application-level (checked via
+    # COUNT(*) in link_pending), not a DB constraint — see ADR-0024 §1/§3.
+    TG_MAX_LINKS_PER_USER: int = Field(default=10, ge=1, le=100)
 
     # --- Telegram push-notifications dispatcher (ADR-0022 §2.4 + §2.8) ---
     # How often the dispatcher drains the Redis ``tg_notify_queue``.

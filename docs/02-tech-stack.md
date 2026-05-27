@@ -20,13 +20,14 @@
 | Static files | starlette `StaticFiles` | (входит в FastAPI) | Раздача CSS/JS |
 | Crypto | cryptography | **42** | AES-GCM (ADR-0005) |
 | Password hashing | argon2-cffi | **23.1** | argon2id (ADR-0006) |
-| HTTP client | httpx | **0.27** | Тесты, будущие интеграции |
+| HTTP client | httpx | **0.27** | Тесты, Telegram Bot API, **OAuth token endpoint Microsoft (ADR-0025)** |
 | Logging | structlog | **24.1** | Структурные JSON-логи (ADR-0014) |
 | Rate limiting | slowapi | **0.1.9** | Поверх Redis (ADR-0009) |
 | Sessions backend | redis (python client) | **5.0** | Async; sessions, rate-limit, lockout |
 | HTML→text | html2text | **2024.2** | Конвертация HTML-писем в plain text (ADR-0012) |
-| Email parsing/build | stdlib `email` + `imap-tools` | imap-tools **1.6** | IMAP fetch + парсинг (ADR-0002) |
-| SMTP | aiosmtplib | **3.0** | Async SMTP send (ADR-0002) |
+| Email parsing/build | stdlib `email` + `imap-tools` | imap-tools **1.6** | IMAP fetch + парсинг (ADR-0002). **XOAUTH2 (ADR-0025):** через нижележащий `imaplib.authenticate("XOAUTH2", …)` — `imap-tools` `MailBox.client`; проверить совместимость версии (TD-030). |
+| SMTP | aiosmtplib | **3.0** | Async SMTP send (ADR-0002). **XOAUTH2 (ADR-0025):** через `AUTH XOAUTH2 <base64>`; проверить механизм в версии (TD-030). |
+| OAuth2 Microsoft | **без отдельной библиотеки (httpx)** | — | **ADR-0025:** authorize/token-flow реализуем вручную на `httpx` (consumers tenant). MSAL не вводим — flow простой (auth-code + refresh), а MSAL тянет лишние зависимости и кэш-абстракции, не нужные при хранении токенов в БД. |
 | MinIO/S3 client | aioboto3 | **13.2.0** | Async S3 API |
 | Scheduler (worker) | APScheduler | **3.10** | Cron + interval triggers (ADR-0003) |
 
@@ -98,3 +99,5 @@
 | Дата | Изменение | Автор |
 | --- | --- | --- |
 | 2026-05-05 | Initial. | architect |
+| 2026-05-27 | ADR-0025 (Outlook OAuth2): OAuth token endpoint вызывается через уже имеющийся `httpx` (async); XOAUTH2 для IMAP/SMTP строится через `imap-tools`/`aiosmtplib` thin-helpers (TD-030). MSAL и иные OAuth-библиотеки **не вводятся** — минимизация зависимостей. | architect |
+| 2026-05-27 | ADR-0024 (multi-TG 1:N): снят `UNIQUE(telegram_links.user_id)` → один user может иметь несколько Telegram-привязок (1:N); новый env `TG_MAX_LINKS_PER_USER` (default 10) — мягкий лимит против абьюза. Новых библиотек не требует. | architect |

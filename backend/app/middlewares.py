@@ -160,6 +160,8 @@ _OVERRIDE_REGEX_PATHS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^/api/tags/\d+/rules$"),  # POST add rule (no override)
     re.compile(r"^/api/tags/\d+/rules/\d+/delete$"),  # DELETE sibling for rule
     re.compile(r"^/api/tags/\d+/apply-to-existing$"),
+    # Telegram multi-link (ADR-0024 §4) — DELETE sibling for unlink.
+    re.compile(r"^/api/telegram/links/\d+/delete$"),
 )
 
 _ALLOWED_OVERRIDE_METHODS: frozenset[str] = frozenset({"DELETE", "PATCH", "PUT"})

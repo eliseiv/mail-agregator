@@ -123,3 +123,36 @@ class TelegramAuthResponse(BaseModel):
     redirect: str
 
     model_config = ConfigDict(extra="forbid")
+
+
+# ---------------------------------------------------------------------------
+# ADR-0024 — multi-link management (POST/GET/DELETE /api/telegram/links)
+# ---------------------------------------------------------------------------
+
+
+class TelegramLinkAddRequest(BaseModel):
+    """``POST /api/telegram/links`` body — initData of a fresh TG opened in the
+    target Telegram account, to be linked to the active session's user."""
+
+    init_data: str = Field(min_length=1, max_length=4096)
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class TelegramLinkItem(BaseModel):
+    """One entry in ``GET /api/telegram/links``."""
+
+    telegram_user_id: int
+    created_at: str  # ISO 8601
+    dead: bool
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class TelegramLinksResponse(BaseModel):
+    """``GET /api/telegram/links`` body (ADR-0024 §4)."""
+
+    links: list[TelegramLinkItem]
+    max: int
+
+    model_config = ConfigDict(extra="forbid")

@@ -46,7 +46,7 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import ValidationError as PydanticValidationError
 
 from backend.app.cookies import set_session_cookies
-from backend.app.deps import DbSession
+from backend.app.deps import CurrentUser, DbSession
 from backend.app.exceptions import (
     NotFoundError,
     RateLimitedError,
@@ -55,10 +55,12 @@ from backend.app.exceptions import (
 from backend.app.rate_limit import (
     LIMIT_TG_AUTH_IP,
     LIMIT_TG_AUTH_USER,
+    LIMIT_TG_LINKS_WRITE,
     Limit,
     client_ip,
     consume,
 )
+from backend.app.repositories.telegram_links import TelegramLinksRepo
 from backend.app.repositories.users import UsersRepo
 from backend.app.sessions import SessionStore
 from backend.app.telegram.bot import handle_update
@@ -66,6 +68,9 @@ from backend.app.telegram.callback_handler import handle_callback_query
 from backend.app.telegram.schemas import (
     TelegramAuthRequest,
     TelegramAuthResponse,
+    TelegramLinkAddRequest,
+    TelegramLinkItem,
+    TelegramLinksResponse,
     TelegramUpdate,
 )
 from backend.app.telegram.sso_service import (
@@ -243,6 +248,12 @@ async def telegram_auth(request: Request, db: DbSession) -> Response:
     if resolved.kind == "linked":
         assert resolved.user_id is not None
         user = await UsersRepo(db).get_by_id(resolved.user_id)
+        # ``verify_and_resolve`` + ``get_by_id`` issued SELECTs that auto-began
+        # a read-only transaction. Close it before either ``db.begin()`` write
+        # block below — otherwise ``db.begin()`` raises "A transaction is
+        # already begun on this Session" (same pattern as the ``current_user``
+        # dependency in backend/app/deps.py).
+        await db.commit()
         if user is None:
             # Link points at a user that was deleted out-of-band. Drop the
             # stale link and treat as ``unlinked`` — caller will go through
@@ -302,3 +313,133 @@ async def telegram_auth(request: Request, db: DbSession) -> Response:
         had_stale_link=resolved_user_id_was_present,
     )
     return response
+
+
+# ---------------------------------------------------------------------------
+# Multi-link management (ADR-0024 §4 — docs/04-api-contracts.md §4b)
+# ---------------------------------------------------------------------------
+# All three are cookie-authenticated (``CurrentUser`` dep) and CSRF-protected
+# by the global middleware (not in the exempt list — only ``/api/telegram/auth``
+# and the webhook prefix are exempt). They let an already-logged-in user manage
+# several Telegram links (personal / work) from settings.
+
+
+@router.get("/api/telegram/links")
+async def list_telegram_links(db: DbSession, user: CurrentUser) -> JSONResponse:
+    """List the current user's Telegram links (ADR-0024 §4).
+
+    Returns every link (live and dead) so the UI can show dead ones with a
+    re-link hint; ``dead`` reflects ``dead_at IS NOT NULL``.
+    """
+    links = await TelegramLinksRepo(db).list_by_user_id(user.id)
+    payload = TelegramLinksResponse(
+        links=[
+            TelegramLinkItem(
+                telegram_user_id=link.telegram_user_id,
+                created_at=link.created_at.isoformat(),
+                dead=link.dead_at is not None,
+            )
+            for link in links
+        ],
+        max=get_settings().TG_MAX_LINKS_PER_USER,
+    )
+    return JSONResponse(content=payload.model_dump())
+
+
+@router.post("/api/telegram/links")
+async def add_telegram_link(request: Request, db: DbSession, user: CurrentUser) -> JSONResponse:
+    """Link a fresh Telegram account to the active session (ADR-0024 §4).
+
+    Validates the supplied ``init_data`` HMAC (same as ``/api/telegram/auth``)
+    and binds the resolved ``telegram_user_id`` to ``user.id`` directly — no
+    pending-cookie flow. Applies the soft limit ``TG_MAX_LINKS_PER_USER`` and
+    refuses re-binding a TG owned by a different internal user.
+    """
+    ip = client_ip(request)
+    ua = request.headers.get("user-agent", "")[:256] or None
+    await consume(LIMIT_TG_LINKS_WRITE, f"user:{user.id}")
+
+    try:
+        body = await request.json()
+    except ValueError as exc:
+        raise ValidationError("Body is not valid JSON") from exc
+    try:
+        payload = TelegramLinkAddRequest.model_validate(body)
+    except PydanticValidationError as exc:
+        raise ValidationError("Invalid link payload") from exc
+
+    settings = get_settings()
+    if not settings.telegram_bot_enabled:
+        # No bot token → cannot validate HMAC. Opaque 401 (don't leak config).
+        log.info("telegram_link_add_bot_disabled", user_id=user.id)
+        return _invalid_init_data_response("invalid_init_data", "initData validation failed")
+
+    svc = TelegramSSOService(db)
+    try:
+        resolved = await svc.verify_and_resolve(payload.init_data)
+    except InvalidInitDataError as exc:
+        if exc.reason == "expired":
+            return _invalid_init_data_response("init_data_expired", "initData expired")
+        return _invalid_init_data_response("invalid_init_data", "initData validation failed")
+
+    # ``verify_and_resolve`` issued a SELECT, which auto-began a read-only
+    # transaction on the session. Close it before opening the write
+    # transaction below — otherwise ``db.begin()`` raises
+    # "A transaction is already begun on this Session" (same pattern as the
+    # ``current_user`` dependency in backend/app/deps.py).
+    await db.commit()
+
+    # link_session_add raises TelegramLinkLimitError / TelegramLinkOwnedByOtherError
+    # (both DomainError → handled by the global envelope as 409).
+    async with db.begin():
+        await svc.link_session_add(
+            telegram_user_id=resolved.telegram_user_id,
+            user_id=user.id,
+            ip=ip,
+            user_agent=ua,
+        )
+    log.info(
+        "telegram_link_added_via_session",
+        user_id=user.id,
+        telegram_user_id=resolved.telegram_user_id,
+    )
+    return JSONResponse(content={"linked": True, "telegram_user_id": resolved.telegram_user_id})
+
+
+@router.delete("/api/telegram/links/{telegram_user_id}")
+async def delete_telegram_link(
+    telegram_user_id: int, request: Request, db: DbSession, user: CurrentUser
+) -> JSONResponse:
+    """Unlink a specific TG owned by the current user (ADR-0024 §4).
+
+    Idempotent: ``{"deleted": false}`` (still 200) when no such link exists or
+    it belongs to another user — never leaks ownership via a 404.
+    """
+    ip = client_ip(request)
+    ua = request.headers.get("user-agent", "")[:256] or None
+    await consume(LIMIT_TG_LINKS_WRITE, f"user:{user.id}")
+
+    async with db.begin():
+        deleted = await TelegramSSOService(db).revoke_one(
+            user_id=user.id,
+            telegram_user_id=telegram_user_id,
+            ip=ip,
+            user_agent=ua,
+        )
+    return JSONResponse(content={"deleted": deleted})
+
+
+@router.delete("/api/telegram/links/{telegram_user_id}/delete")
+async def delete_telegram_link_form(
+    telegram_user_id: int, request: Request, db: DbSession, user: CurrentUser
+) -> JSONResponse:
+    """Form-fallback sibling for ``DELETE`` (ADR-0015, docs §4b).
+
+    The no-JS unlink button POSTs to this ``/delete`` path with a hidden
+    ``_method=DELETE`` field; :class:`MethodOverrideMiddleware` (the path is
+    whitelisted) rewrites the POST into a DELETE that this handler serves.
+    Delegates to the canonical handler logic.
+    """
+    return await delete_telegram_link(
+        telegram_user_id=telegram_user_id, request=request, db=db, user=user
+    )

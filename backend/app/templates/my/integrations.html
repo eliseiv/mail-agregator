@@ -284,6 +284,67 @@
     </div>
   {% endif %}
 
+  {# ====================================================================
+     Telegram-привязки (ADR-0024 §4 / 04-api-contracts.md §4b).
+
+     Список и управление привязками — клиентский рендер: секция вызывает
+     GET /api/telegram/links при загрузке и рисует строки. Так как в проекте
+     нет server-rendered HTML-роута для этого списка (только JSON-эндпоинты),
+     прогрессивное улучшение через telegram_links.js — единственный путь без
+     изменения backend. Без JS секция показывает понятную подсказку с no-JS
+     fallback на отвязку (form POST `_method=DELETE`, но без id строки её
+     не построить — поэтому без JS управление недоступно, см. <noscript>).
+
+     Добавление новой привязки требует Telegram WebApp initData
+     (window.Telegram.WebApp.initData), которое доступно только при открытии
+     сервиса внутри Telegram-бота. В обычном браузере initData нет — кнопка
+     «Добавить» показывает инструкцию открыть бот в нужном TG-аккаунте.
+
+     Эндпоинты:
+       GET    /api/telegram/links               → {links:[{telegram_user_id, created_at, dead}], max}
+       POST   /api/telegram/links {init_data}   → {linked:true, telegram_user_id} | 409 tg_link_limit / tg_link_owned_by_other
+       DELETE /api/telegram/links/{tg_user_id}  → {deleted: bool}
+  #}
+  <section class="tg-links" aria-labelledby="tg-links-heading" data-tg-links-section>
+    <header class="tg-links__header">
+      <h2 id="tg-links-heading" class="integrations-card__title">Telegram-уведомления</h2>
+    </header>
+    <p class="integrations-card__hint">
+      Бот присылает уведомления о новых письмах во все привязанные
+      Telegram-аккаунты. Можно привязать несколько (личный, рабочий и т.д.).
+    </p>
+
+    {# Loading state — заменяется JS после ответа GET /api/telegram/links. #}
+    <div class="tg-links__body" data-tg-links-body>
+      <p class="tg-links__loading" role="status" data-tg-links-loading>
+        Загрузка списка привязок&hellip;
+      </p>
+    </div>
+
+    {# Действие «Добавить» — обработчик в telegram_links.js. Поведение зависит
+       от наличия Telegram WebApp initData (см. комментарий выше). #}
+    <div class="tg-links__actions">
+      <button
+        type="button"
+        class="btn btn--primary"
+        data-tg-link-add
+        hidden>
+        + Добавить Telegram-аккаунт
+      </button>
+      <p class="field__hint tg-links__add-hint" data-tg-link-add-hint hidden>
+        Чтобы привязать новый Telegram, откройте этот сервис через бота
+        в нужном Telegram-аккаунте и нажмите «Добавить» там.
+      </p>
+    </div>
+
+    <noscript>
+      <p class="tg-links__noscript" role="status">
+        Управление Telegram-привязками требует JavaScript. Включите его,
+        чтобы видеть список и привязывать/отвязывать аккаунты.
+      </p>
+    </noscript>
+  </section>
+
   {# ---------- Secret reveal modal ---------- #}
   {% if secret_revealed %}
     <dialog
@@ -345,4 +406,5 @@
 
 {% block extra_js %}
 <script src="/static/js/integrations.js?v={{ static_v }}"></script>
+<script src="/static/js/telegram_links.js?v={{ static_v }}"></script>
 {% endblock %}

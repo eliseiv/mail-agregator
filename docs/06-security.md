@@ -116,7 +116,7 @@
 | T | Подмена `telegram_user_id` в payload | Невозможна — `user` поле подписано HMAC'ом. Любая мутация → 401. |
 | T | Подмена `mas_tg_pending` cookie | Token random 32 байта (base64url, `secrets.token_urlsafe(32)`); HttpOnly + Secure + SameSite=Lax + 15min TTL; одноразовый (deleted в Redis после link или после `mas_session` создан). |
 | T | Brute-force HMAC без bot-token | HMAC-SHA256 неразрешим без ключа. Rate-limit `30/min per IP` + `10/min per telegram_user_id` (после успешной валидации) отсекает скан. |
-| R | Скрытие факта линковки/разлинковки | Новые actions в `admin_audit`: `telegram_link_created` (с `details.replaced: bool`), `telegram_link_revoked` (с `details.reason`), `telegram_link_dead_marked` (с `details.reason='bot_api_403'\|...`), `telegram_link_collision`. Все super_admin может видеть в `/admin/audit`. |
+| R | Скрытие факта линковки/разлинковки | Новые actions в `admin_audit`: `telegram_link_created` (с `details.replaced: bool`), `telegram_link_rebound` (ADR-0024 — TG перепривязан с другого user'а), `telegram_link_revoked` (с `details.telegram_user_ids: [...]` — массив, logout/reset сбрасывают ВСЕ привязки, ADR-0024 §5), `telegram_link_dead_marked` (с `details.reason='bot_api_403'\|...`), `telegram_link_limit_reached` (ADR-0024 — достигнут `TG_MAX_LINKS_PER_USER`), `telegram_link_collision` (**deprecated** — ADR-0024 §3, больше не пишется; запись остаётся читаемой для истории). Все super_admin может видеть в `/admin/audit`. |
 | I | Утечка `init_data` через логи | `init_data` НЕ логируется в полной форме (содержит подписанные PII — user name, потенциально username). Логируем только `telegram_user_id` и `auth_date` ПОСЛЕ валидации. |
 | I | Утечка bot-token → выпуск произвольных сессий | Знание bot-token + любого валидного `telegram_user_id` залинкованного user'а позволит атакующему выпустить себе HMAC + получить сессию. Митigация: bot-token строго в env + redact-list (ADR-0014); при компрометации — массовый `DELETE FROM telegram_links` + ротация bot-token + ротация секрета webhook'а. |
 | D | DOS на `/api/telegram/auth` | Rate-limit slowapi 30/min per IP + 10/min per telegram_user_id. HMAC валидация дешёвая (~µs). |
@@ -131,7 +131,9 @@
 | T | Подмена контента уведомления через injection (HTML/Markdown) | Все user-controlled значения (`tag.name`, `from_addr`, `from_name`, `mail_account.display_name`, `mail_account.email`) экранируются `html.escape()` перед формированием HTML-строки для Bot API parse_mode=HTML. |
 | R | Скрытие факта доставки уведомления | Запись в `telegram_notifications (message_id, user_id, sent_at, telegram_message_id)` для каждой доставки. |
 | I | Утечка содержимого письма через notification | Текст содержит только email-адрес ящика, имя/email отправителя и имена тегов — не само тело. Кнопка «Посмотреть сообщение» открывает auth'd страницу `/messages/{id}` (через persistent SSO) — без линковки + login доступа не получит. |
-| D | Spam-rate exceeded → user-блокировка бота | Получатель сам контролирует через opt-out (`users_settings.tg_notifications_enabled=false`). При 403 от Bot API (user заблокировал) — линковка mark-dead, спам прекращается автоматически. |
+| D | Spam-rate exceeded → user-блокировка бота | Получатель сам контролирует через opt-out (`users_settings.tg_notifications_enabled=false`). При 403 от Bot API (user заблокировал) — линковка mark-dead, спам прекращается автоматически. **ADR-0024:** mark-dead изолирован per `telegram_user_id` — блокировка в одном чате не отключает остальные привязки того же user'а. |
+| T | (ADR-0024) Пользователь отвязывает чужой TG | `DELETE /api/telegram/links/{tg_user_id}` фильтрует WHERE `user_id=session AND telegram_user_id=path` — нельзя удалить привязку, не принадлежащую вызывающему. |
+| E | (ADR-0024) Добавление второго TG к чужому аккаунту | `POST /api/telegram/links` привязывает только к `session.user_id`; если `telegram_user_id` уже принадлежит другому — `409 tg_link_owned_by_other` (перепривязка из чужого аккаунта только через login-flow с паролем). Мягкий лимит `TG_MAX_LINKS_PER_USER` против абьюза. |
 | D | Очередь `tg_notify_queue` забивается при outage Bot API | Backoff на 429; transient/5xx → re-LPUSH (max 1 in-place retry, дальше — следующий тик). Recovery_scan покрывает потерянные. Bot API quota (~30 msg/sec) выше нашего ожидаемого rate (~5 msg/sec пик). |
 | E | Получатель видит уведомление о письме, которое не должен видеть | Recipient SQL построен поверх той же `VisibilityScope` модели, что и UI — никаких асимметрий. Полный SQL — ADR-0022 §2.2. |
 
@@ -154,6 +156,22 @@
 | E | SSRF: лидер указывает `https://localhost:<port>` или `https://10.x.y.z` → сканирование внутренней сети | Lexical reject `localhost`/`127.0.0.1`/`0.0.0.0`/`[::1]`; DNS-резолв всех A/AAAA + проверка на приватные CIDR (см. §4 ниже). При попадании → `400 webhook_url_private_ip` на CRUD. В диспатчере на момент POST — accepted risk (DNS cache poisoning), `dead_at` если decrypt failed по любой причине. `httpx.AsyncClient(follow_redirects=False)` — 3xx → треатируется как failed, не следует за redirect (защита от Location: внутренняя сеть). |
 | E | Чужой лидер настроил webhook на чужую команду | Невозможно: `scope.group_id` строго фиксируется на сессии (`group_leader`) или явно через `?group_id=` (только `super_admin`). `group_member` отвечен 403 на всех endpoint'ах. |
 | E | Compromise `MAIL_ENCRYPTION_KEY` → расшифровка всех secret'ов всех webhook'ов | Те же последствия, что для `mail_accounts.encrypted_password` (ADR-0005). Ротация ключа через `mas-cli reencrypt` обрабатывает `webhooks.secret_encrypted` наравне; после ротации **обязательная массовая rotate-secret** через `POST /api/webhooks/me/rotate-secret` (потому что receiver'ам поставляется plaintext-secret, который мог утечь вместе с ключом). Backend-агент при реализации `mas-cli reencrypt` добавляет `webhooks` в список обрабатываемых таблиц. |
+
+### 1.11 OAuth2 Outlook (ADR-0025)
+
+| Угроза | Описание | Митигация |
+| --- | --- | --- |
+| S | CSRF / authorization-code injection на callback | `state` (32B random) в Redis `oauth_state:{state}` TTL 600с, привязан к инициировавшему `user_id`, одноразовый (GET+DEL). Callback без валидного state → `400 oauth_state_invalid`. PKCE S256 (`code_verifier` хранится со state) защищает от code-interception. |
+| S | Атакующий подсовывает свой `code` | code-обмен требует `client_secret` + `code_verifier` (PKCE); без них token endpoint Microsoft отклонит. Полученный токен привязывается к `user_id` из state, не к произвольному. |
+| T | Подмена `redirect_uri` | `redirect_uri` зарегистрирован в Azure App и проверяется Microsoft при authorize и token-обмене; mismatch → отказ на стороне Microsoft. |
+| R | Скрытие подключения OAuth-аккаунта | Audit `oauth_account_linked` (`mail_account_id`, `email`, `scopes`); инвалидация — `oauth_refresh_invalidated`. |
+| I | Утечка БД → расшифровка refresh/access токенов | `oauth_refresh_token_encrypted`/`oauth_access_token_encrypted` — AES-256-GCM (`MailPasswordCipher`, AAD=`account_id`, ADR-0005). Без `MAIL_ENCRYPTION_KEY` blob бесполезен; AAD блокирует перестановку между аккаунтами. См. §2.2. |
+| I | Логирование токенов / code / client_secret | `access_token`, `refresh_token`, `code`, `client_secret`, `OUTLOOK_CLIENT_SECRET`, `id_token` — в structlog redact-list (рядом с `MAIL_ENCRYPTION_KEY`/`TELEGRAM_BOT_TOKEN`). Ответы token endpoint не логируются целиком. |
+| I | Избыточные scopes → доступ шире необходимого | Только delegated `IMAP.AccessAsUser.All`, `SMTP.Send`, `offline_access`, `openid`, `email`, `profile`. Никаких Mail.ReadWrite/широких Graph. |
+| E | Compromise `MAIL_ENCRYPTION_KEY` → расшифровка всех refresh-токенов | Те же последствия, что для `mail_accounts.encrypted_password`. После ротации ключа `mas-cli reencrypt` обрабатывает `oauth_refresh_token_encrypted`/`oauth_access_token_encrypted` наравне; access-кэш можно просто инвалидировать (перевыпустится по refresh). |
+| D | Refresh инвалидирован (Microsoft `invalid_grant`) | `oauth_needs_consent=true`, sync аккаунта пропускается, UI показывает «переподключить»; не зацикливаемся на failed-refresh. |
+
+> SSRF к Outlook IMAP/SMTP не релевантен (хосты фиксированы Microsoft'ом, не вводятся пользователем). Per-account proxy (`proxy_url`) заложен, но не используется (TD-029) — трафик идёт напрямую.
 
 ---
 
@@ -219,7 +237,16 @@ blob = b"\x01" || iv (12B) || ciphertext_with_tag (variable)
 - Rate-limit: 5/час per webhook_id (защита от accidental DoS на receiver-side rotation logic).
 - Двойного secret (старый ещё валиден M минут) в MVP **нет** (см. ADR-0023 Q-WH-1 / TD-019).
 
-**Ротация мастер-ключа `MAIL_ENCRYPTION_KEY`** (см. §10 ниже): `mas-cli reencrypt` обрабатывает blob'ы обеих таблиц (`mail_accounts.encrypted_password` + `webhooks.secret_encrypted`) — общий механизм `version_byte` (0x00 = старый ключ, 0x01 = новый). После ротации **обязательная массовая `POST /api/webhooks/me/rotate-secret`** через UI, потому что plaintext-secret уже передан receiver'у и считается потенциально скомпрометированным.
+**Ротация мастер-ключа `MAIL_ENCRYPTION_KEY`** (см. §10 ниже): `mas-cli reencrypt` обрабатывает blob'ы обеих таблиц (`mail_accounts.encrypted_password` + `webhooks.secret_encrypted` + **OAuth-токены `mail_accounts.oauth_refresh_token_encrypted`/`oauth_access_token_encrypted`**, ADR-0025) — общий механизм `version_byte` (0x00 = старый ключ, 0x01 = новый). После ротации **обязательная массовая `POST /api/webhooks/me/rotate-secret`** через UI, потому что plaintext-secret уже передан receiver'у и считается потенциально скомпрометированным.
+
+### 2.2 OAuth2 token storage (ADR-0025)
+
+`mail_accounts.oauth_refresh_token_encrypted` и `oauth_access_token_encrypted` используют **тот же примитив** AES-256-GCM (`MailPasswordCipher`) с **тем же AAD-префиксом**, что и пароли (`b"mail_account_password|" + account_id`) — токены живут в той же таблице `mail_accounts`, AAD по `account_id` блокирует перестановку blob между аккаунтами. (Domain-separation между password-blob и token-blob не нужна: оба принадлежат одному `account_id`; разные колонки разделяют их структурно.)
+
+- **refresh-token** — источник истины OAuth-доступа; шифруется при создании/каждом rotation (Microsoft может вернуть новый refresh при refresh-grant).
+- **access-token** — кэш (~1ч), шифруется; при потере перевыпускается по refresh (не критичен).
+- **Не логировать**: см. §1.11 redact-list.
+- `INSERT` с предсказанным id (`nextval('mail_accounts_id_seq')`) — тот же паттерн, что для password-аккаунтов (см. §2 / модуль `crypto`).
 
 ---
 
@@ -362,7 +389,8 @@ CSP запрещает inline JS — все скрипты только из `/s
   - Groups (ADR-0019 §9): `group_create`, `group_delete`, `group_rename`, `user_role_change`, `user_group_change`.
 - Authentication-related: `lockout_triggered`.
 - System: `account_auto_disabled` (worker отключил аккаунт за 3 fail).
-- **Telegram (ADR-0022):** `telegram_link_created` (`details.replaced: bool, telegram_user_id`), `telegram_link_revoked` (`details.telegram_user_id, reason`), `telegram_link_dead_marked` (`details.telegram_user_id, reason='bot_api_403'\|...`), `telegram_link_collision` (`details.existing_telegram_user_id, attempted_telegram_user_id`). `actor_user_id` = сам пользователь (user-инициированное действие) — допустимо в этой таблице, хотя исторически она для super_admin actions; решение: расширяем семантику (см. ADR-0022 §1.4), `target_user_id` = тот же user.
+- **Telegram (ADR-0022 + ADR-0024):** `telegram_link_created` (`details.replaced: bool, telegram_user_id`), `telegram_link_rebound` (ADR-0024 — TG перепривязан с другого user'а; `details.telegram_user_id, replaced=true`), `telegram_link_revoked` (`details.telegram_user_ids: [...], reason` — массив: logout/reset сбрасывают ВСЕ привязки, ADR-0024 §5), `telegram_link_dead_marked` (`details.telegram_user_id, reason='bot_api_403'\|...` — per-chat), `telegram_link_limit_reached` (ADR-0024 — достигнут `TG_MAX_LINKS_PER_USER`; `details.attempted_telegram_user_id, limit`). `telegram_link_collision` — **deprecated** (ADR-0024 §3: больше не пишется, инвариант «один user — один TG» снят; запись остаётся читаемой для истории). `actor_user_id` = сам пользователь (user-инициированное действие) — допустимо в этой таблице, хотя исторически она для super_admin actions; решение: расширяем семантику (см. ADR-0022 §1.4), `target_user_id` = тот же user.
+- **OAuth Outlook (ADR-0025):** `oauth_account_linked` (`details={mail_account_id, email, scopes}` — подключён/переподключён OAuth-аккаунт), `oauth_refresh_invalidated` (`details={mail_account_id, reason}` — refresh отозван Microsoft `invalid_grant`, аккаунт требует re-consent). `actor_user_id` = инициатор подключения, `target_user_id` = тот же user.
 - **Outbound webhooks (ADR-0023):** `webhook_created` (`actor = инициатор, target_user_id = leader группы, details = {group_id, webhook_id, url}`), `webhook_updated` (`details = {webhook_id, changed_fields: [...], previous_dead_at}`), `webhook_deleted` (`details = {webhook_id, group_id, url}`), `webhook_secret_rotated` (`details = {webhook_id}`), `webhook_dead_marked` (`actor = leader_user_id (system action на его команде), target_user_id = leader_user_id, details = {webhook_id, reason: '410_gone'\|'consecutive_4xx'\|'secret_decrypt_failed'}`). При каскадном удалении группы (`DELETE /api/admin/groups/{id}`) отдельный `webhook_deleted` **не** пишется — каскад покрыт audit'ом `group_delete`.
 - **Не пишутся в audit**: действия `group_leader` и `group_member` (создание mail-аккаунтов, отправка писем, теги). Для них достаточно structlog application-логов (см. ADR-0019 §9).
 - Доступен через `/admin/audit` UI и `GET /api/admin/audit` (только super_admin).

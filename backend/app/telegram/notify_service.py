@@ -228,6 +228,22 @@ class TelegramNotifyService:
         if not recipients:
             return
 
+        # ADR-0024: the recipient SQL ``SELECT DISTINCT`` already yields one
+        # row per ``(user_id, telegram_user_id)``, but a user with several
+        # links now legitimately produces several rows. Defensively collapse
+        # duplicate chats (same ``telegram_user_id`` seen twice — e.g. via
+        # super_admin + owner visibility overlap) so each chat is processed
+        # once; ``try_reserve`` would dedup anyway, this just avoids wasted
+        # throttle consumption.
+        seen_chats: set[int] = set()
+        deduped: list[NotifyRecipient] = []
+        for r in recipients:
+            if r.telegram_user_id in seen_chats:
+                continue
+            seen_chats.add(r.telegram_user_id)
+            deduped.append(r)
+        recipients = deduped
+
         # Round-12 bug A: tags are now resolved **once per message** (not
         # per recipient). Every group member receives the same tag-name
         # list, which matches the visibility model (if you can see the
@@ -290,9 +306,9 @@ class TelegramNotifyService:
             # Per-chat throttle BEFORE try_reserve (§2.9): if the per-chat
             # budget is exhausted, skip this recipient now WITHOUT reserving a
             # telegram_notifications row and WITHOUT a hot re-enqueue. Leaving
-            # the (message_id, user_id) row absent lets the hourly recovery
-            # scan (§2.8, per-recipient NOT EXISTS) pick this recipient up
-            # later — natural ~1h backoff, no busy-loop under sustained flood.
+            # the (message_id, telegram_user_id) row absent lets the hourly
+            # recovery scan (§2.8, per-chat NOT EXISTS — ADR-0024 §7) pick this
+            # chat up later — natural ~1h backoff, no busy-loop under flood.
             if not await try_consume(throttle_limit, key=str(recipient.telegram_user_id)):
                 log.info(
                     "tg_notify_throttled",
@@ -320,8 +336,8 @@ class TelegramNotifyService:
 
         if needs_retry:
             # Re-enqueue: dispatch_one will eventually re-process; the
-            # UNIQUE on (message_id, user_id) ensures already-delivered
-            # recipients are skipped.
+            # UNIQUE on (message_id, telegram_user_id) (ADR-0024 §6) ensures
+            # already-delivered chats are skipped.
             await self.enqueue_recovery([payload.message_id])
             log.info(
                 "tg_notify_dispatch_requeued",
@@ -351,7 +367,9 @@ class TelegramNotifyService:
         per message by the caller and shared across recipients.
         """
         notification_id = await self._notifications.try_reserve(
-            message_id=payload.message_id, user_id=recipient.user_id
+            message_id=payload.message_id,
+            user_id=recipient.user_id,
+            telegram_user_id=recipient.telegram_user_id,
         )
         if notification_id is None:
             # Already delivered (or claimed) — skip.

@@ -160,6 +160,24 @@ class TagApplyTooManyError(DomainError):
     code = "tag_apply_too_many"
 
 
+class TelegramLinkLimitError(DomainError):
+    """User reached ``TG_MAX_LINKS_PER_USER`` active Telegram links
+    (ADR-0024 §3). Surfaced as 409 ``tg_link_limit``."""
+
+    status_code = 409
+    code = "tg_link_limit"
+
+
+class TelegramLinkOwnedByOtherError(DomainError):
+    """The ``telegram_user_id`` is already linked to a *different* internal
+    user; re-binding from an authenticated session is refused (ADR-0024 §4 —
+    only the password login-flow may re-bind). Surfaced as 409
+    ``tg_link_owned_by_other``."""
+
+    status_code = 409
+    code = "tg_link_owned_by_other"
+
+
 class WebhookUrlPrivateIpError(DomainError):
     """Outbound webhook URL would target a private/loopback/link-local
     address — ADR-0023 §4.3 SSRF protection.

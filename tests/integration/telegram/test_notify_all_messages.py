@@ -58,10 +58,17 @@ async def _recovery(db_engine: AsyncEngine, *, window_hours: int = 24) -> list[i
         )
 
 
-async def _reserve(db_engine: AsyncEngine, *, message_id: int, user_id: int) -> None:
+async def _reserve(
+    db_engine: AsyncEngine, *, message_id: int, user_id: int, telegram_user_id: int
+) -> None:
+    # ADR-0024 §6: the idempotency key is per-chat ``(message_id,
+    # telegram_user_id)``. Callers pass the chat that the recipient's link
+    # resolves to so the recovery NOT EXISTS matches on the right grain.
     factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
     async with factory() as ses, ses.begin():
-        await TelegramNotificationsRepo(ses).try_reserve(message_id=message_id, user_id=user_id)
+        await TelegramNotificationsRepo(ses).try_reserve(
+            message_id=message_id, user_id=user_id, telegram_user_id=telegram_user_id
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -279,11 +286,13 @@ class TestRecoveryPerRecipient:
         assert super_admin_user.id in recipients
         assert member.id in recipients
 
-        # A delivered (row created); B has no row.
-        await _reserve(db_engine, message_id=msg.id, user_id=super_admin_user.id)
+        # A delivered (row created for chat 220001); B (chat 220002) has no row.
+        await _reserve(
+            db_engine, message_id=msg.id, user_id=super_admin_user.id, telegram_user_id=220001
+        )
 
         ids = await _recovery(db_engine)
-        assert msg.id in ids, "per-recipient gap: B undelivered must re-enqueue the message"
+        assert msg.id in ids, "per-chat gap: B undelivered must re-enqueue the message"
 
     async def test_fully_delivered_message_not_returned(
         self,
@@ -305,12 +314,14 @@ class TestRecoveryPerRecipient:
         acc = await create_mail_account(leader.id, "full@example.com", group_id=group.id)
         msg = await create_message(acc.id, uid=220101)
 
-        # Both delivered.
-        await _reserve(db_engine, message_id=msg.id, user_id=super_admin_user.id)
-        await _reserve(db_engine, message_id=msg.id, user_id=member.id)
+        # Both delivered — reserve each chat (A=220101, B=220102).
+        await _reserve(
+            db_engine, message_id=msg.id, user_id=super_admin_user.id, telegram_user_id=220101
+        )
+        await _reserve(db_engine, message_id=msg.id, user_id=member.id, telegram_user_id=220102)
 
         ids = await _recovery(db_engine)
-        assert msg.id not in ids, "fully-delivered message must NOT be re-enqueued"
+        assert msg.id not in ids, "fully-delivered message (both chats) must NOT be re-enqueued"
 
     async def test_recovery_respects_window_cutoff(
         self,

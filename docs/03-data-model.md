@@ -17,7 +17,7 @@ erDiagram
     users ||--o{ admin_audit : "subject_user (nullable, no FK)"
     users ||--o{ admin_audit : "performed (super-admin only, no FK)"
     users ||--o{ tags : owns
-    users ||--o| telegram_links : "linked_to (0..1)"
+    users ||--o{ telegram_links : "linked_to (1:N, ADR-0024)"
     users ||--o{ telegram_notifications : "received_by"
     users ||--o| users_settings : "has (0..1)"
     groups ||--o| webhooks : "has outbound (0..1)"
@@ -177,15 +177,16 @@ erDiagram
 
     telegram_links {
         bigint telegram_user_id PK "Telegram User.id from signed init_data"
-        bigint user_id FK "UNIQUE; ON DELETE CASCADE"
+        bigint user_id FK "indexed (NOT unique, ADR-0024 — 1:N); ON DELETE CASCADE"
         timestamptz created_at
-        timestamptz dead_at "nullable; set on Bot API 403/400"
+        timestamptz dead_at "nullable; set on Bot API 403/400 (per-chat)"
     }
 
     telegram_notifications {
         bigint id PK
         bigint message_id FK "ON DELETE CASCADE"
-        bigint user_id FK "ON DELETE CASCADE"
+        bigint user_id FK "ON DELETE CASCADE; получатель-владелец"
+        bigint telegram_user_id "NOT NULL; целевой чат (ADR-0024 §6); слепок chat_id на момент доставки, без FK"
         timestamptz sent_at "nullable"
         bigint telegram_message_id "nullable; from sendMessage response"
     }
@@ -302,9 +303,17 @@ erDiagram
 | --- | --- | --- | --- |
 | `id` | BIGSERIAL | PK | |
 | `user_id` | BIGINT | NOT NULL, FK → `users(id)` ON DELETE CASCADE | Владелец mail-аккаунта. Visibility (super_admin / group_leader / group_member) определяется через JOIN `mail_accounts.user_id → users.group_id` (см. ADR-0019 §7.1). |
-| `email` | TEXT | NOT NULL | Адрес почты пользователя в этом сервисе. |
+| `email` | TEXT | NOT NULL | Адрес почты пользователя в этом сервисе. Для OAuth-аккаунтов — извлекается из `id_token`/Graph при consent. |
 | `display_name` | TEXT | NULL, CHECK length 1..100 | Никнейм / ярлык для UI. Если задан — показывается вместо `email` (см. ADR-0020). Не уникален. Любая UTF-8 строка 1..100 (после trim'а пустая интерпретируется как NULL). |
-| `encrypted_password` | BYTEA | NOT NULL | AES-256-GCM blob (см. ADR-0005). |
+| `auth_type` | TEXT | NOT NULL DEFAULT `'password'`, CHECK in (`'password'`,`'oauth_outlook'`) | **ADR-0025:** способ аутентификации. `password` — IMAP/SMTP LOGIN по зашифрованному паролю; `oauth_outlook` — XOAUTH2 по OAuth-токенам. |
+| `encrypted_password` | BYTEA | **NULL** (ADR-0025; ранее NOT NULL) | AES-256-GCM blob (см. ADR-0005). Для `auth_type='password'` — NOT NULL (CHECK); для `oauth_outlook` — NULL. |
+| `oauth_provider` | TEXT | NULL | **ADR-0025:** `'outlook'`. NULL для password-аккаунтов. |
+| `oauth_refresh_token_encrypted` | BYTEA | NULL | **ADR-0025:** refresh-token, AES-256-GCM (AAD=`account_id`, тот же `MailPasswordCipher`). NOT NULL для `oauth_outlook` (CHECK). |
+| `oauth_access_token_encrypted` | BYTEA | NULL | **ADR-0025:** кэш access-token (~1ч), шифрован. Кэш, не источник истины. |
+| `oauth_access_token_expires_at` | TIMESTAMPTZ | NULL | **ADR-0025:** истечение access-token; sync проверяет до коннекта (буфер 60с). |
+| `oauth_needs_consent` | BOOLEAN | NOT NULL DEFAULT false | **ADR-0025:** true → refresh инвалидирован (`invalid_grant`); требуется повторный consent; worker пропускает. |
+| `oauth_scopes` | TEXT | NULL | **ADR-0025:** фактически выданные scopes (space-separated) — диагностика. |
+| `proxy_url` | TEXT | NULL | **ADR-0025 (заложено, не используется — TD-029):** per-account proxy. worker/тестеры игнорируют в текущем спринте. |
 | `imap_host` | TEXT | NOT NULL | |
 | `imap_port` | INT | NOT NULL DEFAULT 993 | |
 | `imap_ssl` | BOOLEAN | NOT NULL DEFAULT true | |
@@ -328,6 +337,9 @@ erDiagram
 - CHECK `NOT (smtp_ssl AND smtp_starttls)` — взаимоисключающие.
 - CHECK `display_name IS NULL OR char_length(display_name) BETWEEN 1 AND 100` (см. ADR-0020).
 - UNIQUE `(user_id, email)` — один пользователь не может дважды добавить ту же почту.
+- **ADR-0025:** CHECK `auth_type IN ('password','oauth_outlook')` (`ck_mail_accounts_auth_type`).
+- **ADR-0025:** CHECK `auth_type <> 'password' OR encrypted_password IS NOT NULL` (`ck_mail_accounts_password_creds`).
+- **ADR-0025:** CHECK `auth_type <> 'oauth_outlook' OR (oauth_refresh_token_encrypted IS NOT NULL AND oauth_provider = 'outlook')` (`ck_mail_accounts_oauth_creds`).
 
 **Индексы:**
 - `INDEX (user_id)` — FK lookup.
@@ -434,7 +446,7 @@ erDiagram
 | --- | --- | --- | --- |
 | `id` | BIGSERIAL | PK | |
 | `actor_user_id` | BIGINT | NOT NULL | id супер-админа. **БЕЗ FK** (запись должна жить даже если случайно удалили админа из БД; см. seed-логику). |
-| `action` | TEXT | NOT NULL | Enum-string: `admin_login`, `admin_logout`, `create_user`, `reset_password`, `delete_user`, `lockout_triggered`, `account_auto_disabled`, **`group_create`**, **`group_delete`**, **`group_rename`**, **`user_role_change`**, **`user_group_change`** (новые из ADR-0019 §9), **`telegram_link_created`**, **`telegram_link_revoked`**, **`telegram_link_dead_marked`**, **`telegram_link_collision`** (новые из ADR-0022), **`webhook_created`**, **`webhook_updated`**, **`webhook_deleted`**, **`webhook_secret_rotated`**, **`webhook_dead_marked`** (новые из ADR-0023). |
+| `action` | TEXT | NOT NULL | Enum-string: `admin_login`, `admin_logout`, `create_user`, `reset_password`, `delete_user`, `lockout_triggered`, `account_auto_disabled`, **`group_create`**, **`group_delete`**, **`group_rename`**, **`user_role_change`**, **`user_group_change`** (новые из ADR-0019 §9), **`telegram_link_created`**, **`telegram_link_revoked`**, **`telegram_link_dead_marked`** (из ADR-0022), **`telegram_link_rebound`**, **`telegram_link_limit_reached`** (новые из ADR-0024), `telegram_link_collision` (**deprecated** ADR-0024 §3 — больше не пишется, оставлен для исторических записей), **`webhook_created`**, **`webhook_updated`**, **`webhook_deleted`**, **`webhook_secret_rotated`**, **`webhook_dead_marked`** (из ADR-0023), **`oauth_account_linked`**, **`oauth_refresh_invalidated`** (новые из ADR-0025). |
 | `target_user_id` | BIGINT | NULL | id затронутого пользователя (для user-actions). |
 | `target_username` | TEXT | NULL | snapshot username на случай delete. |
 | `details` | JSONB | NULL | Произвольная структурированная информация (например, для `account_auto_disabled` — `{mail_account_id, reason}`). |
@@ -528,44 +540,47 @@ Many-to-many линки тегов и сообщений. Создаются wor
 
 ### `telegram_links`
 
-Источник истины — [ADR-0022](./adr/ADR-0022-telegram-sso-and-notifications.md). Связка `telegram_user_id` (внешний ID в Telegram Bot API) с внутренним `users.id`. Создаётся при первом успешном `POST /login`/`POST /set-password` после открытия WebApp через бот; удаляется при `POST /logout`, `POST /api/admin/users/{id}/reset`, `DELETE /api/admin/users/{id}` (каскад). Активная линковка обеспечивает persistent SSO и доставку push-уведомлений.
+Источник истины — [ADR-0022](./adr/ADR-0022-telegram-sso-and-notifications.md) + [ADR-0024](./adr/ADR-0024-multi-telegram-links.md). Связка `telegram_user_id` (внешний ID в Telegram Bot API) с внутренним `users.id`. Создаётся при первом успешном `POST /login`/`POST /set-password` после открытия WebApp через бот, либо через `POST /api/telegram/links` при активной сессии (добавление второго TG, ADR-0024 §4); удаляется при `POST /logout` (все), `POST /api/admin/users/{id}/reset` (все), `DELETE /api/telegram/links/{telegram_user_id}` (конкретный), `DELETE /api/admin/users/{id}` (каскад). Активная линковка обеспечивает persistent SSO и доставку push-уведомлений.
+
+**ADR-0024:** инвариант «один user — один TG» снят. Один `user_id` может иметь **несколько** активных `telegram_user_id` (мягкий потолок `TG_MAX_LINKS_PER_USER`, default 10). Направление `telegram_user_id` (PK) → `user_id` остаётся 1:1, поэтому SSO-резолв однозначен.
 
 | Колонка | Тип | Constraints | Описание |
 | --- | --- | --- | --- |
-| `telegram_user_id` | BIGINT | PRIMARY KEY | Telegram User.id (из подписанного `init_data.user`). PK выбран для атомарного `INSERT … ON CONFLICT (telegram_user_id) DO UPDATE` при перепривязке. |
-| `user_id` | BIGINT | NOT NULL, UNIQUE, FK → `users(id)` ON DELETE CASCADE | Внутренний user. UNIQUE → один internal user — максимум один Telegram. |
+| `telegram_user_id` | BIGINT | PRIMARY KEY | Telegram User.id (из подписанного `init_data.user`). PK выбран для атомарного `INSERT … ON CONFLICT (telegram_user_id) DO UPDATE` при перепривязке. Один TG-аккаунт по-прежнему принадлежит ровно одному internal user. |
+| `user_id` | BIGINT | NOT NULL, FK → `users(id)` ON DELETE CASCADE | Внутренний user. **ADR-0024: UNIQUE снят** — один user может иметь несколько TG-привязок. |
 | `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | Обновляется при перепривязке через `ON CONFLICT DO UPDATE SET created_at=now()`. |
-| `dead_at` | TIMESTAMPTZ | NULL | Если != NULL — Bot API вернул 403/400 (user заблокировал бота); диспатчер пропускает доставку. При следующем успешном `POST /api/telegram/auth` от того же tg-user'а — обнуляется через upsert. |
+| `dead_at` | TIMESTAMPTZ | NULL | Если != NULL — Bot API вернул 403/400 (user заблокировал бота в ЭТОМ чате); диспатчер пропускает доставку в этот чат, остальные линки того же user'а живут. При следующем успешном `POST /api/telegram/auth` от того же tg-user'а — обнуляется через upsert. |
 
 **Индексы:**
 - PK на `telegram_user_id` — обслуживает lookup при SSO (`/api/telegram/auth`).
-- `telegram_links_user_id_idx` на `(user_id)` — обслуживает logout (`DELETE WHERE user_id=:uid`) и SQL получателей нотификаций (`JOIN telegram_links tl ON tl.user_id = u.id`).
+- `telegram_links_user_id_idx` на `(user_id)` (**неуникальный**, ADR-0024) — обслуживает logout (`DELETE WHERE user_id=:uid`), список «мои привязки» и SQL получателей нотификаций (`JOIN telegram_links tl ON tl.user_id = u.id` — теперь даёт по строке на каждый живой TG).
 
-**Объём:** ≤ 5 строк (≤ 5 пользователей × ≤ 1 tg-аккаунт).
+**Объём:** ≤ 5 пользователей × ≤ `TG_MAX_LINKS_PER_USER` (10) = ≤ 50 строк.
 
 ---
 
 ### `telegram_notifications`
 
-Источник истины — [ADR-0022](./adr/ADR-0022-telegram-sso-and-notifications.md) §2.3. Реестр доставленных push-уведомлений в Telegram (дедуп per `(message_id, user_id)`). Создаётся диспатчером перед `sendMessage` (через `INSERT … ON CONFLICT DO NOTHING`); если RETURNING пустой — доставка пропускается (уже было).
+Источник истины — [ADR-0022](./adr/ADR-0022-telegram-sso-and-notifications.md) §2.3 + [ADR-0024](./adr/ADR-0024-multi-telegram-links.md) §6. Реестр доставленных push-уведомлений в Telegram. **ADR-0024: дедуп per `(message_id, telegram_user_id)`** (раньше `(message_id, user_id)`) — при нескольких чатах на одного user каждый чат должен получить уведомление, поэтому ключ идемпотентности — конкретный чат. Создаётся диспатчером перед `sendMessage` (через `INSERT … ON CONFLICT DO NOTHING`); если RETURNING пустой — доставка в этот чат пропускается (уже было).
 
 | Колонка | Тип | Constraints | Описание |
 | --- | --- | --- | --- |
 | `id` | BIGSERIAL | PK | |
 | `message_id` | BIGINT | NOT NULL, FK → `messages(id)` ON DELETE CASCADE | Привязка к письму. CASCADE → автоматическая очистка при retention cleanup (ADR-0011). |
-| `user_id` | BIGINT | NOT NULL, FK → `users(id)` ON DELETE CASCADE | Получатель. |
+| `user_id` | BIGINT | NOT NULL, FK → `users(id)` ON DELETE CASCADE | Получатель-владелец (для аудита «что доставлено user X» и recovery-JOIN). |
+| `telegram_user_id` | BIGINT | NOT NULL | **ADR-0024:** конкретный chat_id, в который доставлено. FK на `telegram_links` НЕ ставится (реестр доставок переживает удаление/перепривязку линка — слепок chat_id на момент доставки, как `telegram_message_id`). Legacy-строки после миграции с потерянным линком → `0` (см. TD-028). |
 | `sent_at` | TIMESTAMPTZ | NULL | NULL → row claim'ed диспатчером, но `sendMessage` ещё не завершён (или провалился до COMMIT). Используется как маркер «попытка-без-доставки» при mark-dead. |
 | `telegram_message_id` | BIGINT | NULL | message_id в Telegram chat (ответ Bot API `sendMessage.result.message_id`). Зарезервирован под будущие операции (edit/delete уведомлений). |
 
 **Constraints:**
-- UNIQUE `(message_id, user_id)` (constraint `telegram_notifications_unique`) — идемпотентность доставки.
+- UNIQUE `(message_id, telegram_user_id)` (constraint/индекс `telegram_notifications_msg_chat_uq`) — идемпотентность доставки per-chat (ADR-0024). Старый `telegram_notifications_unique` на `(message_id, user_id)` — **снят**.
 
 **Индексы:**
-- UNIQUE-индекс по `(message_id, user_id)` — также обслуживает lookup «было ли уже отправлено».
-- `telegram_notifications_message_id_idx` на `(message_id)` — для recovery_scan LEFT JOIN.
-- `telegram_notifications_user_id_idx` на `(user_id)` — для будущих аудит-запросов «что отправлено user'у X».
+- UNIQUE-индекс по `(message_id, telegram_user_id)` — также обслуживает lookup «было ли уже отправлено в этот чат».
+- `telegram_notifications_message_id_idx` на `(message_id)` — для recovery_scan.
+- `telegram_notifications_user_id_idx` на `(user_id)` — для аудит-запросов «что отправлено user'у X».
 
-**Объём:** оценка ≤ 5 users × ≤ 100 ящиков × ~5 писем-с-тегами/день × 30 дней retention = **~75 000 строк max**. С `ON DELETE CASCADE` от `messages` автоматически очищается вместе с письмами (ADR-0011).
+**Объём:** оценка ≤ 5 users × ≤ `TG_MAX_LINKS_PER_USER` чатов × ≤ 100 ящиков × ~5 писем/день × 30 дней retention. С `ON DELETE CASCADE` от `messages` автоматически очищается вместе с письмами (ADR-0011).
 
 ---
 
@@ -776,3 +791,21 @@ BUILTIN_TAGS = [
      - `webhooks` — после первого `POST /api/webhooks/me` от лидера команды (или super_admin'а).
      - `webhook_deliveries` — после первого письма с тегом в команде, где настроен webhook (триггер симметричен ADR-0022, см. `worker.sync_cycle.save_message`).
   4. Backend-агент дополнительно расширяет `ALLOWED_ACTIONS` в `backend/app/audit/service.py` на 5 новых action'ов: `webhook_created`, `webhook_updated`, `webhook_deleted`, `webhook_secret_rotated`, `webhook_dead_marked` (см. таблицу `admin_audit` выше).
+- **Миграция `20260527_017_multi_telegram_links`** (ADR-0024, Спринт A) — down_revision `20260521_016`:
+  1. `op.drop_constraint(<uq telegram_links.user_id>, 'telegram_links')` — снять column-level UNIQUE с `user_id` (фактическое имя определить через `\d telegram_links`; column-level UNIQUE обычно `telegram_links_user_id_key`). Убедиться, что неуникальный `telegram_links_user_id_idx` существует (пересоздать, если он был поглощён unique-индексом).
+  2. `ALTER TABLE telegram_notifications ADD COLUMN telegram_user_id BIGINT NULL` (временно nullable для backfill).
+  3. Backfill: `UPDATE telegram_notifications tn SET telegram_user_id = tl.telegram_user_id FROM telegram_links tl WHERE tl.user_id = tn.user_id` (на момент миграции 1:1 ещё держится → однозначно).
+  4. Осиротевшие строки (линк уже удалён): `UPDATE telegram_notifications SET telegram_user_id = 0 WHERE telegram_user_id IS NULL` (синтетический legacy chat, TD-028; уже доставлены, вычистятся retention).
+  5. `ALTER COLUMN telegram_user_id SET NOT NULL`.
+  6. `op.drop_constraint('telegram_notifications_unique', 'telegram_notifications')` — снять `(message_id, user_id)`.
+  7. `CREATE UNIQUE INDEX telegram_notifications_msg_chat_uq ON telegram_notifications (message_id, telegram_user_id)`.
+  - `down`: lossy — восстановление `(message_id,user_id)` UNIQUE требует дедупа multi-chat строк (оставить `min(id)`); задокументировано в ADR-0024 §8.
+- **Миграция `20260527_018_outlook_oauth2`** (ADR-0025, Спринт B) — down_revision `20260527_017`:
+  1. `ALTER TABLE mail_accounts ADD COLUMN auth_type TEXT NOT NULL DEFAULT 'password'`.
+  2. `ADD COLUMN oauth_provider TEXT NULL`, `oauth_refresh_token_encrypted BYTEA NULL`, `oauth_access_token_encrypted BYTEA NULL`, `oauth_access_token_expires_at TIMESTAMPTZ NULL`, `oauth_needs_consent BOOLEAN NOT NULL DEFAULT false`, `oauth_scopes TEXT NULL`, `proxy_url TEXT NULL`.
+  3. `ALTER COLUMN encrypted_password DROP NOT NULL`.
+  4. `ADD CONSTRAINT ck_mail_accounts_auth_type CHECK (auth_type IN ('password','oauth_outlook'))`.
+  5. `ADD CONSTRAINT ck_mail_accounts_password_creds CHECK (auth_type <> 'password' OR encrypted_password IS NOT NULL)`.
+  6. `ADD CONSTRAINT ck_mail_accounts_oauth_creds CHECK (auth_type <> 'oauth_outlook' OR (oauth_refresh_token_encrypted IS NOT NULL AND oauth_provider = 'outlook'))`.
+  - Никакой data-миграции: все существующие строки получают `auth_type='password'` (default), инвариант выполняется (`encrypted_password` у них NOT NULL).
+  - `down`: drop constraints + columns; восстановить `encrypted_password NOT NULL` (lossy при наличии oauth-строк — требует предварительного удаления oauth-аккаунтов).

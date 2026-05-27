@@ -35,6 +35,10 @@ ALLOWED_ACTIONS: Final[frozenset[str]] = frozenset(
         "telegram_link_created",
         "telegram_link_revoked",
         "telegram_link_dead_marked",
+        # ADR-0024 — multi-TG link lifecycle.
+        "telegram_link_rebound",
+        "telegram_link_limit_reached",
+        # deprecated (ADR-0024 §3): no longer written, kept for historical rows.
         "telegram_link_collision",
         # ADR-0023 §G — outbound webhook lifecycle.
         "webhook_created",
