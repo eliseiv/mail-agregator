@@ -178,6 +178,15 @@ class TelegramLinkOwnedByOtherError(DomainError):
     code = "tg_link_owned_by_other"
 
 
+class OAuthReconsentRequiredError(DomainError):
+    """Send/test attempted on an oauth_outlook account whose refresh token was
+    invalidated (``oauth_needs_consent=true``) — ADR-0025 §9.1. The user must
+    reconnect Outlook before the account can be used again."""
+
+    status_code = 409
+    code = "oauth_reconsent_required"
+
+
 class WebhookUrlPrivateIpError(DomainError):
     """Outbound webhook URL would target a private/loopback/link-local
     address — ADR-0023 §4.3 SSRF protection.

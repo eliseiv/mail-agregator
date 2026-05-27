@@ -106,4 +106,6 @@ CLAUDE.md
 smoke_test.py
 _rt_*
 _rev_*
+_smoke_*
+docker-compose.qa-local.yml
 *.jpg

@@ -177,7 +177,8 @@ def fetch_blocking(
     port: int,
     ssl_on: bool,
     username: str,
-    password: str,
+    password: str | None = None,
+    access_token: str | None = None,
     last_synced_uidnext: int | None,
     last_uidvalidity: int | None,
     initial_sync_days: int,
@@ -189,9 +190,20 @@ def fetch_blocking(
 
     Implements ADR-0008 (UIDNEXT-based incremental + UIDVALIDITY check +
     initial 30-day backfill).
+
+    Authentication (ADR-0025 §4): when ``access_token`` is provided, the
+    mailbox authenticates via SASL XOAUTH2 (``MailBox.xoauth2`` — first-class
+    in imap-tools 1.6, TD-030); otherwise it does the classic ``LOGIN`` with
+    ``password``. Exactly one of ``password`` / ``access_token`` must be set.
     """
     mailbox = _open_mailbox(host=host, port=port, ssl_on=ssl_on, timeout=timeout)
-    mailbox.login(username, password, initial_folder="INBOX")
+    if access_token is not None:
+        # XOAUTH2 path (oauth_outlook accounts). ``outlook.office365.com`` is
+        # always SSL; ``_open_mailbox`` honours ``ssl_on`` regardless.
+        mailbox.xoauth2(username, access_token, initial_folder="INBOX")
+    else:
+        assert password is not None, "fetch_blocking needs a password or an access_token"
+        mailbox.login(username, password, initial_folder="INBOX")
     try:
         # imap-tools returns these as either str or int depending on the
         # server reply; coerce defensively.

@@ -113,6 +113,66 @@
   </details>
   {% endif %}
 
+  {% if not account %}
+  {# ── Подключение Outlook через OAuth2 (ADR-0025) ──────────────────────────
+     Личные Outlook-ящики (outlook.com / hotmail.com / live.com) с сентября 2024
+     не принимают логин по паролю — нужен OAuth2. Consent проходит в нужном
+     профиле OctoBrowser, поэтому мы НЕ редиректим автоматически: backend отдаёт
+     ссылку, пользователь открывает её в правильном профиле.
+     Секция видна всегда; если фича выключена на сервере (404 от authorize),
+     outlook_oauth.js прячет кнопку и показывает «недоступно». #}
+  <section class="outlook-oauth" aria-labelledby="outlook-oauth-heading" data-outlook-section>
+    <h2 id="outlook-oauth-heading" class="outlook-oauth__title">Личный Outlook (рекомендуется)</h2>
+    <p class="outlook-oauth__lead">
+      Для личных ящиков <code>@outlook.com</code>, <code>@hotmail.com</code>,
+      <code>@live.com</code> Microsoft больше не принимает пароль приложения.
+      Подключите ящик через защищённый вход Microsoft (OAuth2) — пароль вводить
+      не нужно.
+    </p>
+
+    <button type="button" class="btn btn--primary" data-outlook-connect>
+      Подключить Outlook (OAuth)
+    </button>
+
+    <p class="form-error outlook-oauth__error" role="alert" data-outlook-error hidden></p>
+
+    <p class="outlook-oauth__unavailable" role="status" data-outlook-unavailable hidden>
+      Подключение Outlook временно недоступно. Обратитесь к администратору
+      или добавьте ящик вручную ниже.
+    </p>
+
+    <div class="outlook-oauth__result" data-outlook-result hidden>
+      <p class="outlook-oauth__instruction">
+        <strong>Откройте эту ссылку в нужном профиле OctoBrowser</strong>, войдите
+        в нужный аккаунт Outlook и подтвердите доступ. После подтверждения ящик
+        автоматически появится в списке аккаунтов.
+      </p>
+      <div class="outlook-oauth__url-row">
+        <label class="visually-hidden" for="outlook-url">Ссылка для подключения Outlook</label>
+        <input class="field__input outlook-oauth__url" type="text" id="outlook-url"
+               readonly data-outlook-url
+               aria-describedby="outlook-oauth-heading">
+        <button type="button" class="btn btn--secondary btn--small" data-outlook-copy>
+          Скопировать
+        </button>
+        <a class="btn btn--secondary btn--small" data-outlook-open
+           href="#" target="_blank" rel="noopener noreferrer">
+          Открыть
+        </a>
+      </div>
+      <p class="field__hint">
+        Кнопка «Открыть» откроет ссылку в текущем браузере — используйте её только
+        если вы уже в нужном профиле. Для OctoBrowser скопируйте ссылку и вставьте
+        в адресную строку нужного профиля.
+      </p>
+    </div>
+  </section>
+
+  <div class="outlook-oauth__divider" role="separator" aria-hidden="true">
+    <span>или добавьте ящик вручную (IMAP / пароль)</span>
+  </div>
+  {% endif %}
+
   <p class="form-error" role="alert" data-account-error
      {% if not error_message %}hidden{% endif %}>{{ error_message | default('') | e }}</p>
 
@@ -325,4 +385,5 @@
 
 {% block extra_js %}
 <script src="/static/js/account_form.js?v={{ static_v }}"></script>
+<script src="/static/js/outlook_oauth.js?v={{ static_v }}"></script>
 {% endblock %}

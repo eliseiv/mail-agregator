@@ -16,6 +16,7 @@ port scanner (``docs/06-security.md`` sec. 4).
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import ssl
 from typing import Any
@@ -35,6 +36,19 @@ log = get_logger(__name__)
 
 _IMAP_TIMEOUT = 30
 _SMTP_TIMEOUT = 30
+
+
+def build_xoauth2_string(email: str, access_token: str) -> str:
+    """Build the base64 SASL XOAUTH2 initial-client-response (ADR-0025 §4).
+
+    Format (RFC 7628 / Microsoft):
+    ``base64("user=<email>\\x01auth=Bearer <token>\\x01\\x01")``.
+
+    Returned base64 is *not* a secret per se but embeds the access token, so
+    callers must never log it.
+    """
+    raw = f"user={email}\x01auth=Bearer {access_token}\x01\x01"
+    return base64.b64encode(raw.encode("utf-8")).decode("ascii")
 
 
 def _safe_error_text(exc: BaseException, max_len: int = 200) -> str:
@@ -152,6 +166,115 @@ async def smtp_test_login(
     except aiosmtplib.SMTPAuthenticationError as exc:
         raise SMTPLoginFailedError(
             "SMTP authentication failed",
+            details={"detail": _safe_error_text(exc)},
+        ) from exc
+    except (
+        aiosmtplib.SMTPConnectError,
+        aiosmtplib.SMTPServerDisconnected,
+        aiosmtplib.SMTPException,
+        TimeoutError,
+        OSError,
+    ) as exc:
+        raise SMTPLoginFailedError(
+            "Could not connect to SMTP server",
+            details={"detail": _safe_error_text(exc)},
+        ) from exc
+    finally:
+        with contextlib.suppress(Exception):
+            await client.quit()
+
+
+# ---------------------------------------------------------------------------
+# XOAUTH2 (ADR-0025) — used by oauth_outlook accounts (TD-030)
+# ---------------------------------------------------------------------------
+
+
+def _imap_oauth_login_blocking(host: str, port: int, email: str, access_token: str) -> None:
+    """Sync IMAP XOAUTH2 login + ``SELECT INBOX`` sanity check, then logout.
+
+    ``imap-tools`` exposes a first-class :meth:`MailBox.xoauth2` (builds the
+    SASL string and calls ``imaplib.authenticate('XOAUTH2', ...)``). We rely
+    on it rather than the lower-level ``client.authenticate`` (TD-030: if a
+    future imap-tools drop removes ``xoauth2`` this is the single place to
+    fall back to bare ``imaplib``). Personal Outlook IMAP is always SSL:993.
+    """
+    mailbox: Any | None = None
+    try:
+        mailbox = imap_tools.MailBox(host, port=port, timeout=_IMAP_TIMEOUT)
+        mailbox.xoauth2(email, access_token, initial_folder="INBOX")
+    except imap_tools.MailboxLoginError as exc:
+        raise IMAPLoginFailedError(
+            "IMAP XOAUTH2 login failed",
+            details={"detail": _safe_error_text(exc)},
+        ) from exc
+    except imap_tools.MailboxFolderSelectError as exc:
+        raise IMAPLoginFailedError(
+            "Cannot select INBOX",
+            details={"detail": "cannot_select_inbox"},
+        ) from exc
+    except (TimeoutError, OSError) as exc:
+        raise IMAPLoginFailedError(
+            "Could not connect to IMAP server",
+            details={"detail": _safe_error_text(exc)},
+        ) from exc
+
+    with contextlib.suppress(Exception):
+        mailbox.logout()
+
+
+async def imap_test_oauth(*, host: str, port: int, email: str, access_token: str) -> None:
+    """Test an IMAP XOAUTH2 connection. Raises :class:`IMAPLoginFailedError`."""
+    assert_public_host(host, port=port)
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(_imap_oauth_login_blocking, host, port, email, access_token),
+            timeout=_IMAP_TIMEOUT + 5,
+        )
+    except TimeoutError as exc:
+        raise IMAPLoginFailedError(
+            "IMAP XOAUTH2 login timed out",
+            details={"detail": "timeout"},
+        ) from exc
+
+
+async def smtp_test_oauth(
+    *, host: str, port: int, starttls: bool, email: str, access_token: str
+) -> None:
+    """Test an SMTP XOAUTH2 connection (ADR-0025 §4).
+
+    ``aiosmtplib`` 3.0.2 has no built-in XOAUTH2 mechanism, so we drive the
+    raw ``AUTH XOAUTH2 <base64>`` command via :meth:`SMTP.execute_command`
+    after STARTTLS (TD-030). Personal Outlook SMTP is ``smtp-mail.outlook.com``
+    :587 STARTTLS.
+    """
+    assert_public_host(host, port=port)
+    client = aiosmtplib.SMTP(
+        hostname=host,
+        port=port,
+        use_tls=False,
+        start_tls=False,
+        timeout=_SMTP_TIMEOUT,
+    )
+    auth_b64 = build_xoauth2_string(email, access_token)
+    try:
+        await client.connect()
+        if starttls:
+            await client.starttls(tls_context=_ssl_context())
+        await client.ehlo()
+        # AUTH XOAUTH2 <base64-initial-response>; a 235 means success.
+        resp = await client.execute_command(
+            b"AUTH",
+            b"XOAUTH2",
+            auth_b64.encode("ascii"),
+        )
+        if resp.code != 235:
+            raise SMTPLoginFailedError(
+                "SMTP XOAUTH2 authentication failed",
+                details={"detail": f"smtp_code_{resp.code}"},
+            )
+    except aiosmtplib.SMTPAuthenticationError as exc:
+        raise SMTPLoginFailedError(
+            "SMTP XOAUTH2 authentication failed",
             details={"detail": _safe_error_text(exc)},
         ) from exc
     except (

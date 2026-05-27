@@ -36,6 +36,21 @@
               <span class="account-list__provider">{{ acc.provider_label | e }}</span>
             {% endif %}
 
+            {# OAuth-аккаунты (ADR-0025): бейдж типа подключения + статус consent. #}
+            {% if acc.auth_type == 'oauth_outlook' %}
+              {% if acc.oauth_needs_consent %}
+                <span class="integrations-badge integrations-badge--warn"
+                      title="Доступ Microsoft отозван или истёк — нужно переподключить Outlook">
+                  Требуется повторное подключение
+                </span>
+              {% else %}
+                <span class="integrations-badge integrations-badge--ok"
+                      title="Подключён через защищённый вход Microsoft (OAuth2)">
+                  Outlook (OAuth)
+                </span>
+              {% endif %}
+            {% endif %}
+
             <span class="account-list__sync">
               {% if acc.last_synced_at %}
                 Синхронизация: {{ m.time_tag_short(acc.last_synced_at) }}
@@ -45,6 +60,11 @@
             </span>
 
             <span class="account-list__actions">
+              {% if acc.auth_type == 'oauth_outlook' and acc.oauth_needs_consent %}
+                <button type="button" class="btn btn--primary btn--small" data-outlook-reconnect>
+                  Переподключить
+                </button>
+              {% endif %}
               <a class="btn btn--secondary btn--small" href="/accounts/{{ acc.id }}/edit">Изменить</a>
 
               <form
@@ -88,9 +108,32 @@
       {% endfor %}
     </ul>
   {% endif %}
+
+  {# Панель переподключения Outlook (ADR-0025). Скрыта; outlook_oauth.js
+     раскрывает её при клике «Переподключить» и кладёт authorize_url. #}
+  <div class="outlook-oauth__result outlook-reconnect-panel" data-outlook-reconnect-panel hidden>
+    <p class="outlook-oauth__instruction">
+      <strong>Откройте эту ссылку в нужном профиле OctoBrowser</strong>, войдите
+      в нужный Outlook-аккаунт и подтвердите доступ заново. После подтверждения
+      синхронизация ящика возобновится.
+    </p>
+    <div class="outlook-oauth__url-row">
+      <label class="visually-hidden" for="outlook-reconnect-url">Ссылка для переподключения Outlook</label>
+      <input class="field__input outlook-oauth__url" type="text" id="outlook-reconnect-url"
+             readonly data-outlook-reconnect-url>
+      <button type="button" class="btn btn--secondary btn--small" data-outlook-reconnect-copy>
+        Скопировать
+      </button>
+      <a class="btn btn--secondary btn--small" data-outlook-reconnect-open
+         href="#" target="_blank" rel="noopener noreferrer">
+        Открыть
+      </a>
+    </div>
+  </div>
 </section>
 {% endblock %}
 
 {% block extra_js %}
 <script src="/static/js/account_form.js?v={{ static_v }}"></script>
+<script src="/static/js/outlook_oauth.js?v={{ static_v }}"></script>
 {% endblock %}

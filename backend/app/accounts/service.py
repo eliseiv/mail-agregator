@@ -19,14 +19,21 @@ from backend.app.accounts.schemas import (
     OwnerBriefDTO,
     TestResult,
 )
-from backend.app.accounts.testers import imap_test_login, smtp_test_login
+from backend.app.accounts.testers import (
+    imap_test_login,
+    imap_test_oauth,
+    smtp_test_login,
+    smtp_test_oauth,
+)
 from backend.app.deps import VisibilityScope
 from backend.app.exceptions import (
     ConflictError,
     ForbiddenError,
     NotFoundError,
+    OAuthReconsentRequiredError,
     ValidationError,
 )
+from backend.app.oauth.service import OAuthRefreshInvalidError, OutlookTokenService
 from backend.app.repositories.mail_accounts import MailAccountsRepo
 from backend.app.repositories.messages import MessagesRepo
 from backend.app.repositories.users import UsersRepo
@@ -37,6 +44,18 @@ from shared.redis_client import get_redis
 from shared.storage import get_storage
 
 log = get_logger(__name__)
+
+
+def _require(value: str | None, field: str) -> str:
+    """Narrow an optional credential field to ``str`` for the ad-hoc test path.
+
+    The :class:`MailAccountTestRequest` validator already guarantees these are
+    present when ``account_id`` is unset; this keeps mypy honest at the call
+    site and degrades to a clear 400 if a caller bypasses the schema.
+    """
+    if not value:
+        raise ValidationError(f"{field} is required", field=field)
+    return value
 
 
 def _to_dto(acc: MailAccount, owner: User) -> MailAccountDTO:
@@ -50,6 +69,8 @@ def _to_dto(acc: MailAccount, owner: User) -> MailAccountDTO:
         ),
         email=acc.email,
         display_name=acc.display_name,
+        auth_type=acc.auth_type,
+        oauth_needs_consent=acc.oauth_needs_consent,
         imap_host=acc.imap_host,
         imap_port=acc.imap_port,
         imap_ssl=acc.imap_ssl,
@@ -146,23 +167,133 @@ class MailAccountService:
 
     # --- Test login --------------------------------------------------------
 
-    async def test(self, payload: MailAccountTestRequest) -> TestResult:
-        await imap_test_login(
-            host=payload.imap_host,
-            port=payload.imap_port,
-            ssl_on=payload.imap_ssl,
-            username=payload.email,
-            password=payload.password,
+    async def test(
+        self,
+        payload: MailAccountTestRequest,
+        *,
+        scope: VisibilityScope | None = None,
+    ) -> TestResult:
+        """Test connectivity.
+
+        Two modes (ADR-0025 §4c):
+
+        - ``payload.account_id`` set → resolve the stored account (within the
+          caller's visibility ``scope``) and re-test it with its persisted
+          secrets. ``oauth_outlook`` accounts go the XOAUTH2 path
+          (refresh→access→connect); password accounts re-probe with the
+          stored password.
+        - otherwise → ad-hoc credential test using the submitted fields
+          (account-creation flow).
+        """
+        if payload.account_id is not None:
+            if scope is None:
+                # Defensive: the existing-account path is only reachable from
+                # the router, which always supplies a scope.
+                raise ValidationError("account_id requires an authenticated scope")
+            return await self._test_existing_account(scope, payload.account_id)
+        return await self._test_credentials(
+            email=_require(payload.email, "email"),
+            password=_require(payload.password, "password"),
+            imap_host=_require(payload.imap_host, "imap_host"),
+            imap_port=payload.imap_port,
+            imap_ssl=payload.imap_ssl,
+            smtp_host=_require(payload.smtp_host, "smtp_host"),
+            smtp_port=payload.smtp_port,
+            smtp_ssl=payload.smtp_ssl,
+            smtp_starttls=payload.smtp_starttls,
+            smtp_username=payload.smtp_username,
+            smtp_password=payload.smtp_password,
         )
-        smtp_user = payload.smtp_username or payload.email
-        smtp_pwd = payload.smtp_password or payload.password
+
+    async def _test_credentials(
+        self,
+        *,
+        email: str,
+        password: str,
+        imap_host: str,
+        imap_port: int,
+        imap_ssl: bool,
+        smtp_host: str,
+        smtp_port: int,
+        smtp_ssl: bool,
+        smtp_starttls: bool,
+        smtp_username: str | None,
+        smtp_password: str | None,
+    ) -> TestResult:
+        await imap_test_login(
+            host=imap_host,
+            port=imap_port,
+            ssl_on=imap_ssl,
+            username=email,
+            password=password,
+        )
         await smtp_test_login(
-            host=payload.smtp_host,
-            port=payload.smtp_port,
-            ssl_on=payload.smtp_ssl,
-            starttls=payload.smtp_starttls,
-            username=smtp_user,
-            password=smtp_pwd,
+            host=smtp_host,
+            port=smtp_port,
+            ssl_on=smtp_ssl,
+            starttls=smtp_starttls,
+            username=smtp_username or email,
+            password=smtp_password or password,
+        )
+        return TestResult(imap_ok=True, smtp_ok=True)
+
+    async def _test_existing_account(self, scope: VisibilityScope, account_id: int) -> TestResult:
+        visible = await self._visible_user_ids(scope)
+        acc = await self._repo.get_for_user_ids(visible, account_id)
+        if acc is None:
+            raise NotFoundError()
+
+        if acc.auth_type == "oauth_outlook":
+            return await self._test_oauth_account(acc)
+
+        # Password account: re-probe with the stored credentials.
+        assert acc.encrypted_password is not None
+        imap_pwd = decrypt_mail_password(acc.encrypted_password, acc.id)
+        if acc.smtp_encrypted_password is not None:
+            smtp_pwd: str = decrypt_mail_password(acc.smtp_encrypted_password, acc.id)
+        else:
+            smtp_pwd = imap_pwd
+        return await self._test_credentials(
+            email=acc.email,
+            password=imap_pwd,
+            imap_host=acc.imap_host,
+            imap_port=acc.imap_port,
+            imap_ssl=acc.imap_ssl,
+            smtp_host=acc.smtp_host,
+            smtp_port=acc.smtp_port,
+            smtp_ssl=acc.smtp_ssl,
+            smtp_starttls=acc.smtp_starttls,
+            smtp_username=acc.smtp_username,
+            smtp_password=smtp_pwd,
+        )
+
+    async def _test_oauth_account(self, acc: MailAccount) -> TestResult:
+        """XOAUTH2 connectivity probe for an oauth_outlook account (ADR-0025 §4).
+
+        Mirrors the send path: a needs-consent account is rejected with the
+        documented 409 before any token refresh / network connect.
+        """
+        if acc.oauth_needs_consent:
+            raise OAuthReconsentRequiredError("Reconnect Outlook to test this account")
+        try:
+            access_token = await OutlookTokenService(self._db).get_valid_access_token(acc)
+        except OAuthRefreshInvalidError as exc:
+            # The refresh token died between the consent and this probe — the
+            # service has already flagged ``oauth_needs_consent``; surface the
+            # documented 409 so the UI prompts a reconnect (ADR-0025 §9.1).
+            raise OAuthReconsentRequiredError("Reconnect Outlook to test this account") from exc
+        await imap_test_oauth(
+            host=acc.imap_host,
+            port=acc.imap_port,
+            email=acc.email,
+            access_token=access_token,
+        )
+        await smtp_test_oauth(
+            host=acc.smtp_host,
+            port=acc.smtp_port,
+            starttls=acc.smtp_starttls,
+            email=acc.email,
+            access_token=access_token,
         )
         return TestResult(imap_ok=True, smtp_ok=True)
 
@@ -222,7 +353,7 @@ class MailAccountService:
         existing = await self._repo.find_by_user_email(target_user_id, payload.email)
         if existing is not None:
             raise ConflictError("Email already added", field="email")
-        await self.test(payload)
+        await self.test(payload.as_test_request())
 
         # FE-FIX round-10: bind the new account to the owner's CURRENT
         # group at insert time. Subsequent owner-group changes do NOT move
@@ -277,6 +408,41 @@ class MailAccountService:
         if acc is None:
             raise NotFoundError()
 
+        # ADR-0025 §4c: oauth_outlook accounts have fixed Microsoft host/port
+        # and token-based auth — only ``display_name`` may be edited. Any
+        # attempt to change credentials / hosts / ports is rejected.
+        if acc.auth_type == "oauth_outlook":
+            forbidden_changes = (
+                payload.email is not None
+                or payload.password is not None
+                or payload.imap_host is not None
+                or payload.imap_port is not None
+                or payload.imap_ssl is not None
+                or payload.smtp_host is not None
+                or payload.smtp_port is not None
+                or payload.smtp_ssl is not None
+                or payload.smtp_starttls is not None
+                or payload.smtp_username is not None
+                or payload.smtp_password is not None
+            )
+            if forbidden_changes:
+                raise ValidationError(
+                    "OAuth accounts allow editing only the display name",
+                    field="auth_type",
+                )
+            oauth_update_fields: dict[str, object] = {}
+            if payload.clear_display_name:
+                oauth_update_fields["display_name"] = None
+            elif payload.display_name is not None:
+                oauth_update_fields["display_name"] = payload.display_name
+            if oauth_update_fields:
+                await self._repo.update_fields(account_id, **oauth_update_fields)
+            refreshed = await self._repo.get_by_id(account_id)
+            assert refreshed is not None
+            owner = await self._users.get_by_id(refreshed.user_id)
+            assert owner is not None
+            return _to_dto(refreshed, owner)
+
         new_email = payload.email or acc.email
         new_imap_host = payload.imap_host or acc.imap_host
         new_imap_port = payload.imap_port or acc.imap_port
@@ -308,6 +474,10 @@ class MailAccountService:
             if payload.password:
                 imap_pwd = payload.password
             else:
+                # password accounts always have a non-NULL encrypted_password
+                # (DB CHECK ck_mail_accounts_password_creds); oauth accounts
+                # already returned above.
+                assert acc.encrypted_password is not None
                 imap_pwd = decrypt_mail_password(acc.encrypted_password, acc.id)
 
             if payload.smtp_password:

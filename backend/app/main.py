@@ -46,6 +46,7 @@ from backend.app.middlewares import (
     SecurityHeadersMiddleware,
     SessionMiddleware,
 )
+from backend.app.oauth.router import router as oauth_router
 from backend.app.rate_limit import install_rate_limiter
 from backend.app.send.router import router as send_router
 from backend.app.tags.router import router as tags_router
@@ -158,6 +159,7 @@ def create_app() -> FastAPI:
     # --- Routers ---
     app.include_router(auth_router)
     app.include_router(accounts_router)
+    app.include_router(oauth_router)
     app.include_router(messages_router)
     app.include_router(send_router)
     app.include_router(tags_router)

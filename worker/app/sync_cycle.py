@@ -35,6 +35,7 @@ from cryptography.exceptions import InvalidTag
 # `shared/` per ``deploy/Dockerfile``.
 from backend.app.audit import AuditWriter
 from backend.app.exceptions import InvalidHostError
+from backend.app.oauth.service import OAuthError, OAuthRefreshInvalidError, OutlookTokenService
 from backend.app.repositories.mail_accounts import MailAccountsRepo
 from backend.app.repositories.messages import MessagesRepo
 from backend.app.repositories.users import UsersRepo
@@ -127,16 +128,14 @@ async def sync_one_account(
     cycle_log = log.bind(mail_account_id=account.id, user_id=account.user_id)
     cycle_log.info("sync_account_start")
 
-    try:
-        password = decrypt_mail_password(account.encrypted_password, account.id)
-    except InvalidTag as exc:
-        cycle_log.error("sync_account_decrypt_fail", detail=str(exc)[:200])
-        await _record_failure(
-            account.id,
-            error="decrypt_fail",
-            disable=True,
-        )
+    # ADR-0025 §4: resolve credentials — an XOAUTH2 access token for
+    # oauth_outlook accounts (refreshed if needed) or the decrypted password
+    # otherwise. ``None`` means "skip this account" (the helper already
+    # recorded the appropriate state / failure).
+    creds = await _resolve_credentials(account, cycle_log)
+    if creds is None:
         return 0, 0
+    password, access_token = creds
 
     # SSRF guard per ``docs/06-security.md`` sec. 4: backend (test) AND worker
     # (sync) must verify the host doesn't resolve to a private network. Guards
@@ -163,6 +162,7 @@ async def sync_one_account(
                 ssl_on=account.imap_ssl,
                 username=account.email,
                 password=password,
+                access_token=access_token,
                 last_synced_uidnext=account.last_synced_uidnext,
                 last_uidvalidity=account.last_uidvalidity,
                 initial_sync_days=initial_sync_days,
@@ -377,6 +377,73 @@ async def sync_one_account(
 # ---------------------------------------------------------------------------
 # Helpers used by sync_one_account
 # ---------------------------------------------------------------------------
+
+
+async def _resolve_credentials(
+    account: MailAccount, cycle_log: structlog.stdlib.BoundLogger
+) -> tuple[str | None, str | None] | None:
+    """Resolve ``(password, access_token)`` for the account, or ``None`` to skip.
+
+    Exactly one of the two is non-``None`` on success. Returning ``None`` means
+    the account must be skipped this cycle — the helper has already logged /
+    recorded the reason (oauth needs-consent, decrypt fail, token error).
+    """
+    if account.auth_type == "oauth_outlook":
+        if account.oauth_needs_consent:
+            # Refresh invalidated by Microsoft — skip without bumping the
+            # failure counter (ADR-0025 §3 step 5); UI prompts re-consent.
+            cycle_log.info("sync_account_oauth_needs_consent")
+            return None
+        token = await _resolve_oauth_access_token(account, cycle_log)
+        if token is None:
+            return None
+        return None, token
+
+    try:
+        assert account.encrypted_password is not None
+        password = decrypt_mail_password(account.encrypted_password, account.id)
+    except (InvalidTag, AssertionError) as exc:
+        cycle_log.error("sync_account_decrypt_fail", detail=str(exc)[:200])
+        await _record_failure(account.id, error="decrypt_fail", disable=True)
+        return None
+    return password, None
+
+
+async def _resolve_oauth_access_token(
+    account: MailAccount, cycle_log: structlog.stdlib.BoundLogger
+) -> str | None:
+    """Get a valid XOAUTH2 access token for an oauth_outlook account (ADR-0025 §3).
+
+    Returns ``None`` (and records the appropriate state) when a token cannot
+    be obtained:
+    - ``invalid_grant`` -> :class:`OutlookTokenService` already flagged
+      ``oauth_needs_consent``; we skip without bumping the failure counter.
+    - any other token-endpoint error / network blip -> bump the failure
+      counter so the standard auto-disable-after-3 path applies.
+    """
+    try:
+        async with make_session() as s:
+            return await OutlookTokenService(s).get_valid_access_token(account)
+    except OAuthRefreshInvalidError:
+        # Already marked needs-consent inside the service; nothing else to do.
+        cycle_log.info("sync_account_oauth_refresh_invalidated")
+        return None
+    except OAuthError as exc:
+        cycle_log.warning("sync_account_oauth_token_error", detail=str(exc.code))
+        failed = await _record_failure(
+            account.id, error=f"oauth_token_error: {exc.code}", disable=False
+        )
+        if failed >= _DISABLE_AFTER_FAILS:
+            await _disable_after_failures(account.id, failed=failed, user_id=account.user_id)
+        return None
+    except Exception as exc:  # network / unexpected — treat as transient failure
+        cycle_log.warning("sync_account_oauth_token_unexpected", detail=str(exc)[:200])
+        failed = await _record_failure(
+            account.id, error=f"oauth_token_unexpected: {type(exc).__name__}", disable=False
+        )
+        if failed >= _DISABLE_AFTER_FAILS:
+            await _disable_after_failures(account.id, failed=failed, user_id=account.user_id)
+        return None
 
 
 async def _record_failure(account_id: int, *, error: str, disable: bool) -> int:

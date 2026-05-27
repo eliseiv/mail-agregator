@@ -183,7 +183,7 @@ async def test_account(
     payload: MailAccountTestRequest, db: DbSession, scope: CurrentScope
 ) -> TestResult:
     await consume(LIMIT_ACCOUNT_TEST, str(scope.user_id))
-    return await MailAccountService(db).test(payload)
+    return await MailAccountService(db).test(payload, scope=scope)
 
 
 @api.post(

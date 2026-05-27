@@ -49,6 +49,17 @@ REDACT_KEYS: frozenset[str] = frozenset(
         "TELEGRAM_BOT_TOKEN",
         "TELEGRAM_WEBHOOK_SECRET",
         "X-Telegram-Bot-Api-Secret-Token",
+        # OAuth2 Outlook (ADR-0025 §1.11, docs/06-security.md): never log the
+        # authorization code, tokens, PKCE verifier or client secret.
+        "OUTLOOK_CLIENT_SECRET",
+        "client_secret",
+        "code",
+        "code_verifier",
+        "access_token",
+        "refresh_token",
+        "oauth_access_token",
+        "oauth_refresh_token",
+        "id_token",
     }
 )
 

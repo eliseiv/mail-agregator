@@ -1124,7 +1124,7 @@ Payload (`event="message_tagged"`):
 | --- | --- |
 | Auth | session cookie. |
 | Логика | Генерит `state` (32B urlsafe) + PKCE `code_verifier`/`code_challenge` (S256), сохраняет в Redis `oauth_state:{state}` = `{user_id, code_verifier}` TTL `OUTLOOK_OAUTH_STATE_TTL_SECONDS` (default 600), привязка к `session.user_id`. Строит Microsoft authorize URL. |
-| 200 | `{"authorize_url": "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize?..."}` — фронт показывает ссылку «открыть в OctoBrowser» (НЕ auto-redirect — пользователь открывает в нужном профиле). |
+| 200 | `{"authorize_url": "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize?...", "state": "<32B urlsafe>"}` (`OAuthAuthorizeResponse`) — фронт показывает ссылку «открыть в OctoBrowser» (НЕ auto-redirect — пользователь открывает в нужном профиле). `state` отдаётся для отображения/трекинга на клиенте. |
 | 404 | `not_found` если `OUTLOOK_OAUTH_ENABLED=false`. |
 
 ### `GET /api/oauth/outlook/callback`
@@ -1133,7 +1133,7 @@ Payload (`event="message_tagged"`):
 | Это | зарегистрированный в Azure `redirect_uri` = `{APP_BASE_URL}/api/oauth/outlook/callback`. |
 | Query | `code`, `state` (успех) либо `error`, `error_description` (отказ). |
 | Логика | GET+DEL `oauth_state:{state}` (одноразовый); нет/истёк → `400 oauth_state_invalid`. Обмен `code`→токены на token endpoint (`grant_type=authorization_code` + `code_verifier`). Email из `id_token`/Graph `GET /me`. Create/update `mail_account` (`auth_type='oauth_outlook'`, Outlook host/port, зашифрованные токены). Q-OAUTH-1: callback может прийти без cookie сессии (другой OctoBrowser-профиль) → доверяем Redis-state, привязанному к `user_id`. |
-| 302 | Редирект на `/accounts` с flash «Outlook подключён». |
+| 302 | Редирект на `/accounts?outlook=connected` (фронт показывает «Outlook подключён» по query-параметру). |
 | 400 | `oauth_state_invalid` / `oauth_exchange_failed` (token endpoint вернул ошибку) / `oauth_consent_denied` (пришёл `error`). |
 | Audit | `oauth_account_linked` с `details={mail_account_id, email, scopes}`. |
 | CSRF | exempt (state выполняет роль anti-CSRF; cookie может отсутствовать). |

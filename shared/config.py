@@ -132,6 +132,22 @@ class Settings(BaseSettings):
     # skipped this tick and picked up later by the recovery scan.
     TG_SEND_PER_CHAT_PER_MINUTE: int = Field(default=20, ge=1, le=60)
 
+    # --- Outlook OAuth2 (ADR-0025, Sprint B) ------------------------------
+    # Azure App (Personal Microsoft accounts only) credentials. When BOTH
+    # client id and secret are set, ``outlook_oauth_enabled`` flips on and the
+    # ``/api/oauth/outlook/*`` routes serve real flows; otherwise they 404
+    # (route hidden — symmetric to ``telegram_bot_enabled``).
+    OUTLOOK_CLIENT_ID: str = ""
+    # Marked redact in ``shared/logging.py`` (alongside MAIL_ENCRYPTION_KEY).
+    OUTLOOK_CLIENT_SECRET: str = ""
+    # ``{APP_BASE_URL}/api/oauth/outlook/callback`` — must match Azure exactly.
+    OUTLOOK_REDIRECT_URI: str = ""
+    # tenant for the authorize/token endpoints; personal mailboxes -> consumers.
+    OUTLOOK_TENANT: str = "consumers"
+    # TTL of the Redis ``oauth_state:{state}`` key (CSRF/anti-fixation state +
+    # PKCE verifier). Default 600s per ADR-0025 §6.
+    OUTLOOK_OAUTH_STATE_TTL_SECONDS: int = Field(default=600, ge=60, le=3600)
+
     # --- Outbound webhooks dispatcher (ADR-0023 §3 + §5) ------------------
     # How often ``webhook_dispatch`` drains the Redis queue.
     WEBHOOK_DISPATCH_INTERVAL_SECONDS: int = Field(default=5, ge=1, le=600)
@@ -217,6 +233,26 @@ class Settings(BaseSettings):
         BotFather setup.
         """
         return bool(self.BOT_TOKEN and self.TELEGRAM_WEBHOOK_SECRET and self.TELEGRAM_WEBAPP_URL)
+
+    @property
+    def outlook_oauth_enabled(self) -> bool:
+        """True only when both Azure App credentials are configured (ADR-0025 §6).
+
+        Derived flag — symmetric with :pyattr:`telegram_bot_enabled`. When
+        false the ``/api/oauth/outlook/*`` routes return 404 (feature hidden);
+        lets us wire the routes in dev/CI without a real Azure App.
+        """
+        return bool(self.OUTLOOK_CLIENT_ID and self.OUTLOOK_CLIENT_SECRET)
+
+    @property
+    def outlook_authorize_endpoint(self) -> str:
+        """Microsoft authorize endpoint for the configured tenant (ADR-0025 §6)."""
+        return f"https://login.microsoftonline.com/{self.OUTLOOK_TENANT}/oauth2/v2.0/authorize"
+
+    @property
+    def outlook_token_endpoint(self) -> str:
+        """Microsoft token endpoint for the configured tenant (ADR-0025 §6)."""
+        return f"https://login.microsoftonline.com/{self.OUTLOOK_TENANT}/oauth2/v2.0/token"
 
     def mail_master_key_bytes(self) -> bytes:
         """Decoded current key — never logged, never cached on disk."""

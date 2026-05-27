@@ -286,6 +286,107 @@ class MailAccountsRepo:
         await self._s.refresh(acc)
         return acc
 
+    async def insert_oauth_account_with_id(
+        self,
+        *,
+        account_id: int,
+        user_id: int,
+        group_id: int | None,
+        email: str,
+        oauth_provider: str,
+        oauth_refresh_token_encrypted: bytes,
+        oauth_access_token_encrypted: bytes | None,
+        oauth_access_token_expires_at: datetime | None,
+        oauth_scopes: str | None,
+        imap_host: str,
+        imap_port: int,
+        imap_ssl: bool,
+        smtp_host: str,
+        smtp_port: int,
+        smtp_ssl: bool,
+        smtp_starttls: bool,
+        display_name: str | None = None,
+    ) -> MailAccount:
+        """Insert an ``auth_type='oauth_outlook'`` row (ADR-0025).
+
+        ``encrypted_password`` stays NULL (oauth accounts have no password);
+        the DB CHECK ``ck_mail_accounts_oauth_creds`` enforces a non-NULL
+        ``oauth_refresh_token_encrypted`` + ``oauth_provider='outlook'``.
+        """
+        acc = MailAccount(
+            id=account_id,
+            user_id=user_id,
+            group_id=group_id,
+            email=email,
+            display_name=display_name,
+            encrypted_password=None,
+            auth_type="oauth_outlook",
+            oauth_provider=oauth_provider,
+            oauth_refresh_token_encrypted=oauth_refresh_token_encrypted,
+            oauth_access_token_encrypted=oauth_access_token_encrypted,
+            oauth_access_token_expires_at=oauth_access_token_expires_at,
+            oauth_needs_consent=False,
+            oauth_scopes=oauth_scopes,
+            imap_host=imap_host,
+            imap_port=imap_port,
+            imap_ssl=imap_ssl,
+            smtp_host=smtp_host,
+            smtp_port=smtp_port,
+            smtp_ssl=smtp_ssl,
+            smtp_starttls=smtp_starttls,
+            smtp_username=None,
+            smtp_encrypted_password=None,
+            is_active=True,
+            consecutive_failures=0,
+        )
+        self._s.add(acc)
+        await self._s.flush()
+        await self._s.refresh(acc)
+        return acc
+
+    async def update_oauth_tokens(
+        self,
+        account_id: int,
+        *,
+        oauth_refresh_token_encrypted: bytes | None = None,
+        oauth_access_token_encrypted: bytes | None = None,
+        oauth_access_token_expires_at: datetime | None = None,
+        oauth_scopes: str | None = None,
+        oauth_needs_consent: bool | None = None,
+    ) -> None:
+        """Persist refreshed OAuth tokens / consent state (ADR-0025 §3).
+
+        Only non-``None`` keyword arguments are written, so a plain
+        access-token refresh does not clobber the stored refresh token unless
+        Microsoft rotated it.
+        """
+        values: dict[str, object] = {"updated_at": datetime.now(UTC)}
+        if oauth_refresh_token_encrypted is not None:
+            values["oauth_refresh_token_encrypted"] = oauth_refresh_token_encrypted
+        if oauth_access_token_encrypted is not None:
+            values["oauth_access_token_encrypted"] = oauth_access_token_encrypted
+        if oauth_access_token_expires_at is not None:
+            values["oauth_access_token_expires_at"] = oauth_access_token_expires_at
+        if oauth_scopes is not None:
+            values["oauth_scopes"] = oauth_scopes
+        if oauth_needs_consent is not None:
+            values["oauth_needs_consent"] = oauth_needs_consent
+        await self._s.execute(
+            update(MailAccount).where(MailAccount.id == account_id).values(**values)
+        )
+
+    async def mark_oauth_needs_consent(self, account_id: int) -> None:
+        """Flag an oauth account as requiring re-consent (Microsoft invalid_grant).
+
+        ADR-0025 §3 step 5: leave ``is_active`` untouched; the worker skips
+        sync while ``oauth_needs_consent`` is true and the UI shows "reconnect".
+        """
+        await self._s.execute(
+            update(MailAccount)
+            .where(MailAccount.id == account_id)
+            .values(oauth_needs_consent=True, updated_at=datetime.now(UTC))
+        )
+
     async def update_fields(self, account_id: int, **fields: object) -> None:
         if not fields:
             return

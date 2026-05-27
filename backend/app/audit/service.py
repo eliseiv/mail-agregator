@@ -46,6 +46,9 @@ ALLOWED_ACTIONS: Final[frozenset[str]] = frozenset(
         "webhook_deleted",
         "webhook_secret_rotated",
         "webhook_dead_marked",
+        # ADR-0025 §8 — OAuth Outlook account lifecycle.
+        "oauth_account_linked",
+        "oauth_refresh_invalidated",
     }
 )
 

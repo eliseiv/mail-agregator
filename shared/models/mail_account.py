@@ -47,7 +47,28 @@ class MailAccount(Base):
     )
     email: Mapped[str] = mapped_column(Text, nullable=False)
     display_name: Mapped[str | None] = mapped_column(Text, nullable=True)
-    encrypted_password: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    # ADR-0025: ``encrypted_password`` is now NULLABLE — oauth_outlook
+    # accounts authenticate via XOAUTH2 tokens and have no password. The
+    # CHECK ``ck_mail_accounts_password_creds`` keeps it NOT NULL for
+    # ``auth_type='password'`` rows.
+    encrypted_password: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    # --- ADR-0025: OAuth2 (XOAUTH2) for personal Outlook accounts ---------
+    # ``password`` = IMAP/SMTP LOGIN with ``encrypted_password``;
+    # ``oauth_outlook`` = SASL XOAUTH2 with the oauth_* token columns below.
+    auth_type: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'password'"))
+    oauth_provider: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # AES-256-GCM blobs (shared.crypto.MailPasswordCipher, AAD=account_id).
+    oauth_refresh_token_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    oauth_access_token_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    oauth_access_token_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    oauth_needs_consent: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+    oauth_scopes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Reserved per-account proxy (ADR-0025 §1, TD-029) — NOT used yet.
+    proxy_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     imap_host: Mapped[str] = mapped_column(Text, nullable=False)
     imap_port: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("993"))
     imap_ssl: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
@@ -81,6 +102,20 @@ class MailAccount(Base):
         CheckConstraint(
             "display_name IS NULL OR char_length(display_name) BETWEEN 1 AND 100",
             name="ck_mail_accounts_display_name_length",
+        ),
+        # ADR-0025 — auth_type domain + per-type credential invariants.
+        CheckConstraint(
+            "auth_type IN ('password', 'oauth_outlook')",
+            name="ck_mail_accounts_auth_type",
+        ),
+        CheckConstraint(
+            "auth_type <> 'password' OR encrypted_password IS NOT NULL",
+            name="ck_mail_accounts_password_creds",
+        ),
+        CheckConstraint(
+            "auth_type <> 'oauth_outlook' "
+            "OR (oauth_refresh_token_encrypted IS NOT NULL AND oauth_provider = 'outlook')",
+            name="ck_mail_accounts_oauth_creds",
         ),
         UniqueConstraint("user_id", "email", name="uq_mail_accounts_user_email"),
         Index("ix_mail_accounts_user_id", "user_id"),
