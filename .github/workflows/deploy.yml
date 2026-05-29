@@ -167,7 +167,16 @@ jobs:
 
           # Recreate exactly the services that ship our code (now that the
           # schema is at head — new code never starts on an old schema).
-          docker compose --profile prod up -d --remove-orphans api worker
+          # --force-recreate is mandatory: when the image is pulled under the
+          # same tag, or when ONLY .env (env_file) changed, compose considers
+          # the running container "up to date" and silently skips it. That
+          # caused a prod incident where new code + new OUTLOOK_* env vars did
+          # NOT apply (containers stayed on the previous image/.env until a
+          # manual `up -d --force-recreate`). Forcing recreation guarantees
+          # both the new image AND the refreshed .env are picked up. The blip
+          # is the same few seconds as any deploy; mas-migrations above is a
+          # one-shot `run --rm` and is unaffected; this stays idempotent.
+          docker compose --profile prod up -d --remove-orphans --force-recreate api worker
 
           # Recreate nginx AFTER api/worker so two things happen, fixing the
           # recurring "502 Bad Gateway after deploy" for good:
