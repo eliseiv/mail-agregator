@@ -12,12 +12,34 @@ OUTLOOK_IMAP_PORT: Final[int] = 993
 OUTLOOK_SMTP_HOST: Final[str] = "smtp-mail.outlook.com"
 OUTLOOK_SMTP_PORT: Final[int] = 587
 
-# Minimal delegated scopes (ADR-0025 §5). ``offline_access`` is required to
-# obtain a refresh token; ``openid email profile`` let us read the mailbox
-# address from the id_token without a Graph call.
+# Minimal delegated scopes (ADR-0025 §5).
+#
+# IMPORTANT: the OAuth *scope resource* for Outlook IMAP/SMTP is
+# ``outlook.office.com`` — NOT ``outlook.office365.com``. The latter is the
+# IMAP/SMTP *connection host* (outlook.office365.com:993, see
+# ``OUTLOOK_IMAP_HOST`` above), but Microsoft rejects it as a scope resource
+# with ``invalid_scope`` ("The provided resource value for the input
+# parameter 'scope' is not valid.").
+#
+# ``offline_access`` is required to obtain a refresh token. ``openid`` yields
+# an id_token; we ALSO request the reserved OIDC scopes ``email`` and
+# ``profile`` so the id_token reliably carries an email-bearing claim
+# (``email`` / ``preferred_username`` / ``upn`` / ``unique_name``) for personal
+# Microsoft accounts — ``_decode_email_from_id_token`` reads those to resolve
+# the mailbox address without a Graph call.
+#
+# NOTE: ``email`` / ``profile`` are reserved OpenID Connect scopes addressed to
+# the *identity* endpoint, not the Graph resource — adding them alongside the
+# ``outlook.office.com`` resource scopes does NOT trigger ``invalid_scope``
+# (real-world consent succeeded with this exact set). The earlier
+# ``invalid_scope`` was caused ONLY by the wrong resource host
+# (``outlook.office365.com`` -> ``outlook.office.com``), not by these scopes.
+# Dropping ``email``/``profile`` left the id_token without an email claim for
+# personal accounts, yielding "Could not resolve mailbox email" — hence they
+# are restored here.
 OUTLOOK_SCOPES: Final[tuple[str, ...]] = (
-    "https://outlook.office365.com/IMAP.AccessAsUser.All",
-    "https://outlook.office365.com/SMTP.Send",
+    "https://outlook.office.com/IMAP.AccessAsUser.All",
+    "https://outlook.office.com/SMTP.Send",
     "offline_access",
     "openid",
     "email",

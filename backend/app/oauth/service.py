@@ -118,7 +118,13 @@ def _decode_email_from_id_token(id_token: str | None) -> str | None:
     We do NOT verify the JWT signature here — the token came straight from a
     TLS call to Microsoft's token endpoint in response to our own
     authorization-code exchange, so it is trusted transport-wise (ADR-0025
-    §2 step 4). We only need the ``email`` / ``preferred_username`` claim.
+    §2 step 4). We only need an email-bearing claim: personal Microsoft
+    accounts populate it inconsistently, so we probe several known claim names
+    (``email`` / ``preferred_username`` / ``upn`` / ``unique_name``).
+
+    On failure we log the *names* of the claims Microsoft sent (never their
+    values, and never the raw id_token) to aid debugging without leaking PII or
+    secrets.
     """
     if not id_token:
         return None
@@ -133,8 +139,17 @@ def _decode_email_from_id_token(id_token: str | None) -> str | None:
         return None
     if not isinstance(payload, dict):
         return None
-    email = payload.get("email") or payload.get("preferred_username")
-    return email if isinstance(email, str) and "@" in email else None
+    for claim in ("email", "preferred_username", "upn", "unique_name"):
+        value = payload.get(claim)
+        if isinstance(value, str) and "@" in value:
+            return value
+    # No email-bearing claim found. Log only the claim KEYS (not values) so we
+    # can see what Microsoft returned without logging the token or any PII.
+    log.warning(
+        "oauth.id_token_no_email_claim",
+        claim_keys=sorted(payload.keys()),
+    )
+    return None
 
 
 class _TokenClient:
