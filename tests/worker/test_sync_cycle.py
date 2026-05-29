@@ -94,51 +94,71 @@ class TestSyncOneAccount:
         async with factory() as ses:
             acc = await ses.get(MailAccount, admin_user_with_account["account_id"])
         assert acc is not None
-        new_count, conflict = await sc.sync_one_account(
+        # ADR-0026: sync_one_account returns an _AccountResult and no longer bumps
+        # the counter in the moment of error — a timeout is TRANSIENT (phase 0
+        # writes last_sync_error only; bump/disable deferred to phase 2).
+        result = await sc.sync_one_account(
             acc,
             timeout_seconds=1,
             initial_sync_days=30,
             max_body_bytes=1024,
             max_att_bytes=1024,
         )
-        assert new_count == 0 and conflict == 0
+        assert result.new_count == 0 and result.conflict_count == 0
+        assert result.outcome == "transient"
 
         async with factory() as ses:
             acc2 = await ses.get(MailAccount, admin_user_with_account["account_id"])
         assert acc2 is not None
-        assert acc2.consecutive_failures >= 1
+        # Transient: counter UNCHANGED, account NOT disabled, error recorded.
+        assert acc2.consecutive_failures == 0
+        assert acc2.is_active is True
         assert acc2.last_sync_error is not None
         assert "timeout" in acc2.last_sync_error.lower()
 
-    async def test_three_consecutive_timeouts_auto_disable_and_audit(
+    async def test_repeated_timeouts_never_disable_transient(
         self,
         admin_user_with_account: dict[str, Any],
         db_engine: AsyncEngine,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        """ADR-0026 root-cause-A fix: timeouts are TRANSIENT and must NEVER disable.
+
+        Pre-ADR-0026 three consecutive timeouts auto-disabled the mailbox — exactly
+        the over-eager disable the ADR removed. Run the FULL two-phase
+        ``_run_for_accounts`` three times; the account must stay active, the
+        counter must stay 0, and no ``account_auto_disabled`` audit may be written.
+        (Permanent-only threshold disable is covered in
+        test_breaker_repo_adr0026.py.)
+        """
+
+        # Deterministically surface a timeout the way a real IMAP stall does:
+        # ``asyncio.wait_for`` raises ``TimeoutError`` when the to_thread call
+        # exceeds the cycle's ``IMAP_TIMEOUT_SECONDS``. We raise it directly so
+        # the test exercises the timeout->transient path regardless of the
+        # configured timeout (sleeping less than IMAP_TIMEOUT_SECONDS would
+        # instead let ``fetch_blocking`` "return" None and raise an unrelated
+        # AttributeError, which masks what this test is asserting).
         async def _fake_to_thread(*_a: Any, **_k: Any) -> None:
-            await asyncio.sleep(10)
+            raise TimeoutError("timed out")
 
         monkeypatch.setattr(asyncio, "to_thread", _fake_to_thread)
         factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
-        async with factory() as ses:
-            acc = await ses.get(MailAccount, admin_user_with_account["account_id"])
-        assert acc is not None
 
         for _ in range(3):
-            await sc.sync_one_account(
-                acc,
-                timeout_seconds=1,
-                initial_sync_days=30,
-                max_body_bytes=1024,
-                max_att_bytes=1024,
-            )
+            async with factory() as ses:
+                acc = await ses.get(MailAccount, admin_user_with_account["account_id"])
+            assert acc is not None
+            await sc._run_for_accounts([acc])
 
         async with factory() as ses:
             acc2 = await ses.get(MailAccount, admin_user_with_account["account_id"])
         assert acc2 is not None
-        assert acc2.is_active is False
-        assert acc2.consecutive_failures >= 3
+        assert acc2.is_active is True  # transient never disables
+        assert acc2.consecutive_failures == 0  # transient never bumps
+        assert acc2.last_sync_error is not None
+        assert "timeout" in acc2.last_sync_error.lower()
+
         async with factory() as ses:
             audits = (
                 (
@@ -149,8 +169,7 @@ class TestSyncOneAccount:
                 .scalars()
                 .all()
             )
-        assert len(audits) >= 1
-        assert audits[0].target_user_id == admin_user_with_account["user_id"]
+        assert audits == []  # no auto-disable for transient timeouts
 
     async def test_decrypt_failure_disables_account(
         self,
@@ -169,21 +188,31 @@ class TestSyncOneAccount:
         async with factory() as ses:
             acc = await ses.get(MailAccount, admin_user_with_account["account_id"])
         assert acc is not None
-        new_count, _ = await sc.sync_one_account(
-            acc,
-            timeout_seconds=10,
-            initial_sync_days=30,
-            max_body_bytes=1024,
-            max_att_bytes=1024,
-        )
-        assert new_count == 0
+        # ADR-0026: decrypt failure is an EXPLICIT PERMANENT (rule 9) — instant
+        # disable, but the disable happens in phase 2. Run the full cycle (single
+        # account, breaker not engaged) so phase 0 classifies + phase 2 disables.
+        await sc._run_for_accounts([acc])
 
         async with factory() as ses:
             acc2 = await ses.get(MailAccount, admin_user_with_account["account_id"])
         assert acc2 is not None
-        assert acc2.is_active is False  # disable=True for decrypt failure
+        assert acc2.is_active is False  # explicit-permanent => instant disable
+        assert acc2.consecutive_failures == 1  # bumped once before disable
         assert acc2.last_sync_error is not None
         assert "decrypt" in acc2.last_sync_error.lower()
+
+        async with factory() as ses:
+            audits = (
+                (
+                    await ses.execute(
+                        select(AdminAudit).where(AdminAudit.action == "account_auto_disabled")
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        assert len(audits) == 1
+        assert audits[0].details["reason"] == "decrypt_fail"
 
     async def test_successful_sync_persists_messages_via_idempotent_insert(
         self,
@@ -243,29 +272,30 @@ class TestSyncOneAccount:
         assert acc is not None
 
         # First run: 1 new message inserted.
-        new1, conflict1 = await sc.sync_one_account(
+        res1 = await sc.sync_one_account(
             acc,
             timeout_seconds=10,
             initial_sync_days=30,
             max_body_bytes=1024,
             max_att_bytes=1024 * 1024,
         )
-        assert new1 == 1
-        assert conflict1 == 0
+        assert res1.new_count == 1
+        assert res1.conflict_count == 0
+        assert res1.outcome == "ok"
 
         # Second run: same UID -> ON CONFLICT DO NOTHING => 0 new, 1 conflict.
         async with factory() as ses:
             acc2 = await ses.get(MailAccount, admin_user_with_account["account_id"])
         assert acc2 is not None
-        new2, conflict2 = await sc.sync_one_account(
+        res2 = await sc.sync_one_account(
             acc2,
             timeout_seconds=10,
             initial_sync_days=30,
             max_body_bytes=1024,
             max_att_bytes=1024 * 1024,
         )
-        assert new2 == 0
-        assert conflict2 == 1
+        assert res2.new_count == 0
+        assert res2.conflict_count == 1
 
 
 def _single_message_box(uid: int) -> Any:
@@ -371,14 +401,15 @@ class TestNotifyAllMessagesGate:
             acc = await ses.get(MailAccount, admin_user_with_account["account_id"])
         assert acc is not None
 
-        new_count, _ = await sc.sync_one_account(
+        # ADR-0026: sync_one_account returns an _AccountResult (not a tuple).
+        result = await sc.sync_one_account(
             acc,
             timeout_seconds=10,
             initial_sync_days=30,
             max_body_bytes=1024,
             max_att_bytes=1024,
         )
-        assert new_count == 1
+        assert result.new_count == 1
         # Even though 0 tags were applied, the message was enqueued.
         assert captured, "enqueue_message_ids was never called"
         flat = [mid for batch in captured for mid in batch]
@@ -404,14 +435,15 @@ class TestNotifyAllMessagesGate:
             acc = await ses.get(MailAccount, admin_user_with_account["account_id"])
         assert acc is not None
 
-        new_count, _ = await sc.sync_one_account(
+        # ADR-0026: sync_one_account returns an _AccountResult (not a tuple).
+        result = await sc.sync_one_account(
             acc,
             timeout_seconds=10,
             initial_sync_days=30,
             max_body_bytes=1024,
             max_att_bytes=1024,
         )
-        assert new_count == 1
+        assert result.new_count == 1
         # 0 tags + flag off → no enqueue at all.
         flat = [mid for batch in captured for mid in batch]
         assert flat == [], f"flag-off must not enqueue untagged messages, got {flat}"
@@ -435,14 +467,15 @@ class TestNotifyAllMessagesGate:
             acc = await ses.get(MailAccount, admin_user_with_account["account_id"])
         assert acc is not None
 
-        new_count, _ = await sc.sync_one_account(
+        # ADR-0026: sync_one_account returns an _AccountResult (not a tuple).
+        result = await sc.sync_one_account(
             acc,
             timeout_seconds=10,
             initial_sync_days=30,
             max_body_bytes=1024,
             max_att_bytes=1024,
         )
-        assert new_count == 1
+        assert result.new_count == 1
         flat = [mid for batch in captured for mid in batch]
         assert len(flat) == 1, "flag-off with applied>0 must enqueue the message"
         get_settings.cache_clear()

@@ -323,12 +323,12 @@ erDiagram
 | `smtp_starttls` | BOOLEAN | NOT NULL DEFAULT false | true для порта 587. Взаимоисключаемо с `smtp_ssl`. |
 | `smtp_username` | TEXT | NULL | Если NULL — использовать `email`. |
 | `smtp_encrypted_password` | BYTEA | NULL | Если NULL — использовать `encrypted_password`. |
-| `is_active` | BOOLEAN | NOT NULL DEFAULT true | false → worker пропускает. Может быть выключен пользователем или автоматически при 3 fail (см. ADR-0008). |
+| `is_active` | BOOLEAN | NOT NULL DEFAULT true | false → worker пропускает. Может быть выключен пользователем или автоматически (см. ADR-0008/ADR-0026). **ADR-0026:** auto-disable только по PERMANENT-ошибкам (порог `SYNC_MAX_CONSECUTIVE_FAILURES` или явный auth/decrypt) и только если не сработал circuit-breaker; TRANSIENT-ошибки НЕ дисейблят. |
 | `last_synced_uidnext` | BIGINT | NULL | UIDNEXT INBOX, зафиксированный после последнего успешного цикла. |
 | `last_uidvalidity` | BIGINT | NULL | UIDVALIDITY INBOX. |
-| `last_synced_at` | TIMESTAMPTZ | NULL | |
-| `last_sync_error` | TEXT | NULL | Краткое описание последней ошибки (без секретов). |
-| `consecutive_failures` | INT | NOT NULL DEFAULT 0 | Сброс на 0 при успешном цикле. |
+| `last_synced_at` | TIMESTAMPTZ | NULL | Время последней синхронизации. **ADR-0026:** обновляется на success и на PERMANENT-ошибку; на TRANSIENT НЕ трогается (сохраняет приоритет `list_active()` ORDER BY `last_synced_at NULLS FIRST`). |
+| `last_sync_error` | TEXT | NULL | Краткое описание последней ошибки (без секретов). **ADR-0026:** пишется и для TRANSIENT, и для PERMANENT; UI-префикс из `error_classify.error_prefix()`. NULL = успех. |
+| `consecutive_failures` | INT | NOT NULL DEFAULT 0 | **ADR-0026:** счётчик подряд идущих **PERMANENT**-ошибок (TRANSIENT не инкрементит). Сброс на 0 при успешном цикле (`mark_sync_success`). `>= SYNC_MAX_CONSECUTIVE_FAILURES` (default 3) → auto-disable при не сработавшем circuit-breaker. |
 | `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | |
 | `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | |
 

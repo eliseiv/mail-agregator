@@ -833,13 +833,19 @@ def suggest_provider_defaults(email: str) -> ProviderHint | None
 ```mermaid
 stateDiagram-v2
     [*] --> Active: created (test passed)
-    Active --> Active: sync ok (failures=0)
-    Active --> Active: sync fail (failures<3, last_sync_error=...)
-    Active --> Disabled: failures>=3 OR auth_failed
+    Active --> Active: sync ok (failures=0, last_sync_error=NULL)
+    Active --> Active: TRANSIENT fail (last_sync_error set, failures NOT incremented)
+    Active --> Active: PERMANENT fail (failures<threshold OR breaker tripped)
+    Active --> Disabled: PERMANENT failures>=SYNC_MAX_CONSECUTIVE_FAILURES (or explicit auth/decrypt) AND breaker NOT tripped
     Disabled --> Active: user PATCH (re-test passes)
     Active --> [*]: deleted
     Disabled --> [*]: deleted
 ```
+
+> **ADR-0026:** переход в `Disabled` происходит **только** по PERMANENT-ошибкам и **только** если
+> circuit-breaker не сработал в этом цикле. TRANSIENT-ошибки (DNS/таймаут/сеть/«too many
+> simultaneous connections»/нераспознанное) **никогда** не ведут в `Disabled` и не инкрементят
+> счётчик — аккаунт остаётся `Active` и само-восстанавливается следующим успешным циклом.
 
 ### Edge cases
 - IMAP login OK, но INBOX недоступен (?нет таких прав) — `imap_login_failed` с `details.detail="cannot_select_inbox"`.
@@ -1226,18 +1232,123 @@ async def sync_one_account(account: MailAccount) -> AccountSyncResult
 - **Enqueue notification (ADR-0022 §2.1):** ПОСЛЕ COMMIT транзакции save_message (а не внутри неё — чтобы доставка не зависела от транзакционной видимости), если `apply_tags_to_message` вернул `applied_count > 0`, добавить `message_id` в локальный аккумулятор `notify_ids`. После завершения цикла обработки одного account'а (т.е. в `sync_one_account` после `mailbox.logout()`) выполнить **один** `LPUSH tg_notify_queue val1 val2 …` всеми накопленными ID. Padение LPUSH (Redis down) — ловится try/except + log warn `event=tg_notify_enqueue_failed`; **не** прерывает sync_cycle. Recovery_scan (см. 14.1) подберёт упущенные.
 - **Enqueue outbound webhook (ADR-0023 §3.1):** **параллельно и независимо** от TG-блока выше. Тот же `notify_ids` (один источник истины — письма с `applied_count > 0`) передаётся в `WebhookDispatchService(s).enqueue_message_ids(notify_ids)`, который делает pre-filter (отбрасывает ids, у которых владеющая группа не имеет активного webhook'а) и один batched `LPUSH webhook_dispatch_queue val1 val2 …`. Падение этого блока ловится своим try/except + log warn `event=webhook_enqueue_failed`; **не** валит ни sync_cycle, ни TG-доставку. Recovery_scan webhook'ов (см. 14.2) подберёт упущенные с тем же 24-часовым окном.
 
-### Обработка ошибок (per-account)
-| Ошибка | Действие |
-| --- | --- |
-| `imaplib.error.AUTHENTICATIONFAILED` | `last_sync_error="auth_failed"`, `is_active=false`, audit `account_auto_disabled` |
-| TimeoutError / `asyncio.TimeoutError` (60s timeout) | `last_sync_error="timeout"`, increment failures |
-| `OSError` (network) | `last_sync_error="network: <msg>"`, increment failures |
-| Любая другая | `last_sync_error="error: <type>"`, increment failures |
+### Обработка ошибок (per-account) — ADR-0026
 
-После 3 подряд failures (`consecutive_failures >= 3`): `is_active=false`, audit `account_auto_disabled` с `details.reason="3_consecutive_failures"`.
+Источник истины: [ADR-0026](./adr/ADR-0026-sync-error-resilience.md). Ключевой принцип: worker
+различает **TRANSIENT** (вина сети/сервера/провайдера — пройдёт сам) и **PERMANENT** (вина
+настроек/данных) ошибки. Только PERMANENT инкрементит счётчик и может привести к disable.
+
+**Единый модуль классификации** `worker/app/error_classify.py`:
+```python
+def classify(exc_or_text) -> Literal["transient", "permanent"]
+def error_prefix(exc_or_text) -> str   # UI-текст: invalid_host | auth_failed | timeout | network | error | …
+```
+Обе функции читают **одну** таблицу подстрок (lower-case) → UI-префикс и класс никогда не
+расходятся. **Класс определяется НЕЗАВИСИМО от UI-префикса.**
+
+#### Таблица классификации и приоритетов (первое совпадение выигрывает; transient-блок 1–7 до permanent-блока 8–9)
+
+> **Single source of truth — [ADR-0026](./adr/ADR-0026-sync-error-resilience.md) §1.** Таблица ниже —
+> побитовая копия таблицы ADR-0026 §1 (те же подстроки, типы, порядок, классы, UI-префиксы). Backend
+> кодит по этой таблице; при изменении правил правятся **оба** документа в одном коммите. Любое
+> расхождение между ADR §1 и этой таблицей — баг документации.
+
+| Приоритет | Условие (тип / подстрока в lower-case) | Класс | UI-префикс |
+| --- | --- | --- | --- |
+| 1 | `socket.timeout` / `TimeoutError` / `asyncio.TimeoutError` | transient | `timeout` |
+| 2 | `socket.gaierror` / `could not resolve` / `name or service not known` / `temporary failure in name resolution` / `nodename nor servname` | transient | `invalid_host` |
+| 3 | `too many` / `simultaneous` / `try again` / `temporarily` / `unavailable` / `inuse` / `system error` / `rate` / `throttl` | transient | `auth_failed` (если есть auth-маркер) иначе `network` |
+| 4 | `timed out` / `timeout` | transient | `timeout` |
+| 5 | `ConnectionError` / `ssl.SSLError` / `connection refused` / `connection reset` / `broken pipe` / `network is unreachable` / `no route to host` / `ssl` | transient | `network` |
+| 6 | `OSError` с сетевым errno (`ECONNREFUSED/ECONNRESET/ETIMEDOUT/EHOSTUNREACH/ENETUNREACH/EPIPE`) | transient | `network` |
+| 7 | OAuth httpx `5xx`/`429`/network (worker-обёртка `oauth_token_error: …`: подстроки `5xx`/`429`/`token_network`/`network`/`timeout`/`unexpected`/`oauth_exchange_failed`) | transient | `oauth_token_error` |
+| 8 | `authenticationfailed` / `invalid credentials` / `login failed` / `[alert]` / `account is disabled` / `account has been blocked` / oauth `invalid_grant` | **permanent** | `auth_failed` |
+| 9 | decrypt-fail (`InvalidTag`/`AssertionError`) | **permanent** | `decrypt_fail` |
+| 10 | нераспознанное — **в т.ч. программные исключения** (`TypeError`/`KeyError`/`AttributeError`/`ValueError`, не из network/IMAP/OAuth-наборов 1–9) | **transient** (fail-open) | `error` |
+
+**Кейс корня инцидента:** `"too many simultaneous connections"` приходит как `LOGIN NO`, но
+совпадает по приоритету 3 → **transient** (а не auth) → НЕ дисейблит. Permanent-блок (8–9)
+срабатывает только если ни одно правило 1–7 не совпало.
+
+**Fail-open (приоритет 10):** нераспознанное → transient. Цена ложного permanent (зря отключим
+ящик навсегда) >> цены ложного transient (повторит попытку, запишет ошибку).
+**Логирование (приоритет 10):** программные исключения, не распознанные правилами 1–9, логируются
+на уровне **ERROR с traceback** (`exc_info=True`, event `sync_account_unexpected_error`) — сигнал
+алертинга, что код встретил неожиданный путь; класс остаётся `transient`. Сетевые/IMAP-ошибки
+(правила 1–9) — WARNING.
+
+#### Поведение по классам
+
+| | TRANSIENT | PERMANENT |
+| --- | --- | --- |
+| `last_sync_error` | пишется (для UI) | пишется (в т.ч. при подавлении брейкером — см. ниже) |
+| `consecutive_failures` | **НЕ** инкрементится | `+1` |
+| `last_synced_at` | **НЕ** трогается (= «последний успех» для UI) | `now()` |
+| `is_active` | **НЕ** трогается | disable при пороге (см. ниже) |
+| следующий цикл | повторит; success само-восстановит | продолжит инкремент до disable |
+
+**Инвариант полноты выборки (нет starvation, ADR-0026 §2):** transient оставляет `last_synced_at`
+нетронутым **безопасно**, потому что `list_active()` (`backend/app/repositories/mail_accounts.py`)
+**НЕ лимитирует** выборку — `SELECT … WHERE is_active ORDER BY last_synced_at NULLS FIRST, id` **без
+LIMIT**. `sync_cycle` прогоняет **всех** активных под семафором каждый цикл; `ORDER BY` влияет
+только на **порядок** обработки внутри цикла, **не на состав**. Поэтому устойчиво-transient аккаунт
+(вечно стоящий в голове очереди со старым/`NULL` `last_synced_at`) **не вытесняет** здоровые ящики —
+они синхронизируются в том же цикле. Голодание невозможно by construction; отдельное `last_attempt_at`
+и миграция не нужны. Если когда-либо `list_active()` начнёт LIMIT-ить выборку — потребуется новый ADR
+с `last_attempt_at`.
+
+- PERMANENT disable: при `consecutive_failures >= SYNC_MAX_CONSECUTIVE_FAILURES` (config, default 3),
+  **либо** для явных auth (приоритет 8) / decrypt (приоритет 9) — мгновенно (порог не нужен), —
+  но всегда **через circuit-breaker** (см. ниже).
+- **Инвариант само-восстановления:** `mark_sync_success` сбрасывает
+  `consecutive_failures=0, last_sync_error=NULL`. Так как transient не отключает аккаунт, он остаётся
+  `is_active=true` → попадает в следующий `list_active()` → первый успешный цикл после восстановления
+  сети сам обнуляет состояние. Отдельный re-enable job не нужен.
+
+#### Circuit-breaker (защита от массового disable)
+
+Если в одном цикле `total >= SYNC_MASS_FAILURE_MIN` (default 5) И
+`permanent_failures / total >= SYNC_MASS_FAILURE_RATIO` (default 0.5) → **подавить и инкремент, и
+disable** для всех permanent-аккаунтов этого цикла (вероятен общий сбой, а не «у всех разом протух
+пароль»). Подавлять только disable нельзя — иначе на следующем цикле все перешагнут порог разом.
+`last_sync_error` при этом всё равно пишется (информативно и безопасно).
+
+**Двухфазный `_run_for_accounts`:**
+1. `sync_one_account` на ошибке вычисляет `classify()`/`error_prefix()`, **сразу** пишет
+   `last_sync_error` (transient — no-bump метод; permanent — тоже пишет error, но bump/disable
+   откладывает) и возвращает `outcome: "ok" | "transient" | "permanent"`.
+2. После `asyncio.gather` цикл считает `total` и `permanent_failures`, вычисляет `breaker_tripped`.
+3. Если `breaker_tripped` — ничего со счётчиками не делать (лог `sync_breaker_tripped` WARNING +
+   audit `sync_mass_failure_suppressed` severity warning). Иначе для каждого permanent: bump через
+   `mark_sync_failure(disable=False)`; если порог достигнут или это явный auth/decrypt →
+   `_disable_after_failures` (disable + audit `account_auto_disabled`,
+   `details.reason="N_consecutive_failures"` или `"auth_failed"`/`"decrypt_fail"`).
+
+**Наблюдаемость подавлённых permanent (ADR-0026 §3):** `last_sync_error` пишется в фазе 1 для **ВСЕХ**
+ошибок, **включая permanent, подавлённые брейкером** — поэтому в UI у каждого реально-протухшего
+ящика виден его конкретный `last_sync_error`, даже когда disable подавлён и аккаунт остался `Active`.
+Audit `sync_mass_failure_suppressed` (severity warning, один раз на цикл) несёт
+`details={total, permanent_failures, transient_failures, ratio, threshold_ratio, threshold_min}`.
+Эскалация при N подряд сработавших брейкер-циклах (вечный массовый permanent → провайдер заблокировал
+IP) — [TD-035](./100-known-tech-debt.md).
+
+Edge-cases: `total<MIN` → брейкер выключен (покрывает `force_sync_dispatch` с 1 аккаунтом);
+ровно `ratio==RATIO` → срабатывает (`>=`); все permanent при `total>=MIN` → `ratio=1.0` → срабатывает
+(сценарий инцидента); один протухший из 85 → `1/85<0.5` → нормально дисейблится.
+
+#### DNS / connect retry (`imap_fetcher`)
+Открытие соединения + login оборачивается в `SYNC_CONNECT_RETRIES` (default 2) повторов с backoff
+`0.5s/1.0s` **только** на **мгновенные** `gaierror`/`ConnectionError`/сетевой `OSError`
+(резолв/коннект). **`socket.timeout`/`TimeoutError` НЕ ретраятся** (ADR-0026 §4, MINOR-1): ретрай
+таймаута умножил бы время ожидания (`(retries+1)×timeout`) и растянул цикл — таймаут проходит
+обычным transient-путём и повторится в следующем 5-мин цикле. Auth-fail и permanent **не** ретраятся.
+Единичный DNS-глюк не считается ошибкой вообще. Бюджет ≤1.5s/падающий аккаунт при
+`MAX_CONCURRENT_IMAP=10` приемлем. Job `sync_cycle` — `max_instances=1, coalesce=True` (как остальные
+worker-jobs), поэтому растянутый retry-окнами цикл не наложится на следующий тик.
 
 ### Edge cases
-- INBOX отсутствует/переименован — IMAP server вернёт ошибку SELECT — обрабатывается как auth_failed-аналог, помечаем acc как `is_active=false` с `last_sync_error="cannot_select_inbox"`.
+- INBOX отсутствует/переименован — IMAP server вернёт ошибку SELECT; классифицируется обычной
+  таблицей (если содержит auth-маркер без transient-маркеров → permanent `auth_failed`), `last_sync_error="cannot_select_inbox"`.
 - Пустой UIDs — записываем new_uidnext = old (если IMAP не вернул UIDNEXT — не трогаем).
 - Очень много новых писем (>1000) — батчуем по 50.
 

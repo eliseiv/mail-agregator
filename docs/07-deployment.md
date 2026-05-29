@@ -193,6 +193,10 @@ Healthcheck не настроен — это бесконечный sleep-цик
 | `IMAP_TIMEOUT_SECONDS` | `60` | no | Per-account timeout (см. ADR-0013). |
 | `INITIAL_SYNC_DAYS` | `30` | no | Окно при первом подключении. |
 | `MAX_ATTACHMENT_BYTES` | `26214400` | no | 25 MiB. |
+| `SYNC_MAX_CONSECUTIVE_FAILURES` | `3` | no | ADR-0026: порог PERMANENT-ошибок подряд → auto-disable (`ge=1, le=20`). Заменяет хардкод `_DISABLE_AFTER_FAILS`. |
+| `SYNC_MASS_FAILURE_RATIO` | `0.5` | no | ADR-0026: доля PERMANENT-падений за цикл, при которой circuit-breaker подавляет массовый disable (`ge=0.0, le=1.0`). |
+| `SYNC_MASS_FAILURE_MIN` | `5` | no | ADR-0026: минимум аккаунтов в цикле для активации circuit-breaker (`ge=1, le=10000`). |
+| `SYNC_CONNECT_RETRIES` | `2` | no | ADR-0026: повторы открытия IMAP-соединения/login на DNS/connection-ошибках, backoff 0.5s/1.0s (`ge=0, le=10`). |
 
 ### Sessions / auth
 

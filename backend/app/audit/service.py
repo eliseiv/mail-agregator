@@ -49,6 +49,8 @@ ALLOWED_ACTIONS: Final[frozenset[str]] = frozenset(
         # ADR-0025 §8 — OAuth Outlook account lifecycle.
         "oauth_account_linked",
         "oauth_refresh_invalidated",
+        # ADR-0026 §3 — sync circuit-breaker mass-failure suppression.
+        "sync_mass_failure_suppressed",
     }
 )
 

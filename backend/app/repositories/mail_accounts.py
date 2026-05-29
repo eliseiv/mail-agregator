@@ -420,6 +420,26 @@ class MailAccountsRepo:
             )
         )
 
+    async def mark_transient_error(self, account_id: int, *, error: str) -> None:
+        """Record a TRANSIENT sync error (ADR-0026 §2).
+
+        Writes ``last_sync_error`` only. Deliberately does NOT touch
+        ``consecutive_failures`` (transient must not count toward auto-disable),
+        ``is_active`` (transient must not disable the account), or
+        ``last_synced_at`` (its semantics = "time of last *successful* sync";
+        leaving it untouched keeps the account near the head of the
+        ``list_active()`` ORDER BY so it retries promptly without starving
+        healthy mailboxes — see ADR-0026 §2 starvation invariant).
+        """
+        await self._s.execute(
+            update(MailAccount)
+            .where(MailAccount.id == account_id)
+            .values(
+                last_sync_error=error[:500],
+                updated_at=datetime.now(UTC),
+            )
+        )
+
     async def mark_sync_failure(
         self,
         account_id: int,

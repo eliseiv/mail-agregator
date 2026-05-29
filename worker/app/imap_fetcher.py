@@ -9,16 +9,53 @@ from __future__ import annotations
 
 import contextlib
 import datetime as _dt
+import errno
+import socket
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 
 import imap_tools
 from imap_tools import AND, MailBoxUnencrypted
 
+from shared.config import get_settings
 from shared.html_sanitize import sanitize_email_html, strip_invisible_padding
 from shared.logging import get_logger
 
 log = get_logger(__name__)
+
+# ADR-0026 §4: backoff schedule (seconds) for connection/login retries. The
+# Nth retry sleeps ``_RETRY_BACKOFFS[N-1]``; if more retries than entries are
+# configured the last value is reused.
+_RETRY_BACKOFFS: tuple[float, ...] = (0.5, 1.0)
+
+# Networking ``OSError`` errnos that represent an immediate connect failure
+# worth retrying (NOT timeouts). Mirrors ADR-0026 §4.
+_RETRYABLE_ERRNOS: frozenset[int] = frozenset(
+    {
+        errno.ECONNREFUSED,
+        errno.ECONNRESET,
+        errno.EHOSTUNREACH,
+        errno.ENETUNREACH,
+    }
+)
+
+
+def _is_retryable_connect_error(exc: BaseException) -> bool:
+    """True for immediate DNS/connect failures we retry (ADR-0026 sec. 4).
+
+    Explicitly EXCLUDES ``socket.timeout`` / ``TimeoutError``: retrying a
+    timeout would multiply the wait ((retries+1)x timeout) and blow the cycle
+    budget. Auth/permanent failures are also never retried (they surface as
+    ``imap_tools`` login errors, not the network types below).
+    """
+    if isinstance(exc, socket.timeout | TimeoutError):
+        return False
+    if isinstance(exc, socket.gaierror | ConnectionError):
+        return True
+    if isinstance(exc, OSError):
+        return exc.errno in _RETRYABLE_ERRNOS
+    return False
 
 
 @dataclass(slots=True)
@@ -171,6 +208,56 @@ def _open_mailbox(*, host: str, port: int, ssl_on: bool, timeout: int) -> imap_t
     return MailBoxUnencrypted(host, port=port, timeout=timeout)
 
 
+def _connect_and_login(
+    *,
+    host: str,
+    port: int,
+    ssl_on: bool,
+    username: str,
+    password: str | None,
+    access_token: str | None,
+    timeout: int,
+) -> imap_tools.BaseMailBox:
+    """Open the connection + authenticate, retrying ONLY transient DNS/connect
+    errors (ADR-0026 §4).
+
+    ``SYNC_CONNECT_RETRIES`` (default 2) extra attempts with backoff 0.5s/1.0s
+    on ``gaierror`` / ``ConnectionError`` / networking ``OSError``. Timeouts and
+    auth/permanent errors propagate immediately (no retry). On success the open,
+    authenticated mailbox is returned (caller owns logout).
+    """
+    retries = get_settings().SYNC_CONNECT_RETRIES
+    attempt = 0
+    while True:
+        mailbox = _open_mailbox(host=host, port=port, ssl_on=ssl_on, timeout=timeout)
+        try:
+            if access_token is not None:
+                # XOAUTH2 path (oauth_outlook accounts).
+                mailbox.xoauth2(username, access_token, initial_folder="INBOX")
+            else:
+                assert password is not None, "fetch_blocking needs a password or an access_token"
+                mailbox.login(username, password, initial_folder="INBOX")
+            return mailbox
+        except BaseException as exc:
+            # Best-effort close the half-open socket before retrying.
+            with contextlib.suppress(Exception):
+                mailbox.logout()
+            if attempt >= retries or not _is_retryable_connect_error(exc):
+                raise
+            backoff = _RETRY_BACKOFFS[min(attempt, len(_RETRY_BACKOFFS) - 1)]
+            log.warning(
+                "imap_connect_retry",
+                host=host,
+                port=port,
+                attempt=attempt + 1,
+                max_retries=retries,
+                backoff_seconds=backoff,
+                detail=f"{type(exc).__name__}: {exc}"[:200],
+            )
+            time.sleep(backoff)
+            attempt += 1
+
+
 def fetch_blocking(
     *,
     host: str,
@@ -196,14 +283,18 @@ def fetch_blocking(
     in imap-tools 1.6, TD-030); otherwise it does the classic ``LOGIN`` with
     ``password``. Exactly one of ``password`` / ``access_token`` must be set.
     """
-    mailbox = _open_mailbox(host=host, port=port, ssl_on=ssl_on, timeout=timeout)
-    if access_token is not None:
-        # XOAUTH2 path (oauth_outlook accounts). ``outlook.office365.com`` is
-        # always SSL; ``_open_mailbox`` honours ``ssl_on`` regardless.
-        mailbox.xoauth2(username, access_token, initial_folder="INBOX")
-    else:
-        assert password is not None, "fetch_blocking needs a password or an access_token"
-        mailbox.login(username, password, initial_folder="INBOX")
+    # ADR-0026 §4: open + authenticate with DNS/connect retry. ``outlook.
+    # office365.com`` is always SSL; ``_open_mailbox`` honours ``ssl_on``
+    # regardless. XOAUTH2 vs LOGIN is chosen inside the helper.
+    mailbox = _connect_and_login(
+        host=host,
+        port=port,
+        ssl_on=ssl_on,
+        username=username,
+        password=password,
+        access_token=access_token,
+        timeout=timeout,
+    )
     try:
         # imap-tools returns these as either str or int depending on the
         # server reply; coerce defensively.

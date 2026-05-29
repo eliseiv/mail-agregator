@@ -75,6 +75,21 @@ class Settings(BaseSettings):
     INITIAL_SYNC_DAYS: int = Field(default=30, ge=1, le=365)
     MAX_ATTACHMENT_BYTES: int = Field(default=26_214_400, ge=1024, le=1_073_741_824)
     MAX_BODY_BYTES: int = Field(default=1_048_576, ge=1024, le=10_485_760)
+    # --- Sync error resilience (ADR-0026) ---
+    # Consecutive PERMANENT failures before auto-disable. Replaces the
+    # hard-coded ``_DISABLE_AFTER_FAILS`` in ``worker/app/sync_cycle.py``.
+    SYNC_MAX_CONSECUTIVE_FAILURES: int = Field(default=3, ge=1, le=20)
+    # Circuit-breaker: per-cycle share of PERMANENT failures at which the mass
+    # disable is suppressed (probable common infra outage, not 85 passwords
+    # expiring at once). ADR-0026 §3.
+    SYNC_MASS_FAILURE_RATIO: float = Field(default=0.5, ge=0.0, le=1.0)
+    # Circuit-breaker: minimum accounts processed in a cycle for the breaker to
+    # be considered (below this, single-account force-sync behaves normally).
+    SYNC_MASS_FAILURE_MIN: int = Field(default=5, ge=1, le=10_000)
+    # DNS/connect retries on opening the IMAP connection + login. 0 disables.
+    # Backoff 0.5s/1.0s; only for gaierror/connection/network OSError, never
+    # for timeouts or auth/permanent failures. ADR-0026 §4.
+    SYNC_CONNECT_RETRIES: int = Field(default=2, ge=0, le=10)
 
     # --- Sessions / auth ---
     SESSION_TTL_SECONDS: int = Field(default=43_200, ge=60)

@@ -22,8 +22,10 @@ Idempotency: ``ON CONFLICT DO NOTHING`` on
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import uuid
 from dataclasses import dataclass
+from typing import Literal
 
 import structlog
 from cryptography.exceptions import InvalidTag
@@ -49,13 +51,34 @@ from shared.logging import get_logger
 from shared.models import MailAccount
 from shared.redis_client import get_redis
 from shared.storage import get_storage
+from worker.app.error_classify import classify, error_prefix, is_explicit_permanent
 from worker.app.imap_fetcher import FetchedBox, fetch_blocking
 
 log = get_logger(__name__)
 
-# Tag for invalid auth — gets ``is_active=false`` immediately (per ADR-0008).
-_AUTH_FAIL_PREFIX = "auth_failed"
-_DISABLE_AFTER_FAILS = 3
+# ADR-0026: outcome of one account's sync, used by the two-phase
+# ``_run_for_accounts`` to apply bump/disable AFTER the circuit-breaker
+# decision (so a mass infra outage cannot disable everything at once).
+AccountSyncOutcome = Literal["ok", "transient", "permanent"]
+
+
+@dataclass(slots=True)
+class _AccountResult:
+    """Per-account result carried out of :func:`sync_one_account` so phase 2 of
+    :func:`_run_for_accounts` can apply the circuit-breaker decision."""
+
+    account_id: int
+    user_id: int
+    new_count: int
+    conflict_count: int
+    outcome: AccountSyncOutcome
+    # Only set for ``outcome == "permanent"``: the error text already written
+    # to ``last_sync_error`` (phase 0), the UI prefix (for the audit reason on
+    # an explicit-permanent disable) and the "instant disable" flag (explicit
+    # auth/decrypt — no threshold needed, ADR-0026 §2/§3).
+    error: str | None = None
+    prefix: str | None = None
+    explicit_permanent: bool = False
 
 
 @dataclass(slots=True)
@@ -114,8 +137,16 @@ async def sync_one_account(
     initial_sync_days: int,
     max_body_bytes: int,
     max_att_bytes: int,
-) -> tuple[int, int]:
-    """Sync one account. Returns ``(new_messages_count, conflict_count)``.
+) -> _AccountResult:
+    """Sync one account. Returns an :class:`_AccountResult`.
+
+    ADR-0026 §2/§3: this function NEVER bumps ``consecutive_failures`` or
+    disables the account in the moment of error. On any error it (phase 0)
+    classifies via :func:`error_classify.classify` / :func:`error_prefix`,
+    writes ``last_sync_error`` IMMEDIATELY (transient via the no-bump repo
+    method; permanent writes the error too but defers bump/disable), and
+    returns the ``outcome`` so :func:`_run_for_accounts` can apply
+    bump/disable after the circuit-breaker decision.
 
     Side-effect: updates ``mail_accounts`` row + writes any new ``messages``
     + ``attachments`` + uploads attachment blobs to MinIO.
@@ -130,28 +161,35 @@ async def sync_one_account(
 
     # ADR-0025 §4: resolve credentials — an XOAUTH2 access token for
     # oauth_outlook accounts (refreshed if needed) or the decrypted password
-    # otherwise. ``None`` means "skip this account" (the helper already
-    # recorded the appropriate state / failure).
-    creds = await _resolve_credentials(account, cycle_log)
-    if creds is None:
-        return 0, 0
-    password, access_token = creds
+    # otherwise. ``None`` means "skip this account": either a clean skip
+    # (needs-consent) or a classified failure already recorded in phase 0.
+    creds_result = await _resolve_credentials(account, cycle_log)
+    if isinstance(creds_result, _AccountResult):
+        return creds_result
+    if creds_result is None:
+        return _AccountResult(
+            account_id=account.id,
+            user_id=account.user_id,
+            new_count=0,
+            conflict_count=0,
+            outcome="ok",
+        )
+    password, access_token = creds_result
 
     # SSRF guard per ``docs/06-security.md`` sec. 4: backend (test) AND worker
     # (sync) must verify the host doesn't resolve to a private network. Guards
     # against DNS-rebinding and tampered DB rows pointing at internal hosts.
     # No-op in dev (so localhost mock IMAP servers still work).
+    #
+    # ADR-0026 root-cause B fix: when DNS is down, ``assert_public_host`` raises
+    # ``InvalidHostError("Could not resolve host", ...)``. That used to disable
+    # the account immediately. Now it is classified like any other error — the
+    # "could not resolve" substring makes it TRANSIENT (no disable, retries).
     try:
         assert_public_host(account.imap_host, port=account.imap_port)
     except InvalidHostError as exc:
         detail = str(exc.message) if hasattr(exc, "message") else str(exc)
-        cycle_log.warning("sync_account_invalid_host", detail=detail[:200])
-        await _record_failure(
-            account.id,
-            error=f"invalid_host: {detail[:200]}",
-            disable=True,
-        )
-        return 0, 0
+        return await _handle_sync_error(account, exc, detail=detail, cycle_log=cycle_log)
 
     try:
         box: FetchedBox = await asyncio.wait_for(
@@ -172,46 +210,9 @@ async def sync_one_account(
             ),
             timeout=timeout_seconds,
         )
-    except TimeoutError:
-        cycle_log.warning("sync_account_timeout")
-        # ADR-0008 + ``docs/05-modules.md`` sec. 14: auto-disable after 3
-        # consecutive failures applies to ANY repeat failure, including
-        # timeouts (otherwise persistent network/firewall blocks would never
-        # auto-disable).
-        failed = await _record_failure(
-            account.id, error=f"timeout_{timeout_seconds}s", disable=False
-        )
-        if failed >= _DISABLE_AFTER_FAILS:
-            cycle_log.warning(
-                "sync_account_auto_disabled",
-                consecutive_failures=failed,
-            )
-            await _disable_after_failures(account.id, failed=failed, user_id=account.user_id)
-        return 0, 0
     except Exception as exc:
-        msg = type(exc).__name__
-        text = str(exc).replace("\r", " ").replace("\n", " ")[:200]
-        full = f"{msg}: {text}"
-        # Distinguish auth failures (which should disable) from network blips.
-        is_auth = "AUTHENTICATIONFAILED" in text.upper() or "LOGIN" in msg.upper()
-        if is_auth or "MailboxLoginError" in msg:
-            cycle_log.warning("sync_account_auth_fail", detail=text)
-            await _record_failure(
-                account.id,
-                error=f"{_AUTH_FAIL_PREFIX}: {text}",
-                disable=True,
-            )
-        else:
-            cycle_log.warning("sync_account_error", detail=full)
-            failed = await _record_failure(account.id, error=full, disable=False)
-            if failed >= _DISABLE_AFTER_FAILS:
-                cycle_log.warning(
-                    "sync_account_auto_disabled",
-                    consecutive_failures=failed,
-                )
-                # Re-mark as disabled and write audit.
-                await _disable_after_failures(account.id, failed=failed, user_id=account.user_id)
-        return 0, 0
+        text = str(exc).replace("\r", " ").replace("\n", " ")
+        return await _handle_sync_error(account, exc, detail=text, cycle_log=cycle_log)
 
     # Save messages + attachments.
     new_count = 0
@@ -371,7 +372,13 @@ async def sync_one_account(
         conflicts=conflict_count,
         tags_applied=tags_applied_total,
     )
-    return new_count, conflict_count
+    return _AccountResult(
+        account_id=account.id,
+        user_id=account.user_id,
+        new_count=new_count,
+        conflict_count=conflict_count,
+        outcome="ok",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -379,14 +386,83 @@ async def sync_one_account(
 # ---------------------------------------------------------------------------
 
 
+async def _handle_sync_error(
+    account: MailAccount,
+    exc: BaseException,
+    *,
+    detail: str,
+    cycle_log: structlog.stdlib.BoundLogger,
+) -> _AccountResult:
+    """Phase 0 of ADR-0026: classify, write ``last_sync_error`` immediately,
+    and build the per-account result. Bump/disable are deferred to phase 2.
+
+    For TRANSIENT (incl. DNS/network/rate-limit and the fail-open rule 10) we
+    write ``last_sync_error`` via the no-bump repo method — the account is NOT
+    disabled and the counter is untouched. For PERMANENT we write
+    ``last_sync_error`` too (so the operator always sees the cause even when the
+    breaker later suppresses the disable), but the bump/disable itself happens in
+    phase 2 under the circuit-breaker decision.
+    """
+    cls = classify(exc)
+    prefix = error_prefix(exc)
+    detail_clean = detail.replace("\r", " ").replace("\n", " ")[:200]
+    error_text = f"{prefix}: {detail_clean}"
+
+    if cls == "transient":
+        # Rule 10 (unrecognised, incl. programming errors) -> ERROR + traceback
+        # for alerting; recognised network/IMAP/OAuth transients -> WARNING.
+        if prefix == "error":
+            cycle_log.error(
+                "sync_account_unexpected_error",
+                exc_info=True,
+                detail=error_text,
+            )
+        else:
+            cycle_log.warning(
+                "sync_account_transient",
+                error_class=cls,
+                prefix=prefix,
+                detail=error_text,
+            )
+        await _record_transient(account.id, error=error_text)
+        return _AccountResult(
+            account_id=account.id,
+            user_id=account.user_id,
+            new_count=0,
+            conflict_count=0,
+            outcome="transient",
+        )
+
+    # PERMANENT: write last_sync_error now (phase 0); defer bump/disable.
+    cycle_log.warning(
+        "sync_account_permanent",
+        error_class=cls,
+        prefix=prefix,
+        detail=error_text,
+    )
+    await _record_transient(account.id, error=error_text)
+    return _AccountResult(
+        account_id=account.id,
+        user_id=account.user_id,
+        new_count=0,
+        conflict_count=0,
+        outcome="permanent",
+        error=error_text,
+        prefix=prefix,
+        explicit_permanent=is_explicit_permanent(exc),
+    )
+
+
 async def _resolve_credentials(
     account: MailAccount, cycle_log: structlog.stdlib.BoundLogger
-) -> tuple[str | None, str | None] | None:
-    """Resolve ``(password, access_token)`` for the account, or ``None`` to skip.
+) -> tuple[str | None, str | None] | _AccountResult | None:
+    """Resolve ``(password, access_token)`` for the account.
 
-    Exactly one of the two is non-``None`` on success. Returning ``None`` means
-    the account must be skipped this cycle — the helper has already logged /
-    recorded the reason (oauth needs-consent, decrypt fail, token error).
+    Returns:
+    - ``tuple`` on success (exactly one of password / access_token set);
+    - ``None`` for a clean skip (oauth needs-consent — no failure recorded);
+    - :class:`_AccountResult` when a classified failure occurred (the helper
+      already wrote ``last_sync_error`` in phase 0; bump/disable deferred).
     """
     if account.auth_type == "oauth_outlook":
         if account.oauth_needs_consent:
@@ -394,66 +470,73 @@ async def _resolve_credentials(
             # failure counter (ADR-0025 §3 step 5); UI prompts re-consent.
             cycle_log.info("sync_account_oauth_needs_consent")
             return None
-        token = await _resolve_oauth_access_token(account, cycle_log)
-        if token is None:
-            return None
-        return None, token
+        return await _resolve_oauth_access_token(account, cycle_log)
 
     try:
         assert account.encrypted_password is not None
         password = decrypt_mail_password(account.encrypted_password, account.id)
     except (InvalidTag, AssertionError) as exc:
-        cycle_log.error("sync_account_decrypt_fail", detail=str(exc)[:200])
-        await _record_failure(account.id, error="decrypt_fail", disable=True)
-        return None
+        # Rule 9 — decrypt failure -> PERMANENT (explicit, instant disable).
+        return await _handle_sync_error(account, exc, detail="decrypt_fail", cycle_log=cycle_log)
     return password, None
 
 
 async def _resolve_oauth_access_token(
     account: MailAccount, cycle_log: structlog.stdlib.BoundLogger
-) -> str | None:
+) -> tuple[str | None, str | None] | _AccountResult | None:
     """Get a valid XOAUTH2 access token for an oauth_outlook account (ADR-0025 §3).
 
-    Returns ``None`` (and records the appropriate state) when a token cannot
-    be obtained:
-    - ``invalid_grant`` -> :class:`OutlookTokenService` already flagged
-      ``oauth_needs_consent``; we skip without bumping the failure counter.
-    - any other token-endpoint error / network blip -> bump the failure
-      counter so the standard auto-disable-after-3 path applies.
+    Returns:
+    - ``(None, token)`` on success;
+    - ``None`` for ``invalid_grant`` (already marked needs-consent — clean skip);
+    - :class:`_AccountResult` for any other token error (classified, phase 0).
     """
     try:
         async with make_session() as s:
-            return await OutlookTokenService(s).get_valid_access_token(account)
+            token = await OutlookTokenService(s).get_valid_access_token(account)
+        return None, token
     except OAuthRefreshInvalidError:
         # Already marked needs-consent inside the service; nothing else to do.
         cycle_log.info("sync_account_oauth_refresh_invalidated")
         return None
     except OAuthError as exc:
-        cycle_log.warning("sync_account_oauth_token_error", detail=str(exc.code))
-        failed = await _record_failure(
-            account.id, error=f"oauth_token_error: {exc.code}", disable=False
+        # OAuth 5xx/429/network -> transient (rule 7); invalid_grant handled
+        # above via OAuthRefreshInvalidError. The classifier reads the code.
+        return await _handle_sync_error(
+            account, exc, detail=f"oauth_token_error: {exc.code}", cycle_log=cycle_log
         )
-        if failed >= _DISABLE_AFTER_FAILS:
-            await _disable_after_failures(account.id, failed=failed, user_id=account.user_id)
-        return None
-    except Exception as exc:  # network / unexpected — treat as transient failure
-        cycle_log.warning("sync_account_oauth_token_unexpected", detail=str(exc)[:200])
-        failed = await _record_failure(
-            account.id, error=f"oauth_token_unexpected: {type(exc).__name__}", disable=False
+    except Exception as exc:  # network / unexpected — classify (fail-open transient)
+        return await _handle_sync_error(
+            account,
+            exc,
+            detail=f"oauth_token_unexpected: {type(exc).__name__}",
+            cycle_log=cycle_log,
         )
-        if failed >= _DISABLE_AFTER_FAILS:
-            await _disable_after_failures(account.id, failed=failed, user_id=account.user_id)
-        return None
+
+
+async def _record_transient(account_id: int, *, error: str) -> None:
+    """Write ``last_sync_error`` without bumping the counter (ADR-0026 §2)."""
+    async with make_session() as s, s.begin():
+        await MailAccountsRepo(s).mark_transient_error(account_id, error=error)
 
 
 async def _record_failure(account_id: int, *, error: str, disable: bool) -> int:
-    """Write the failure to ``mail_accounts``. Returns new ``consecutive_failures``."""
+    """Bump ``consecutive_failures`` (+ optional disable). Returns new count.
+
+    Used in phase 2 of :func:`_run_for_accounts` for PERMANENT accounts when the
+    circuit-breaker did NOT trip.
+    """
     async with make_session() as s, s.begin():
         return await MailAccountsRepo(s).mark_sync_failure(account_id, error=error, disable=disable)
 
 
-async def _disable_after_failures(account_id: int, *, failed: int, user_id: int) -> None:
-    """Disable the account and write an audit row."""
+async def _disable_after_failures(account_id: int, *, user_id: int, reason: str) -> None:
+    """Disable the account and write an ``account_auto_disabled`` audit row.
+
+    ``reason`` is a stable string for ``details.reason``:
+    ``"N_consecutive_failures"`` (threshold) or ``"auth_failed"`` /
+    ``"decrypt_fail"`` (explicit permanent, instant disable). ADR-0026 §3.
+    """
     async with make_session() as s, s.begin():
         await MailAccountsRepo(s).update_fields(account_id, is_active=False)
         # The audit log requires ``actor_user_id``. For system actions we
@@ -468,7 +551,37 @@ async def _disable_after_failures(account_id: int, *, failed: int, user_id: int)
             target_user_id=user_id,
             details={
                 "mail_account_id": account_id,
-                "reason": f"{failed}_consecutive_failures",
+                "reason": reason,
+            },
+        )
+
+
+async def _audit_mass_failure_suppressed(
+    *,
+    total: int,
+    permanent_failures: int,
+    transient_failures: int,
+    ratio: float,
+    threshold_ratio: float,
+    threshold_min: int,
+    fallback_user_id: int,
+) -> None:
+    """Write the once-per-cycle ``sync_mass_failure_suppressed`` audit row when
+    the circuit-breaker trips (ADR-0026 §3). ``actor_user_id`` is the system
+    super-admin (falls back to an affected user if no admin row exists)."""
+    async with make_session() as s, s.begin():
+        admin = await UsersRepo(s).get_admin()
+        actor_id = admin.id if admin else fallback_user_id
+        await AuditWriter(s).log(
+            actor_user_id=actor_id,
+            action="sync_mass_failure_suppressed",
+            details={
+                "total": total,
+                "permanent_failures": permanent_failures,
+                "transient_failures": transient_failures,
+                "ratio": round(ratio, 4),
+                "threshold_ratio": threshold_ratio,
+                "threshold_min": threshold_min,
             },
         )
 
@@ -481,10 +594,22 @@ async def _disable_after_failures(account_id: int, *, failed: int, user_id: int)
 async def _run_for_accounts(accounts: list[MailAccount]) -> tuple[int, int, int]:
     """Run :func:`sync_one_account` for each account under the IMAP semaphore.
 
-    Returns ``(accounts_ok, accounts_failed, new_messages)``. Exceptions from
-    individual accounts are captured (``return_exceptions=True``) so a single
-    failure can never abort the others — guaranteed by ``docs/05-modules.md``
-    sec. 14 ("Failure одного аккаунта не валит остальные").
+    Two-phase per ADR-0026 §3:
+
+    * Phase 1 — ``asyncio.gather`` all accounts (``return_exceptions=True`` so a
+      single failure never aborts the others, per ``docs/05-modules.md`` §14).
+      Each ``sync_one_account`` already wrote ``last_sync_error`` in phase 0;
+      here we only collect outcomes and compute ``total`` / ``permanent_count``.
+    * Phase 2 — circuit-breaker decision. If ``breaker_tripped`` we suppress
+      BOTH the bump and the disable for every permanent account this cycle
+      (probable common infra outage — ``last_sync_error`` is already written so
+      the operator still sees each cause). Otherwise we bump each permanent and
+      disable on threshold OR explicit auth/decrypt.
+
+    Returns ``(accounts_ok, accounts_failed, new_messages)`` where
+    ``accounts_failed`` counts transient + permanent + unexpected-exception
+    results (transient is a failure for the cycle stats even though it never
+    disables).
     """
     if not accounts:
         return 0, 0, 0
@@ -492,7 +617,7 @@ async def _run_for_accounts(accounts: list[MailAccount]) -> tuple[int, int, int]
     settings = get_settings()
     sem = asyncio.Semaphore(settings.MAX_CONCURRENT_IMAP)
 
-    async def _bounded(acc: MailAccount) -> tuple[int, int]:
+    async def _bounded(acc: MailAccount) -> _AccountResult:
         async with sem:
             return await sync_one_account(
                 acc,
@@ -502,18 +627,92 @@ async def _run_for_accounts(accounts: list[MailAccount]) -> tuple[int, int, int]
                 max_att_bytes=settings.MAX_ATTACHMENT_BYTES,
             )
 
-    results = await asyncio.gather(*[_bounded(a) for a in accounts], return_exceptions=True)
+    raw_results = await asyncio.gather(*[_bounded(a) for a in accounts], return_exceptions=True)
 
-    ok = 0
-    failed = 0
+    # --- Phase 1: collect outcomes ---------------------------------------
+    results: list[_AccountResult] = []
+    unexpected = 0
     new_msgs = 0
-    for res in results:
+    for acc, res in zip(accounts, raw_results, strict=True):
         if isinstance(res, BaseException):
-            failed += 1
+            # An exception escaping sync_one_account itself (not a per-account
+            # sync error, which is already an _AccountResult). Defensive — log,
+            # write last_sync_error as a transient (fail-open), count as failed,
+            # but do NOT disable.
+            log.error(
+                "sync_account_runner_crashed",
+                exc_info=res,
+                mail_account_id=acc.id,
+            )
+            with contextlib.suppress(Exception):
+                await _record_transient(acc.id, error=f"error: {type(res).__name__}: {res}"[:200])
+            unexpected += 1
             continue
-        new_count, _conflicts = res
-        ok += 1
-        new_msgs += new_count
+        results.append(res)
+        new_msgs += res.new_count
+
+    ok = sum(1 for r in results if r.outcome == "ok")
+    permanent = [r for r in results if r.outcome == "permanent"]
+    transient_count = sum(1 for r in results if r.outcome == "transient")
+    permanent_count = len(permanent)
+    total = len(results)
+    failed = total - ok + unexpected
+
+    # --- Phase 2: circuit-breaker decision -------------------------------
+    ratio = (permanent_count / total) if total else 0.0
+    breaker_tripped = (
+        total >= settings.SYNC_MASS_FAILURE_MIN and ratio >= settings.SYNC_MASS_FAILURE_RATIO
+    )
+
+    if breaker_tripped:
+        # Suppress BOTH bump and disable for all permanent accounts this cycle.
+        # last_sync_error was already written in phase 0 (observability intact).
+        log.warning(
+            "sync_breaker_tripped",
+            total=total,
+            permanent_failures=permanent_count,
+            transient_failures=transient_count,
+            ratio=round(ratio, 4),
+            threshold_ratio=settings.SYNC_MASS_FAILURE_RATIO,
+            threshold_min=settings.SYNC_MASS_FAILURE_MIN,
+        )
+        if permanent:
+            await _audit_mass_failure_suppressed(
+                total=total,
+                permanent_failures=permanent_count,
+                transient_failures=transient_count,
+                ratio=ratio,
+                threshold_ratio=settings.SYNC_MASS_FAILURE_RATIO,
+                threshold_min=settings.SYNC_MASS_FAILURE_MIN,
+                fallback_user_id=permanent[0].user_id,
+            )
+    else:
+        # Normal path: bump each permanent; disable on threshold or explicit
+        # auth/decrypt.
+        for r in permanent:
+            new_failed = await _record_failure(
+                r.account_id, error=r.error or "error", disable=False
+            )
+            if r.explicit_permanent:
+                reason = r.prefix or "auth_failed"
+                log.warning(
+                    "sync_account_auto_disabled",
+                    mail_account_id=r.account_id,
+                    reason=reason,
+                )
+                await _disable_after_failures(r.account_id, user_id=r.user_id, reason=reason)
+            elif new_failed >= settings.SYNC_MAX_CONSECUTIVE_FAILURES:
+                log.warning(
+                    "sync_account_auto_disabled",
+                    mail_account_id=r.account_id,
+                    consecutive_failures=new_failed,
+                )
+                await _disable_after_failures(
+                    r.account_id,
+                    user_id=r.user_id,
+                    reason=f"{new_failed}_consecutive_failures",
+                )
+
     return ok, failed, new_msgs
 
 

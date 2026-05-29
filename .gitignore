@@ -107,5 +107,11 @@ smoke_test.py
 _rt_*
 _rev_*
 _smoke_*
+_smoke.py
+_diag_*.txt
+_review_*.txt
+final*.txt
+*check.txt
+smoke_*.txt
 docker-compose.qa-local.yml
 *.jpg
