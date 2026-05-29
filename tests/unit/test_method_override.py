@@ -118,11 +118,19 @@ class TestExtractMethodFromForm:
 
 class TestRegexCount:
     def test_regex_paths_present(self) -> None:
-        # Per docs/04-api-contracts.md sec. 8 + ADR-0017 (tags) + ADR-0019 (groups):
-        # mail-accounts (PATCH/delete-sibling/sync-now), admin user (reset/delete),
-        # tags (PATCH/delete-sibling/rules/rule-delete-sibling/apply), groups
-        # (PATCH/delete-sibling).
-        assert len(_OVERRIDE_REGEX_PATHS) == 13
+        # Per docs/04-api-contracts.md sec. 8 + ADR-0017 (tags) + ADR-0019 (groups)
+        # + ADR-0024 (multi-TG): mail-accounts (PATCH/delete-sibling/sync-now),
+        # admin user (reset/delete), groups (PATCH/delete-sibling), tags
+        # (PATCH/delete-sibling/rules/rule-delete-sibling/apply), telegram links
+        # (delete-sibling). 14 total.
+        assert len(_OVERRIDE_REGEX_PATHS) == 14
+
+    def test_telegram_link_delete_path_whitelisted(self) -> None:
+        # ADR-0024 §4 — form-fallback DELETE for unlinking a Telegram link (no-JS).
+        assert _is_whitelisted_path("/api/telegram/links/1/delete") is True
+        assert _is_whitelisted_path("/api/telegram/links/12345/delete") is True
+        # Non-numeric id must not match.
+        assert _is_whitelisted_path("/api/telegram/links/abc/delete") is False
 
     def test_exact_paths_present(self) -> None:
         # /api/messages/send, /api/mail-accounts, /api/admin/users, /api/tags,
