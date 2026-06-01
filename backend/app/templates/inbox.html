@@ -35,21 +35,89 @@
           </select>
         {% endif %}
 
-        <label class="visually-hidden" for="filter-account">Фильтр по почте</label>
-        <select
-          class="field__input field__input--compact"
-          id="filter-account"
-          name="account_id"
-          data-inbox-filter>
-          <option value="">Все почты</option>
-          {% for acc in accounts | default([]) %}
-            <option
-              value="{{ acc.id }}"
-              {% if selected_account_id is defined and selected_account_id and selected_account_id == acc.id %}selected{% endif %}>
-              {{ m.effective_account_label(acc) }}
-            </option>
-          {% endfor %}
-        </select>
+        {# Account filter — searchable combobox (ARIA 1.2 combobox pattern).
+           JS progressively enhances this into a typeahead: the user types
+           part of an email OR display_name (никнейм) and a filtered list of
+           matching mailboxes drops down. Selecting one writes its id into the
+           hidden ``account_id`` input and submits the form. Without JS the
+           <noscript> <select> below is the fallback. #}
+        {% set _sel = namespace(label="") %}
+        {% for acc in accounts | default([]) %}
+          {% if selected_account_id is defined and selected_account_id and selected_account_id == acc.id %}
+            {% set _sel.label = m.effective_account_label(acc) %}
+          {% endif %}
+        {% endfor %}
+        <div
+          class="combobox"
+          data-account-combobox
+          data-empty-label="Все почты">
+          {# Hidden field that actually carries account_id into the GET form.
+             ``disabled`` by default so that WITHOUT JS it does not submit —
+             the <noscript> <select> below is the sole carrier of account_id
+             then. JS removes ``disabled`` on init, making this the carrier and
+             leaving the (script-disabled) noscript <select> inert. #}
+          <input
+            type="hidden"
+            name="account_id"
+            value="{{ selected_account_id if selected_account_id else '' }}"
+            data-account-value
+            disabled>
+          {# Accounts payload for client-side filtering: id + email + никнейм. #}
+          <script
+            type="application/json"
+            data-account-options>
+            [
+              {% for acc in accounts | default([]) -%}
+              {"id": {{ acc.id | tojson }}, "email": {{ acc.email | tojson }}, "name": {{ (acc.display_name or "") | tojson }}}{{ "," if not loop.last else "" }}
+              {% endfor -%}
+            ]
+          </script>
+          <label class="visually-hidden" for="filter-account-input">Поиск по почте или никнейму</label>
+          <input
+            type="text"
+            id="filter-account-input"
+            class="field__input field__input--compact combobox__input"
+            role="combobox"
+            aria-expanded="false"
+            aria-controls="filter-account-listbox"
+            aria-autocomplete="list"
+            aria-haspopup="listbox"
+            autocomplete="off"
+            placeholder="Все почты"
+            value="{{ _sel.label }}"
+            data-account-input>
+          <button
+            type="button"
+            class="combobox__clear"
+            aria-label="Сбросить фильтр по почте — все почты"
+            data-account-clear
+            {% if not selected_account_id %}hidden{% endif %}>
+            &times;
+          </button>
+          <ul
+            class="combobox__listbox"
+            id="filter-account-listbox"
+            role="listbox"
+            aria-label="Почты"
+            data-account-listbox
+            hidden></ul>
+        </div>
+        <noscript>
+          <label class="visually-hidden" for="filter-account">Фильтр по почте</label>
+          <select
+            class="field__input field__input--compact"
+            id="filter-account"
+            name="account_id">
+            <option value="">Все почты</option>
+            {% for acc in accounts | default([]) %}
+              <option
+                value="{{ acc.id }}"
+                {% if selected_account_id is defined and selected_account_id and selected_account_id == acc.id %}selected{% endif %}>
+                {{ m.effective_account_label(acc) }}
+              </option>
+            {% endfor %}
+          </select>
+        </noscript>
 
         <label class="visually-hidden" for="filter-tag">Фильтр по тегу</label>
         <select

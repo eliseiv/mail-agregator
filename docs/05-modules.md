@@ -118,7 +118,7 @@ backend/
       _macros.html           # csrf_input, flash_messages, error_text(code) — RU mapping (ADR-0021); tag_chip; secret_reveal_block (ADR-0023, one-shot show plaintext)
       login.html
       set_password.html
-      inbox.html             # колонки display_name, owner; group filter (super_admin)
+      inbox.html             # колонки display_name, owner; group filter (super_admin); фильтр «по почте» — searchable typeahead-combobox (UX-слой; серверный параметр account_id НЕ изменён, см. 08-frontend.md §4.3)
       message_view.html
       compose.html
       accounts/list.html     # display_name + owner для group-видимости

@@ -57,9 +57,21 @@ def _ctx(extra: dict[str, Any] | None = None) -> dict[str, Any]:
     return base
 
 
-# Inline-content / inline-event regexes. We deliberately permit
-# ``<script src="...">`` and ``<link rel="stylesheet">`` (external assets).
-_INLINE_SCRIPT_RE = re.compile(r"<script(?![^>]*\bsrc=)[^>]*>", re.IGNORECASE)
+# Inline-content / inline-event regexes. We deliberately permit:
+#  - ``<script src="...">``                    — external asset (script-src 'self').
+#  - ``<link rel="stylesheet">``                — external stylesheet.
+#  - ``<script type="application/json">``       — NON-executable JSON data island.
+#
+# CSP ``script-src`` governs *executable* scripts only. A <script> with a
+# non-JS MIME type (e.g. ``application/json``) is never executed by the
+# browser, so it does not require ``'unsafe-inline'`` and is CSP-safe. The
+# inbox account-combobox embeds its options as such a data island
+# (``<script type="application/json" data-account-options>``); excluding it
+# here keeps the check focused on genuinely inline *executable* scripts.
+_INLINE_SCRIPT_RE = re.compile(
+    r'<script(?![^>]*\bsrc=)(?![^>]*\btype\s*=\s*"application/json")[^>]*>',
+    re.IGNORECASE,
+)
 _INLINE_STYLE_BLOCK_RE = re.compile(r"<style[^>]*>", re.IGNORECASE)
 _INLINE_STYLE_ATTR_RE = re.compile(r'\sstyle\s*=\s*"', re.IGNORECASE)
 _INLINE_EVENT_RE = re.compile(r'\son[a-z]+\s*=\s*"', re.IGNORECASE)

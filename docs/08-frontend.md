@@ -123,7 +123,7 @@ flowchart LR
 | Файл | Назначение |
 | --- | --- |
 | `csrf.js` | Универсальная функция `csrfFetch(url, options)` — обёртка над `fetch`, читает `mas_csrf` cookie и добавляет `X-CSRF-Token`. Все остальные JS используют только её. |
-| `inbox.js` | Inbox: live-toggle "mark as read"; periodic polling списка (опционально); UX-обработка клика по строке. |
+| `inbox.js` | Inbox: live-toggle "mark as read"; periodic polling списка (опционально); UX-обработка клика по строке; **searchable account-combobox** (фильтр «по почте»): читает список почт из data-island `<script type="application/json">`, клиентская фильтрация по email+display_name (case-insensitive), ARIA 1.2 combobox-навигация, проставляет hidden `account_id` и сабмитит GET-форму; `×`/«Все почты» сбрасывают. Прогрессивное улучшение — без JS остаётся `<select>`-fallback. |
 | `compose.js` | Compose: подсветка некорректных email-адресов; счётчик символов subject; клиентская проверка длины body. |
 | `account_form.js` | Add/edit account: при вводе email — auto-fill IMAP/SMTP defaults для известных доменов (хардкод-таблица в JS, см. ниже; backend-эндпоинта provider-suggest нет, чтобы не плодить лишних round-trip'ов); кнопка "Test connection" — POST `/api/mail-accounts/test`, показывает inline-результат. |
 | `admin_users.js` | Admin: раскрытие/сворачивание списка mail-аккаунтов внутри строки пользователя; confirm-диалоги для reset/delete. |
@@ -204,7 +204,11 @@ flowchart LR
 - **Колонка «Аккаунт»** (mail_account label): использует `effective_account_label(account)` (display_name → email; ADR-0020). Отображается chip'ом в начале строки.
 - **Колонка «Владелец»** (owner) — показывается **только** при `request.state.session.role == 'super_admin'` ИЛИ когда у текущего пользователя в видимости больше одного user'а (т.е. он лидер/участник группы и в группе ≥ 2 человек). Использует `effective_user_name(owner)`. Помогает быстро понять «чей это ящик» при group-видимости (ADR-0019 §7.2).
 - **Filter «Группа»** — dropdown появляется **только** для `role == 'super_admin'`. Опции: «Все» + список групп. Параметр `group_id` в query.
-- **Filter «Аккаунт»** — dropdown «Все» + список mail-аккаунтов в области видимости (`VisibilityScope` фильтрует на backend).
+- **Filter «Аккаунт»** — **searchable typeahead-combobox** (UX-слой поверх неизменного серверного фильтра `account_id`). Пользователь вводит email **или** никнейм (`display_name`) ящика → клиентская фильтрация видимого списка почт (case-insensitive, по `email` + `display_name`) → выбор пункта проставляет hidden `account_id` → submit GET-формы → письма выбранной почты. «Все почты» / кнопка `×` сбрасывают фильтр (пустой `account_id`). Источник списка почт — те же mail-аккаунты в области видимости (`VisibilityScope` фильтрует на backend); combobox лишь облегчает выбор. Поведение (см. `inbox.js`, секция 3):
+  - **ARIA 1.2 combobox pattern** (`role="combobox"` + `aria-expanded`/`aria-activedescendant`, listbox с `role="option"`).
+  - **Progressive enhancement / noscript fallback**: без JS рендерится обычный `<select>` (combobox-обёртка скрыта до JS; hidden `account_id` disabled пока JS не активен — чтобы не дублировать параметр с `<select>`). Серверный контракт идентичен: единственный передаваемый параметр — `account_id`.
+  - **CSP-safe**: список почт передаётся через data-island `<script type="application/json">`; обработчики навешиваются через `data-*` + `addEventListener` (без inline-`onclick`, без inline-`style`).
+  - **Backend не меняется**: серверный фильтр `account_id` и его scope-авторизация прежние (см. `04-api-contracts.md` `GET /` и `GET /api/messages`). `display_name` уже присутствует в контексте (`mail_account_display_name` / `MailAccountDTO`).
 - **Filter «Тег»** — dropdown «Все» + список тегов **текущего пользователя** (теги per-user; ADR-0017). Параметр `tag_id`.
 - Pagination: keyset (next_cursor); кнопка `[далее >]` ведёт на `/?cursor=...`. Кнопка `[< назад]` хранит previous cursor через JS history (опционально; в простой версии — только next).
 - "Обновить" — JS-обновление списка через `GET /api/messages?...` (без перезагрузки).
@@ -690,6 +694,7 @@ Telegram WebApp adaptation — см. секцию 10 ниже.
 - [ ] Шаблоны `tags/list.html`, `tags/form.html` созданы; `tags.js` подключается только на этих страницах через `{% block extra_js %}`. Без JS — форма с 5 пустыми rule-rows работает; цвет выбирается radio-buttons.
 - [ ] Tag-chips на inbox и message_view используют `_macros.html → tag_chip(tag)` с CSS-классом `.tag-color-cN` из палитры (секция 5.1) — без inline-style.
 - [ ] Tag-фильтр на inbox: `<select name="tag_id">` с list пользовательских тегов; query-param пробрасывается.
+- [ ] Фильтр «по почте» на inbox: searchable typeahead-combobox (ARIA 1.2), клиентская фильтрация scoped-списка по email+display_name; hidden `account_id` проставляется выбором, `×`/«Все почты» сбрасывают. Без JS — `<select>`-fallback (combobox скрыт, hidden `account_id` disabled). CSP-safe: data-island `<script type="application/json">` + `data-*`/`addEventListener`. Серверный параметр `account_id` НЕ изменён.
 - [ ] `tg.js` подключён в `base.html` (defer); открытие в обычном браузере — no-op; открытие через Telegram-бот — применяется тема и `body.tg-app` (см. секцию 10).
 - [ ] CSS-правила `body.tg-app` добавлены в `main.css` (секция 10.3).
 - [ ] Bottom-nav с 5 пунктами (Входящие / Почты / Теги / Админ* / Выйти) присутствует в `base.html` для авторизованных пользователей (секция 11). Видна в `tg-app` И на mobile (≤640px); скрыта на desktop browser. Пункт «Админ» — только для `request.state.session.role == 'super_admin'`.

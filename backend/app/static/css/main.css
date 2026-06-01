@@ -2805,3 +2805,77 @@ body.tg-app.page--integrations .integrations-secret-reveal__row {
 body.tg-app.page--integrations .integrations-secret-reveal__row .btn {
   width: 100%;
 }
+
+/* =============================================================================
+   Searchable account combobox (inbox filter — ARIA 1.2 combobox pattern).
+   ========================================================================== */
+.combobox {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+.combobox__input {
+  /* Leave room for the clear (×) button on the right. */
+  padding-right: 2rem;
+}
+.combobox__clear {
+  position: absolute;
+  right: var(--space-2);
+  top: 50%;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.25rem;
+  height: 1.25rem;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--color-text-muted);
+  font-size: 1.1rem;
+  line-height: 1;
+  cursor: pointer;
+}
+.combobox__clear:hover { color: var(--color-text); }
+.combobox__clear:focus-visible {
+  outline: none;
+  box-shadow: var(--shadow-ring-focus);
+}
+.combobox__listbox {
+  position: absolute;
+  top: calc(100% + var(--space-1));
+  left: 0;
+  z-index: 30;
+  margin: 0;
+  padding: var(--space-1);
+  list-style: none;
+  width: 100%;
+  min-width: 16rem;
+  max-height: 18rem;
+  overflow-y: auto;
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+}
+.combobox__option {
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-sm);
+  color: var(--color-text);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.combobox__option:hover,
+.combobox__option.is-active {
+  background: var(--color-primary-soft);
+  color: var(--color-text);
+}
+
+@media (max-width: 768px) {
+  .combobox { width: 100%; }
+  .combobox__input { width: 100%; }
+}
