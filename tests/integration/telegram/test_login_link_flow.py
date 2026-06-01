@@ -159,18 +159,25 @@ class TestPendingRedeemOnLogin:
         self,
         client: httpx.AsyncClient,
     ) -> None:
-        """Without an intervening logout, the link survives and a second
-        auth returns ``linked=true`` immediately."""
+        """Without an intervening logout, the link survives. round-38
+        (ADR-0022 §1.6): because the second ``/api/telegram/auth`` now carries
+        a valid ``mas_session`` (set by the login above), the endpoint enters
+        **self-heal** mode instead of the legacy ``linked=true`` flow — it
+        idempotently confirms the live binding and answers
+        ``{linked:false, healed:true}`` (NO redirect, NO new session). The
+        link still persists (covered explicitly by the self-heal NO-OP test in
+        ``test_self_heal.py``)."""
         s = get_settings()
         tg_id = 91004
         raw = make_init_data(telegram_user_id=tg_id)
         await client.post("/api/telegram/auth", json={"init_data": raw})
         await _login_two_step(client, username=s.ADMIN_LOGIN, password=s.ADMIN_PASSWORD)
-        # Do NOT logout; just call SSO again with fresh initData.
+        # Do NOT logout; just call SSO again with fresh initData. The active
+        # session routes this into the self-heal branch (round-38).
         raw2 = make_init_data(telegram_user_id=tg_id)
         resp = await client.post("/api/telegram/auth", json={"init_data": raw2})
         assert resp.status_code == 200
-        assert resp.json()["linked"] is True
+        assert resp.json() == {"linked": False, "healed": True}
 
 
 # ---------------------------------------------------------------------------

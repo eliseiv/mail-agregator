@@ -73,14 +73,14 @@ backend/
       __init__.py
       router.py            # POST /api/telegram/webhook/{secret}, POST /api/telegram/auth
       bot.py               # send_message_with_webapp_button, send_notification, handle_update; httpx async к api.telegram.org
-      auth_service.py      # TelegramAuthService: validate_init_data, try_sso, link_pending, revoke_for_user, mark_link_dead
+      sso_service.py       # TelegramSSOService: validate_init_data, try_sso, link_pending, link_session_add, self_heal_link, revoke_for_user, mark_link_dead
       schemas.py           # TelegramUpdate, TelegramAuthRequest, TelegramAuthResponse, ValidatedTelegramUser
       notify_format.py     # format_notification(acc_label, from_label, tag_names, subject, body_preview) -> HTML-строка (round-36 формат: 🆔/#️⃣/Клиент/Тема)
     webhooks/              # ADR-0023 — outbound webhooks per группа
       __init__.py
       router.py            # GET /my/integrations, GET/POST/PATCH/DELETE /api/webhooks/me, /rotate-secret, /test
       service.py           # WebhooksService.create_for_scope/get_for_scope/update_for_scope/delete_for_scope/rotate_secret/send_test
-      dispatch_service.py  # WebhookDispatchService.enqueue_message_ids, dispatch_one_payload — копируется по паттерну telegram/auth_service+notify_format
+      dispatch_service.py  # WebhookDispatchService.enqueue_message_ids, dispatch_one_payload — копируется по паттерну telegram/sso_service+notify_format
       schemas.py           # WebhookCreate, WebhookUpdate, WebhookDTO (no secret), WebhookCreatedDTO (with one-shot secret), TestResultDTO
       payload.py           # build_message_tagged_payload(ctx, team_tags, webhook_id, delivery_id) — формирование dict для json.dumps
     audit/
@@ -1898,7 +1898,7 @@ WHITELIST_PATHS = [
 ### Назначение
 Telegram-интеграция в трёх ролях:
 1. **Bot launcher (ADR-0018)** — `/start` → inline-keyboard с WebApp-кнопкой на `TELEGRAM_WEBAPP_URL`.
-2. **Persistent SSO (ADR-0022 §1)** — при открытии WebApp с валидным `init_data` и существующей `telegram_links`-записью пользователь логинится без ввода username+password. При первом login через бот линковка `telegram_user_id ↔ user_id` создаётся автоматически и удаляется при logout.
+2. **Persistent SSO + self-heal привязки (ADR-0022 §1, §1.6)** — при открытии WebApp с валидным `init_data` и существующей `telegram_links`-записью **анонимный** пользователь логинится без ввода username+password. При первом login через бот линковка `telegram_user_id ↔ user_id` создаётся автоматически и удаляется при logout. **round-38 (self-heal):** если на момент открытия WebApp пользователь **уже залогинен** (есть `mas_session`), тот же `POST /api/telegram/auth` делает idempotent upsert привязки `telegram_user_id → current_session.user_id` (без создания второй сессии и без `mas_tg_pending`). Это устраняет баг «после logout привязка не пересоздаётся» — привязка самовосстанавливается при каждом заходе в Telegram WebApp. logout по-прежнему рвёт **все** привязки (явный выбор пользователя «Выйти»). См. ADR-0022 §1.6.
 3. **Push-нотификации (ADR-0022 §2)** — диспатчер в worker'е шлёт `sendMessage` всем получателям, у которых: (а) активная линковка, (б) право видеть письмо (super_admin/group/owner) + при `TG_NOTIFY_ALL_MESSAGES=false` на письме есть любой тег; при `true` (default, round-31) — по всем письмам, (в) включены уведомления. Доставка под per-chat throttle (§2.9).
 
 Источники истины — [ADR-0018](./adr/ADR-0018-telegram-launcher.md) (launcher) + [ADR-0022](./adr/ADR-0022-telegram-sso-and-notifications.md) (SSO + нотификации; partially supersedes ADR-0018 в части «нет линковки / нет initData auth»).
@@ -1906,7 +1906,8 @@ Telegram-интеграция в трёх ролях:
 ### Публичный API
 - HTTP routes (см. `04-api-contracts.md` секция 4a):
   - `POST /api/telegram/webhook/{secret}` — webhook launcher (ADR-0018).
-  - `POST /api/telegram/auth` — Persistent SSO (ADR-0022 §1.2).
+  - `POST /api/telegram/auth` — Persistent SSO (аноним) **+ self-heal привязки (залогинен, round-38, ADR-0022 §1.6)**. Ветвление по наличию `mas_session`: нет сессии → SSO (linked/unlinked); есть сессия → self-heal upsert привязки, ответ `{"linked": false, "healed": true}`.
+  - `GET|POST|DELETE /api/telegram/links` — управление несколькими TG-привязками при активной сессии (ADR-0024 §4).
   - `PATCH /api/me/settings` — opt-out toggle для push-нотификаций (ADR-0022 §2.7).
 - Bot helpers (`backend/app/telegram/bot.py`):
 ```python
@@ -1932,7 +1933,7 @@ async def send_notification(*, chat_id: int, text_html: str, message_id: int) ->
     # kind='transient' — 5xx или network — диспатчер делает DELETE row и LPUSH back to queue
 ```
 
-- Auth-service (`backend/app/telegram/auth_service.py`):
+- SSO-service (`backend/app/telegram/sso_service.py`):
 ```python
 @dataclass(frozen=True)
 class ValidatedTelegramUser:
@@ -1941,7 +1942,7 @@ class ValidatedTelegramUser:
     username: str | None
     auth_date: int
 
-class TelegramAuthService:
+class TelegramSSOService:
     async def validate_init_data(init_data: str) -> ValidatedTelegramUser
         # HMAC-SHA256 + auth_date TTL (env TG_AUTH_INIT_DATA_TTL_SEC=300)
         # raises InvalidInitDataError | InitDataExpiredError
@@ -1951,16 +1952,37 @@ class TelegramAuthService:
         # 'linked' — нашли telegram_links запись с dead_at IS NULL → создали session
         # 'pending' — линковки нет → создали Redis tg_pending:{token} TTL 15min с {telegram_user_id}
 
-    async def link_pending(pending_token: str, user_id: int, ip: str, ua: str) -> bool
+    async def link_pending(*, telegram_user_id: int, user_id: int, ip: str, user_agent: str | None) -> None
         # Вызывается из AuthService.login (step-2) и complete_set_password ПОСЛЕ успешного verify.
-        # Читает Redis tg_pending:{token} → telegram_user_id; применяет soft-limit
-        #   COUNT(active) < TG_MAX_LINKS_PER_USER (ADR-0024 §3); делает upsert в telegram_links;
-        #   удаляет Redis ключ; пишет audit:
-        #     telegram_link_created (новая привязка / refresh своего TG),
+        # login-flow: общий _link(..., allow_rebind_from_other=True, via="login_flow"). Применяет soft-limit
+        #   COUNT(active) < TG_MAX_LINKS_PER_USER (ADR-0024 §3). Audit:
+        #     telegram_link_created (новая привязка / реактивация своего dead-TG),
         #     telegram_link_rebound (TG перепривязан с другого user'а — upsert сменил user_id),
-        #     telegram_link_limit_reached (потолок достигнут → не привязываем, поднять TelegramLinkLimitError).
-        # Returns True если линковка создана/обновлена, False если token expired/missing/limit.
+        #     telegram_link_limit_reached (потолок → не привязываем; login-flow НЕ raise).
+        # round-38 critical-fix (§1.6 edge-3): если привязка УЖЕ ЖИВАЯ на того же user (dead_at IS NULL) → NO-OP —
+        #   upsert НЕ вызывается, created_at НЕ сдвигается, audit НЕ пишется. (Иначе recipient-SQL m.internal_date>=tl.created_at
+        #   терял бы письма из окна между upsert'ами.) Pending-token читается/удаляется на уровне AuthService.
         # ADR-0024 §3: collision-логика по UNIQUE(user_id) удалена (констрейнт снят).
+
+    async def link_session_add(*, telegram_user_id: int, user_id: int, ip: str, user_agent: str | None) -> None
+        # POST /api/telegram/links (ADR-0024 §4). Общий _link(..., allow_rebind_from_other=False, via="session_add").
+        #   - привязка на ДРУГОГО user → raise TelegramLinkOwnedByOtherError (409 tg_link_owned_by_other);
+        #   - потолок → raise TelegramLinkLimitError (409 tg_link_limit).
+        # round-38 critical-fix (§1.6 edge-3): уже-живая привязка того же user (dead_at IS NULL) → NO-OP (created_at не сдвигается).
+
+    async def self_heal_link(*, telegram_user_id: int, user_id: int, ip: str, user_agent: str | None) -> None
+        # round-38 (ADR-0022 §1.6). Вызывается из POST /api/telegram/auth когда есть валидная mas_session.
+        # idempotent привязка telegram_links(telegram_user_id → user_id=current_session.user_id).
+        #   Логика связывания = общий _link(...) с allow_rebind_from_other=True, via="self_heal":
+        #     - линк отсутствует              → soft-limit COUNT(active)<TG_MAX_LINKS_PER_USER; upsert (created_at=now())
+        #                                       + audit telegram_link_created; при потолке → audit telegram_link_limit_reached, no-op (НЕ raise).
+        #     - линк на текущего, dead_at IS NULL (живой) → NO-OP: upsert НЕ вызывается, created_at НЕ сдвигается, audit НЕ пишется
+        #                                       (round-38 critical-fix §1.6 edge-3 — не терять письма из окна между заходами).
+        #     - линк на текущего, dead_at IS NOT NULL (dead) → реактивация upsert (dead_at=NULL, created_at=now());
+        #                                       audit telegram_link_created replaced=true.
+        #     - линк на другого              → rebound (upsert переносит на текущего, created_at=now()); audit telegram_link_rebound.
+        # BEST-EFFORT: метод НЕ поднимает исключений наружу (лимит → no-op; внутренняя ошибка → лог
+        #   telegram_self_heal_failed, router отвечает healed:false). НЕ создаёт сессию, НЕ трогает cookies.
 
     async def revoke_for_user(user_id: int, reason: str = 'logout') -> None
         # delete_all_by_user_id(user_id) — удаляет ВСЕ привязки user'а (ADR-0024 §5);
@@ -1976,13 +1998,22 @@ class TelegramAuthService:
 - Repository (`backend/app/repositories/telegram_links.py`):
 ```python
 class TelegramLinksRepo:    # ADR-0024 — 1:N (user → many TG); UNIQUE(user_id) снят
+    async def get_by_telegram_user_id(tid: int) -> TelegramLink | None         # по PK (вкл. dead) — нужен сервису для решения NO-OP vs write (round-38 §1.6 edge-3)
     async def get_active_by_telegram_user_id(tid: int) -> TelegramLink | None  # WHERE dead_at IS NULL; SSO-резолв (TG→user 1:1 по PK)
     async def list_by_user_id(uid: int) -> list[TelegramLink]                  # ВСЕ линки user'а (вкл. dead) — ADR-0024 §2
     async def list_active_by_user_id(uid: int) -> list[TelegramLink]           # WHERE dead_at IS NULL — для UI «мои привязки» + подсчёт лимита
+    async def count_active_by_user_id(uid: int) -> int                         # COUNT(dead_at IS NULL) — backs soft-limit
     async def upsert(telegram_user_id: int, user_id: int) -> tuple[TelegramLink, bool]
-        # SQL: INSERT … ON CONFLICT (telegram_user_id) DO UPDATE SET user_id=EXCLUDED.user_id,
-        #      created_at=now(), dead_at=NULL RETURNING *
-        # Bool = True если запись обновлена (replaced/rebound), False если новая
+        # WRITE-ПРИМИТИВ (всегда сдвигает created_at=now()). SQL:
+        #   INSERT … ON CONFLICT (telegram_user_id) DO UPDATE SET user_id=EXCLUDED.user_id,
+        #   created_at=now(), dead_at=NULL RETURNING *
+        # Bool = True если запись обновлена (реактивация/rebound), False если новая (INSERT).
+        # round-38 critical-fix (§1.6 edge-3): upsert НЕЛЬЗЯ вызывать для уже-живой привязки того же user
+        #   (created_at сдвинулся бы → потеря писем из окна между upsert'ами). Решение «писать или NO-OP»
+        #   принимает сервис TelegramSSOService._link(...) на основе предварительного get_by_telegram_user_id:
+        #   upsert вызывается ТОЛЬКО при INSERT (нет строки) / реактивации (dead_at IS NOT NULL) / rebound (user_id≠current).
+        #   Альтернатива (backend на выбор): условный ON CONFLICT … DO UPDATE … WHERE
+        #   telegram_links.dead_at IS NOT NULL OR telegram_links.user_id <> EXCLUDED.user_id — тот же NO-OP атомарно.
         # ADR-0024 §3: collision-логики по UNIQUE(user_id) больше НЕТ (констрейнт снят);
         #   несколько TG на user разрешены, потолок — прикладной COUNT(active)<TG_MAX_LINKS_PER_USER.
     async def delete_all_by_user_id(user_id: int) -> list[int]                 # удалить ВСЕ; вернуть список удалённых telegram_user_id (для audit) — ADR-0024 §2/§5
@@ -2046,7 +2077,7 @@ class TelegramUpdate(BaseModel):
 - structlog redact-list содержит `TELEGRAM_BOT_TOKEN` (см. `06-security.md` §1.8 + ADR-0014). Дополнительно: `init_data` НЕ логируется в полной форме (логируем только `telegram_user_id` и `auth_date` после валидации).
 - repositories: `telegram_links`, `telegram_notifications`, `user_settings`.
 - redis: ключи `tg_pending:{token}` (SSO pending), `tg_notify_queue` (list, дисптчер).
-- audit (actions): `telegram_link_created`, `telegram_link_rebound` (ADR-0024), `telegram_link_revoked`, `telegram_link_dead_marked`, `telegram_link_limit_reached` (ADR-0024). `telegram_link_collision` — **deprecated** (ADR-0024 §3: больше не пишется, инвариант «один user — один TG» снят; оставлен в перечислении как исторический для старых записей).
+- audit (actions): `telegram_link_created`, `telegram_link_rebound` (ADR-0024), `telegram_link_revoked`, `telegram_link_dead_marked`, `telegram_link_limit_reached` (ADR-0024). round-38: self-heal-ветка пишет те же действия с `details.via="self_heal"` (наряду с `login_flow`/`session_add`). `telegram_link_collision` — **deprecated** (ADR-0024 §3: больше не пишется, инвариант «один user — один TG» снят; оставлен в перечислении как исторический для старых записей).
 
 ### Состояния
 - Webhook handler — stateless.
@@ -2054,7 +2085,7 @@ class TelegramUpdate(BaseModel):
 - Persistent линковка — `telegram_links` (Postgres), 3 состояния:
   - **none** — нет строки в таблице. По умолчанию.
   - **active** — строка есть, `dead_at IS NULL`. SSO срабатывает, нотификации доставляются.
-  - **dead** — строка есть, `dead_at IS NOT NULL`. SSO **не** срабатывает (treat as none — пользователь увидит /login); нотификации не доставляются. При следующем `POST /api/telegram/auth` от того же tg_user_id upsert обнуляет dead_at → переход в active.
+  - **dead** — строка есть, `dead_at IS NOT NULL`. SSO **не** срабатывает (treat as none — пользователь увидит /login); нотификации не доставляются. При следующем `POST /api/telegram/auth` от того же tg_user_id upsert обнуляет dead_at → переход в active — как в анонимной SSO-ветке, так и в self-heal-ветке для залогиненного пользователя (round-38).
 
 ### Алгоритм webhook handler
 ```text
@@ -2070,7 +2101,7 @@ class TelegramUpdate(BaseModel):
 ```text
 1. Rate-limit check (slowapi): 30/min per IP → 429 если превышен
 2. Parse JSON body: TelegramAuthRequest(init_data: str)
-3. Через TelegramAuthService.validate_init_data:
+3. Через TelegramSSOService.validate_init_data:
    a. Parse init_data как application/x-www-form-urlencoded
    b. Extract hash, build data_check_string (отсортировано "k=v", joined by "\n", без поля "hash")
    c. secret_key = HMAC_SHA256("WebAppData", TELEGRAM_BOT_TOKEN)
@@ -2079,18 +2110,26 @@ class TelegramUpdate(BaseModel):
    f. auth_date = int(fields["auth_date"]); now - auth_date > TG_AUTH_INIT_DATA_TTL_SEC → InitDataExpiredError → 401 init_data_expired
    g. user_payload = json.loads(fields["user"]); telegram_user_id = int(user_payload["id"])
 4. Дополнительный rate-limit: 10/min per telegram_user_id → 429
-5. SELECT FROM telegram_links WHERE telegram_user_id=:tid AND dead_at IS NULL
-6. IF row exists:
-   a. Создать session (SessionStore.create_for_user(user_id=row.user_id, ip, ua))
-   b. Set-Cookie mas_session + mas_csrf
-   c. log event=telegram_sso_success, telegram_user_id=…, user_id=…
-   d. return 200 {linked: true, redirect: "/"}
-7. ELSE:
+5. round-38: РАЗРЕШИТЬ текущую сессию — current = request.state.session (если SessionMiddleware поставил)
+   IF current is not None (валидная mas_session) → ВЕТКА SELF-HEAL (шаг 8); ELSE → SSO (шаги 6/7).
+6. [аноним] SELECT FROM telegram_links WHERE telegram_user_id=:tid AND dead_at IS NULL
+   IF row exists:
+     a. record_login_success(row.user_id); Создать session (SessionStore.create(user_id=row.user_id, role, group_id, ip, ua))
+     b. Set-Cookie mas_session + mas_csrf
+     c. log event=telegram_sso_success, telegram_user_id=…, user_id=…
+     d. return 200 {linked: true, redirect: "/"}
+7. [аноним] ELSE (нет привязки):
    a. pending_token = secrets.token_urlsafe(32)
    b. Redis SETEX tg_pending:{pending_token} 900 json.dumps({telegram_user_id})
    c. Set-Cookie mas_tg_pending=pending_token (HttpOnly, Secure, SameSite=Lax, 15min)
    d. log event=telegram_sso_pending, telegram_user_id=…
    e. return 200 {linked: false, redirect: "/login"}
+8. [залогинен — SELF-HEAL, round-38 / ADR-0022 §1.6]
+   a. try: await svc.self_heal_link(telegram_user_id=tid, user_id=current.user_id, ip, ua)
+        # idempotent upsert (rebind разрешён); soft-limit; best-effort — НЕ raise наружу.
+   b. НЕ создавать session, НЕ трогать mas_session/mas_csrf, НЕ выставлять mas_tg_pending.
+   c. log event=telegram_self_heal_ok | telegram_self_heal_failed, telegram_user_id=…, user_id=…
+   d. return 200 {linked: false, healed: true}  (healed: false если шаг (a) внутренне упал)
 ```
 
 ### Алгоритм линковки (вызов из AuthService.login / complete_set_password) — ADR-0024 §3
@@ -2099,30 +2138,37 @@ class TelegramUpdate(BaseModel):
 2. pending_token = request.cookies.get("mas_tg_pending"); if None → return (нечего линковать)
 3. raw = await redis.get(f"tg_pending:{pending_token}"); if None → return (expired или невалиден)
 4. telegram_user_id = json.loads(raw)["telegram_user_id"]
-5. existing = await telegram_links_repo.get_active_by_telegram_user_id(telegram_user_id)  # резолв по PK (TG→user 1:1)
-6. # Решение по audit-action и лимиту (ADR-0024 §3) — collision-логики НЕТ (UNIQUE(user_id) снят):
-   IF existing is not None and existing.user_id == user.id:
-       # no-op refresh своего TG — upsert обнулит dead_at / created_at
-       row, replaced = await telegram_links_repo.upsert(telegram_user_id, user.id)
+5. existing = await telegram_links_repo.get_by_telegram_user_id(telegram_user_id)  # по PK, ВКЛ. dead — нужно для NO-OP/реактивации
+6. # Решение по audit-action / NO-OP / лимиту (ADR-0024 §3 + round-38 §1.6 edge-3) — collision-логики НЕТ:
+   IF existing is not None and existing.user_id != user.id:
+       # rebound: перепривязка TG-аккаунта на текущего (ON CONFLICT перенесёт user_id, created_at=now())
+       await telegram_links_repo.upsert(telegram_user_id, user.id)
+       action = "telegram_link_rebound"
+   ELIF existing is not None and existing.user_id == user.id:
+       IF existing.dead_at is None:
+           # round-38 critical-fix: привязка УЖЕ ЖИВАЯ на того же user → ПОЛНЫЙ NO-OP.
+           # НЕ upsert (created_at не сдвигаем — иначе теряем письма из окна), НЕ audit.
+           goto 8   # просто очищаем pending-cookie/Redis ниже
+       # реактивация своего dead-TG — upsert обнулит dead_at, created_at=now()
+       await telegram_links_repo.upsert(telegram_user_id, user.id)
        action = "telegram_link_created"   # details.replaced=true
-   ELIF existing is not None and existing.user_id != user.id:
-       # перепривязка TG-аккаунта на текущего user'а (ON CONFLICT перенесёт user_id)
-       row, replaced = await telegram_links_repo.upsert(telegram_user_id, user.id)
-       action = "telegram_link_rebound"   # details={telegram_user_id, replaced:true}
    ELSE:  # линка с этим telegram_user_id нет
-       active = await telegram_links_repo.list_active_by_user_id(user.id)
-       IF len(active) >= settings.TG_MAX_LINKS_PER_USER:
+       active = await telegram_links_repo.count_active_by_user_id(user.id)
+       IF active >= settings.TG_MAX_LINKS_PER_USER:
            await audit.log(action="telegram_link_limit_reached", actor_user_id=user.id, target_user_id=user.id,
                            details={"attempted_telegram_user_id": telegram_user_id,
                                     "limit": settings.TG_MAX_LINKS_PER_USER}, ip, ua)
            # НЕ привязываем; не падаем (login успешен). UI flash; через POST /api/telegram/links → 409 tg_link_limit.
            goto 8
-       row, replaced = await telegram_links_repo.upsert(telegram_user_id, user.id)  # replaced=false
+       await telegram_links_repo.upsert(telegram_user_id, user.id)  # INSERT, created_at=now()
        action = "telegram_link_created"   # details.replaced=false
 7. await audit.log(action=action, actor_user_id=user.id, target_user_id=user.id,
-                   details={"telegram_user_id": telegram_user_id, "replaced": replaced}, ip, ua)
+                   details={"telegram_user_id": telegram_user_id, "via": "login_flow"}, ip, ua)
+   # (шаг 7 пропускается для NO-OP-ветки выше — audit не пишется)
 8. Redis DEL tg_pending:{pending_token}; clear cookie mas_tg_pending в response
 ```
+
+> **Единообразие (round-38 §1.6 edge-3):** этот же decision-table (NO-OP для уже-живой привязки того же user; upsert только при INSERT / реактивации dead / rebound) реализован в общем `TelegramSSOService._link(...)` и применяется **одинаково** к `login_flow`, `session_add` (POST /api/telegram/links) и `self_heal`. Различие между entry-point'ами только в обработке rebound/лимита (login_flow и self_heal — best-effort/rebind-allowed; session_add — raise `TelegramLinkOwnedByOtherError`/`TelegramLinkLimitError`), но правило «не сдвигать `created_at` живой привязки» — общее для всех.
 
 ### Алгоритм logout-revoke — ADR-0024 §5 (сбрасывает ВСЕ привязки)
 ```text
@@ -2205,16 +2251,16 @@ class TelegramUpdate(BaseModel):
 
 ### Интеграция с другими модулями
 - **auth** — расширен (ADR-0022):
-  - `AuthService.login` (step-2) после успешного verify password проверяет cookie `mas_tg_pending` → если есть, вызывает `TelegramAuthService.link_pending(...)`.
+  - `AuthService.login` (step-2) после успешного verify password проверяет cookie `mas_tg_pending` → если есть, вызывает `TelegramSSOService.link_pending(...)`.
   - `AuthService.complete_set_password` — то же.
-  - `AuthService.logout` ПЕРЕД revoke session вызывает `TelegramAuthService.revoke_for_user(user_id, reason='logout')`.
+  - `AuthService.logout` ПЕРЕД revoke session вызывает `TelegramSSOService.revoke_for_user(user_id, reason='logout')`.
   - Cookies `mas_session`/`mas_csrf` ставятся ровно как в браузере. Telegram WebView shares cookies with system WebView (на iOS WKWebView, на Android system WebView), `SameSite=Lax` + `Secure` поверх HTTPS работают.
-- **admin** — `AdminService.reset_password` дополнительно вызывает `TelegramAuthService.revoke_for_user(user_id, reason='password_reset')`. `AdminService.delete_user` НЕ требует явного вызова — `telegram_links` каскадно удаляется через FK `ON DELETE CASCADE`.
+- **admin** — `AdminService.reset_password` дополнительно вызывает `TelegramSSOService.revoke_for_user(user_id, reason='password_reset')`. `AdminService.delete_user` НЕ требует явного вызова — `telegram_links` каскадно удаляется через FK `ON DELETE CASCADE`.
 - **redis** — два новых ключа:
   - `tg_pending:{token}` — SSO pending (TTL 15min, value `{"telegram_user_id": int}`).
   - `tg_notify_queue` — LIST для диспатчера нотификаций; LPUSH со стороны `worker.sync_cycle.save_message`, LPOP со стороны `worker.tg_notify_dispatch`.
 - **БД** — три новые таблицы (см. `03-data-model.md`): `telegram_links`, `telegram_notifications`, `users_settings`. Каскады описаны в data-model.
-- **middlewares** — `/api/telegram/webhook/*` и `/api/telegram/auth` имеют CSRF-exempt (нет session при first call); SessionMiddleware применяется (для `mas_tg_pending` cookie). Rate-limit slowapi применяется для обоих.
+- **middlewares** — `/api/telegram/webhook/*` и `/api/telegram/auth` имеют CSRF-exempt (защита SSO/self-heal — HMAC `init_data`, не CSRF-токен). SessionMiddleware применяется к `/api/telegram/auth` и **обязателен** для round-38 self-heal: backend читает `request.state.session`, чтобы отличить анонимную SSO-ветку от self-heal-ветки залогиненного пользователя. Rate-limit slowapi применяется для обоих.
 - **messages module** — `GET /messages/{id}` принимает query `embed: str | None`; при `embed=='tg'` шаблон `message_view.html` скрывает секцию attachments (ADR-0022 §2.6).
 - **worker.sync_cycle** (см. модуль 14) — после успешного COMMIT INSERT messages + apply_tags, если `applied_count > 0`, LPUSH в `tg_notify_queue`. Падение LPUSH **не** валит sync_cycle (try/except + log).
 - **worker.tg_notify_dispatch** (см. модуль 14.1 ниже) — drainит `tg_notify_queue` каждые 5 сек, шлёт sendMessage всем получателям.
@@ -2223,24 +2269,30 @@ class TelegramUpdate(BaseModel):
 ### Persistent SSO frontend flow
 - `static/js/tg.js` (расширен от ADR-0018):
   - Существующая логика (theme vars + `body.tg-app`) сохраняется.
-  - Новая логика на DOMContentLoaded:
+  - Логика на DOMContentLoaded (**round-38: gate `data-anonymous` СНЯТ** — POST делается при любой непустой `initData`, и для анонима, и для залогиненного; backend по `mas_session` сам выбирает SSO vs self-heal):
     ```js
     const tg = window.Telegram?.WebApp;
-    if (tg && tg.initData && document.body.dataset.anonymous === '1') {
+    if (tg && tg.initData && !window.__masTgSsoTried) {
+      window.__masTgSsoTried = true;   // guard от повторных вызовов (HMR / повторный DOMContentLoaded)
       fetch('/api/telegram/auth', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({init_data: tg.initData}),
         credentials: 'same-origin',
-      }).then(r => r.json().then(b => ({status: r.status, body: b})))
+      }).then(r => r.json().then(b => ({status: r.status, body: b})).catch(() => ({status: r.status, body: null})))
         .then(({status, body}) => {
-          if (status === 200 && body.linked) { window.location.replace(body.redirect || '/'); }
-          // linked=false — backend выставил mas_tg_pending, оставляем пользователя на текущей странице (/login)
-          // 401/429 — оставляем на текущей странице, пользователь увидит обычный /login form
-        }).catch(() => { /* network — no-op, fallback на manual login */ });
+          if (status !== 200 || !body) return;                  // 401/429/5xx — остаёмся на странице
+          if (body.linked === true && body.redirect) {          // аноним → выпущена сессия
+            window.location.replace(body.redirect);
+          }
+          // body.linked===false:
+          //   аноним без привязки → backend выставил mas_tg_pending, остаёмся на /login;
+          //   залогинен (self-heal) → {linked:false, healed:true} БЕЗ redirect → НЕ перезагружаемся
+          //     (привязка восстановлена молча; пользователь остаётся на текущей странице).
+        }).catch(() => { /* network — no-op */ });
     }
     ```
-  - `data-anonymous="1"` устанавливается в `base.html` когда у запроса нет активной сессии: `<body class="..." {% if not session %}data-anonymous="1"{% endif %}>`.
+  - `data-anonymous="1"` (`base.html`) с round-38 **больше не используется** для гейта SSO-вызова (фронт шлёт POST всегда при наличии `initData`). Маркер может остаться в шаблоне для других целей (топбар/навигация), но `tg.js` его **не** читает. frontend-агент: удалить чтение `dataset.anonymous` из `tg.js`; решение «аноним vs залогинен» делает backend.
 
 ---
 

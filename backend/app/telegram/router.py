@@ -245,6 +245,35 @@ async def telegram_auth(request: Request, db: DbSession) -> Response:
     # Per-tg_user_id rate-limit (post-HMAC).
     await consume(LIMIT_TG_AUTH_USER, f"tg:{resolved.telegram_user_id}")
 
+    # round-38 (ADR-0022 §1.6) — resolve the current session AFTER HMAC +
+    # rate-limit. A valid ``mas_session`` (populated by SessionMiddleware)
+    # switches this endpoint into self-heal mode: idempotently rebind the
+    # proven TG to the already-logged-in user, WITHOUT issuing a second
+    # session or a ``mas_tg_pending`` cookie.
+    current_session = getattr(request.state, "session", None)
+    if current_session is not None:
+        # ``verify_and_resolve`` issued SELECTs that auto-began a read-only
+        # transaction; close it before ``self_heal_link`` opens its own
+        # ``db.begin()`` (it owns the write transaction — best-effort rollback).
+        await db.commit()
+        healed = await svc.self_heal_link(
+            telegram_user_id=resolved.telegram_user_id,
+            user_id=current_session.user_id,
+            ip=ip,
+            user_agent=ua,
+        )
+        log.info(
+            "telegram_auth_self_heal",
+            user_id=current_session.user_id,
+            telegram_user_id=resolved.telegram_user_id,
+            healed=healed,
+        )
+        # No Set-Cookie, no redirect — frontend stays on the current page.
+        return JSONResponse(
+            content=TelegramAuthResponse(linked=False, healed=healed).model_dump(exclude_none=True),
+            status_code=status.HTTP_200_OK,
+        )
+
     if resolved.kind == "linked":
         assert resolved.user_id is not None
         user = await UsersRepo(db).get_by_id(resolved.user_id)
@@ -282,7 +311,9 @@ async def telegram_auth(request: Request, db: DbSession) -> Response:
                 user.id, user.role, user.group_id, ip, ua
             )
             response = JSONResponse(
-                content=TelegramAuthResponse(linked=True, redirect="/").model_dump(),
+                content=TelegramAuthResponse(linked=True, redirect="/").model_dump(
+                    exclude_none=True
+                ),
                 status_code=status.HTTP_200_OK,
             )
             set_session_cookies(response, session_token, csrf, settings)
@@ -298,7 +329,7 @@ async def telegram_auth(request: Request, db: DbSession) -> Response:
     # Unlinked → create pending token + cookie.
     token = await svc.create_pending(resolved.telegram_user_id)
     response = JSONResponse(
-        content=TelegramAuthResponse(linked=False, redirect="/login").model_dump(),
+        content=TelegramAuthResponse(linked=False, redirect="/login").model_dump(exclude_none=True),
         status_code=status.HTTP_200_OK,
     )
     # Local import to avoid a circular import at module load (cookies.py

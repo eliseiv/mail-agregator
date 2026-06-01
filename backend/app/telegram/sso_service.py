@@ -218,6 +218,58 @@ class TelegramSSOService:
             via="session_add",
         )
 
+    async def self_heal_link(
+        self,
+        *,
+        telegram_user_id: int,
+        user_id: int,
+        ip: str,
+        user_agent: str | None,
+    ) -> bool:
+        """Idempotently restore the ``telegram_user_id → user_id`` binding for
+        an **already-logged-in** user (round-38, ADR-0022 §1.6 self-heal).
+
+        Called by ``POST /api/telegram/auth`` when a valid ``mas_session`` is
+        present. Shares the exact decision table of :meth:`_link` with
+        ``allow_rebind_from_other=True`` and ``via="self_heal"``:
+
+        - live link of the same user (``dead_at IS NULL``) → **full NO-OP**
+          (``created_at`` is *not* bumped, no audit) — preserves the push
+          delivery window (ADR-0022 §1.6 edge-3);
+        - missing → INSERT; dead → reactivation; other owner → rebound — each
+          bumps ``created_at`` and writes the matching audit entry.
+
+        Best-effort: never propagates an exception. It owns its own write
+        transaction (``db.begin()``) so a failed ``_link`` can be rolled back
+        cleanly — the caller must **not** wrap this in an outer transaction.
+        On any internal failure it rolls back, logs ``telegram_self_heal_failed``
+        and returns ``False`` so the router can answer
+        ``{"linked": false, "healed": false}`` without breaking the WebApp open.
+        Returns ``True`` when the binding is live afterwards (NO-OP, INSERT,
+        reactivation or rebound all count as healed).
+        """
+        try:
+            async with self._db.begin():
+                await self._link(
+                    telegram_user_id=telegram_user_id,
+                    user_id=user_id,
+                    ip=ip,
+                    user_agent=user_agent,
+                    allow_rebind_from_other=True,
+                    via="self_heal",
+                )
+        except Exception:  # best-effort: self-heal must not raise to the caller
+            # FK race (session user vanished mid-request, ADR-0022 §1.6 edge-5)
+            # or any transient DB error. The ``db.begin()`` context already
+            # rolled back; swallow so the WebApp still opens.
+            log.warning(
+                "telegram_self_heal_failed",
+                user_id=user_id,
+                telegram_user_id=telegram_user_id,
+            )
+            return False
+        return True
+
     async def _link(
         self,
         *,
@@ -230,20 +282,34 @@ class TelegramSSOService:
     ) -> None:
         """Shared link logic for both entry points (ADR-0024 §3/§4).
 
-        Decision table:
+        Decision table (round-38, ADR-0022 §1.6 edge-3 — applied **uniformly**
+        to ``login_flow`` / ``session_add`` / ``self_heal``):
 
-        - existing link points at **another** user:
-          - ``allow_rebind_from_other`` (login-flow) → rebind via upsert,
-            audit ``telegram_link_rebound``;
+        - existing link points at **another** user (rebound):
+          - ``allow_rebind_from_other`` (login-flow / self-heal) → rebind via
+            upsert (``created_at=now()``, ``dead_at=NULL``), audit
+            ``telegram_link_rebound``;
           - else (session-add) → raise
             :class:`TelegramLinkOwnedByOtherError`.
-        - existing link points at **this** user → refresh via upsert, audit
-          ``telegram_link_created`` with ``replaced=true``.
+        - existing link points at **this** user:
+          - ``dead_at IS NULL`` (live) → **full NO-OP**: the row is left
+            untouched (``created_at`` preserved) and **no** audit is written.
+            Bumping ``created_at`` here would advance the push-delivery window
+            (recipient SQL filters ``m.internal_date >= tl.created_at``) and
+            silently drop messages that arrived between two WebApp opens — the
+            critical defect this fix removes.
+          - ``dead_at IS NOT NULL`` (dead) → reactivate via upsert
+            (``created_at=now()``, ``dead_at=NULL``), audit
+            ``telegram_link_created`` with ``replaced=true``.
         - no existing link → enforce ``COUNT(active) <
           TG_MAX_LINKS_PER_USER``; at the cap audit
-          ``telegram_link_limit_reached`` and (login-flow) no-op or
+          ``telegram_link_limit_reached`` and (login-flow / self-heal) no-op or
           (session-add) raise :class:`TelegramLinkLimitError`; otherwise
-          create + audit ``telegram_link_created``.
+          INSERT (``created_at=now()``) + audit ``telegram_link_created``.
+
+        ``repo.upsert`` stays a pure write primitive (it always sets
+        ``created_at=now()``); the "write vs NO-OP" decision lives here, keyed
+        off the ``get_by_telegram_user_id`` lookup (PK read — sees dead rows).
         """
         existing = await self._links.get_by_telegram_user_id(telegram_user_id)
 
@@ -275,7 +341,20 @@ class TelegramSSOService:
             return
 
         if existing is not None and existing.user_id == user_id:
-            # Same owner — refresh (clears dead_at, bumps created_at).
+            if existing.dead_at is None:
+                # round-38 critical-fix (ADR-0022 §1.6 edge-3): the binding is
+                # already live for this user → FULL NO-OP. Do NOT upsert
+                # (created_at must not move) and do NOT audit (avoids the
+                # ``replaced=true`` spam on every WebApp open).
+                log.debug(
+                    "telegram_link_noop_live",
+                    user_id=user_id,
+                    telegram_user_id=telegram_user_id,
+                    via=via,
+                )
+                return
+            # Dead link of the same user → reactivate (clears dead_at, bumps
+            # created_at so push resumes "forward" only).
             await self._links.upsert(telegram_user_id=telegram_user_id, user_id=user_id)
             await self._audit.log(
                 actor_user_id=user_id,

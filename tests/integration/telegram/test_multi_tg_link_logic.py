@@ -5,7 +5,8 @@ to validate the §3 decision table without going through HMAC/initData:
 
 F. link logic:
    - NEW TG to one's own user → ``telegram_link_created`` (replaced=False);
-   - REPEAT one's own TG → ``telegram_link_created`` (replaced=True, refresh);
+   - REPEAT one's own LIVE TG → full NO-OP (round-38, ADR-0022 §1.6: no audit,
+     ``created_at`` frozen — uniform rule across login_flow/session_add/self_heal);
    - someone else's TG via session-add → ``TelegramLinkOwnedByOtherError``
      (router → 409 ``tg_link_owned_by_other``);
    - someone else's TG via login-flow → rebind, ``telegram_link_rebound``.
@@ -89,25 +90,46 @@ class TestLinkDecisionTable:
         assert (created[0].details or {}).get("replaced") is False
         assert (created[0].details or {}).get("via") == "session_add"
 
-    async def test_repeat_own_tg_is_refresh_replaced_true(
+    async def test_repeat_own_live_tg_is_full_noop(
         self,
         db_engine: AsyncEngine,
         client: Any,
         super_admin_user: User,
         make_link: Any,
     ) -> None:
+        """round-38 (ADR-0022 §1.6, uniform NO-OP rule): re-adding an
+        already-LIVE TG of the same user via ``link_session_add`` is a **full
+        NO-OP** — no ``telegram_link_created`` audit (the old ``replaced=true``
+        refresh is gone) and ``created_at`` is NOT moved (it must not advance
+        the push-delivery window). The rule applies uniformly to
+        login_flow / session_add / self_heal."""
         await make_link(410101, super_admin_user.id)
         factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
+        async with factory() as ses:
+            before = (
+                await ses.execute(
+                    select(TelegramLink).where(TelegramLink.telegram_user_id == 410101)
+                )
+            ).scalar_one()
+            created_at_0 = before.created_at
+
         async with factory() as ses, ses.begin():
             await TelegramSSOService(ses).link_session_add(
                 telegram_user_id=410101, user_id=super_admin_user.id, ip=_IP, user_agent=_UA
             )
 
+        # NO-OP: no audit written.
         created = await _audits(db_engine, "telegram_link_created")
-        assert len(created) == 1
-        assert (created[0].details or {}).get("replaced") is True
-        # Still exactly one link for the user (refresh, not a new row).
+        assert created == [], "live repeat session-add must be a NO-OP (no audit)"
+        # Still exactly one link for the user, created_at frozen.
         assert await _count_active(db_engine, super_admin_user.id) == 1
+        async with factory() as ses:
+            after = (
+                await ses.execute(
+                    select(TelegramLink).where(TelegramLink.telegram_user_id == 410101)
+                )
+            ).scalar_one()
+            assert after.created_at == created_at_0, "created_at must not move on a NO-OP"
 
     async def test_other_users_tg_via_session_add_is_refused(
         self,

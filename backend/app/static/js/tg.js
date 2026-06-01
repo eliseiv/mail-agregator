@@ -73,13 +73,17 @@
     tg.onEvent("themeChanged", applyTheme);
   }
 
-  // ADR-0022 §1.3 — Persistent SSO attempt.
+  // ADR-0022 §1.3 + §1.6 — Persistent SSO attempt + self-heal of the TG link.
   //
-  // When the page is rendered for an anonymous visitor (server-side marker
-  // `<body data-anonymous="1">` — see base.html; `mas_session` is HttpOnly and
-  // cannot be inspected from JS), and we have a non-empty `initData` from the
-  // Telegram WebApp, POST it to `/api/telegram/auth` to see if this Telegram
-  // user is already linked to an internal account.
+  // round-38: the `data-anonymous` / `isAnonymous` gate has been REMOVED. When we
+  // have a non-empty `initData` from the Telegram WebApp we POST it to
+  // `/api/telegram/auth` ALWAYS — for anonymous AND for already-logged-in users.
+  // The frontend no longer decides "anonymous vs logged-in" (the `mas_session`
+  // cookie is HttpOnly and not visible to JS). The backend reads `mas_session`
+  // and picks the branch itself:
+  //   - no valid session  → SSO (linked/unlinked), as before;
+  //   - valid session     → self-heal upsert of `telegram_links` (§1.6), which
+  //                          re-creates the link silently so notifications resume.
   //
   // Endpoint is CSRF-exempt (ADR-0022 §1.2) — no `X-CSRF-Token` header needed;
   // protection relies on HMAC of `init_data` + 5-minute `auth_date` TTL.
@@ -87,12 +91,10 @@
   //
   // `__masTgSsoTried` guards against duplicate calls (HMR re-execution, repeated
   // DOMContentLoaded handlers, etc.) — set BEFORE the fetch so an in-flight call
-  // is never re-fired.
+  // is never re-fired and we can never enter an infinite reload/POST loop.
   var initData = typeof tg.initData === "string" ? tg.initData : "";
-  var isAnonymous =
-    document.body && document.body.dataset && document.body.dataset.anonymous === "1";
 
-  if (initData && isAnonymous && !window.__masTgSsoTried) {
+  if (initData && !window.__masTgSsoTried) {
     window.__masTgSsoTried = true;
 
     fetch("/api/telegram/auth", {
@@ -102,39 +104,42 @@
       credentials: "same-origin",
     })
       .then(function (response) {
-        if (response.status === 200) {
-          return response
-            .json()
-            .then(function (body) {
-              if (body && body.linked === true) {
-                // Backend set `mas_session` + `mas_csrf` cookies; reload into
-                // the authenticated app. `redirect` is provided by the backend
-                // (defaults to "/").
-                var target = body.redirect || "/";
-                window.location.replace(target);
-              }
-              // linked === false: backend has set the short-lived `mas_tg_pending`
-              // cookie. We stay on the anonymous page so the user can complete the
-              // normal login flow, which will pick up the cookie and create the
-              // telegram_links row on success.
-            })
-            .catch(function () {
-              // Malformed JSON from a 200 — non-fatal, fall back to manual login.
-            });
+        var status = response.status;
+        return response
+          .json()
+          .then(function (body) {
+            return { status: status, body: body };
+          })
+          .catch(function () {
+            // Non-200 with empty/non-JSON body, or malformed JSON from a 200.
+            return { status: status, body: null };
+          });
+      })
+      .then(function (result) {
+        if (result.status !== 200 || !result.body) {
+          // 401 (invalid_init_data / init_data_expired), 429 (rate_limited),
+          // 5xx, or malformed body — degrade silently, stay on the current page.
+          return;
         }
-        // 401 (invalid_init_data / init_data_expired), 429 (rate_limited),
-        // 5xx — degrade silently to the server-rendered login page.
-        if (response.status >= 400) {
-          // eslint-disable-next-line no-console
-          console.warn("[tg.js] /api/telegram/auth status", response.status);
+        var body = result.body;
+        if (body.linked === true && body.redirect) {
+          // Anonymous visitor just authenticated via SSO: backend set the
+          // `mas_session` + `mas_csrf` cookies. Reload into the authenticated app.
+          window.location.replace(body.redirect);
+          return;
         }
-        return null;
+        // body.linked === false:
+        //   - anonymous without a link: backend set the short-lived
+        //     `mas_tg_pending` cookie; we stay on /login so the normal login flow
+        //     can pick it up and create the telegram_links row on success.
+        //   - logged-in self-heal (§1.6): backend returned {linked:false,
+        //     healed:true} WITHOUT a redirect and WITHOUT mas_tg_pending. We do
+        //     NOT reload — the link was restored silently and the page is
+        //     unchanged.
       })
       .catch(function () {
         // Network error (offline, CSP block, DNS, etc.) — page still works
-        // without SSO; user can log in manually.
-        // eslint-disable-next-line no-console
-        console.warn("[tg.js] /api/telegram/auth network error");
+        // without SSO/self-heal; user can log in manually. Stay silent.
       });
   }
 })();

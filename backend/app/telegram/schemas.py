@@ -117,10 +117,22 @@ class TelegramAuthRequest(BaseModel):
 
 
 class TelegramAuthResponse(BaseModel):
-    """``POST /api/telegram/auth`` body for both linked/unlinked outcomes."""
+    """``POST /api/telegram/auth`` body for linked / unlinked / self-heal outcomes.
+
+    - Anonymous SSO (ADR-0022 §1.3): ``{linked, redirect}`` — ``healed`` omitted.
+    - Self-heal (round-38, ADR-0022 §1.6): ``{linked: false, healed: true}`` (or
+      ``healed: false`` when the best-effort upsert failed internally) — **no**
+      ``redirect`` so the frontend does not reload an already-logged-in WebApp.
+
+    ``healed`` defaults to ``None`` and is excluded from the serialised body via
+    ``model_dump(exclude_none=True)`` at the call sites, so the existing
+    anonymous responses (``linked``/``redirect`` only) are byte-for-byte
+    unchanged. ``redirect`` is optional because the self-heal branch omits it.
+    """
 
     linked: bool
-    redirect: str
+    redirect: str | None = None
+    healed: bool | None = None
 
     model_config = ConfigDict(extra="forbid")
 
