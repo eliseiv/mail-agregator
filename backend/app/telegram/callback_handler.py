@@ -48,6 +48,7 @@ from backend.app.telegram.bot import (
 )
 from backend.app.telegram.schemas import TelegramCallbackQuery
 from shared.html_sanitize import (
+    collapse_blank_lines_tg,
     linkify_plain_text,
     sanitize_telegram_html,
     strip_invisible_padding,
@@ -96,6 +97,7 @@ def _format_message_body(
 
     if body_html:
         body_safe = sanitize_telegram_html(body_html)
+        body_safe = collapse_blank_lines_tg(body_safe)  # round-39: post-sanitize collapse
         if not body_safe.strip():
             # Sanitiser may strip the body to nothing if every tag was
             # disallowed (rare). Fall back to the plain-text path so the

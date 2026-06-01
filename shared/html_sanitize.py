@@ -300,6 +300,76 @@ def collapse_blank_lines_html(html: str | None) -> str:
     return _MULTI_BR_RE.sub("<br><br>", collapsed)  # 3+ <br> → 2
 
 
+# --- TG full-body post-sanitize collapse (ADR-0022 2.10, round-39) ----------
+#
+# A "blank" line in the TG full-body view is a line made up of ANY whitespace.
+# Unlike round-37 _COLLAPSE_BLANK_TEXT_LINES_RE (narrow ASCII class
+# [ \t\r\f\v]) this needs a WIDE class: Apple / marketing indent lines contain
+# U+00A0 (nbsp), U+2003 (em space), U+3000 (ideographic space) and friends.
+# Zero-width chars (U+200B/200C/200D/2060/FEFF) are NOT whitespace in the
+# Unicode sense (the [^\S\n] class does NOT match them), but by this point they
+# are already removed inside sanitize_telegram_html (strip_invisible_padding,
+# before collapse), so they are absent at the collapse input. Ordering
+# "collapse AFTER sanitize" is therefore mandatory.
+#
+# A separator run = (optional whitespace, then a newline OR <br>), repeated so
+# that between two "content" lines there are 2+ breaks. Collapse such a run to
+# EXACTLY one paragraph separator ("\n\n").
+#
+# \S in Python re (str mode, re.UNICODE by default) = NON-whitespace, so
+# [^\S\n] = "all Unicode whitespace EXCEPT \n" -- includes \xa0 / em space /
+# ideographic space, but does NOT eat the \n itself (those are "breaks",
+# matched separately via _TG_BREAK). This yields deterministic
+# "horizontal-whitespace around breaks". Newline and <br> are normalised as
+# interchangeable "breaks".
+_TG_BREAK = r"(?:\n|<br\s*/?>)"
+_TG_HSPACE = r"[^\S\n]"  # any whitespace EXCEPT \n (incl. \xa0, em/ideographic space)
+#
+# 3+ breaks (\n|<br>) with arbitrary h-whitespace between/around -> "\n\n".
+_COLLAPSE_TG_BLANK_RE: Final[re.Pattern[str]] = re.compile(
+    rf"{_TG_HSPACE}*{_TG_BREAK}(?:{_TG_HSPACE}*{_TG_BREAK}){{2,}}{_TG_HSPACE}*"
+)
+#
+# Split on <pre>...</pre>: the capturing group puts <pre> blocks into the ODD
+# segments of the re.split result, ordinary text into the EVEN ones. Collapse
+# is applied ONLY to the even segments (outside <pre>); newlines inside <pre>
+# are significant and preserved verbatim. <pre> is in _TELEGRAM_ALLOWED_TAGS,
+# i.e. it survives until collapse -- the split is built RIGHT INTO the function
+# body (not a "requirement on backend").
+_TG_PRE_SPLIT_RE: Final[re.Pattern[str]] = re.compile(
+    r"(<pre\b.*?</pre>)", re.DOTALL | re.IGNORECASE
+)
+
+
+def collapse_blank_lines_tg(text: str | None) -> str:
+    """Collapse blank lines in ALREADY-sanitised Telegram HTML.
+
+    Operates on the output of :func:`sanitize_telegram_html` (a mix of "\\n"
+    and "<br>"). A run of 3+ line breaks (any combination of "\\n" and "<br>",
+    with arbitrary horizontal whitespace -- incl. ``\\xa0``/``\\u2003``/
+    ``\\u3000`` -- between them) collapses to a single paragraph separator
+    ("\\n\\n"). Paragraphs stay separated by exactly one blank line; a single
+    break and a single blank line are left untouched (the rule only fires on
+    3+ breaks). Leading / trailing blank lines are stripped.
+
+    ``<pre>`` content is NOT touched: the input is split on ``<pre>...</pre>``
+    via ``_TG_PRE_SPLIT_RE`` (the capturing group puts <pre> blocks into the
+    ODD segments), collapse is applied ONLY to the even (outside-<pre>)
+    segments; newlines inside ``<pre>`` are preserved verbatim. Segments are
+    joined back together.
+
+    Applied ONLY in the TG full-body view (``_format_message_body``) on top of
+    :func:`sanitize_telegram_html`. Empty / ``None`` input -> ''. The STORED
+    body is never modified (render-time only)."""
+    if not text:
+        return ""
+    parts = _TG_PRE_SPLIT_RE.split(text)
+    # even segments = text outside <pre> (collapse); odd = <pre>...</pre> (as-is)
+    for i in range(0, len(parts), 2):
+        parts[i] = _COLLAPSE_TG_BLANK_RE.sub("\n\n", parts[i])
+    return "".join(parts).strip("\n")
+
+
 def sanitize_telegram_html(html: str) -> str:
     """Return HTML reduced to the Telegram Bot API ``parse_mode=HTML`` subset.
 

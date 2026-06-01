@@ -959,6 +959,147 @@ if needs_retry:                                     # ТОЛЬКО retry_after /
 
 **Миграций нет.** Изменение чисто на уровне отображения; схема БД и хранимые данные не меняются. Чинит и существующие письма (нормализация на каждом просмотре).
 
+##### round-39 — post-sanitize collapse для TG «Посмотреть сообщение» (bug «множество пустых строк в TG full-body view»)
+
+**Постановка проблемы (баг, подтверждён на проде — письмо Apple `id=1252`).**
+
+round-37 (выше) добавил `collapse_blank_lines_text` / `collapse_blank_lines_html` и применил их в `MessageService.get` к `body_text` / `body_html`. Это закрыло **web**-вью (`message_view.html`) и JSON `GET /api/messages/{id}`. Но TG «Посмотреть сообщение» рендерится **не** из `MessageService.get`, а отдельным путём — `backend/app/telegram/callback_handler.py::_format_message_body` (строки 74–113), который при наличии `body_html` строит тело так:
+
+```python
+body_safe = sanitize_telegram_html(body_html)   # строка 98
+```
+
+Диагноз на письме Apple `id=1252`:
+- сохранённый `body_text` **чистый** (без строк-отступов); `body_html` присутствует (1917 байт) — табличная вёрстка (Apple/marketing: вложенные `<table>/<tr>/<td>` со spacer-ячейками и whitespace-узлами).
+- `_format_message_body` идёт по **HTML-ветке** (`body_html` непустой) → `sanitize_telegram_html`. Эта функция оставляет только Telegram-подмножество (`b/i/u/s/a/code/pre`), а `<table>/<tr>/<td>/<div>` **стрипает**, при этом блок-закрытия (`_BLOCK_CLOSE_TO_NL_RE`, вкл. `</table>`/`</tr>`) → `\n`. Сплошные вложенные таблицы с пустыми ячейками + whitespace-узлы после стрипа дают **много** строк-отступов вида `\n                \n`.
+- **Почему round-37 не помог:** `collapse_blank_lines_html` чистит только пустые `<p>/<div>` и 3+`<br>` — таблицы он не трогает; а пустота **рождается на этапе `sanitize_telegram_html` (стрип таблиц)**, который выполняется **после** `MessageService.get`-нормализации (в TG-ветке `MessageService.get` вообще не на пути — `_format_message_body` сам зовёт `sanitize_telegram_html`). Поэтому артефакт остаётся.
+- **Почему встроенный `_COLLAPSE_BLANK_LINES_RE` (`\n{3,}`) внутри `sanitize_telegram_html`, строка 342, не справляется:** он матчит только прогоны **голых** `\n`. Строки-отступы содержат пробелы (`\n`+пробелы+`\n`), поэтому `\n{3,}` на них **не срабатывает** — между переводами строки стоят whitespace-символы. Это и есть корневая причина.
+
+**Решение (round-39): схлопывать пустые строки ПОСЛЕ `sanitize_telegram_html`**, расширенным правилом, которое (а) считает «пустой» строку с **любым** whitespace (вкл. `\xa0`/zero-width/` `/`　`), и (б) обрабатывает **смешанные** прогоны `\n` и `<br>`.
+
+**Где применять — вариант (а) «в `_format_message_body`», НЕ (б) «внутри `sanitize_telegram_html`».**
+
+| Критерий | (а) collapse в `_format_message_body` (после строки 98) | (б) встроить collapse в `sanitize_telegram_html` |
+| --- | --- | --- |
+| Кто получит фикс | только TG full-body view (единственный потребитель, сохраняющий построчную структуру) | все потребители `sanitize_telegram_html` |
+| Польза для `html_to_plain` (preview) | n/a — preview и так не страдает | **нулевая**: `html_to_plain` сразу гонит выход через `_ANY_TAG_RE` + `normalize_preview`, который `[\s\xa0]+ → " "` схлопывает **любой** whitespace в один пробел; пустые строки для preview уже неразличимы |
+| Польза для `notify_format` | n/a | нулевая (тот же `normalize_preview`) |
+| Риск регрессии | минимальный, локализован одной call-site | средний: изменение «общего» санитайзера может тонко сдвинуть существующее поведение preview/tag-stripping и потребует переутверждения юнит-тестов `test_notify_format` |
+| Семантика | «компактный вывод именно для full-body view» — там, где это и нужно | размывает контракт `sanitize_telegram_html` («сузить markup до TG-подмножества») доп. ответственностью |
+| blast-radius | 1 функция + 1 call-site | 1 функция, но затрагивает 3 потребителя |
+
+**Выбран вариант (а).** Единственный потребитель `sanitize_telegram_html`, который **сохраняет построчную структуру** и потому страдает от пустых строк, — это `_format_message_body` (TG full-body view). `html_to_plain` (preview) и `notify_format` уже выравнивают любой whitespace в один пробел через `normalize_preview` (`_WHITESPACE_RUN_RE = [\s\xa0]+`), поэтому встраивание в санитайзер им **ничего не даёт**, но расширяет blast-radius и риск регрессии общего модуля. Фикс локализуется в TG-ветке `_format_message_body`, что соответствует принципу простоты README.
+
+> Существующий `_COLLAPSE_BLANK_LINES_RE` (`\n{3,}`) **внутри** `sanitize_telegram_html` (строка 342) **оставляем как есть** — он дёшев и схлопывает голые `\n`-прогоны для всех потребителей; round-39 добавляет **дополнительный** проход поверх его выхода в TG-ветке, закрывающий whitespace-классы и `<br>`, которые `\n{3,}` пропускает. Дубль-чистка идемпотентна и безвредна.
+
+**Новая функция (`shared/html_sanitize.py`):**
+
+```python
+# shared/html_sanitize.py — round-39 (ADR-0022 §2.10)
+#
+# «Пустая» строка для TG full-body view = строка из ЛЮБОГО whitespace.
+# В отличие от round-37 _COLLAPSE_BLANK_TEXT_LINES_RE (узкий ASCII-класс
+# [ \t\r\f\v]) здесь нужен ШИРОКИЙ класс, т.к. строки-отступы Apple/marketing
+# содержат U+00A0 (nbsp), U+2003 (em space), U+3000 (ideographic space) и т.п.
+# zero-width-символы (U+200B/200C/200D/2060/FEFF) НЕ являются whitespace в
+# Unicode-смысле (класс [^\S\n] их НЕ матчит), но к этому моменту они уже
+# удалены внутри sanitize_telegram_html (strip_invisible_padding, до collapse) —
+# поэтому на входе collapse их нет. Порядок «collapse ПОСЛЕ санитайза» обязателен.
+#
+# Прогон-сепаратор = (необязательный whitespace, затем перевод строки ИЛИ <br>),
+# повторённый так, что между двумя «контентными» строками стоит 2+ разрыва.
+# Схлопываем такой прогон в РОВНО один разделитель абзаца ("\n\n").
+#
+# \S в Python re (str-режим, re.UNICODE по умолчанию) = НЕ-whitespace; значит
+# [^\S\n] = «весь Unicode-whitespace, КРОМЕ \n» — включает \xa0 / em-space / 　,
+# но НЕ съедает сами \n (они — «разрывы», матчатся отдельно через _TG_BREAK).
+# Это даёт детерминированный «horizontal-whitespace вокруг разрывов».
+# Перевод строки и <br> нормализуем как взаимозаменяемые «разрывы».
+_TG_BREAK = r"(?:\n|<br\s*/?>)"
+_TG_HSPACE = r"[^\S\n]"            # любой whitespace КРОМЕ \n (incl. \xa0, ,　)
+#
+# 3+ разрыва (\n|<br>) с произвольным h-whitespace между/вокруг → "\n\n".
+_COLLAPSE_TG_BLANK_RE: Final[re.Pattern[str]] = re.compile(
+    rf"{_TG_HSPACE}*{_TG_BREAK}(?:{_TG_HSPACE}*{_TG_BREAK}){{2,}}{_TG_HSPACE}*"
+)
+#
+# Split по <pre>…</pre>: захватывающая группа → блоки <pre> попадают в
+# НЕЧЁТНЫЕ сегменты результата re.split, обычный текст — в ЧЁТНЫЕ. Collapse
+# применяется ТОЛЬКО к чётным (вне <pre>); переносы внутри <pre> значимы и
+# сохраняются дословно. <pre> входит в _TELEGRAM_ALLOWED_TAGS, т.е. доживает
+# до collapse — split встроен ПРЯМО в тело функции (не «требование к backend»).
+_TG_PRE_SPLIT_RE: Final[re.Pattern[str]] = re.compile(
+    r"(<pre\b.*?</pre>)", re.DOTALL | re.IGNORECASE
+)
+
+def collapse_blank_lines_tg(text: str | None) -> str:
+    """Схлопнуть пустые строки в УЖЕ-санитизированном Telegram-HTML
+    (выход sanitize_telegram_html: смесь "\\n" и "<br>").
+
+    Прогон из 3+ разрывов строки (любая комбинация "\\n" и "<br>", с
+    произвольным horizontal-whitespace — вкл. \\xa0/\\u2003/\\u3000 — между
+    ними) схлопывается в один разделитель абзаца ("\\n\\n"). Абзацы остаются
+    разделены ровно одной пустой строкой; одиночный разрыв и одиночная пустая
+    строка не трогаются. Ведущие/замыкающие пустые строки убираются.
+
+    <pre>-содержимое НЕ трогается: вход режется по <pre>…</pre> через
+    _TG_PRE_SPLIT_RE (захватывающая группа → блоки <pre> = НЕЧЁТНЫЕ сегменты),
+    collapse применяется ТОЛЬКО к чётным (вне <pre>) сегментам; переносы
+    внутри <pre> сохраняются дословно. Сегменты склеиваются обратно.
+
+    Применяется ТОЛЬКО в TG full-body view (_format_message_body) поверх
+    sanitize_telegram_html. Пустой/None-вход → ''. Хранимое body НЕ
+    меняется (render-time)."""
+    if not text:
+        return ""
+    parts = _TG_PRE_SPLIT_RE.split(text)
+    # чётные сегменты = текст вне <pre> (collapse); нечётные = <pre>…</pre> (как есть)
+    for i in range(0, len(parts), 2):
+        parts[i] = _COLLAPSE_TG_BLANK_RE.sub("\n\n", parts[i])
+    return "".join(parts).strip("\n")
+```
+
+**Точный whitespace-класс (round-39).** «Пустой» считается строка, содержащая любой из:
+- ASCII horizontal: ` ` `\t` `\r` `\f` `\v`;
+- Unicode-пробелы, попадающие в `\s` при `str`-режиме `re`: `\xa0` (U+00A0 NBSP), ` ` (EM SPACE), `　` (IDEOGRAPHIC SPACE), ` / … `, ` `, ` `, и др. из Zs;
+- zero-width (`​/‌/‍/⁠/﻿`) — уже удалены `strip_invisible_padding` внутри `sanitize_telegram_html` до collapse, но класс `[^\S\n]` их не «ловит» (они не whitespace в Unicode-смысле). Поэтому **порядок обязателен**: collapse применяется к выходу `sanitize_telegram_html`, который уже прогнал `strip_invisible_padding` (строка 336) — zero-width на входе collapse отсутствуют. Дополнительной защиты не требуется.
+
+Класс выражен как `[^\S\n]` = «любой whitespace, кроме `\n`». Это надёжнее перечисления: `\S` = не-whitespace, `[^\S\n]` = whitespace-минус-`\n`, что точно отделяет horizontal-whitespace от самих разрывов строк и даёт детерминированный результат (round-37 для plain-ветки использует узкий `[ \t\r\f\v]`; round-39 расширяет до Unicode, т.к. артефакт содержит `\xa0`/` `).
+
+**Обработка смешанных `\n` / `<br>` (round-39).** После `sanitize_telegram_html` в выводе встречаются **оба** разрыва: `\n` (из `_BR_TO_NL_RE` + `_BLOCK_CLOSE_TO_NL_RE`) и потенциально оставшиеся `<br>` (Telegram-санитайзер конвертит `<br>`→`\n` **до** bleach, так что `<br>` в выходе быть не должно — но `collapse_blank_lines_tg` устойчив к обоим на случай прямого вызова/будущих изменений). `_TG_BREAK = (?:\n|<br\s*/?>)` трактует `\n` и `<br>` как **взаимозаменяемые** разрывы; прогон из 3+ любых их комбинаций (`\n\n<br>`, `<br>\n<br>`, `\n   \n   \n`) → `\n\n`. Результат — чистый `\n`-разделённый TG-HTML (без `<br>`-остатков), что корректно для `parse_mode=HTML` (Telegram не принимает `<br>`).
+
+**Где встраивается (backend, точная правка):**
+
+`backend/app/telegram/callback_handler.py::_format_message_body`, HTML-ветка — после строки 98:
+
+```python
+if body_html:
+    body_safe = sanitize_telegram_html(body_html)
+    body_safe = collapse_blank_lines_tg(body_safe)   # round-39: post-sanitize collapse
+    if not body_safe.strip():
+        body_safe = ""
+```
+
+И импорт `collapse_blank_lines_tg` рядом с `sanitize_telegram_html` (строка 52).
+
+**body_text-ветка (строки 105–109)** — `linkify_plain_text(strip_invisible_padding(body_text))`. По диагнозу `body_text` для проблемных писем **чистый**, но HTML-fallback писем без `text/html` part может содержать `html2text`-артефакт. round-39 **не меняет** body_text-ветку: (1) её артефакт уже покрывается тем, что для таких писем `body_html` обычно пуст → ветка достигается, но `linkify_plain_text` сохраняет переводы строк, а основной баг (Apple) идёт по HTML-ветке; (2) применять `collapse_blank_lines_tg` к выходу `linkify_plain_text` безопасно, но **не требуется** для закрытия текущего бага. Решение: **scope round-39 = только HTML-ветка `_format_message_body`** (минимальный фикс под подтверждённый баг). Если позже всплывёт артефакт в plain-fallback TG-view — добавить `collapse_blank_lines_tg` и в body_text-ветку (тривиально, отдельной итерацией); сейчас не раздуваем scope.
+
+**Edge-cases (round-39):**
+- **Кликабельные ссылки (`<a>`).** `sanitize_telegram_html` сохраняет `<a href>`; `collapse_blank_lines_tg` матчит только разрывы строк (`\n`/`<br>`) и horizontal-whitespace **между** ними — `<a …>текст</a>` не содержит таких прогонов внутри и **не рвётся**. Regex не трогает содержимое тегов.
+- **`<pre>`-блоки.** Переносы внутри `<pre>` значимы. `<pre>` входит в `_TELEGRAM_ALLOWED_TAGS` и доживает до collapse, поэтому защита встроена **прямо в тело `collapse_blank_lines_tg`** (а не оставлена «требованием к backend»): вход режется через `_TG_PRE_SPLIT_RE = re.compile(r'(<pre\b.*?</pre>)', re.DOTALL | re.IGNORECASE)`; захватывающая группа кладёт блоки `<pre>…</pre>` в **нечётные** сегменты `re.split`, обычный текст — в **чётные**; `_COLLAPSE_TG_BLANK_RE.sub("\n\n", …)` применяется **только к чётным** сегментам, нечётные (`<pre>`) переносятся в результат **дословно**, затем сегменты склеиваются. Так переносы внутри `<pre>` гарантированно сохранены при любом письме (не только когда `<pre>` фактически отсутствует у Apple/marketing). Backend копирует код-блок §2.10 как есть — отдельной правки не требуется.
+- **Пустое тело.** `body_html=""`/`None` → HTML-ветка не достигается или `collapse_blank_lines_tg("")→""` → fallback на body_text / `<em>(пустое тело)</em>` (строки 105–111). Без изменений.
+- **Одиночная пустая строка / одиночный разрыв** — НЕ трогается (правило срабатывает на 3+ разрывах).
+- **Заголовки (`Тема:`/`От:`)** формируются отдельно (`html.escape`, строки 94–95, 113) и в `body_safe` не входят — collapse их не затрагивает.
+
+**WEB-ветка (`message_view.html`) — scope-решение round-39.** Web рендерит `body_html | safe` как **полный** HTML с таблицами (`<table>` в whitelist `sanitize_email_html`); в браузере Apple-таблицы со spacer-ячейками дают вертикальные пробелы, а `collapse_blank_lines_html` (round-37, чистит только `<p>/<div>/<br>`) их не убирает. **Решение: web-ветку в round-39 НЕ трогаем.** Обоснование:
+- Основной канал просмотра у пользователя — **TG «Посмотреть сообщение»** (подтверждённый баг именно там); web — вторичный.
+- Чистка spacer-ячеек таблиц в **полном** HTML — отдельная задача с риском сломать легитимную табличную вёрстку (отличить spacer-`<td>` от контентного без рендера сложно); это раздуло бы scope.
+- В TG-ветке таблицы **стрипаются** санитайзером (Telegram их не рендерит), поэтому достаточно схлопнуть результат; в web таблицы **сохраняются намеренно** (богатый просмотр) — другой компромисс.
+
+Если web-артефакт станет приоритетным — отдельная итерация: либо расширить `collapse_blank_lines_html` правилом «удалять `<tr>`/`<td>`, чьё единственное содержимое — whitespace/`&nbsp;`/spacer-`<img>`», либо ограничить высоту через CSS. Заведено как tech-debt `TD-039` (`100-known-tech-debt.md`) — **не блокирует** round-39 TG-фикс.
+
+**Миграций нет.** Изменение render-time, локализовано в TG full-body view (`_format_message_body`) + одна новая чистая функция в `shared/html_sanitize.py`. Схема БД и хранимые данные не меняются. Чинит и существующие письма (нормализация на каждом просмотре). Юнит-тесты — отдельной задачей QA (вне scope architect): `collapse_blank_lines_tg` (смешанные `\n`/`<br>`, `\xa0`/` `/`　`, `<a>`-неразрыв, `<pre>`-сохранение, пустой вход) + интеграционный на `_format_message_body` с Apple-подобным HTML.
+
 ---
 
 ### 3. Изменения в data model (новые таблицы + новые `admin_audit.action`)
@@ -1306,6 +1447,11 @@ async def send_notification(*, chat_id: int, text_html: str, message_id: int) ->
 | **round-38 (self-heal реактивация):** привязка того же user, `dead_at IS NOT NULL` | integration | upsert: `dead_at=NULL`, `created_at=now()`; audit `telegram_link_created replaced=true via=self_heal` |
 | **round-38 (self-heal rebound):** привязка на ДРУГОГО user | integration | upsert переносит `user_id`, `created_at=now()`; audit `telegram_link_rebound via=self_heal` |
 | **round-38 (login_flow/session_add NO-OP):** повторный upsert уже-живой привязки того же user через login_flow / session_add | integration | NO-OP — `created_at` не сдвигается (единообразное правило, §1.6 edge-3) |
+| **round-39 (collapse_blank_lines_tg):** прогон смешанных `\n`/`<br>` с whitespace (`\xa0`/` `/`　`) между ними | unit | 3+ разрывов → ровно `\n\n`; одиночный разрыв/пустая строка не тронуты; ведущие/замыкающие убраны |
+| **round-39:** `<a href>` внутри прогона | unit | ссылка не разорвана, остаётся кликабельной |
+| **round-39:** `<pre>`-блок с переносами | unit | переносы внутри `<pre>` сохранены (collapse применён только вне `<pre>`-сегментов) |
+| **round-39:** `_format_message_body` на Apple-подобном HTML (вложенные таблицы, spacer-ячейки) | integration | после `sanitize_telegram_html`+`collapse_blank_lines_tg` нет столба пустых строк; заголовки `Тема:`/`От:` целы |
+| **round-39:** пустое тело (`body_html`=`''`/`None`) | unit | `collapse_blank_lines_tg('')==''`; fallback на body_text / `(пустое тело)` |
 
 ---
 
@@ -1323,7 +1469,7 @@ async def send_notification(*, chat_id: int, text_html: str, message_id: int) ->
 
 - `03-data-model.md` — три новые таблицы (`telegram_links`, `telegram_notifications`, `users_settings`); четыре новые `admin_audit.action`.
 - `04-api-contracts.md` — новые `POST /api/telegram/auth`, `PATCH /api/me/settings`; изменения `GET /api/me`, `POST /logout`, `POST /api/admin/users/{id}/reset`, `GET /messages/{id}`.
-- `05-modules.md` — расширение модуля 18 (`telegram`) на SSO + dispatcher + bot.send_notification; новый sub-модуль `repositories/telegram_*`, `repositories/user_settings`; изменения в `auth`, `admin`, `worker.sync_cycle`. **round-37:** модуль `messages` (`MessageService.get` нормализует тело при отображении, §2.10) + `shared/html_sanitize` (новые `collapse_blank_lines_text`/`collapse_blank_lines_html`).
+- `05-modules.md` — расширение модуля 18 (`telegram`) на SSO + dispatcher + bot.send_notification; новый sub-модуль `repositories/telegram_*`, `repositories/user_settings`; изменения в `auth`, `admin`, `worker.sync_cycle`. **round-37:** модуль `messages` (`MessageService.get` нормализует тело при отображении, §2.10) + `shared/html_sanitize` (новые `collapse_blank_lines_text`/`collapse_blank_lines_html`). **round-39:** модуль `telegram` (`callback_handler._format_message_body` — post-sanitize collapse для TG full-body view, §2.10 round-39) + `shared/html_sanitize` (новая `collapse_blank_lines_tg`); web-вью (`message_view.html`) вне scope → `TD-039`.
 - `06-security.md` — новая секция 1.9 (STRIDE для Telegram SSO); §7 — rate-limit `/api/telegram/auth`; §8 — новые audit-actions.
 - `07-deployment.md` — env vars (`TG_NOTIFY_*`, `TG_NOTIFY_ALL_MESSAGES`, `TG_SEND_PER_CHAT_PER_MINUTE`, `TG_AUTH_INIT_DATA_TTL_SEC`, `TG_PENDING_COOKIE_TTL_SEC`); cleanup TD-014 (имя `TELEGRAM_BOT_TOKEN`).
 - `08-frontend.md` — `tg.js` расширение для SSO call; `message_view.html` — `embed_tg` flag.
