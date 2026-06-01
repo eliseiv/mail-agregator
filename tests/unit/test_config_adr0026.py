@@ -33,7 +33,12 @@ class TestDefaults:
         assert s.SYNC_MAX_CONSECUTIVE_FAILURES == 3
         assert s.SYNC_MASS_FAILURE_RATIO == 0.5
         assert s.SYNC_MASS_FAILURE_MIN == 5
-        assert s.SYNC_CONNECT_RETRIES == 2
+        # ADR-0026 update §4: default bumped 2 -> 3 so the connect/login retry
+        # loop covers the sporadic Outlook "authenticated but not connected"
+        # flake out of the box (0.5/1.0/2.0 backoff).
+        assert s.SYNC_CONNECT_RETRIES == 3
+        # ADR-0026 update §2: transient last_sync_error suppression window.
+        assert s.SYNC_TRANSIENT_SUPPRESS_MINUTES == 60
 
 
 class TestBoundaries:
@@ -72,3 +77,12 @@ class TestBoundaries:
     def test_connect_retries_out_of_range_rejected(self, val: int) -> None:
         with pytest.raises(ValidationError):
             _make(SYNC_CONNECT_RETRIES=val)
+
+    @pytest.mark.parametrize("val", [0, 60, 10_080])
+    def test_transient_suppress_minutes_in_range_ok(self, val: int) -> None:
+        assert val == _make(SYNC_TRANSIENT_SUPPRESS_MINUTES=val).SYNC_TRANSIENT_SUPPRESS_MINUTES
+
+    @pytest.mark.parametrize("val", [-1, 10_081])
+    def test_transient_suppress_minutes_out_of_range_rejected(self, val: int) -> None:
+        with pytest.raises(ValidationError):
+            _make(SYNC_TRANSIENT_SUPPRESS_MINUTES=val)

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime as _dt
 import uuid
 from dataclasses import dataclass
 from typing import Literal
@@ -409,6 +410,14 @@ async def _handle_sync_error(
     error_text = f"{prefix}: {detail_clean}"
 
     if cls == "transient":
+        # ADR-0026 update §2: a sporadic transient flake on an otherwise-working
+        # mailbox must not surface in the UI. If the last SUCCESSFUL sync was
+        # within SYNC_TRANSIENT_SUPPRESS_MINUTES we suppress the
+        # ``last_sync_error`` write (the next cycle retries / succeeds). If the
+        # last success is stale (or never happened) we DO write it — the sync is
+        # genuinely stuck and the operator must see it. The consecutive-failures
+        # counter is never touched for transient either way.
+        suppress = _should_suppress_transient(account.last_synced_at)
         # Rule 10 (unrecognised, incl. programming errors) -> ERROR + traceback
         # for alerting; recognised network/IMAP/OAuth transients -> WARNING.
         if prefix == "error":
@@ -423,8 +432,10 @@ async def _handle_sync_error(
                 error_class=cls,
                 prefix=prefix,
                 detail=error_text,
+                last_sync_error_suppressed=suppress,
             )
-        await _record_transient(account.id, error=error_text)
+        if not suppress:
+            await _record_transient(account.id, error=error_text)
         return _AccountResult(
             account_id=account.id,
             user_id=account.user_id,
@@ -512,6 +523,29 @@ async def _resolve_oauth_access_token(
             detail=f"oauth_token_unexpected: {type(exc).__name__}",
             cycle_log=cycle_log,
         )
+
+
+def _should_suppress_transient(last_synced_at: _dt.datetime | None) -> bool:
+    """True if a TRANSIENT ``last_sync_error`` write should be suppressed.
+
+    ADR-0026 update §2: a sporadic flake on a mailbox that synced successfully
+    within ``SYNC_TRANSIENT_SUPPRESS_MINUTES`` is hidden from the UI (the next
+    cycle retries / succeeds). A stale (older than the window) or ``NULL``
+    ``last_synced_at`` means the sync is genuinely stuck -> do NOT suppress (the
+    operator must see the error).
+
+    ``SYNC_TRANSIENT_SUPPRESS_MINUTES == 0`` disables suppression entirely
+    (every transient error is written, the pre-update behaviour).
+    """
+    window_minutes = get_settings().SYNC_TRANSIENT_SUPPRESS_MINUTES
+    if window_minutes <= 0 or last_synced_at is None:
+        return False
+    # ``last_synced_at`` is stored timezone-aware (DateTime(timezone=True));
+    # coerce a naive value defensively so the subtraction never raises.
+    if last_synced_at.tzinfo is None:
+        last_synced_at = last_synced_at.replace(tzinfo=_dt.UTC)
+    age = _dt.datetime.now(_dt.UTC) - last_synced_at
+    return age <= _dt.timedelta(minutes=window_minutes)
 
 
 async def _record_transient(account_id: int, *, error: str) -> None:

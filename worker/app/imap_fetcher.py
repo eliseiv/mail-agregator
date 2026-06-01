@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import datetime as _dt
 import errno
+import imaplib
 import socket
 import time
 from collections.abc import Iterator
@@ -26,8 +27,10 @@ log = get_logger(__name__)
 
 # ADR-0026 §4: backoff schedule (seconds) for connection/login retries. The
 # Nth retry sleeps ``_RETRY_BACKOFFS[N-1]``; if more retries than entries are
-# configured the last value is reused.
-_RETRY_BACKOFFS: tuple[float, ...] = (0.5, 1.0)
+# configured the last value is reused. Third element (2.0) added in the
+# ADR-0026 update so the default 3 retries cover the sporadic Microsoft
+# "authenticated but not connected" flake (0.5/1.0/2.0).
+_RETRY_BACKOFFS: tuple[float, ...] = (0.5, 1.0, 2.0)
 
 # Networking ``OSError`` errnos that represent an immediate connect failure
 # worth retrying (NOT timeouts). Mirrors ADR-0026 §4.
@@ -38,6 +41,37 @@ _RETRYABLE_ERRNOS: frozenset[int] = frozenset(
         errno.EHOSTUNREACH,
         errno.ENETUNREACH,
     }
+)
+
+# ADR-0026 update §4: sporadic / transient IMAP server responses that warrant
+# an in-cycle retry. Microsoft personal Outlook IMAP intermittently answers a
+# perfectly valid XOAUTH2 on a healthy mailbox with
+# ``imaplib.IMAP4.error: User is authenticated but not connected``; a 2nd/3rd
+# attempt with backoff clears it. We also retry generic provider "try again" /
+# "temporarily" / "too many" rate-limit flakes (lower-case substring match on
+# the IMAP4 error text). These are matched ONLY for ``imaplib.IMAP4.error`` /
+# ``imaplib.IMAP4.abort`` instances (raised by ``mailbox.xoauth2`` /
+# ``mailbox.login`` inside imap-tools).
+_RETRYABLE_IMAP_SUBSTRINGS: tuple[str, ...] = (
+    "authenticated but not connected",
+    "not connected",
+    "try again",
+    "temporarily",
+    "too many",
+)
+
+# Permanent auth markers that MUST NOT be retried even when they arrive as an
+# ``IMAP4.error`` — a wrong password / disabled account is not a flake. Checked
+# FIRST in :func:`_is_retryable_imap_error` so e.g. "AUTHENTICATIONFAILED" never
+# matches the broad "not connected" family. (``"authenticated but not
+# connected"`` contains "authenticated" but is NOT one of these — order +
+# specificity keep them apart.)
+_PERMANENT_IMAP_SUBSTRINGS: tuple[str, ...] = (
+    "authenticationfailed",
+    "login failed",
+    "invalid credentials",
+    "account is disabled",
+    "account has been blocked",
 )
 
 
@@ -56,6 +90,29 @@ def _is_retryable_connect_error(exc: BaseException) -> bool:
     if isinstance(exc, OSError):
         return exc.errno in _RETRYABLE_ERRNOS
     return False
+
+
+def _is_retryable_imap_error(exc: BaseException) -> bool:
+    """True for SPORADIC transient IMAP errors worth an in-cycle retry.
+
+    Only ``imaplib.IMAP4.error`` / ``imaplib.IMAP4.abort`` instances qualify
+    (these wrap an IMAP ``NO``/``BAD`` reply or a dropped server connection).
+    Real auth failures (``AUTHENTICATIONFAILED`` / ``LOGIN failed`` / invalid
+    credentials / disabled account) are explicitly EXCLUDED — they are
+    permanent and must propagate so the classifier disables the account; a
+    retry there only wastes the cycle budget.
+
+    The canonical case (ADR-0026 update) is Microsoft personal Outlook IMAP
+    returning ``User is authenticated but not connected`` on a healthy mailbox:
+    it is transient (the next attempt succeeds), so we retry it.
+    """
+    if not isinstance(exc, imaplib.IMAP4.error | imaplib.IMAP4.abort):
+        return False
+    text = str(exc).lower()
+    # Permanent auth/account-state markers win — never retry these.
+    if any(needle in text for needle in _PERMANENT_IMAP_SUBSTRINGS):
+        return False
+    return any(needle in text for needle in _RETRYABLE_IMAP_SUBSTRINGS)
 
 
 @dataclass(slots=True)
@@ -218,13 +275,21 @@ def _connect_and_login(
     access_token: str | None,
     timeout: int,
 ) -> imap_tools.BaseMailBox:
-    """Open the connection + authenticate, retrying ONLY transient DNS/connect
-    errors (ADR-0026 §4).
+    """Open the connection + authenticate, retrying transient DNS/connect AND
+    sporadic transient IMAP errors (ADR-0026 §4 + update).
 
-    ``SYNC_CONNECT_RETRIES`` (default 2) extra attempts with backoff 0.5s/1.0s
-    on ``gaierror`` / ``ConnectionError`` / networking ``OSError``. Timeouts and
-    auth/permanent errors propagate immediately (no retry). On success the open,
-    authenticated mailbox is returned (caller owns logout).
+    ``SYNC_CONNECT_RETRIES`` (default 3) extra attempts with backoff
+    0.5s/1.0s/2.0s on:
+
+    * ``gaierror`` / ``ConnectionError`` / networking ``OSError`` (DNS/connect),
+      via :func:`_is_retryable_connect_error`; and
+    * sporadic ``imaplib.IMAP4.error`` / ``IMAP4.abort`` whose text is a known
+      transient flake (e.g. Microsoft "User is authenticated but not
+      connected"), via :func:`_is_retryable_imap_error`.
+
+    Timeouts and real auth/permanent errors (``AUTHENTICATIONFAILED`` / invalid
+    credentials / disabled account) propagate immediately (no retry). On success
+    the open, authenticated mailbox is returned (caller owns logout).
     """
     retries = get_settings().SYNC_CONNECT_RETRIES
     attempt = 0
@@ -242,7 +307,8 @@ def _connect_and_login(
             # Best-effort close the half-open socket before retrying.
             with contextlib.suppress(Exception):
                 mailbox.logout()
-            if attempt >= retries or not _is_retryable_connect_error(exc):
+            retryable = _is_retryable_connect_error(exc) or _is_retryable_imap_error(exc)
+            if attempt >= retries or not retryable:
                 raise
             backoff = _RETRY_BACKOFFS[min(attempt, len(_RETRY_BACKOFFS) - 1)]
             log.warning(

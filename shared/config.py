@@ -87,9 +87,21 @@ class Settings(BaseSettings):
     # be considered (below this, single-account force-sync behaves normally).
     SYNC_MASS_FAILURE_MIN: int = Field(default=5, ge=1, le=10_000)
     # DNS/connect retries on opening the IMAP connection + login. 0 disables.
-    # Backoff 0.5s/1.0s; only for gaierror/connection/network OSError, never
-    # for timeouts or auth/permanent failures. ADR-0026 §4.
-    SYNC_CONNECT_RETRIES: int = Field(default=2, ge=0, le=10)
+    # Backoff 0.5s/1.0s/2.0s; retried for gaierror/connection/network OSError
+    # AND sporadic transient IMAP errors ("authenticated but not connected" /
+    # "not connected" / "try again" / "temporarily" / "too many"), never for
+    # timeouts or real auth/permanent failures. ADR-0026 §4.
+    # Default raised 2 -> 3 (ADR-0026 update): Microsoft personal Outlook IMAP
+    # sporadically returns "User is authenticated but not connected" on a
+    # healthy mailbox; a 3rd attempt clears the flake (backoff 0.5/1.0/2.0).
+    SYNC_CONNECT_RETRIES: int = Field(default=3, ge=0, le=10)
+    # Suppress a TRANSIENT ``last_sync_error`` write when the last SUCCESSFUL
+    # sync was within this many minutes (ADR-0026 update §2): a sporadic flake
+    # on an otherwise-working mailbox must not surface in the UI and scare the
+    # user. If ``last_synced_at`` is older than this window (or NULL) the
+    # transient error IS written (the sync is genuinely stuck). The
+    # consecutive-failures counter is never touched either way.
+    SYNC_TRANSIENT_SUPPRESS_MINUTES: int = Field(default=60, ge=0, le=10_080)
 
     # --- Sessions / auth ---
     SESSION_TTL_SECONDS: int = Field(default=43_200, ge=60)

@@ -11,10 +11,11 @@ architectural fix for root cause B (an ``auth_failed``-looking message such as
 "too many simultaneous connections" must still be classified ``transient``).
 
 Order of evaluation is strict top-to-bottom; the **first match wins**. The
-transient block (rules 1-7) is checked **entirely before** the permanent block
-(rules 8-9): any transient marker beats any auth/permanent marker in the same
-text. Rule 10 (unrecognised, incl. programming errors) is fail-open ->
-transient.
+transient block (rules 1-7, incl. rule 3b -- sporadic IMAP "authenticated but
+not connected" / "not connected" flake, ADR-0026 update) is checked **entirely
+before** the permanent block (rules 8-9): any transient marker beats any
+auth/permanent marker in the same text. Rule 10 (unrecognised, incl.
+programming errors) is fail-open -> transient.
 
 Usage::
 
@@ -79,6 +80,21 @@ _RATE_LIMIT_SUBSTRINGS: tuple[str, ...] = (
     "system error",
     "rate",
     "throttl",
+)
+
+# Rule 3b -- sporadic transient IMAP connection-state flakes (ADR-0026 update).
+# Microsoft personal Outlook IMAP intermittently answers a valid XOAUTH2 on a
+# HEALTHY mailbox with "User is authenticated but not connected"; it is a
+# server-side flake, not an auth failure. Classified transient with the
+# ``network`` UI-prefix (a KNOWN transient -> WARNING), never rule-10 fail-open
+# (ERROR sync_account_unexpected_error). Checked BEFORE the permanent auth
+# block. NOTE: "authenticated but not connected" contains "authenticated" but
+# NOT "authenticationfailed", so it never matches rule 8 -- and being a
+# transient rule it would win anyway (transient block is evaluated in full
+# first).
+_IMAP_CONN_FLAKE_SUBSTRINGS: tuple[str, ...] = (
+    "authenticated but not connected",
+    "not connected",
 )
 
 # Rule 4 -- generic timeout text (the isinstance timeout check is rule 1).
@@ -198,6 +214,8 @@ def _matches_transient(exc: BaseException | None, text: str) -> bool:
         or _has_any(text, _RESOLVE_SUBSTRINGS)
         # Rule 3 -- provider rate-limit / temporary unavailability (beats auth).
         or _has_any(text, _RATE_LIMIT_SUBSTRINGS)
+        # Rule 3b -- sporadic transient IMAP connection-state flake.
+        or _has_any(text, _IMAP_CONN_FLAKE_SUBSTRINGS)
         # Rule 4 -- generic timeout text.
         or _has_any(text, _TIMEOUT_SUBSTRINGS)
         # Rule 5 -- connection / TLS errors (text).
@@ -259,6 +277,9 @@ def error_prefix(exc_or_text: object) -> str:  # noqa: PLR0911 -- one return per
     # auth response, else network. Class stays transient regardless.
     if _has_any(text, _RATE_LIMIT_SUBSTRINGS):
         return "auth_failed" if _has_any(text, _AUTH_MARKER_SUBSTRINGS) else "network"
+    # Rule 3b -- sporadic transient IMAP connection-state flake -> network.
+    if _has_any(text, _IMAP_CONN_FLAKE_SUBSTRINGS):
+        return "network"
     # Rule 4 -- generic timeout text.
     if _has_any(text, _TIMEOUT_SUBSTRINGS):
         return "timeout"
