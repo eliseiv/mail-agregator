@@ -28,6 +28,16 @@
   --color-primary-fg:    #ffffff;
   --color-primary-ring:  rgba(79, 70, 229, 0.18);
 
+  /* Combobox listbox surface/foreground — defined as a *matched pair* so the
+     dropdown can never end up with a background from one scheme and text from
+     another (the dark-on-dark / light-on-light contrast bug). Light theme:
+     white surface + near-black text. Overridden together in the dark-scheme
+     and body.tg-app blocks below — always both, never one. */
+  --combobox-surface:    #ffffff;
+  --combobox-fg:         #0a0a0a;
+  --combobox-hover-bg:   #eef2ff;
+  --combobox-border:     #d4d4d8;
+
   --color-danger:        #dc2626;
   --color-danger-hover:  #b91c1c;
   --color-danger-soft:   #fef2f2;
@@ -112,6 +122,12 @@
     --color-primary-soft:  rgba(129, 140, 248, 0.12);
     --color-primary-fg:    #0b0a18;
     --color-primary-ring:  rgba(129, 140, 248, 0.28);
+
+    /* Dark-scheme combobox pair (surface + fg flip together → readable). */
+    --combobox-surface:    #18181b;
+    --combobox-fg:         #fafafa;
+    --combobox-hover-bg:   rgba(129, 140, 248, 0.18);
+    --combobox-border:     rgba(255, 255, 255, 0.22);
 
     --color-danger:        #f87171;
     --color-danger-hover:  #fca5a5;
@@ -2246,10 +2262,25 @@ body.tg-app {
   --color-bg:         var(--tg-bg, #ffffff);
   --color-bg-subtle:  var(--tg-secondary-bg, #fafafa);
   --color-bg-hover:   var(--tg-secondary-bg, #f4f4f5);
+  /* Elevated surface was previously NOT rebound here, so it kept the
+     prefers-color-scheme value while --color-text followed --tg-text. When the
+     OS scheme and the Telegram theme disagreed (e.g. OS dark + TG light) the
+     combobox listbox got a dark surface with dark text — the reported
+     "dark-on-dark, unreadable" bug. Bind the elevated surface to Telegram's
+     own background so surface + text always come from the SAME theme. */
+  --color-bg-elevated: var(--tg-secondary-bg, var(--tg-bg, #ffffff));
   --color-text:       var(--tg-text, #0a0a0a);
   --color-text-muted: var(--tg-hint, #52525b);
   --color-primary:    var(--tg-button, #4f46e5);
   --color-primary-fg: var(--tg-button-text, #ffffff);
+
+  /* Combobox pair, sourced entirely from the Telegram theme so the dropdown
+     surface and option text are guaranteed mutually consistent inside the
+     WebApp regardless of the device OS colour scheme. */
+  --combobox-surface:  var(--tg-secondary-bg, var(--tg-bg, #ffffff));
+  --combobox-fg:       var(--tg-text, #0a0a0a);
+  --combobox-hover-bg: var(--tg-bg, rgba(129, 140, 248, 0.18));
+  --combobox-border:   var(--tg-hint, rgba(0, 0, 0, 0.18));
 }
 
 /* Telegram WebView already shows its own back-button + close-button at the
@@ -2854,34 +2885,41 @@ body.tg-app.page--integrations .integrations-secret-reveal__row .btn {
   min-width: 16rem;
   max-height: 18rem;
   overflow-y: auto;
-  /* Pin the surface explicitly (do not inherit from the filter toolbar, which
-     may sit on a Telegram-themed / tinted panel). Light scheme → #ffffff with
-     dark --color-text; dark scheme → #18181b with light --color-text. Both
-     tokens flip together so the listbox always has readable contrast. */
-  background: var(--color-bg-elevated);
-  color: var(--color-text);
-  border: 1px solid var(--color-border-strong);
+  /* Pin the surface + text as a MATCHED PAIR (--combobox-surface / -fg). These
+     two tokens are always redefined together — in :root (light), the
+     prefers-color-scheme:dark block, and body.tg-app — so the dropdown can
+     never get a background from one scheme and text from another. This is the
+     real fix for the "dark-on-dark / unreadable" report: the earlier version
+     mixed --color-bg-elevated (scheme-driven) with --color-text (tg-driven),
+     which desynced when the OS scheme and Telegram theme disagreed. */
+  background-color: var(--combobox-surface);
+  color: var(--combobox-fg);
+  border: 1px solid var(--combobox-border);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-lg);
 }
+/* Scope option colours under .combobox__listbox for extra specificity so no
+   ancestor rule (e.g. a tinted toolbar text colour) can override them. */
+.combobox__listbox .combobox__option,
 .combobox__option {
   padding: var(--space-2) var(--space-3);
   border-radius: var(--radius-md);
   font-size: var(--font-size-sm);
-  /* Force the option text to the scheme-aware foreground so it can never
-     inherit a tinted/dark colour from an ancestor and clash with the light
-     listbox surface (the contrast bug this block fixes). */
-  color: var(--color-text);
-  background: transparent;
+  /* Inherit the matched listbox foreground; explicit so it can never pick up a
+     tinted/dark colour from an ancestor and clash with the surface. */
+  color: var(--combobox-fg);
+  background-color: transparent;
   cursor: pointer;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.combobox__listbox .combobox__option:hover,
+.combobox__listbox .combobox__option.is-active,
 .combobox__option:hover,
 .combobox__option.is-active {
-  background: var(--color-primary-soft);
-  color: var(--color-text);
+  background-color: var(--combobox-hover-bg);
+  color: var(--combobox-fg);
 }
 
 @media (max-width: 768px) {
