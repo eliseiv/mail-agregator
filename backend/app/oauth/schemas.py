@@ -12,60 +12,32 @@ OUTLOOK_IMAP_PORT: Final[int] = 993
 OUTLOOK_SMTP_HOST: Final[str] = "smtp-mail.outlook.com"
 OUTLOOK_SMTP_PORT: Final[int] = 587
 
-# Delegated scopes — TWO-STEP audience-correction flow (ADR-0025 §5, P2-фикс).
+# Delegated scopes — SINGLE-STEP flow (ADR-0025 §5, working Sprint-B config).
 #
-# WHY TWO SETS: with P1 (tenant=common) consent succeeds and an access_token is
-# issued, but personal-Outlook IMAP XOAUTH2 still fails with "User is
-# authenticated but not connected". Root cause is an *audience* mismatch — when
-# you request the ``https://outlook.office.com/…`` resource scopes DIRECTLY at
-# the authorize/code-exchange step for a *personal* Microsoft account, the
-# issued access_token does not carry ``aud=https://outlook.office.com`` in the
-# form the IMAP/SMTP front-end accepts, so the SASL bind is rejected.
+# The EXPLICIT ``https://outlook.office.com/…`` resource scopes are requested
+# DIRECTLY at the authorize + code-exchange step (one ``code -> token`` request,
+# no two-step audience upgrade). This is the configuration that synced personal
+# Outlook IMAP locally in Sprint B. The P1 (tenant=common) and P2 (two-step
+# short-form -> resource-scope refresh) attempts did NOT fix the prod
+# "User is authenticated but not connected" symptom and have been reverted.
 #
-# Confirmed workaround (Microsoft Q&A thread #1691402): obtain the refresh
-# token using SHORT-form scopes first, then IMMEDIATELY do a refresh_token grant
-# asking for the EXPLICIT ``https://outlook.office.com/…`` resource scopes. The
-# refresh-issued access_token then carries the correct ``aud`` and IMAP accepts
-# it. The scope of the refresh request — not the original consent — determines
-# the audience of the issued access_token.
-#
-# STEP 1 — ``OUTLOOK_AUTHORIZE_SCOPES`` (authorize + code-exchange):
-#   SHORT-form scope names (NO ``https://outlook.office.com/`` prefix). These
-#   request the same delegated permissions (Microsoft resolves the bare
-#   ``IMAP.AccessAsUser.All`` / ``SMTP.Send`` against the Outlook resource) and
-#   are the set the user consents to. ``offline_access`` yields the refresh
-#   token; ``openid`` + the reserved OIDC scopes ``email`` / ``profile`` make the
-#   id_token reliably carry an email-bearing claim
-#   (``email`` / ``preferred_username`` / ``upn`` / ``unique_name``) so
-#   ``_decode_email_from_id_token`` resolves the mailbox address without a Graph
-#   call. OIDC scopes are allowed here because step 1 is addressed to the
-#   identity endpoint.
-#
-# STEP 2 — ``OUTLOOK_RESOURCE_SCOPES`` (immediate upgrade-refresh + all later
-#   refreshes): the EXPLICIT ``https://outlook.office.com/…`` resource scopes
-#   that pin ``aud=outlook.office.com`` on the issued access_token.
-#   ``offline_access`` is kept so the refresh token survives rotation. We must
-#   NOT add ``openid`` / ``email`` / ``profile`` here: mixing the reserved OIDC
-#   scopes with explicit resource scopes in a *refresh* request triggers
-#   ``invalid_scope``. The email is already known from step 1's id_token.
+# ``offline_access`` yields the refresh token. ``openid`` + the reserved OIDC
+# scopes ``email`` / ``profile`` make the id_token reliably carry an
+# email-bearing claim (``email`` / ``preferred_username`` / ``upn`` /
+# ``unique_name``) so ``_decode_email_from_id_token`` resolves the mailbox
+# address without a Graph call. The same scope set is reused for all refreshes.
 #
 # NOTE on the host: the OAuth scope *resource* is ``outlook.office.com`` — NOT
 # ``outlook.office365.com`` (that is the IMAP/SMTP *connection host*,
 # ``OUTLOOK_IMAP_HOST`` above). Using the connection host as a scope resource is
 # rejected with ``invalid_scope``.
-OUTLOOK_AUTHORIZE_SCOPES: Final[tuple[str, ...]] = (
-    "IMAP.AccessAsUser.All",
-    "SMTP.Send",
+OUTLOOK_SCOPES: Final[tuple[str, ...]] = (
+    "https://outlook.office.com/IMAP.AccessAsUser.All",
+    "https://outlook.office.com/SMTP.Send",
     "offline_access",
     "openid",
     "email",
     "profile",
-)
-
-OUTLOOK_RESOURCE_SCOPES: Final[tuple[str, ...]] = (
-    "https://outlook.office.com/IMAP.AccessAsUser.All",
-    "https://outlook.office.com/SMTP.Send",
-    "offline_access",
 )
 
 # Seconds of head-room before access-token expiry at which we proactively

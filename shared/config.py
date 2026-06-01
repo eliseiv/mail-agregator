@@ -157,12 +157,12 @@ class Settings(BaseSettings):
     OUTLOOK_CLIENT_SECRET: str = ""
     # ``{APP_BASE_URL}/api/oauth/outlook/callback`` — must match Azure exactly.
     OUTLOOK_REDIRECT_URI: str = ""
-    # tenant for the authorize/token endpoints. ADR-0025: ``common`` (NOT
-    # ``consumers``) for personal mailboxes — the ``consumers`` tenant produced
-    # IMAP XOAUTH2 "User is authenticated but not connected" (token accepted but
-    # the IMAP session never binds). ``common`` accepts both personal and work
-    # accounts; we only need personal, which ``common`` admits. Env overrides.
-    OUTLOOK_TENANT: str = "common"
+    # tenant for the authorize/token endpoints. ADR-0025: ``consumers`` for
+    # personal mailboxes — this is the working Sprint-B configuration that
+    # synced personal Outlook IMAP locally. The P1 switch to ``common`` did NOT
+    # fix the prod "User is authenticated but not connected" symptom and has been
+    # reverted. Env overrides.
+    OUTLOOK_TENANT: str = "consumers"
     # TTL of the Redis ``oauth_state:{state}`` key (CSRF/anti-fixation state +
     # PKCE verifier). Default 600s per ADR-0025 §6.
     OUTLOOK_OAUTH_STATE_TTL_SECONDS: int = Field(default=600, ge=60, le=3600)
