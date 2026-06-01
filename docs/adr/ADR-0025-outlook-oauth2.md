@@ -71,14 +71,27 @@ Microsoft endpoints (tenant `common` — см. историю изменений
 
 Фиксированные Outlook-параметры при создании: `imap_host=outlook.office365.com`, `imap_port=993`, `imap_ssl=true`, `smtp_host=smtp-mail.outlook.com`, `smtp_port=587`, `smtp_ssl=false`, `smtp_starttls=true`. (Провайдерная таблица `providers.py` для `outlook.com/hotmail.com/live.com` сейчас указывает `outlook.office365.com`/`smtp.office365.com:587` — для OAuth личных аккаунтов SMTP-хост `smtp-mail.outlook.com`; добавить отдельную ветку, не ломая password-подсказки.)
 
-### 3. Token refresh
+### 3. Token refresh — TWO-STEP audience correction (P2-фикс, см. историю изменений)
 
-Единый helper `OutlookTokenService.get_valid_access_token(account)`:
+**Почему two-step.** После P1 (tenant=`common`) consent проходит и access-token выдаётся, но IMAP XOAUTH2 для **личных** ящиков всё равно падает "User is authenticated but not connected" — это **audience mismatch**: при прямом запросе resource-scopes (`https://outlook.office.com/…`) на authorize/code-exchange для personal-аккаунта выданный access-token не несёт `aud`, который принимает IMAP/SMTP front-end. Подтверждённый обход (Microsoft Q&A thread #1691402): получить refresh-токен на **SHORT-form** scopes, затем **немедленно** сделать `refresh_token`-grant с **EXPLICIT resource-scopes** (`https://outlook.office.com/…`) → access-token с правильным `aud=outlook.office.com`, который IMAP принимает. **Audience определяется scope’ом refresh-запроса**, а не исходного consent.
+
+Два набора scopes (`backend/app/oauth/schemas.py`):
+- `OUTLOOK_AUTHORIZE_SCOPES` (шаг 1: authorize + code-exchange): `IMAP.AccessAsUser.All`, `SMTP.Send`, `offline_access`, `openid`, `email`, `profile` — **SHORT-form** (без `https://outlook.office.com/` префикса). Те же права; `offline_access` даёт refresh-токен; OIDC-scopes (`openid`/`email`/`profile`) наполняют id_token email-claim’ом.
+- `OUTLOOK_RESOURCE_SCOPES` (шаг 2: немедленный upgrade-refresh + ВСЕ последующие refresh): `https://outlook.office.com/IMAP.AccessAsUser.All`, `https://outlook.office.com/SMTP.Send`, `offline_access`. **Без** `openid`/`email`/`profile` — смешивание reserved OIDC-scopes с explicit resource-scopes в refresh-запросе даёт `invalid_scope`. Email уже известен из id_token шага 1.
+
+**`OutlookOAuthService.exchange_code` (callback):**
+1. **Шаг 1** — `grant_type=authorization_code` со SHORT-form scopes → `refresh_token` (+ `id_token` для email). access-token шага 1 имеет неправильный для IMAP `aud` и **отбрасывается**.
+2. Извлечь email из `id_token` шага 1.
+3. **Шаг 2 (немедленный upgrade)** — `grant_type=refresh_token` (refresh-токеном шага 1) с RESOURCE-form scopes → access-token с `aud=outlook.office.com`. Это access-token, который сохраняется для IMAP/SMTP. Microsoft может ротировать refresh-токен на шаге 2 — сохраняем ротированный (иначе остаётся валидный токен шага 1). `expires_at` берётся из шага 2.
+
+**`OutlookTokenService.get_valid_access_token(account)` (worker перед IMAP, backend перед SMTP):**
 1. Если `oauth_access_token_expires_at` > now + 60s буфер → расшифровать и вернуть кэш.
-2. Иначе POST token endpoint `grant_type=refresh_token` + `refresh_token` (расшифрованный) + `client_id`/`client_secret`/`scope`.
+2. Иначе POST token endpoint `grant_type=refresh_token` + `refresh_token` (расшифрованный) + `client_id`/`client_secret` + **RESOURCE-form scopes** (`https://outlook.office.com/…`) — чтобы каждый перевыпущенный access-token всегда имел правильный для IMAP `aud`.
 3. Microsoft при refresh может вернуть **новый** refresh_token (rotation) — если вернул, перешифровать и сохранить.
 4. Сохранить новый access-token + `expires_at`.
 5. На `invalid_grant` (refresh отозван/протух) → `oauth_needs_consent=true`, `is_active` оставить, sync для этого аккаунта пропускать; UI показывает «переподключить Outlook». Audit `oauth_refresh_invalidated`.
+
+SMTP (`send/service.py`) использует тот же `get_valid_access_token` → тот же resource-audience access-token; `SMTP.Send` входит в `OUTLOOK_RESOURCE_SCOPES`, поэтому отправка работает на нём же.
 
 Refresh выполняется **в worker** перед IMAP-коннектом и **в backend** перед SMTP-send/test. Конкуррентность: на масштабе ≤5 users параллельный refresh одного аккаунта маловероятен; для надёжности — короткий Redis-lock `oauth_refresh_lock:{account_id}` TTL 30s (best-effort, не блокирует фатально).
 
@@ -100,7 +113,7 @@ XOAUTH2 SASL string (base64): `user={email}\x01auth=Bearer {access_token}\x01\x0
 
 ### 5. Безопасность
 
-- **Scopes** — минимально необходимые: `IMAP.AccessAsUser.All`, `SMTP.Send`, `offline_access`, `openid`, `email`, `profile`. Никаких Mail.ReadWrite/Graph-широких.
+- **Scopes** — минимально необходимые, два набора (§3, P2): SHORT-form для authorize/code-exchange (`IMAP.AccessAsUser.All`, `SMTP.Send`, `offline_access`, `openid`, `email`, `profile`) и RESOURCE-form для refresh/upgrade (`https://outlook.office.com/IMAP.AccessAsUser.All`, `https://outlook.office.com/SMTP.Send`, `offline_access`). Никаких Mail.ReadWrite/Graph-широких.
 - **state** — CSRF/anti-fixation: 32-байтный random в Redis с TTL, привязка к `user_id`, одноразовый (GET+DEL).
 - **PKCE S256** — закладываем (§2.3).
 - **Шифрование токенов** — refresh + access через `MailPasswordCipher` (AES-256-GCM, AAD=`account_id`, ADR-0005). Тот же ключ `MAIL_ENCRYPTION_KEY`.
@@ -163,4 +176,5 @@ Endpoints собираются из `OUTLOOK_TENANT`: `https://login.microsofton
 
 ## История изменений
 
+- **2026-06-01 — two-step token / audience correction (P2-фикс).** После P1 (`tenant=common`) consent проходил и аккаунты создавались (`oauth_needs_consent=false`), но IMAP XOAUTH2 для личных ящиков всё равно падал "User is authenticated but not connected" (`mailbox.xoauth2` в `worker/app/imap_fetcher.py`). Причина — **audience mismatch**: прямой запрос `https://outlook.office.com/…` resource-scopes на authorize/code-exchange для personal-аккаунта даёт access-token с неподходящим для IMAP `aud`. Обход (Microsoft Q&A thread #1691402, §3): (1) получить refresh-токен на SHORT-form scopes, (2) немедленно сделать refresh с EXPLICIT resource-scopes → access-token с `aud=outlook.office.com`, который IMAP принимает. Изменения: `backend/app/oauth/schemas.py` — `OUTLOOK_SCOPES` разбит на `OUTLOOK_AUTHORIZE_SCOPES` (short-form) и `OUTLOOK_RESOURCE_SCOPES` (resource-form, без OIDC-scopes — иначе `invalid_scope`); `backend/app/oauth/service.py` — `build_authorize_url`/`exchange_code` шаг-1 используют authorize-scopes, `exchange_code` добавляет немедленный шаг-2 upgrade-refresh, `_TokenClient.refresh` (и значит `OutlookTokenService.get_valid_access_token`) использует resource-scopes. tenant (`common`), PKCE, `redirect_uri`, шифрование, refresh-lock/needs-consent не меняются. **e2e (заработает ли IMAP) проверяется только на проде с реальным ящиком после деплоя + переподключения** — код и моки готовы; код проверен smoke с httpx MockTransport (2 token-запроса с правильными scope-наборами, persisted access-token из шага 2).
 - **2026-06-01 — tenant `consumers` → `common` (P1-фикс).** Личный Outlook IMAP XOAUTH2 падал на реальном e2e с ошибкой "User is authenticated but not connected": OAuth-токен принимался, но IMAP-сессия не привязывалась. Все подтверждённые рабочие конфиги personal Outlook XOAUTH2 используют tenant `common`, не `consumers`. Azure App зарегистрирован как multitenant + personal, поэтому `common` поддерживается; `common` пускает и личные, и рабочие аккаунты — нам достаточно личных. Изменения: `default OUTLOOK_TENANT = "common"` (`shared/config.py`), обновлены §Context (endpoints + Azure App audience), §6 (env-таблица), `docs/07-deployment.md`. Authorize/token URL теперь `https://login.microsoftonline.com/common/oauth2/v2.0/{authorize,token}`. Scopes, PKCE (S256), `redirect_uri`, refresh-flow не меняются — tenant влияет только на сегмент пути. Env на проде/локали может переопределить default.

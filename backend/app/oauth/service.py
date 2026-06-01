@@ -43,9 +43,10 @@ from backend.app.oauth.schemas import (
     OAUTH_REFRESH_LOCK_PREFIX,
     OAUTH_REFRESH_LOCK_TTL_SECONDS,
     OAUTH_STATE_KEY_PREFIX,
+    OUTLOOK_AUTHORIZE_SCOPES,
     OUTLOOK_IMAP_HOST,
     OUTLOOK_IMAP_PORT,
-    OUTLOOK_SCOPES,
+    OUTLOOK_RESOURCE_SCOPES,
     OUTLOOK_SMTP_HOST,
     OUTLOOK_SMTP_PORT,
     OAuthState,
@@ -193,6 +194,13 @@ class _TokenClient:
         )
 
     async def exchange_code(self, code: str, code_verifier: str) -> _TokenResponse:
+        """Step 1: authorization-code -> tokens using SHORT-form scopes.
+
+        Yields the refresh token (+ id_token for email). The access token from
+        this step has the wrong audience for personal-Outlook IMAP and is NOT
+        used for IMAP/SMTP — :meth:`OutlookOAuthService.exchange_code` upgrades
+        it via :meth:`refresh` with the resource scopes (ADR-0025 §3, P2).
+        """
         return await self._post(
             {
                 "grant_type": "authorization_code",
@@ -201,18 +209,22 @@ class _TokenClient:
                 "client_id": self._settings.OUTLOOK_CLIENT_ID,
                 "client_secret": self._settings.OUTLOOK_CLIENT_SECRET,
                 "code_verifier": code_verifier,
-                "scope": " ".join(OUTLOOK_SCOPES),
+                "scope": " ".join(OUTLOOK_AUTHORIZE_SCOPES),
             }
         )
 
     async def refresh(self, refresh_token: str) -> _TokenResponse:
+        """Step 2 / all later refreshes: refresh_token grant requesting the
+        EXPLICIT ``https://outlook.office.com/…`` resource scopes so the issued
+        access_token carries ``aud=outlook.office.com`` (the audience personal
+        Outlook IMAP/SMTP XOAUTH2 accepts — ADR-0025 §3, P2)."""
         return await self._post(
             {
                 "grant_type": "refresh_token",
                 "refresh_token": refresh_token,
                 "client_id": self._settings.OUTLOOK_CLIENT_ID,
                 "client_secret": self._settings.OUTLOOK_CLIENT_SECRET,
-                "scope": " ".join(OUTLOOK_SCOPES),
+                "scope": " ".join(OUTLOOK_RESOURCE_SCOPES),
             }
         )
 
@@ -266,7 +278,7 @@ class OutlookOAuthService:
             "client_id": self._settings.OUTLOOK_CLIENT_ID,
             "response_type": "code",
             "redirect_uri": self._settings.OUTLOOK_REDIRECT_URI,
-            "scope": " ".join(OUTLOOK_SCOPES),
+            "scope": " ".join(OUTLOOK_AUTHORIZE_SCOPES),
             "state": state,
             "code_challenge": challenge,
             "code_challenge_method": "S256",
@@ -299,19 +311,24 @@ class OutlookOAuthService:
         """
         st = await self._consume_state(state)
 
+        # STEP 1 (ADR-0025 §3, P2): exchange the code with SHORT-form scopes to
+        # obtain the refresh token + id_token (for the mailbox email). The
+        # access token from this step has the wrong audience for personal
+        # Outlook IMAP — we discard it and re-mint a correctly-audienced one in
+        # step 2 below.
         try:
-            tokens = await self._token_client.exchange_code(code, st.code_verifier)
+            step1 = await self._token_client.exchange_code(code, st.code_verifier)
         except OAuthRefreshInvalidError as exc:
             # invalid_grant on an authorization-code exchange means the code
             # was already used / expired — treat as a generic exchange failure.
             raise OAuthError("oauth_exchange_failed", "Authorization code rejected") from exc
 
-        if not tokens.refresh_token:
+        if not step1.refresh_token:
             # offline_access should always yield a refresh token; without one
             # we cannot keep the mailbox synced.
             raise OAuthError("oauth_exchange_failed", "No refresh token returned")
 
-        email = _decode_email_from_id_token(tokens.id_token)
+        email = _decode_email_from_id_token(step1.id_token)
         if not email:
             raise OAuthError("oauth_exchange_failed", "Could not resolve mailbox email")
         email = email.strip().lower()
@@ -320,19 +337,35 @@ class OutlookOAuthService:
         if owner is None:
             raise OAuthError("oauth_state_invalid", "Initiating user no longer exists")
 
-        expires_at = datetime.now(UTC) + timedelta(seconds=tokens.expires_in)
+        # STEP 2 (ADR-0025 §3, P2): immediately upgrade the audience — a
+        # refresh_token grant asking for the EXPLICIT outlook.office.com
+        # resource scopes yields an access_token with aud=outlook.office.com,
+        # which personal-Outlook IMAP/SMTP XOAUTH2 accepts. This is the token we
+        # persist for IMAP. Microsoft may rotate the refresh token here; if so we
+        # store the rotated one (else step 1's still-valid token survives).
+        try:
+            step2 = await self._token_client.refresh(step1.refresh_token)
+        except OAuthRefreshInvalidError as exc:
+            raise OAuthError(
+                "oauth_exchange_failed", "Resource-scope token upgrade rejected"
+            ) from exc
+
+        access_token = step2.access_token
+        refresh_token = step2.refresh_token or step1.refresh_token
+        scopes = step2.scope or step1.scope
+        expires_at = datetime.now(UTC) + timedelta(seconds=step2.expires_in)
 
         existing = await self._repo.find_by_user_email(st.user_id, email)
         if existing is not None:
             # Re-consent of an existing account: refresh the stored tokens.
-            refresh_enc = self._cipher.encrypt(tokens.refresh_token, existing.id)
-            access_enc = self._cipher.encrypt(tokens.access_token, existing.id)
+            refresh_enc = self._cipher.encrypt(refresh_token, existing.id)
+            access_enc = self._cipher.encrypt(access_token, existing.id)
             await self._repo.update_oauth_tokens(
                 existing.id,
                 oauth_refresh_token_encrypted=refresh_enc,
                 oauth_access_token_encrypted=access_enc,
                 oauth_access_token_expires_at=expires_at,
-                oauth_scopes=tokens.scope,
+                oauth_scopes=scopes,
                 oauth_needs_consent=False,
             )
             refreshed = await self._repo.get_by_id(existing.id)
@@ -342,8 +375,8 @@ class OutlookOAuthService:
 
         # New oauth account — predict the id so the AAD binds to it (ADR-0005).
         new_id = await self._repo.next_account_id()
-        refresh_enc = self._cipher.encrypt(tokens.refresh_token, new_id)
-        access_enc = self._cipher.encrypt(tokens.access_token, new_id)
+        refresh_enc = self._cipher.encrypt(refresh_token, new_id)
+        access_enc = self._cipher.encrypt(access_token, new_id)
         acc = await self._repo.insert_oauth_account_with_id(
             account_id=new_id,
             user_id=st.user_id,
@@ -353,7 +386,7 @@ class OutlookOAuthService:
             oauth_refresh_token_encrypted=refresh_enc,
             oauth_access_token_encrypted=access_enc,
             oauth_access_token_expires_at=expires_at,
-            oauth_scopes=tokens.scope,
+            oauth_scopes=scopes,
             imap_host=OUTLOOK_IMAP_HOST,
             imap_port=OUTLOOK_IMAP_PORT,
             imap_ssl=True,

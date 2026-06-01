@@ -13,6 +13,7 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 
+from backend.app.oauth.schemas import OUTLOOK_RESOURCE_SCOPES
 from backend.app.oauth.service import (
     OAuthRefreshInvalidError,
     OutlookTokenService,
@@ -146,6 +147,44 @@ class TestRefreshOnExpiry:
         cipher = MailPasswordCipher.from_settings()
         assert stored.oauth_refresh_token_encrypted is not None
         assert cipher.decrypt(stored.oauth_refresh_token_encrypted, acc_id) == "RT-keep"
+
+
+class TestRefreshUsesResourceScopes:
+    """F. Every subsequent refresh requests the EXPLICIT outlook.office.com
+    RESOURCE scopes (the audience personal-Outlook IMAP/SMTP XOAUTH2 accepts).
+    The opaque access token is the mock's return value; correctness of the
+    issued token's ``aud`` is determined by Microsoft from this requested
+    ``scope`` — so we assert the request scope that pins it (ADR-0025 §3, P2)."""
+
+    async def test_refresh_requests_resource_scope_and_updates_access_token(
+        self, redis_client: object
+    ) -> None:
+        acc_id = await _seed_oauth_account(
+            access_token="AT-old", refresh_token="RT-x", expires_in_seconds=-10
+        )
+        acc = await _load(acc_id)
+        ep = TokenEndpoint(
+            [httpx.Response(200, json=token_success_body(access_token="AT-resource", email=None))]
+        )
+        async with make_session() as s:
+            tok = await OutlookTokenService(s, http_client=ep.client()).get_valid_access_token(acc)
+
+        assert tok == "AT-resource"
+        assert ep.calls == 1
+        req = ep.requests[0]
+        assert req["grant_type"] == "refresh_token"
+        assert req["refresh_token"] == "RT-x"
+        # The scope is the EXPLICIT resource form (pins aud=outlook.office.com)
+        # and carries NO reserved OIDC scopes (would trigger invalid_scope).
+        scopes = set(req["scope"].split())
+        assert scopes == set(OUTLOOK_RESOURCE_SCOPES)
+        assert {"openid", "email", "profile"}.isdisjoint(scopes)
+
+        # The refreshed access token is persisted (cache primed for next call).
+        stored = await _load(acc_id)
+        cipher = MailPasswordCipher.from_settings()
+        assert stored.oauth_access_token_encrypted is not None
+        assert cipher.decrypt(stored.oauth_access_token_encrypted, acc_id) == "AT-resource"
 
 
 class TestInvalidGrant:
