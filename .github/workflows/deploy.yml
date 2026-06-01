@@ -117,10 +117,25 @@ jobs:
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
         run: |
-          ssh -o IdentitiesOnly=yes -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" \
+          # ServerAliveInterval/CountMax keep the control connection alive
+          # across the long `pull` + `migrations` steps so a quiet TCP idle
+          # period can't drop the session before `up` runs.
+          #
+          # `bash -s` reads the script from stdin (the heredoc). The script
+          # itself runs each `docker compose ...` line; we force every compose
+          # invocation that could attach to a terminal to use `-T`
+          # (no TTY, do not read this stdin) so it can NOT drain the rest of
+          # the heredoc — see the long comment on the migrations step below.
+          ssh -o IdentitiesOnly=yes \
+              -o ServerAliveInterval=30 -o ServerAliveCountMax=10 \
+              -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" \
             SHA="$SHA" IMAGE_REGISTRY="$IMAGE_REGISTRY" DEPLOY_PATH="$DEPLOY_PATH" \
             bash -s <<'REMOTE_SCRIPT'
           set -euo pipefail
+          # set -x: print every command to the deploy log so that, if a step
+          # ever aborts again, the GitHub Actions log shows exactly where —
+          # cheap and invaluable for an opaque one-shot SSH deploy.
+          set -x
           cd "$DEPLOY_PATH"
 
           echo "==> deploying $SHA from $IMAGE_REGISTRY"
@@ -163,7 +178,24 @@ jobs:
           # upgrade head` is a no-op when the DB is already at head.
           # mas-migrations has no `profiles:` key → it is in the default profile
           # and is therefore selectable under `--profile prod run`.
-          docker compose --profile prod run --rm mas-migrations
+          #
+          # ROOT CAUSE of the "containers stay on the old image" bug:
+          # `docker compose run` (unlike `up`) is an interactive command — by
+          # default it allocates a TTY and ATTACHES TO STDIN. Here the remote
+          # shell is `bash -s`, whose stdin IS the heredoc carrying the rest of
+          # this script. When execution reached this line, `compose run`
+          # inherited that stdin and DRAINED it — swallowing every line below
+          # (the `up --force-recreate`, nginx recreate, healthcheck) as if it
+          # were keyboard input to the migration container. alembic still ran
+          # and exited 0, bash then hit EOF and exited 0 → the job went green,
+          # but api/worker were never recreated. That is exactly the observed
+          # symptom (git/.env/image updated, migrations applied, containers on
+          # the old image, no failure).
+          #
+          # Fix: `-T` disables TTY allocation AND stdin attach, and we also
+          # explicitly redirect stdin from /dev/null so this command can never
+          # consume the heredoc. Belt-and-braces; either alone is sufficient.
+          docker compose --profile prod run --rm -T mas-migrations < /dev/null
 
           # Recreate exactly the services that ship our code (now that the
           # schema is at head — new code never starts on an old schema).
@@ -192,6 +224,24 @@ jobs:
           # future api recreations no longer need this — but we keep it as a
           # belt-and-braces step that is cheap and idempotent.
           docker compose --profile prod up -d --force-recreate nginx
+
+          # Verify api/worker are ACTUALLY running the image we just deployed.
+          # This closes the silent-drift gap: if `up --force-recreate` ever
+          # failed to swap the image (the old bug), this turns it into a loud,
+          # visible job failure in Actions instead of a green-but-stale deploy.
+          # Compare each container's running image reference against the
+          # expected "$IMAGE_REGISTRY/<svc>:$SHA".
+          expected_api="$IMAGE_REGISTRY/api:$SHA"
+          expected_worker="$IMAGE_REGISTRY/worker:$SHA"
+          running_api="$(docker inspect --format='{{.Config.Image}}' mas-api)"
+          running_worker="$(docker inspect --format='{{.Config.Image}}' mas-worker)"
+          echo "==> api    expected=$expected_api running=$running_api"
+          echo "==> worker expected=$expected_worker running=$running_worker"
+          if [ "$running_api" != "$expected_api" ] || [ "$running_worker" != "$expected_worker" ]; then
+            echo "ERROR: containers are NOT on the deployed image ($SHA). up --force-recreate did not apply." >&2
+            docker compose ps
+            exit 1
+          fi
 
           # Smoke-test: poll healthcheck for up to 90s.
           attempts=18
