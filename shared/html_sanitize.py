@@ -156,6 +156,33 @@ _DROP_HTML_COMMENT_RE: Final[re.Pattern[str]] = re.compile(
 # directly.
 _COLLAPSE_BLANK_LINES_RE: Final[re.Pattern[str]] = re.compile(r"\n{3,}")
 
+# --- Render-time blank-line normalisation (ADR-0022 §2.10, round-37) -------
+#
+# When a message body is *displayed* (web ``message_view.html`` / JSON
+# ``GET /api/messages/{id}`` / TG "Посмотреть сообщение") Apple / marketing
+# mail shows a tall column of blank lines between paragraphs. These helpers
+# collapse that artefact at render-time only — the STORED body is untouched
+# (tag-matching ``body_contains`` and push-preview keep reading the raw
+# value via repo/worker, NOT via ``MessageService.get``).
+
+# Plain-text (``body_text``, the ``<pre>`` branch): a run of 3+ newlines —
+# i.e. one or more "blank lines" (a line of optional horizontal whitespace)
+# between two real line breaks — collapses to a single paragraph break.
+# Uses an explicit horizontal-whitespace class ``[ \t\r\f\v]`` rather than
+# ``\s`` so the pattern never consumes the ``\n`` boundaries unpredictably,
+# giving a deterministic "at most one blank line" result.
+_COLLAPSE_BLANK_TEXT_LINES_RE: Final[re.Pattern[str]] = re.compile(
+    r"\n[ \t\r\f\v]*(?:\n[ \t\r\f\v]*)+\n"
+)
+
+# HTML (``body_html``, the ``| safe`` branch): empty block-level separators
+# (``<p>``/``<div>`` whose content is only whitespace / ``&nbsp;`` / ``<br>``)
+# and runs of 3+ ``<br>`` both render as a tall empty column.
+_EMPTY_BLOCK_RE: Final[re.Pattern[str]] = re.compile(
+    r"<(p|div)\b[^>]*>(?:\s|&nbsp;|<br\s*/?>)*</\1>", re.IGNORECASE
+)
+_MULTI_BR_RE: Final[re.Pattern[str]] = re.compile(r"(?:<br\s*/?>\s*){3,}", re.IGNORECASE)
+
 # Round-15 fix: Telegram HTML mode rejects <br>; we must convert it to a
 # literal newline BEFORE bleach so the line break is preserved as text.
 _BR_TO_NL_RE: Final[re.Pattern[str]] = re.compile(r"<\s*br\s*/?\s*>", re.IGNORECASE)
@@ -230,6 +257,47 @@ def sanitize_email_html(html: str) -> str:
         strip=True,
     )
     return strip_invisible_padding(cleaned)
+
+
+def collapse_blank_lines_text(text: str | None) -> str:
+    """Collapse runs of 3+ newlines (blank lines between paragraphs) into a
+    single paragraph break (``\\n\\n``).
+
+    Render-time normalisation for the plain-text body view (ADR-0022 §2.10).
+    Paragraphs stay separated by exactly one blank line; a single blank line
+    between paragraphs is preserved untouched (the rule only fires on 3+
+    line breaks). Leading / trailing blank lines are stripped.
+
+    Empty / falsy input returns ``""``. The STORED body is never modified —
+    this is applied only when assembling the display DTO.
+    """
+    if not text:
+        return ""
+    collapsed = _COLLAPSE_BLANK_TEXT_LINES_RE.sub("\n\n", text)
+    return collapsed.strip("\n")
+
+
+def collapse_blank_lines_html(html: str | None) -> str:
+    """Collapse empty block separators and ``<br>`` runs in a sanitised HTML
+    body so it no longer renders as a tall column of blank lines.
+
+    Render-time normalisation for the HTML body view (ADR-0022 §2.10),
+    applied **on top of** :func:`sanitize_email_html` (the markup is already
+    whitelisted, so a single regex pass is safe):
+
+    - empty ``<p>``/``<div>`` separators (content only whitespace / ``&nbsp;``
+      / ``<br>``) are removed entirely;
+    - runs of 3+ ``<br>`` collapse to ``<br><br>``.
+
+    A single pass (not an iterative fixpoint) — nested empty blocks are rare
+    in practice and one pass clears the visible column. ``<pre>`` is never
+    touched. Empty / falsy input returns ``""``. The STORED body is never
+    modified.
+    """
+    if not html:
+        return ""
+    collapsed = _EMPTY_BLOCK_RE.sub("", html)  # drop empty <p>/<div>
+    return _MULTI_BR_RE.sub("<br><br>", collapsed)  # 3+ <br> → 2
 
 
 def sanitize_telegram_html(html: str) -> str:

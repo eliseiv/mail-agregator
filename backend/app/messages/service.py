@@ -33,6 +33,7 @@ from backend.app.repositories.messages import MessagesRepo
 from backend.app.repositories.tags import MessageTagsRepo
 from backend.app.repositories.users import UsersRepo
 from backend.app.tags.schemas import TagBriefDTO
+from shared.html_sanitize import collapse_blank_lines_html, collapse_blank_lines_text
 from shared.logging import get_logger
 from shared.models import Attachment, Tag, User
 from shared.storage import Storage, get_storage
@@ -243,8 +244,12 @@ class MessageService:
             cc_addrs=msg.cc_addrs,
             subject=msg.subject,
             internal_date=msg.internal_date,
-            body_text=msg.body_text,
-            body_html=msg.body_html,
+            # Round-37 (ADR-0022 §2.10): normalise the "tall column of blank
+            # lines" artefact (Apple/marketing mail) at render-time only. The
+            # stored body is untouched — tag-matching (body_contains) and the
+            # push preview read the raw value via repo/worker, not here.
+            body_text=collapse_blank_lines_text(msg.body_text),
+            body_html=collapse_blank_lines_html(msg.body_html),
             body_truncated=msg.body_truncated,
             body_present=msg.body_present,
             in_reply_to=msg.in_reply_to,
