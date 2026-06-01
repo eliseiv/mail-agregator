@@ -71,9 +71,7 @@ async def _admin_id(db_engine: AsyncEngine) -> int:
     s = get_settings()
     factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
     async with factory() as ses:
-        admin = (
-            await ses.execute(select(User).where(User.username == s.ADMIN_LOGIN))
-        ).scalar_one()
+        admin = (await ses.execute(select(User).where(User.username == s.ADMIN_LOGIN))).scalar_one()
         return admin.id
 
 
@@ -98,9 +96,7 @@ async def _audits(db_engine: AsyncEngine, action: str) -> list[AdminAudit]:
 async def _audit_count(db_engine: AsyncEngine) -> int:
     factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
     async with factory() as ses:
-        return int(
-            (await ses.execute(select(func.count()).select_from(AdminAudit))).scalar_one()
-        )
+        return int((await ses.execute(select(func.count()).select_from(AdminAudit))).scalar_one())
 
 
 # ---------------------------------------------------------------------------
@@ -132,9 +128,9 @@ class TestSelfHealInsert:
         # No session / pending cookies issued on the self-heal path.
         set_cookies = resp.headers.get_list("set-cookie")
         for name in ("mas_session", "mas_csrf", "mas_tg_pending"):
-            assert not any(c.startswith(f"{name}=") for c in set_cookies), (
-                f"{name} must not be (re)set on self-heal; got {set_cookies}"
-            )
+            assert not any(
+                c.startswith(f"{name}=") for c in set_cookies
+            ), f"{name} must not be (re)set on self-heal; got {set_cookies}"
 
         # Row created and owned by the admin, with created_at set & live.
         link = await _get_link(db_engine, tg_id)
@@ -206,9 +202,9 @@ class TestSelfHealLiveNoOp:
         assert after.user_id == admin_id
 
         # NO-OP must not audit at all (no telegram_link_created / rebound).
-        assert await _audits(db_engine, "telegram_link_created") == [], (
-            "NO-OP self-heal of a live link must NOT write telegram_link_created"
-        )
+        assert (
+            await _audits(db_engine, "telegram_link_created") == []
+        ), "NO-OP self-heal of a live link must NOT write telegram_link_created"
         assert await _audits(db_engine, "telegram_link_rebound") == []
 
 
