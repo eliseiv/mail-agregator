@@ -712,7 +712,7 @@ class TestSubjectAndPreviewInDispatch:
         assert "Тема: <b>Shared subject</b>" in the_text
         assert "One body previewed identically for everyone." in the_text
 
-    async def test_no_subject_no_preview_lines_when_message_blank(
+    async def test_blank_message_renders_no_subject_fallback_and_no_preview(
         self,
         db_engine: AsyncEngine,
         client: Any,
@@ -723,8 +723,11 @@ class TestSubjectAndPreviewInDispatch:
         tag_message_for_user: Any,
         fake_send_notification: Any,
     ) -> None:
-        """A message with no subject and an empty body → neither the ``Тема:``
-        line nor a preview line is emitted (both optional)."""
+        """Round-36 (ADR-0022 §2.5): a message with no subject and an empty body
+        → the ``Тема:`` line is STILL present with the ``(без темы)`` fallback,
+        and NO preview line is emitted (empty body drops the preview + its blank
+        separator). The tag line carries the applied tag as usual.
+        """
         tg_id = 160301
         await make_link(tg_id, super_admin_user.id)
         acc = await create_mail_account(super_admin_user.id, "blank@example.com")
@@ -741,7 +744,13 @@ class TestSubjectAndPreviewInDispatch:
         await _dispatch(_payload_for(msg.id), db_engine)
 
         text_html = fake_send_notification.calls[0]["text_html"]
-        assert "Тема:" not in text_html
+        # Subject line is always present with its fallback (round-36).
+        assert "Тема: <b>(без темы)</b>" in text_html
+        # The applied tag renders on the #️⃣ line.
+        assert "#️⃣: <b>tag</b>" in text_html
+        # Empty body → no preview line and no trailing blank separator.
+        assert not text_html.endswith("\n")
+        assert "\n\n\n" not in text_html
 
 
 # ---------------------------------------------------------------------------

@@ -292,7 +292,7 @@ WHERE  mt.message_id = :message_id
 ORDER  BY mt.tag_id;
 ```
 
-При `TG_NOTIFY_ALL_MESSAGES=true` этот запрос для письма без тегов вернёт пустой список — это нормальный кейс (см. §2.5: строка тегов опциональна), уведомление всё равно шлётся.
+При `TG_NOTIFY_ALL_MESSAGES=true` этот запрос для письма без тегов вернёт пустой список — это нормальный кейс (см. §2.5: строка `#️⃣:` тогда показывает «Не сортировано»), уведомление всё равно шлётся.
 
 **Инварианты получателей:**
 - Активная (`dead_at IS NULL`) `telegram_links` запись.
@@ -363,7 +363,7 @@ async def dispatch_one_payload(raw: str) -> None:
     #    2b. round-34: posчитать body_preview ОДИН раз на message (не на recipient):
     #        raw = body_text if body_text.strip() else html_to_plain(body_html)   # fallback через sanitize_telegram_html
     #        preview = normalize_preview(raw)  # схлопнуть whitespace+nbsp+zero-width в 1 пробел, strip,
-    #                                            # обрезать до PREVIEW_LEN=120 (+'…' если длиннее), '' если пусто
+    #                                            # обрезать до PREVIEW_LEN=100 (round-36; +'…' если длиннее), '' если пусто
     #        Срез делается в Python, НЕ в SQL.
     # 3. Загрузить теги письма ОДИН раз (round-12, §2.2). tag_names может быть [].
     #    round-31: НЕТ раннего return при пустом tag_names — продолжаем (теги опциональны, §2.5).
@@ -398,53 +398,69 @@ async def dispatch_one_payload(raw: str) -> None:
 
 Шаблон (новый Jinja2 template **не нужен** — формирование текста в Python, т.к. это не HTML-страница, а Bot API HTML subset).
 
-**Round-31: строка тегов — ОПЦИОНАЛЬНАЯ.** При `TG_NOTIFY_ALL_MESSAGES=true` письмо может прийти без тегов; в этом случае строка тегов **не печатается вовсе** (а не плейсхолдер «—»). Структура:
-- строка «почта» — **всегда**;
-- строка «теги» — **только если** `tag_names` непуст (singular «Тег» / plural «Теги»);
-- строка «отправитель» — **всегда**.
+Bug-fix #4: Telegram `parse_mode=HTML` **не** декодирует HTML-entities (`&laquo;`/`&raquo;`) — пользователь увидел бы их буквально. Используем реальные UTF-8 символы (кавычки `«` `»`, emoji).
 
-Bug-fix #4: Telegram `parse_mode=HTML` **не** декодирует HTML-entities (`&laquo;`/`&raquo;`) — пользователь увидел бы их буквально. Используем реальные UTF-8 кавычки `«` `»`.
+**Round-36: НОВЫЙ формат уведомления (emoji-заголовки, обязательные строки тег/тема).** Формат переработан под продуктовое требование: уведомление о новом письме теперь читается как карточка с emoji-метками. Историческая часть:
+- round-31 ОПЦИОНАЛЬНАЯ строка тегов («не печатается, если тегов нет») → **заменена** на **всегда-присутствующую** строку `#️⃣:` с fallback **«Не сортировано»**;
+- round-34 превью тела **120 → 100** символов (`PREVIEW_LEN`);
+- строка «Отправитель» → **«Клиент:»**;
+- строка «Тема:» теперь **всегда** присутствует, при пустой теме fallback **«(без темы)»** (раньше — round-34 — строка опускалась).
 
-**Round-34: добавлены ТЕМА письма и ПРЕВЬЮ тела.** Уведомление теперь даёт человекочитаемый тизер до открытия письма. `format_notification` получает два новых параметра: `subject: str | None` и `body_preview: str` (уже нормализованный и обрезанный — см. ниже). Обе строки опциональны в выводе:
+**Структура (round-36) — 6 строк, 2 из них — пустые-разделители:**
 
-- строка «почта» — **всегда**;
-- строка «теги» — только если `tag_names` непуст (round-31);
-- строка «отправитель» — **всегда**;
-- строка «Тема:» — **только если** `subject` непуст после `.strip()` (письма без темы → строка не печатается, плейсхолдер «(без темы)» в push **не** показываем — это шум; полный заголовок «(без темы)» остаётся в callback-ответе §2.6 при открытии письма);
-- строка «превью тела» — **только если** `body_preview` непуст (письмо без тела → строка отсутствует).
+1. `🆔: <ник почты>` — **всегда**. Ник = `display_name` аккаунта, при пустом/`NULL` `display_name` → `email`. Источник — `acc_label = account.display_name or account.email` (резолвится в `notify_service.dispatch_one_payload`, см. ниже; правок recipient-SQL **не требуется** — `MailAccount.display_name` уже загружен `mail_accounts.get_by_id`).
+2. `#️⃣: <теги>` — **всегда**. Если у письма есть теги — все логические теги через `, ` (после дедупа по `(name, color)`, round-21). Если тегов нет — **«Не сортировано»**. Выбор «все теги через запятую» (а не один): у письма может быть несколько тегов (auto-tagging применяет несколько `tags`-строк), сокрытие части тегов вводило бы пользователя в заблуждение; запятая компактнее, чем строка-на-тег.
+3. **пустая строка** — разделитель (по ТЗ).
+4. `Клиент: <отправитель>` — **всегда**. `from_label = from_name or from_addr` (без изменений relative round-34, переименован лейбл «Отправитель» → «Клиент:»).
+5. `Тема: <тема>` — **всегда**. `subject` после нормализации; при пустой теме → **«(без темы)»** (согласовано с callback §2.6, где тот же плейсхолдер используется при открытии письма). Обрезка до `SUBJECT_MAX = 150` символов (по границе + «…»).
+6. **пустая строка** — разделитель (по ТЗ).
+7. `<превью тела>` — **только если** `body_preview` непуст (письмо без тела → строка и предшествующий пустой разделитель опускаются, чтобы не оставлять «хвост» из пустой строки). Нормализуется и режется до `PREVIEW_LEN = 100` символов **в Python** (не в SQL) — см. §2.4.
 
-`subject` обрезается до `SUBJECT_MAX = 150` символов (по границе + «…»). `body_preview` нормализуется и режется до `PREVIEW_LEN = 120` символов **в Python** (не в SQL) — см. §2.4. Длины — **константы модуля** `notify_format.py` (не env: ретюн не нужен, лишний env-флаг — overhead). Обе строки — user-controlled → обязательный `html.escape()` (как `acc`/`from`/`tag`).
+Длины (`PREVIEW_LEN = 100`, `SUBJECT_MAX = 150`) — **константы модуля** `notify_format.py` (не env: ретюн не нужен, лишний env-флаг — overhead).
+
+**HTML-форматирование (решение round-36):** значения (`ник`, `теги`, `клиент`, `тема`) выделяются `<b>` для читаемости (консистентно с прежним стилем и контрастно к emoji-меткам). Emoji-метки (`🆔`, `#️⃣`) — plain UTF-8 (не bold). Превью тела — plain (как и раньше). **ВСЕ** user-controlled значения (ник/email, имена тегов, `from`, `subject`, превью) экранируются `html.escape()` — обязательная защита от инъекции в `parse_mode=HTML`. Плейсхолдеры «Не сортировано» / «(без темы)» — статический текст, в escape не нуждаются (но проходят через него вместе со значением — это безопасно).
 
 ```python
-PREVIEW_LEN: Final[int] = 120
+PREVIEW_LEN: Final[int] = 100   # round-36: было 120 (round-34)
 SUBJECT_MAX: Final[int] = 150
+
+_NO_TAG: Final[str] = 'Не сортировано'   # round-36: fallback строки #️⃣
+_NO_SUBJECT: Final[str] = '(без темы)'   # round-36: fallback строки Тема:
 
 def format_notification(
     *,
-    acc_label: str,        # display_name or email
-    from_label: str,       # from_name or from_addr
-    tag_names: list[str],  # может быть ПУСТЫМ (письмо без тегов)
-    subject: str | None,   # тема письма; None/'' -> строка не печатается
+    acc_label: str,        # display_name or email (ник почты)
+    from_label: str,       # from_name or from_addr (клиент)
+    tag_names: list[str],  # может быть ПУСТЫМ -> "Не сортировано"
+    subject: str | None,   # тема письма; None/'' -> "(без темы)"
     body_preview: str,     # уже нормализованное+обрезанное превью; '' -> строка не печатается
 ) -> str:
-    """HTML-строка для sendMessage parse_mode=HTML.
+    """HTML-строка для sendMessage parse_mode=HTML (round-36).
     Все user-controlled значения экранируются через html.escape()."""
     acc_safe = html.escape(acc_label)
     from_safe = html.escape(from_label)
-    lines = [f'Вы получили письмо на почту <b>{acc_safe}</b>']
-    if tag_names:  # строка тегов опциональна
-        if len(tag_names) == 1:
-            lines.append(f'Тег «<b>{html.escape(tag_names[0])}</b>»')
-        else:
-            names = ', '.join(f'«<b>{html.escape(t)}</b>»' for t in tag_names)
-            lines.append(f'Теги {names}')
-    lines.append(f'Отправитель <b>{from_safe}</b>')
-    subj = (subject or '').strip()
-    if subj:
-        if len(subj) > SUBJECT_MAX:
-            subj = subj[:SUBJECT_MAX].rstrip() + '…'
-        lines.append(f'Тема: <b>{html.escape(subj)}</b>')
-    if body_preview:  # body_preview уже нормализован+обрезан в notify_service
+    # #️⃣: все теги через запятую (дедуп по (name,color) сделан в notify_service),
+    # либо "Не сортировано", если тегов нет.
+    if tag_names:
+        tags_safe = ', '.join(html.escape(t) for t in tag_names)
+    else:
+        tags_safe = html.escape(_NO_TAG)
+    # Тема: всегда; пустая -> "(без темы)"; иначе нормализация + срез SUBJECT_MAX.
+    subj = _WHITESPACE_RUN_RE.sub(' ', strip_invisible_padding(subject or '')).strip()
+    if not subj:
+        subj = _NO_SUBJECT
+    elif len(subj) > SUBJECT_MAX:
+        subj = subj[:SUBJECT_MAX].rstrip() + '…'
+    subj_safe = html.escape(subj)
+    lines = [
+        f'🆔: <b>{acc_safe}</b>',
+        f'#️⃣: <b>{tags_safe}</b>',
+        '',                                  # пустой разделитель
+        f'Клиент: <b>{from_safe}</b>',
+        f'Тема: <b>{subj_safe}</b>',
+    ]
+    if body_preview:  # body_preview уже нормализован+обрезан (PREVIEW_LEN) в notify_service
+        lines.append('')                     # пустой разделитель перед превью
         lines.append(html.escape(body_preview))
     return '\n'.join(lines)
 ```
@@ -452,56 +468,52 @@ def format_notification(
 **Нормализация превью (выполняется в `notify_service.dispatch_one_payload`, НЕ в SQL — см. §2.4):**
 - источник — `message.body_text` (plain). Если `body_text` пуст → `strip_tags(message.body_html)` через существующий `sanitize_telegram_html()` + дополнительное снятие оставшейся разметки до plain. **Обоснование выбора `body_text`:** round-29 зафиксировал, что у Apple `body_text` и `body_html` **различаются** (UI рендерит `body_html`). Для тизера в push нужен короткий человекочитаемый текст без верстки/CSS/трекинг-пикселей — `text/plain` part письма заведомо «чище» (нет тегов, нет инлайн-стилей), поэтому даёт осмысленный teaser «из коробки». `body_html` берём только как fallback, прогоняя через тот же sanitiser, что и callback (§2.6), чтобы не протёк CSS/скрипт. Несовпадение версий некритично: push — это тизер-приманка, полный «правильный» рендер (`body_html`) пользователь видит по кнопке «Посмотреть сообщение».
 - схлопнуть любой whitespace (переводы строк `\n\r`, табы, множественные пробелы, неразрывный пробел ` ` и zero-width padding) в **один** пробел; обрезать по краям;
-- срезать до `PREVIEW_LEN = 120` символов; если исходник длиннее — `[:120].rstrip() + '…'`;
-- если после нормализации строка пуста → передать `''` (строка превью не печатается).
+- срезать до `PREVIEW_LEN = 100` символов (round-36; было 120 в round-34); если исходник длиннее — `[:100].rstrip() + '…'`;
+- если после нормализации строка пуста → передать `''` (строка превью + предшествующий пустой разделитель не печатаются).
 
-Пример с темой и телом (round-34):
+Пример с ником почты + тегом + темой + телом (round-36):
 ```
-Вы получили письмо на почту <b>support@example.com</b>
-Тег «<b>DPLA.PLA</b>»
-Отправитель <b>sender@gmail.com</b>
+🆔: <b>Apple Test 1</b>
+#️⃣: <b>DPLA.PLA</b>
+
+Клиент: <b>sender@gmail.com</b>
 Тема: <b>Ваш заказ #12345 отправлен</b>
-Здравствуйте! Ваш заказ был передан в службу доставки и поступит в пункт выдачи в течение 2–3 рабочих дне…
+
+Здравствуйте! Ваш заказ был передан в службу доставки и поступит в пункт выдачи в течение 2–3 раб…
 ```
 
-Пример без темы, но с телом (строка «Тема:» отсутствует):
+Пример без ника почты (только email) + без тега + без темы + с телом (fallback'и «Не сортировано» / «(без темы)»):
 ```
-Вы получили письмо на почту <b>Apple Test 1</b>
-Отправитель <b>AppStoreNotices@apple.com</b>
-Your subscription will renew soon. Tap to review the details and manage your plan in the App Store sett…
+🆔: <b>support@example.com</b>
+#️⃣: <b>Не сортировано</b>
+
+Клиент: <b>AppStoreNotices@apple.com</b>
+Тема: <b>(без темы)</b>
+
+Your subscription will renew soon. Tap to review the details and manage your plan in the App St…
 ```
 
-Пример с темой, но без тела (строка превью отсутствует):
+Пример с несколькими тегами + без тела (строка превью и пустой разделитель перед ней отсутствуют):
 ```
-Вы получили письмо на почту <b>support@example.com</b>
-Отправитель <b>sender@gmail.com</b>
-Тема: <b>(пустое уведомление)</b>
-```
+🆔: <b>support@example.com</b>
+#️⃣: <b>DPLA.PLA, VIP</b>
 
-Пример с тегом — без темы и без тела (структура round-31, 3 строки):
-```
-Вы получили письмо на почту <b>support@example.com</b>
-Тег «<b>DPLA.PLA</b>»
-Отправитель <b>sender@gmail.com</b>
-```
-
-Пример без тегов — `TG_NOTIFY_ALL_MESSAGES=true` (строка тегов отсутствует):
-```
-Вы получили письмо на почту <b>support@example.com</b>
-Отправитель <b>sender@gmail.com</b>
+Клиент: <b>sender@gmail.com</b>
 Тема: <b>Welcome</b>
-Thanks for signing up — confirm your email to get started.
 ```
 
 **Edge-cases:**
-- пустой `subject` (`None` или `''` после strip) → строка «Тема:» опускается, плейсхолдер в push не добавляем;
-- пустое тело (`body_text` и `body_html` оба пусты / дают пустой результат после нормализации) → строка превью опускается;
-- очень длинная тема (>150) → срез `[:150].rstrip()+'…'`; очень длинное тело (>120) → срез `[:120].rstrip()+'…'`;
-- HTML/спецсимволы (`<`, `>`, `&`) и кавычки в `subject`/превью → `html.escape()` (subject и тело сохраняются как обычный текст, не как разметка);
-- многострочный `subject` (редко, но в письмах встречаются folded-заголовки) и переводы строк в теле → схлопываются в один пробел, push остаётся компактным (4096-лимит Bot API не превышается: максимум ~150+120 видимых символов + статичный текст);
+- пустой `display_name` аккаунта (`NULL`/`''`) → строка `🆔:` показывает `email` (резолв `display_name or email` в `notify_service`);
+- письмо без тегов / `TG_NOTIFY_ALL_MESSAGES=true` → строка `#️⃣:` показывает **«Не сортировано»** (строка всегда присутствует — отличие от round-31);
+- несколько тегов на письме → все через `, ` (после дедупа по `(name, color)`);
+- пустой `subject` (`None` или `''` после strip) → строка `Тема:` показывает **«(без темы)»** (строка всегда присутствует — отличие от round-34);
+- пустое тело (`body_text` и `body_html` оба пусты / дают пустой результат после нормализации) → строка превью **и** предшествующий пустой разделитель опускаются (без «висящей» пустой строки в конце);
+- очень длинная тема (>150) → срез `[:150].rstrip()+'…'`; очень длинное тело (>100) → срез `[:100].rstrip()+'…'`;
+- HTML/спецсимволы (`<`, `>`, `&`) и кавычки в `ник`/`email`/`теге`/`subject`/превью → `html.escape()` (значения сохраняются как обычный текст, не как разметка);
+- многострочный `subject` (редко, но в письмах встречаются folded-заголовки) и переводы строк в теле → схлопываются в один пробел, push остаётся компактным (4096-лимит Bot API не превышается: максимум ~150+100 видимых символов + статичный текст);
 - результат `format_notification` гарантированно ≤ ~400 символов после escape → одна `sendMessage`, без chunk-логики (chunk-сплит остаётся только в callback §2.6 для полного тела).
 
-**Следствие для dispatcher (round-31):** ранний `if not message_tags: return` в `dispatch_one_payload` (§2.4) **убирается** — при пустом списке тегов продолжаем с `tag_names=[]`. Дедуп тегов по `(name, color)` (round-21) сохраняется.
+**Следствие для dispatcher (round-31):** ранний `if not message_tags: return` в `dispatch_one_payload` (§2.4) **убирается** — при пустом списке тегов продолжаем с `tag_names=[]` (round-36: `format_notification` сам рендерит «Не сортировано»). Дедуп тегов по `(name, color)` (round-21) сохраняется и выполняется в `notify_service` до вызова `format_notification`.
 
 **Inline keyboard:** одна кнопка `Посмотреть сообщение`. Реализация — **WebApp button** (не обычный URL), чтобы открытие происходило внутри Telegram-WebView, а не в системном браузере (UX → пользователь остаётся в Telegram):
 
@@ -678,6 +690,93 @@ if needs_retry:                                     # ТОЛЬКО retry_after /
 
 **Миграций нет.** Троттлинг полностью в Redis; схема БД не меняется. Идемпотентность доставки (§2.3) сохраняется без изменений.
 
+#### 2.10. Нормализация пустых строк при ПРОСМОТРЕ письма (round-37, bug «множество пустых строк»)
+
+**Проблема.** При открытии письма на web-странице `GET /messages/{id}` (шаблон `message_view.html`) — и, как следствие, в TG «Посмотреть сообщение», т.к. кнопка ведёт на ту же страницу через `?embed=tg` (см. §2.6, §2.5 inline-keyboard) — тело письма показывается с **множеством подряд идущих пустых строк**. Типичный кейс — Apple/маркетинговые письма (например, «Your Apple Account information has been updated»): 15+ пустых строк между абзацами.
+
+**Это НЕ относится к тексту push-уведомления** (§2.5): там превью уже схлопывает любой whitespace в один пробел через `normalize_preview`. Баг — только в **полном** отображении тела письма при просмотре.
+
+**Где артефакт возникает (две render-ветки `message_view.html`, см. §«Tech»):**
+
+1. **HTML-ветка** (`{{ message.body_html | safe }}`) — основной кейс Apple (у письма есть `text/html` part). `mail_accounts`-ingest сохраняет `body_html` через `sanitize_email_html` (`shared/html_sanitize.py`), который **whitelist'ит** блочные теги (`<p>`, `<div>`, `<br>`, `<table>`, `<tr>`…), но **не схлопывает вертикальный whitespace**. Пустые блочные элементы (`<p>&nbsp;</p>`, пустые `<div>`, spacer-`<tr>`) и подряд идущие `<br>` рендерятся браузером как высокий столб пустого вертикального пространства. (В отличие от Telegram-ветки `sanitize_telegram_html`, где `_COLLAPSE_BLANK_LINES_RE` уже схлопывает `\n{3,}` → `\n\n`.)
+2. **Plain-text-ветка** (`<pre>{{ message.body_text | e }}</pre>`) — для писем без `text/html` part. При ingest `body_text` для таких писем формируется `html2text(msg.html)` (`worker/app/imap_fetcher.py`), который оставляет прогоны `\n\n\n…`. `<pre>` сохраняет каждый `\n` буквально → видны пустые строки.
+
+**Решение: нормализация при ОТОБРАЖЕНИИ (render-time), НЕ при ingest.** Хранимые `body_text`/`body_html` остаются нетронутыми.
+
+**Обоснование выбора render-time (а не ingest/worker):**
+- **Чинит существующие письма.** В БД уже лежат письма с артефактом (retention 30 дней — все они видны пользователю). Нормализация при ingest исправила бы только новые письма; render-time чинит и старые без data-миграции/реингеста.
+- **Не теряем оригинал.** Хранимое тело остаётся исходным — если правило схлопывания окажется слишком агрессивным, его можно ослабить без потери данных. Также `body_text` используется для tag-matching (`body_contains`, ADR-0017 §4.2) и для push-превью — менять хранимое значение под нужды одного UI-вью неверно (затронуло бы и другие потребители).
+- **Дёшево.** Тело уже клампится до 1 MiB при ingest (§«Tech»); схлопывание на render — один проход regex по строке ≤1 MiB на запрос просмотра (не hot-path: один просмотр = один пользователь).
+- **Стоимость render-time:** нормализация выполняется на каждый просмотр (нет кэша). Приемлемо: просмотр письма — редкая интерактивная операция (≤5 users), не batch. Если профиль покажет проблему — можно материализовать в отдельную колонку (follow-up, не требуется сейчас).
+
+**Точные правила нормализации (для backend):**
+
+Обе ветки нормализуются **на стороне backend** (в `MessageService.get` → `MessageDetail`, см. ниже), чтобы JSON-API (`GET /api/messages/{id}`) и HTML-страница давали идентичный результат и логика была покрыта unit-тестами (а не пряталась в Jinja-фильтре). Добавляются две чистые функции в `shared/html_sanitize.py` (рядом с уже существующими sanitiser'ами — единый модуль очистки тел):
+
+1. **Plain-text** (`body_text`, ветка `<pre>`): схлопнуть 3+ подряд идущих «пустых» строк (строка, состоящая только из whitespace) в максимум **одну** пустую строку-разделитель (т.е. абзацы остаются разделены ровно одной пустой строкой). Также убрать пустые строки в начале/конце.
+
+   ```python
+   # shared/html_sanitize.py
+   # Строка из необязательного horizontal whitespace, затем перевод строки —
+   # повторённая 2+ раза подряд после первого \n → один разделитель абзаца ("\n\n").
+   # \n\s*\n\s*\n+  → \n\n   (3+ переводов строки с произвольным h-whitespace между ними).
+   _COLLAPSE_BLANK_TEXT_LINES_RE: Final[re.Pattern[str]] = re.compile(r"\n[ \t\r\f\v]*(?:\n[ \t\r\f\v]*)+\n")
+
+   def collapse_blank_lines_text(text: str) -> str:
+       """Схлопнуть прогоны из 3+ переводов строки (пустые строки между абзацами)
+       в один разделитель абзаца (\\n\\n). Сохраняет читаемость: абзацы разделены
+       ровно одной пустой строкой. Ведущие/замыкающие пустые строки убираются.
+       Пустой/None-вход → ''. Хранимое body НЕ меняется — функция применяется на render."""
+       if not text:
+           return ""
+       collapsed = _COLLAPSE_BLANK_TEXT_LINES_RE.sub("\n\n", text)
+       return collapsed.strip("\n")
+   ```
+
+   Замечание: regex использует **не** `\s` внутри класса (чтобы `\s` не «съел» сами `\n` непредсказуемо), а явный класс horizontal-whitespace `[ \t\r\f\v]`; переводы строк `\n` матчатся явно. Это надёжнее, чем `\n\s*\n\s*\n+`, и даёт детерминированный «максимум одна пустая строка».
+
+2. **HTML** (`body_html`, ветка `| safe`): свернуть вертикальные «пустые» конструкции, которые браузер рендерит как пустые строки, оставив максимум один разделитель абзаца. Чистим **после** `sanitize_email_html` (т.е. над уже-санитизированным whitelist-HTML — безопасно, теги уже сужены):
+   - схлопнуть 3+ подряд `<br>` (с произвольным whitespace между ними) → `<br><br>`;
+   - удалить «пустые» блочные элементы-разделители, состоящие только из whitespace/`&nbsp;`/`<br>`: `<p>…</p>`, `<div>…</div>` с пустым содержимым → удалить целиком;
+   - схлопнуть прогоны whitespace между блочными тегами.
+
+   ```python
+   # shared/html_sanitize.py
+   _EMPTY_BLOCK_RE: Final[re.Pattern[str]] = re.compile(
+       r"<(p|div)\b[^>]*>(?:\s|&nbsp;|<br\s*/?>)*</\1>", re.IGNORECASE
+   )
+   _MULTI_BR_RE: Final[re.Pattern[str]] = re.compile(
+       r"(?:<br\s*/?>\s*){3,}", re.IGNORECASE
+   )
+
+   def collapse_blank_lines_html(html: str) -> str:
+       """Свернуть пустые блочные элементы и прогоны <br> в санитизированном
+       HTML-теле, чтобы при рендере не было столба пустых строк. Применяется
+       на render поверх вывода sanitize_email_html. Хранимое body НЕ меняется.
+       Пустой/None-вход → ''."""
+       if not html:
+           return ""
+       collapsed = _EMPTY_BLOCK_RE.sub("", html)        # удалить пустые <p>/<div>
+       collapsed = _MULTI_BR_RE.sub("<br><br>", collapsed)  # 3+ <br> → 2
+       return collapsed
+   ```
+
+   Применяется **один проход** (не итеративно): вложенные пустые блоки на практике у Apple/ESP редки и одного прохода достаточно для устранения видимого столба; итеративный fixpoint — overkill (не вводим).
+
+**Где встраивается (backend):**
+
+- `backend/app/messages/service.py` → `MessageService.get(...)`: перед сборкой `MessageDetail` пропустить `msg.body_text` через `collapse_blank_lines_text(...)` и `msg.body_html` через `collapse_blank_lines_html(...)`. То есть `MessageDetail.body_text` / `.body_html` несут **уже нормализованные для отображения** значения. Это автоматически чинит и HTML-страницу (`message_view.html`), и JSON `GET /api/messages/{id}`, и TG-view (`?embed=tg`) — все три потребляют `MessageDetail`.
+- **`message_view.html` не меняется** — он рендерит `message.body_html | safe` / `message.body_text | e` как раньше; нормализация уже произошла в service.
+- **Хранимое НЕ трогаем:** `worker/app/imap_fetcher.py`, `messages`-repo, миграции — без изменений. tag-matching (`body_contains`) и push-превью продолжают читать сырое `messages.body_text`/`body_html` из БД (они идут через repo/worker, не через `MessageService.get`).
+
+**Edge-cases:**
+- письмо без тела (`body_present=false`) → ветки не достигаются (шаблон показывает «нет читаемого текстового тела»); функции получают `''`/`None` → возвращают `''` — безопасно.
+- `body_truncated=true` (тело обрезано до 1 MiB) → нормализация применяется к обрезанному значению, флаг truncated сохраняется; обрезка по байтам могла оставить «рваный» хвост тега в HTML — `| safe` это уже допускает сегодня (поведение не ухудшается), браузер закрывает незакрытый тег.
+- одиночная пустая строка между абзацами (нормальный текст) → НЕ трогается (правило срабатывает только на 3+ переводах строки / 3+ `<br>`).
+- легитимный `<pre>`-блок с намеренным форматированием внутри HTML-тела — `_EMPTY_BLOCK_RE` матчит только `<p>`/`<div>`, `<pre>` не затрагивается.
+
+**Миграций нет.** Изменение чисто на уровне отображения; схема БД и хранимые данные не меняются. Чинит и существующие письма (нормализация на каждом просмотре).
+
 ---
 
 ### 3. Изменения в data model (новые таблицы + новые `admin_audit.action`)
@@ -765,6 +864,8 @@ CREATE TABLE users_settings (
 
 #### Изменение: `GET /messages/{id}` HTML route — принимает `embed: str | None = Query(default=None)`. Если `embed == 'tg'` — context flag `embed_tg = True` → шаблон скрывает attachments.
 
+#### Изменение (round-37, §2.10): `GET /api/messages/{id}` и `GET /messages/{id}` — поля `body_text` / `body_html` в ответе/контексте теперь **нормализованы для отображения** (схлопнуты прогоны пустых строк/`<br>`/пустых блоков). Контракт схемы `MessageDetail` не меняется (типы те же); меняется только значение — артефакт «множества пустых строк» устранён. Хранимое в БД тело не затронуто.
+
 ---
 
 ### 5. Изменения в безопасности
@@ -841,6 +942,10 @@ CSP `frame-ancestors 'none'` остаётся неизменной — Telegram 
 9. **Создать новый процесс/контейнер для notification dispatcher.** Отвергнуто — лишний deploy-overhead. APScheduler-job в существующем worker достаточен. См. §2.4.
 
 10. **Не делать opt-out в MVP — пользователь захочет отключить, но это второстепенно.** Отвергнуто — must-have. Бот без opt-out быстро превратится в спамер; критическое требование UX.
+
+11. **(round-37, §2.10) Нормализовать пустые строки при ingest** (в `worker/app/imap_fetcher.py`, до сохранения `body_text`/`body_html`). Отвергнуто — (а) не исправило бы уже сохранённые письма (потребовался бы реингест/data-миграция); (б) изменило бы хранимое значение, которое используется не только этим UI-вью, но и tag-matching (`body_contains`, ADR-0017) и push-превью (§2.5) — менять источник под нужды одного потребителя неверно; (в) теряется оригинал. Принято — нормализация на render-time в `MessageService.get` (см. §2.10).
+
+12. **(round-37, §2.10) Чистить пустые строки в Jinja-фильтре в `message_view.html`.** Отвергнуто — логика спряталась бы в шаблоне и не покрывала бы JSON-API (`GET /api/messages/{id}`), давая расхождение HTML vs JSON; её сложнее unit-тестировать. Принято — нормализация в backend-service (`MessageService.get` → `MessageDetail`), общая для HTML-страницы и JSON-API; чистые функции в `shared/html_sanitize.py` покрываются unit-тестами.
 
 ---
 
@@ -1026,7 +1131,7 @@ async def send_notification(*, chat_id: int, text_html: str, message_id: int) ->
 
 - `03-data-model.md` — три новые таблицы (`telegram_links`, `telegram_notifications`, `users_settings`); четыре новые `admin_audit.action`.
 - `04-api-contracts.md` — новые `POST /api/telegram/auth`, `PATCH /api/me/settings`; изменения `GET /api/me`, `POST /logout`, `POST /api/admin/users/{id}/reset`, `GET /messages/{id}`.
-- `05-modules.md` — расширение модуля 18 (`telegram`) на SSO + dispatcher + bot.send_notification; новый sub-модуль `repositories/telegram_*`, `repositories/user_settings`; изменения в `auth`, `admin`, `worker.sync_cycle`.
+- `05-modules.md` — расширение модуля 18 (`telegram`) на SSO + dispatcher + bot.send_notification; новый sub-модуль `repositories/telegram_*`, `repositories/user_settings`; изменения в `auth`, `admin`, `worker.sync_cycle`. **round-37:** модуль `messages` (`MessageService.get` нормализует тело при отображении, §2.10) + `shared/html_sanitize` (новые `collapse_blank_lines_text`/`collapse_blank_lines_html`).
 - `06-security.md` — новая секция 1.9 (STRIDE для Telegram SSO); §7 — rate-limit `/api/telegram/auth`; §8 — новые audit-actions.
 - `07-deployment.md` — env vars (`TG_NOTIFY_*`, `TG_NOTIFY_ALL_MESSAGES`, `TG_SEND_PER_CHAT_PER_MINUTE`, `TG_AUTH_INIT_DATA_TTL_SEC`, `TG_PENDING_COOKIE_TTL_SEC`); cleanup TD-014 (имя `TELEGRAM_BOT_TOKEN`).
 - `08-frontend.md` — `tg.js` расширение для SSO call; `message_view.html` — `embed_tg` flag.
@@ -1045,4 +1150,7 @@ async def send_notification(*, chat_id: int, text_html: str, message_id: int) ->
 | round-31 | 2026-05-26 | (1) Уведомления по ВСЕМ новым письмам под флагом `TG_NOTIFY_ALL_MESSAGES` (default true; §2.1/§2.2/§2.8 — тег-предикат стал условным). (2) Строка тегов в тексте опциональна, плейсхолдер «—» убран, ранний `if not message_tags: return` убран (§2.5). (3) Per-chat троттлинг `TG_SEND_PER_CHAT_PER_MINUTE` через неблокирующий `rate_limit.try_consume` перед `try_reserve`, re-enqueue целого message_id (§2.9). Миграций нет; идемпотентность (§2.3) без изменений. TD-025/TD-026 заведены как follow-up. |
 | round-32 | 2026-05-26 | **Busy-loop fix (§2.9).** Throttled-получатель больше НЕ инициирует немедленный hot re-enqueue в `tg_notify_queue` (`enqueue_recovery`) — он просто `continue` (строка `telegram_notifications` не резервируется), а доставку берёт штатный `recovery_scan` (раз в час, окно 24ч) через `NOT EXISTS telegram_notifications`. Это убирает busy-loop при устойчивом `inflow > per-chat cap` (раньше письмо ре-энквьюилось каждые 5с бесконечно → неограниченный рост очереди + амплификация recipient-SQL). `retry_after`/`transient` (429/5xx) по-прежнему идут через немедленный `enqueue_recovery` (кратковременная, не структурная задержка — busy-loop не возникает). Обновлены §2.4 (контракт dispatch), §2.9. Заведён TD-027 (риск недоставки TG-нотификации за окном 24ч при устойчивом флуде — осознанный компромисс, само письмо не теряется). Миграций нет. |
 | round-33 | 2026-05-26 | **CRITICAL fix: recovery per-recipient (§2.8/§2.9).** Прежний `recovery_scan` отбирал письма по per-**message** `NOT EXISTS (telegram_notifications WHERE message_id=m.id)`. При частичной доставке (письмо видно A и B; A доставлен → строка `(mid,A)` есть; B throttled → строки `(mid,B)` нет) `NOT EXISTS` возвращал FALSE из-за строки A → `mid` не подбирался → B терял уведомление **навсегда**. Это делало путь throttled→recovery (§2.9) недостижимым для частично-доставленных писем и активировало pre-existing хрупкость частичной доставки при крашах. Исправлено (Опция A, без миграции): recovery-SQL теперь переиспользует recipient-логику §2.2 (visibility/link/opt-out/`internal_date` + условный тег-предикат) и отбирает `DISTINCT m.id`, у которых есть видимый получатель без строки `(message_id,user_id)` (`NOT EXISTS tn WHERE message_id=m.id AND user_id=u.id`). Побочно: recovery стал visibility-aware → **TD-025 закрыт**; TD-027 переформулирован (причина недоставки за 24ч — устойчивый throttle, а не маскированная частичная доставка). Идемпотентность (`try_reserve`) и hot-path `retry_after`/`transient` не тронуты. Обновлены §2.8 (новый recovery-SQL), §2.9 (механизм throttled→recovery), `05-modules.md` §14.1. Миграций нет. |
+| round-34 | 2026-05-27 | Push-уведомление (§2.5): добавлены строка `Тема:` и превью тела письма (`PREVIEW_LEN=120`), обе опциональные (опускаются при пустом значении). Введены `notify_format.html_to_plain` / `normalize_preview`; превью считается **один раз на письмо** в `notify_service.dispatch_one_payload` (источник — `body_text`, fallback `body_html` через sanitiser). Срез — в Python, не в SQL. Лейбл «Отправитель» сохранён. Миграций нет. |
+| round-36 | 2026-05-31 | **Новый формат push-уведомления (§2.5), финализирован.** Карточка из 6 строк с emoji-метками: `🆔:` (ник почты `display_name`‖`email`, **всегда**), `#️⃣:` (все теги через `, ` либо fallback **«Не сортировано»**, **всегда**), пустой разделитель, `Клиент:` (был «Отправитель», **всегда**), `Тема:` (**всегда**; пустая → **«(без темы)»**), пустой разделитель, превью тела (только если непусто). Превью `PREVIEW_LEN` 120 → **100**. Значения выделяются `<b>`, emoji-метки plain; все user-controlled значения `html.escape()`. Убран ранний `if not message_tags: return` (теги опциональны). Константы `PREVIEW_LEN=100`, `SUBJECT_MAX=150` — в `notify_format.py`. Миграций нет. **Код `notify_format.py` приводится к этому формату backend-агентом** (на момент round-36 doc-финала код был на round-34). |
+| round-37 | 2026-06-01 | **Bug «множество пустых строк» при ПРОСМОТРЕ письма (§2.10, новый раздел).** При открытии `GET /messages/{id}` (web и TG `?embed=tg`) тело Apple/маркетинговых писем показывалось с 15+ подряд пустыми строками (HTML-ветка: пустые блочные элементы + прогоны `<br>` не схлопывались `sanitize_email_html`; plain-ветка: прогоны `\n\n\n` от `html2text` в `<pre>`). Решение — нормализация **на render-time** (не при ingest): две чистые функции `collapse_blank_lines_text` / `collapse_blank_lines_html` в `shared/html_sanitize.py`, применяемые в `MessageService.get` к `MessageDetail.body_text`/`.body_html`. Схлопывает 3+ пустых строк / 3+ `<br>` / пустые `<p>`/`<div>` в максимум один разделитель абзаца. Хранимое body НЕ меняется (чинит и существующие письма, не ломает tag-matching/push-превью). Общая логика для HTML-страницы и JSON-API. Миграций нет. |
 
