@@ -1143,7 +1143,7 @@ Payload (`event="message_tagged"`):
 | Endpoint | Изменение |
 | --- | --- |
 | `GET /api/mail-accounts`, `GET /api/mail-accounts/{id}` | DTO дополняется `auth_type` и (для oauth) `oauth_needs_consent`. UI показывает бейдж «Outlook OAuth» и кнопку «переподключить» при `oauth_needs_consent=true`. |
-| `PATCH /api/mail-accounts/{id}` | Для `auth_type='oauth_outlook'` запрещено менять `password`/`imap_*`/`smtp_*` креды (они фиксированы); `400 validation_error` `field=auth_type` при попытке. Допускается только `display_name`. |
+| `PATCH /api/mail-accounts/{id}` | Для `auth_type='oauth_outlook'` host/port/ssl/credentials фиксированы — менять можно только `display_name`. Форма редактирования общая с password-аккаунтами и шлёт полный снимок (`email`+`imap_*`+`smtp_*`+`display_name`); поле, переданное **равным текущему значению аккаунта, — no-op** и игнорируется (не ошибка). `400 validation_error` `field=auth_type` возвращается только если поле передано **и отличается** от текущего, либо передан непустой `password`/`smtp_password`. См. ADR-0025 §4c. |
 | `POST /api/mail-accounts/test` | Для oauth-аккаунтов test использует XOAUTH2 (refresh→access→коннект); password-тест не применяется. |
 | `POST /api/mail-accounts` (ручной IMAP/SMTP) | Без изменений — создаёт `auth_type='password'`. |
 

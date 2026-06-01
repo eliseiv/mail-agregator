@@ -183,8 +183,23 @@
     enctype="application/x-www-form-urlencoded"
     novalidate
     data-account-form
-    data-account-id="{{ account.id if account else '' }}">
+    data-account-id="{{ account.id if account else '' }}"
+    data-auth-type="{{ (account.auth_type if account else '') | default('') | e }}">
     {{ m.csrf_input() }}
+
+    {# OAuth-аккаунты (ADR-0025): учётные данные (IMAP/SMTP/токены) управляются
+       Microsoft через OAuth2 и не редактируются вручную. В режиме редактирования
+       такого ящика account_form.js скрывает секции IMAP/SMTP/пароль и оставляет
+       только email (read-only) + никнейм. Этот бейдж/пояснение виден только для
+       oauth_outlook-аккаунтов. #}
+    {% if account and account.auth_type == 'oauth_outlook' %}
+    <div class="form-oauth-note" data-account-oauth-note>
+      <span class="integrations-badge integrations-badge--ok">Outlook (OAuth)</span>
+      <p class="field__hint">
+        Учётные данные управляются Microsoft (OAuth); редактируется только никнейм.
+      </p>
+    </div>
+    {% endif %}
 
     {% if account %}
       <input type="hidden" name="_method" value="PATCH">
@@ -222,7 +237,7 @@
       <p class="field__hint">Если задан — будет показываться вместо email-адреса в списках. До 100 символов.</p>
     </div>
 
-    <div class="field">
+    <div class="field" data-account-credentials>
       <label class="field__label" for="acc-password">
         Пароль
         {% if account %}<span class="field__optional">(оставьте пустым, чтобы не менять)</span>{% endif %}
@@ -238,7 +253,7 @@
         maxlength="256">
     </div>
 
-    <fieldset class="form-section">
+    <fieldset class="form-section" data-account-credentials>
       <legend class="form-section__legend">IMAP</legend>
 
       <div class="field-grid">
@@ -283,7 +298,7 @@
       </div>
     </fieldset>
 
-    <fieldset class="form-section">
+    <fieldset class="form-section" data-account-credentials>
       <legend class="form-section__legend">SMTP</legend>
 
       <div class="field-grid">
@@ -367,7 +382,7 @@
       </details>
     </fieldset>
 
-    <div class="form-actions">
+    <div class="form-actions" data-account-credentials>
       <button type="button" class="btn btn--secondary" data-account-test>Проверить соединение</button>
       <span class="account-test-result" data-account-test-result aria-live="polite"></span>
     </div>

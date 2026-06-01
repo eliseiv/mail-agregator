@@ -80,9 +80,29 @@
     const successPane    = document.querySelector('[data-account-success]');
     const accountId      = form.getAttribute('data-account-id') || '';
     const isEdit         = !!accountId;
+    // OAuth-аккаунты (ADR-0025): IMAP/SMTP/токены управляются Microsoft и не
+    // редактируются. В режиме редактирования такого ящика правится только
+    // никнейм (display_name). Признак приходит из шаблона (data-auth-type на
+    // account.auth_type). На create этого режима нет — OAuth-ящики заводятся
+    // отдельным flow («Подключить Outlook»), а не этой формой.
+    const authType       = (form.getAttribute('data-auth-type') || '').trim();
+    const isOauthEdit    = isEdit && authType === 'oauth_outlook';
+
+    // Для OAuth-edit прячем и отключаем все секции с учётными данными
+    // (пароль, IMAP, SMTP, «Проверить соединение»), чтобы они не отправлялись
+    // и не сбивали с толку. disabled-поля не попадают в FormData.
+    if (isOauthEdit) {
+      form.querySelectorAll('[data-account-credentials]').forEach(function (el) {
+        el.hidden = true;
+        el.querySelectorAll('input, button, select, textarea').forEach(function (ctrl) {
+          ctrl.disabled = true;
+        });
+      });
+    }
 
     // Auto-suggest. Edit mode: only fill empty fields (don't clobber existing values).
-    if (emailInput) {
+    // Для OAuth-edit auto-suggest не нужен (хосты не редактируются).
+    if (emailInput && !isOauthEdit) {
       emailInput.addEventListener('input', applyProviderDefaults);
       emailInput.addEventListener('blur', applyProviderDefaults);
     }
@@ -132,6 +152,14 @@
 
     function buildPayload() {
       const fd = new FormData(form);
+      // OAuth-edit: учётные данные фиксированы Microsoft — шлём только никнейм.
+      // clear-семантика как у password-edit: пустой никнейм → clear_display_name:true
+      // (sentinel JSON-пути backend MailAccountUpdateRequest; display_name:null
+      //  игнорируется сервисом). Непустой → display_name: "<имя>".
+      if (isOauthEdit) {
+        const rawName = (fd.get('display_name') || '').toString().trim();
+        return rawName ? { display_name: rawName } : { clear_display_name: true };
+      }
       const payload = {
         email:           (fd.get('email') || '').toString().trim(),
         password:        (fd.get('password') || '').toString(),
@@ -143,13 +171,18 @@
         smtp_ssl:        !!fd.get('smtp_ssl'),
         smtp_starttls:   !!fd.get('smtp_starttls'),
       };
-      // Mail account nickname (ADR-0020). Trim; empty → null. On edit mode
-      // we always emit the field (including null) so the user can clear it;
-      // on create mode we omit when empty so the backend default kicks in.
+      // Mail account nickname (ADR-0020). Trim. On edit mode: непустой →
+      // display_name; пустой → clear_display_name:true (sentinel JSON-пути
+      // backend; display_name:null сервисом игнорируется). On create mode:
+      // omit when empty so the backend default kicks in.
       const displayNameRaw = (fd.get('display_name') || '').toString();
       const displayName = displayNameRaw.trim();
       if (isEdit) {
-        payload.display_name = displayName ? displayName : null;
+        if (displayName) {
+          payload.display_name = displayName;
+        } else {
+          payload.clear_display_name = true;
+        }
       } else if (displayName) {
         payload.display_name = displayName;
       }
@@ -162,8 +195,8 @@
       return payload;
     }
 
-    // Test-connection button
-    if (testBtn) {
+    // Test-connection button. Для OAuth-edit его нет (секция скрыта/disabled).
+    if (testBtn && !isOauthEdit) {
       testBtn.addEventListener('click', async function () {
         setError('');
         setSuccess('');
@@ -206,20 +239,24 @@
 
       const payload = buildPayload();
 
-      // Basic client-side guards (server-side is authoritative).
-      if (!payload.email) { setError('Email обязателен.'); return; }
-      if (!isEdit && !payload.password) { setError('Пароль обязателен.'); return; }
-      if (!payload.imap_host || !payload.smtp_host) {
-        setError('Хосты IMAP и SMTP обязательны.'); return;
-      }
-      if (payload.imap_port < 1 || payload.imap_port > 65535) {
-        setError('Неверный порт IMAP.'); return;
-      }
-      if (payload.smtp_port < 1 || payload.smtp_port > 65535) {
-        setError('Неверный порт SMTP.'); return;
-      }
-      if (payload.smtp_ssl && payload.smtp_starttls) {
-        setError('SMTP не может одновременно использовать SSL и STARTTLS.'); return;
+      // OAuth-edit: единственное поле — никнейм; серверных credential-проверок
+      // не требуется (пропускаем гварды email/пароль/хосты/порты).
+      if (!isOauthEdit) {
+        // Basic client-side guards (server-side is authoritative).
+        if (!payload.email) { setError('Email обязателен.'); return; }
+        if (!isEdit && !payload.password) { setError('Пароль обязателен.'); return; }
+        if (!payload.imap_host || !payload.smtp_host) {
+          setError('Хосты IMAP и SMTP обязательны.'); return;
+        }
+        if (payload.imap_port < 1 || payload.imap_port > 65535) {
+          setError('Неверный порт IMAP.'); return;
+        }
+        if (payload.smtp_port < 1 || payload.smtp_port > 65535) {
+          setError('Неверный порт SMTP.'); return;
+        }
+        if (payload.smtp_ssl && payload.smtp_starttls) {
+          setError('SMTP не может одновременно использовать SSL и STARTTLS.'); return;
+        }
       }
 
       submitBtn && (submitBtn.disabled = true);

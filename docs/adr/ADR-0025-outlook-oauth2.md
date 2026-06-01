@@ -96,6 +96,8 @@ XOAUTH2 SASL string (base64): `user={email}\x01auth=Bearer {access_token}\x01\x0
 
 `testers.py`: добавить `imap_test_oauth` / `smtp_test_oauth` — пробуют XOAUTH2 коннект свежим access-token (для кнопки «проверить» после подключения).
 
+**Редактирование (PATCH) oauth-аккаунтов (§4c).** Для `auth_type='oauth_outlook'` host/port/ssl/credentials фиксированы (Microsoft + XOAUTH2) и **immutable**; редактировать можно **только `display_name`** (никнейм). Форма редактирования общая с password-аккаунтами и всегда отправляет полный снимок (`email/imap_host/imap_port/imap_ssl/smtp_host/smtp_port/smtp_ssl/smtp_starttls/smtp_username` + `display_name`). Поэтому проверка «запрещённого изменения» сравнивает с текущим значением: поле, переданное **равным** текущему значению аккаунта, — это **no-op, не ошибка** и игнорируется. Запрос отклоняется (`400`, `ValidationError`) только если поле передано **и отличается** от текущего, либо передан непустой `password`/`smtp_password` (у oauth-аккаунта пароля нет). `display_name` обновляется как обычно.
+
 ### 5. Безопасность
 
 - **Scopes** — минимально необходимые: `IMAP.AccessAsUser.All`, `SMTP.Send`, `offline_access`, `openid`, `email`, `profile`. Никаких Mail.ReadWrite/Graph-широких.

@@ -410,24 +410,36 @@ class MailAccountService:
 
         # ADR-0025 §4c: oauth_outlook accounts have fixed Microsoft host/port
         # and token-based auth — only ``display_name`` may be edited. Any
-        # attempt to change credentials / hosts / ports is rejected.
+        # attempt to *change* credentials / hosts / ports is rejected.
+        #
+        # The edit form is shared with password accounts and always submits a
+        # full snapshot (host/port/ssl/starttls + display_name). Resubmitting a
+        # field equal to the stored value is a no-op, not a credential change,
+        # so a field counts as a forbidden change only when it is provided
+        # (not None) AND differs from the account's current value. ``password``
+        # / ``smtp_password`` are forbidden whenever a non-empty value is sent —
+        # oauth accounts have no password to set.
         if acc.auth_type == "oauth_outlook":
             forbidden_changes = (
-                payload.email is not None
-                or payload.password is not None
-                or payload.imap_host is not None
-                or payload.imap_port is not None
-                or payload.imap_ssl is not None
-                or payload.smtp_host is not None
-                or payload.smtp_port is not None
-                or payload.smtp_ssl is not None
-                or payload.smtp_starttls is not None
-                or payload.smtp_username is not None
-                or payload.smtp_password is not None
+                (payload.email is not None and payload.email != acc.email)
+                or bool(payload.password)
+                or (payload.imap_host is not None and payload.imap_host != acc.imap_host)
+                or (payload.imap_port is not None and payload.imap_port != acc.imap_port)
+                or (payload.imap_ssl is not None and payload.imap_ssl != acc.imap_ssl)
+                or (payload.smtp_host is not None and payload.smtp_host != acc.smtp_host)
+                or (payload.smtp_port is not None and payload.smtp_port != acc.smtp_port)
+                or (payload.smtp_ssl is not None and payload.smtp_ssl != acc.smtp_ssl)
+                or (
+                    payload.smtp_starttls is not None and payload.smtp_starttls != acc.smtp_starttls
+                )
+                or (
+                    payload.smtp_username is not None and payload.smtp_username != acc.smtp_username
+                )
+                or bool(payload.smtp_password)
             )
             if forbidden_changes:
                 raise ValidationError(
-                    "OAuth accounts allow editing only the display name",
+                    "OAuth accounts allow changing only the display name",
                     field="auth_type",
                 )
             oauth_update_fields: dict[str, object] = {}
