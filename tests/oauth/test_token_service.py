@@ -13,7 +13,7 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 
-from backend.app.oauth.schemas import OUTLOOK_RESOURCE_SCOPES
+from backend.app.oauth.schemas import OUTLOOK_SCOPES
 from backend.app.oauth.service import (
     OAuthRefreshInvalidError,
     OutlookTokenService,
@@ -149,14 +149,16 @@ class TestRefreshOnExpiry:
         assert cipher.decrypt(stored.oauth_refresh_token_encrypted, acc_id) == "RT-keep"
 
 
-class TestRefreshUsesResourceScopes:
-    """F. Every subsequent refresh requests the EXPLICIT outlook.office.com
-    RESOURCE scopes (the audience personal-Outlook IMAP/SMTP XOAUTH2 accepts).
-    The opaque access token is the mock's return value; correctness of the
-    issued token's ``aud`` is determined by Microsoft from this requested
-    ``scope`` — so we assert the request scope that pins it (ADR-0025 §3, P2)."""
+class TestRefreshUsesOutlookScopes:
+    """F. Every refresh requests the same single ``OUTLOOK_SCOPES`` set used at
+    code-exchange — the direct ``https://outlook.office.com/…`` resource scopes
+    (the audience personal-Outlook IMAP/SMTP XOAUTH2 accepts) plus the OIDC +
+    offline_access scopes. SINGLE-step config (ADR-0025 §3, P2 reverted). The
+    opaque access token is the mock's return value; the issued token's ``aud``
+    is determined by Microsoft from this requested ``scope`` — so we assert the
+    request scope that pins it."""
 
-    async def test_refresh_requests_resource_scope_and_updates_access_token(
+    async def test_refresh_requests_outlook_scope_and_updates_access_token(
         self, redis_client: object
     ) -> None:
         acc_id = await _seed_oauth_account(
@@ -174,11 +176,11 @@ class TestRefreshUsesResourceScopes:
         req = ep.requests[0]
         assert req["grant_type"] == "refresh_token"
         assert req["refresh_token"] == "RT-x"
-        # The scope is the EXPLICIT resource form (pins aud=outlook.office.com)
-        # and carries NO reserved OIDC scopes (would trigger invalid_scope).
+        # The scope is the single OUTLOOK_SCOPES set (direct outlook.office.com
+        # resource scopes + OIDC + offline_access), identical to code-exchange.
         scopes = set(req["scope"].split())
-        assert scopes == set(OUTLOOK_RESOURCE_SCOPES)
-        assert {"openid", "email", "profile"}.isdisjoint(scopes)
+        assert scopes == set(OUTLOOK_SCOPES)
+        assert "https://outlook.office.com/IMAP.AccessAsUser.All" in scopes
 
         # The refreshed access token is persisted (cache primed for next call).
         stored = await _load(acc_id)

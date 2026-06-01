@@ -3,6 +3,11 @@
 No real Azure App / network — the OAuth services accept an injected
 ``http_client`` (ADR-0025 Q-OAUTH-3 / TD-031) and we feed them a client backed
 by a :class:`httpx.MockTransport` whose handler we control per-test.
+
+SINGLE-STEP flow (working Sprint-B config, P1/P2 reverted): ``exchange_code``
+issues exactly ONE ``code -> token`` request with the direct
+``https://outlook.office.com/…`` resource scopes; refresh reuses the same
+scopes. There is no two-step audience upgrade.
 """
 
 from __future__ import annotations
@@ -30,7 +35,10 @@ def token_success_body(
     access_token: str = "ATtok-AAA",
     refresh_token: str | None = "RTtok-AAA",
     expires_in: int = 3600,
-    scope: str = "https://outlook.office365.com/IMAP.AccessAsUser.All offline_access",
+    scope: str = (
+        "https://outlook.office.com/IMAP.AccessAsUser.All "
+        "https://outlook.office.com/SMTP.Send offline_access"
+    ),
     email: str | None = "user@outlook.com",
 ) -> dict[str, object]:
     body: dict[str, object] = {
@@ -49,58 +57,12 @@ def token_success_body(
 def _parse_form(request: httpx.Request) -> dict[str, str]:
     """URL-decode the posted ``application/x-www-form-urlencoded`` body.
 
-    The two-step P2 flow asserts per-request ``scope`` values, which contain
-    URL-reserved characters (``:`` ``/`` in ``https://outlook.office.com/…``),
-    so we must percent-decode — a plain ``split("&")`` leaves them encoded.
+    Tests assert the request ``scope``, which contains URL-reserved characters
+    (``:`` ``/`` in ``https://outlook.office.com/…``), so we must percent-decode
+    — a plain ``split("&")`` leaves them encoded.
     """
     body = request.content.decode()
     return dict(parse_qsl(body, keep_blank_values=True))
-
-
-def two_step_responses(
-    *,
-    email: str | None = "user@outlook.com",
-    step1_access_token: str = "AT-step1-short",
-    step1_refresh_token: str | None = "RT-step1",
-    step2_access_token: str = "AT-step2-resource",
-    step2_refresh_token: str | None = "RT-step2-rotated",
-    step2_expires_in: int = 3600,
-    step2_scope: str = (
-        "https://outlook.office.com/IMAP.AccessAsUser.All "
-        "https://outlook.office.com/SMTP.Send offline_access"
-    ),
-) -> list[httpx.Response | Callable[[httpx.Request], httpx.Response]]:
-    """Canned [step1, step2] responses for the P2 two-step ``exchange_code``.
-
-    * Step 1 (authorization_code, SHORT scopes): carries the ``id_token`` (so
-      the mailbox email resolves) and a refresh token, plus a *wrong-audience*
-      access token that must be discarded.
-    * Step 2 (refresh_token, RESOURCE scopes): the correctly-audienced
-      access token that gets persisted, plus (optionally) a rotated refresh
-      token. Microsoft does NOT return an ``id_token`` on a refresh grant, so
-      step 2 omits it (``email=None``).
-    """
-    return [
-        httpx.Response(
-            200,
-            json=token_success_body(
-                access_token=step1_access_token,
-                refresh_token=step1_refresh_token,
-                scope="IMAP.AccessAsUser.All SMTP.Send offline_access openid email profile",
-                email=email,
-            ),
-        ),
-        httpx.Response(
-            200,
-            json=token_success_body(
-                access_token=step2_access_token,
-                refresh_token=step2_refresh_token,
-                expires_in=step2_expires_in,
-                scope=step2_scope,
-                email=None,  # refresh grant returns no id_token
-            ),
-        ),
-    ]
 
 
 class TokenEndpoint:
@@ -110,10 +72,9 @@ class TokenEndpoint:
     ``(request) -> httpx.Response``. When the queue is exhausted the last entry
     is reused (so a single success response serves repeated refreshes).
 
-    ``requests`` records the decoded form body of EVERY call in order, so
-    two-step (P2) tests can assert step-1 vs step-2 ``grant_type`` / ``scope``
-    independently. ``last_request_data`` is kept as an alias of the most recent
-    entry for the single-call tests.
+    ``requests`` records the decoded form body of EVERY call in order, so tests
+    can assert ``grant_type`` / ``scope``. ``last_request_data`` is kept as an
+    alias of the most recent entry for single-call tests.
     """
 
     def __init__(
