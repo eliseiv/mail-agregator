@@ -1124,7 +1124,7 @@ Payload (`event="message_tagged"`):
 | --- | --- |
 | Auth | session cookie. |
 | Логика | Генерит `state` (32B urlsafe) + PKCE `code_verifier`/`code_challenge` (S256), сохраняет в Redis `oauth_state:{state}` = `{user_id, code_verifier}` TTL `OUTLOOK_OAUTH_STATE_TTL_SECONDS` (default 600), привязка к `session.user_id`. Строит Microsoft authorize URL. |
-| 200 | `{"authorize_url": "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize?...", "state": "<32B urlsafe>"}` (`OAuthAuthorizeResponse`) — фронт показывает ссылку «открыть в OctoBrowser» (НЕ auto-redirect — пользователь открывает в нужном профиле). `state` отдаётся для отображения/трекинга на клиенте. |
+| 200 | `{"authorize_url": "https://login.microsoftonline.com/common/oauth2/v2.0/authorize?...", "state": "<32B urlsafe>"}` (`OAuthAuthorizeResponse`) — фронт показывает ссылку «открыть в OctoBrowser» (НЕ auto-redirect — пользователь открывает в нужном профиле). `state` отдаётся для отображения/трекинга на клиенте. |
 | 404 | `not_found` если `OUTLOOK_OAUTH_ENABLED=false`. |
 
 ### `GET /api/oauth/outlook/callback`

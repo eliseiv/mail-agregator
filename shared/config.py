@@ -157,8 +157,12 @@ class Settings(BaseSettings):
     OUTLOOK_CLIENT_SECRET: str = ""
     # ``{APP_BASE_URL}/api/oauth/outlook/callback`` — must match Azure exactly.
     OUTLOOK_REDIRECT_URI: str = ""
-    # tenant for the authorize/token endpoints; personal mailboxes -> consumers.
-    OUTLOOK_TENANT: str = "consumers"
+    # tenant for the authorize/token endpoints. ADR-0025: ``common`` (NOT
+    # ``consumers``) for personal mailboxes — the ``consumers`` tenant produced
+    # IMAP XOAUTH2 "User is authenticated but not connected" (token accepted but
+    # the IMAP session never binds). ``common`` accepts both personal and work
+    # accounts; we only need personal, which ``common`` admits. Env overrides.
+    OUTLOOK_TENANT: str = "common"
     # TTL of the Redis ``oauth_state:{state}`` key (CSRF/anti-fixation state +
     # PKCE verifier). Default 600s per ADR-0025 §6.
     OUTLOOK_OAUTH_STATE_TTL_SECONDS: int = Field(default=600, ge=60, le=3600)

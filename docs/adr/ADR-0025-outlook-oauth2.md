@@ -12,19 +12,19 @@
 Microsoft с сентября 2024 отключает Basic Auth (LOGIN по паролю) для личных ящиков `outlook.com`/`hotmail.com`/`live.com`. Текущая архитектура (`mail_accounts` + `MailPasswordCipher`, `imap_fetcher` через `imap-tools` `mailbox.login(user, password)`, SMTP через `aiosmtplib.login`) поддерживает только пароль/app-password. Для личных Outlook нужен **OAuth2 + SASL XOAUTH2**.
 
 Решения пользователя (зафиксированы как вход):
-- Личные ящики (`outlook.com`/`hotmail.com`/`live.com`), tenant `consumers`.
+- Личные ящики (`outlook.com`/`hotmail.com`/`live.com`), tenant `common` (см. §6 / историю изменений — изначально `consumers`, заменён на `common` из-за IMAP XOAUTH2 "User is authenticated but not connected").
 - Consent — через **наш сайт + OctoBrowser**: кнопка «Подключить Outlook» → редирект на Microsoft authorize → пользователь открывает ссылку в нужном OctoBrowser-профиле, проходит вход/согласие → callback с `code` → обмен на токены.
 - IMAP-сбор — **напрямую** с сервера (без прокси) через XOAUTH2.
 - Refresh-токен — хранить зашифрованно.
-- Azure App: «Personal Microsoft accounts only», `client_id`, `client_secret`, `redirect_uri`, delegated scopes: `IMAP.AccessAsUser.All`, `SMTP.Send`, `offline_access`, `openid`, `email`, `profile`.
+- Azure App: «Accounts in any organizational directory and personal Microsoft accounts» (multitenant + personal — обязательно для tenant `common`; ранее планировалось «Personal Microsoft accounts only» под `consumers`, см. историю изменений), `client_id`, `client_secret`, `redirect_uri`, delegated scopes: `IMAP.AccessAsUser.All`, `SMTP.Send`, `offline_access`, `openid`, `email`, `profile`.
 
-Microsoft endpoints (tenant `consumers`):
-- authorize: `https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize`
-- token: `https://login.microsoftonline.com/consumers/oauth2/v2.0/token`
+Microsoft endpoints (tenant `common` — см. историю изменений):
+- authorize: `https://login.microsoftonline.com/common/oauth2/v2.0/authorize`
+- token: `https://login.microsoftonline.com/common/oauth2/v2.0/token`
 - IMAP: `outlook.office365.com:993` SSL, SASL XOAUTH2.
 - SMTP: `smtp-mail.outlook.com:587` STARTTLS, SASL XOAUTH2.
 
-> **Требует проверки при реализации (Q-OAUTH-3):** Microsoft периодически меняет статус IMAP/SMTP XOAUTH2 для personal accounts и список допустимых scopes для consumers-tenant. Перед e2e нужно подтвердить на реальном Azure App, что `IMAP.AccessAsUser.All` + `SMTP.Send` выдаются для personal accounts и что `imap-tools` корректно строит XOAUTH2 (см. §5).
+> **Требует проверки при реализации (Q-OAUTH-3):** Microsoft периодически меняет статус IMAP/SMTP XOAUTH2 для personal accounts и список допустимых scopes для tenant. Перед e2e нужно подтвердить на реальном Azure App, что `IMAP.AccessAsUser.All` + `SMTP.Send` выдаются для personal accounts и что `imap-tools` корректно строит XOAUTH2 (см. §5).
 
 ## Decision
 
@@ -116,7 +116,7 @@ XOAUTH2 SASL string (base64): `user={email}\x01auth=Bearer {access_token}\x01\x0
 | `OUTLOOK_CLIENT_ID` | Azure App (Application/client) ID |
 | `OUTLOOK_CLIENT_SECRET` | Azure App client secret (redact) |
 | `OUTLOOK_REDIRECT_URI` | `{APP_BASE_URL}/api/oauth/outlook/callback` |
-| `OUTLOOK_TENANT` | `consumers` (default) |
+| `OUTLOOK_TENANT` | `common` (default) — личные ящики. `consumers` давал IMAP XOAUTH2 "User is authenticated but not connected"; `common` пускает и личные, и рабочие аккаунты (нам нужны личные). |
 | `OUTLOOK_OAUTH_STATE_TTL_SECONDS` | default 600 |
 | `OUTLOOK_OAUTH_ENABLED` | derived: true когда `OUTLOOK_CLIENT_ID` и `OUTLOOK_CLIENT_SECRET` заданы (по аналогии с `telegram_bot_enabled`). |
 
@@ -160,3 +160,7 @@ Endpoints собираются из `OUTLOOK_TENANT`: `https://login.microsofton
 - **Q-OAUTH-1** — callback приходит в OctoBrowser-профиле без cookie сессии нашего сайта. Как связать callback с инициировавшим user'ом? Варианты: (a) `state` несёт `user_id` (уже так) и callback НЕ требует cookie — доверяем подписанному/Redis-хранимому state; (b) показывать пользователю `code` для ручной вставки. Предпочтительно (a): state в Redis уже привязан к user_id, cookie на callback не обязателен. Подтвердить перед реализацией.
 - **Q-OAUTH-2** — PKCE обязателен для confidential client с personal accounts? Закладываем S256 (безопаснее, дёшево). Подтвердить, что Microsoft не конфликтует с `client_secret`+PKCE одновременно.
 - **Q-OAUTH-3** — БЛОКЕР для e2e: подтвердить на реальном Azure App, что (1) personal accounts выдают `IMAP.AccessAsUser.All`+`SMTP.Send`, (2) IMAP/SMTP XOAUTH2 для personal accounts активны, (3) версия `imap-tools`/`aiosmtplib` в lock-файле строит XOAUTH2. Код можно написать и протестировать на моках без `client_id/secret`; e2e — после получения Azure App от пользователя.
+
+## История изменений
+
+- **2026-06-01 — tenant `consumers` → `common` (P1-фикс).** Личный Outlook IMAP XOAUTH2 падал на реальном e2e с ошибкой "User is authenticated but not connected": OAuth-токен принимался, но IMAP-сессия не привязывалась. Все подтверждённые рабочие конфиги personal Outlook XOAUTH2 используют tenant `common`, не `consumers`. Azure App зарегистрирован как multitenant + personal, поэтому `common` поддерживается; `common` пускает и личные, и рабочие аккаунты — нам достаточно личных. Изменения: `default OUTLOOK_TENANT = "common"` (`shared/config.py`), обновлены §Context (endpoints + Azure App audience), §6 (env-таблица), `docs/07-deployment.md`. Authorize/token URL теперь `https://login.microsoftonline.com/common/oauth2/v2.0/{authorize,token}`. Scopes, PKCE (S256), `redirect_uri`, refresh-flow не меняются — tenant влияет только на сегмент пути. Env на проде/локали может переопределить default.

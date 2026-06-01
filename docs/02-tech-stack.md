@@ -27,7 +27,7 @@
 | HTML→text | html2text | **2024.2** | Конвертация HTML-писем в plain text (ADR-0012) |
 | Email parsing/build | stdlib `email` + `imap-tools` | imap-tools **1.6** | IMAP fetch + парсинг (ADR-0002). **XOAUTH2 (ADR-0025):** через нижележащий `imaplib.authenticate("XOAUTH2", …)` — `imap-tools` `MailBox.client`; проверить совместимость версии (TD-030). |
 | SMTP | aiosmtplib | **3.0** | Async SMTP send (ADR-0002). **XOAUTH2 (ADR-0025):** через `AUTH XOAUTH2 <base64>`; проверить механизм в версии (TD-030). |
-| OAuth2 Microsoft | **без отдельной библиотеки (httpx)** | — | **ADR-0025:** authorize/token-flow реализуем вручную на `httpx` (consumers tenant). MSAL не вводим — flow простой (auth-code + refresh), а MSAL тянет лишние зависимости и кэш-абстракции, не нужные при хранении токенов в БД. |
+| OAuth2 Microsoft | **без отдельной библиотеки (httpx)** | — | **ADR-0025:** authorize/token-flow реализуем вручную на `httpx` (tenant `common`). MSAL не вводим — flow простой (auth-code + refresh), а MSAL тянет лишние зависимости и кэш-абстракции, не нужные при хранении токенов в БД. |
 | MinIO/S3 client | aioboto3 | **13.2.0** | Async S3 API |
 | Scheduler (worker) | APScheduler | **3.10** | Cron + interval triggers (ADR-0003) |
 
