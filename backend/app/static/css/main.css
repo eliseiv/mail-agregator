@@ -2854,8 +2854,13 @@ body.tg-app.page--integrations .integrations-secret-reveal__row .btn {
   min-width: 16rem;
   max-height: 18rem;
   overflow-y: auto;
+  /* Pin the surface explicitly (do not inherit from the filter toolbar, which
+     may sit on a Telegram-themed / tinted panel). Light scheme → #ffffff with
+     dark --color-text; dark scheme → #18181b with light --color-text. Both
+     tokens flip together so the listbox always has readable contrast. */
   background: var(--color-bg-elevated);
-  border: 1px solid var(--color-border);
+  color: var(--color-text);
+  border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-lg);
 }
@@ -2863,7 +2868,11 @@ body.tg-app.page--integrations .integrations-secret-reveal__row .btn {
   padding: var(--space-2) var(--space-3);
   border-radius: var(--radius-md);
   font-size: var(--font-size-sm);
+  /* Force the option text to the scheme-aware foreground so it can never
+     inherit a tinted/dark colour from an ancestor and clash with the light
+     listbox surface (the contrast bug this block fixes). */
   color: var(--color-text);
+  background: transparent;
   cursor: pointer;
   white-space: nowrap;
   overflow: hidden;
