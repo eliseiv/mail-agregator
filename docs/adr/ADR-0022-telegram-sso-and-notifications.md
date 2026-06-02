@@ -1100,6 +1100,90 @@ if body_html:
 
 **Миграций нет.** Изменение render-time, локализовано в TG full-body view (`_format_message_body`) + одна новая чистая функция в `shared/html_sanitize.py`. Схема БД и хранимые данные не меняются. Чинит и существующие письма (нормализация на каждом просмотре). Юнит-тесты — отдельной задачей QA (вне scope architect): `collapse_blank_lines_tg` (смешанные `\n`/`<br>`, `\xa0`/` `/`　`, `<a>`-неразрыв, `<pre>`-сохранение, пустой вход) + интеграционный на `_format_message_body` с Apple-подобным HTML.
 
+##### round-40 — удаление невидимых bidi-форматтеров (LRM/RLM) из spacer-строк marketing-писем (bug «строка-спейсер не схлопывается, Glassdoor `id=1264`»)
+
+**Постановка проблемы (баг, подтверждён на проде — письмо Glassdoor `id=1264`).**
+
+round-39 (выше) добавил `collapse_blank_lines_tg` и применил его в `_format_message_body` к выходу `sanitize_telegram_html`. Это закрыло Apple-письма (вложенные таблицы → строки-отступы из `\n`+whitespace схлопываются классом `[^\S\n]`, включающим `\xa0`). **Но** marketing-письма (Glassdoor и подобные) после `sanitize_telegram_html` + `collapse_blank_lines_tg` **сохраняют** длинную строку-СПЕЙСЕР preheader'а, которая не схлопывается.
+
+Диагноз на письме Glassdoor `id=1264`:
+- после `sanitize_telegram_html` + `collapse_blank_lines_tg` остаётся одна длинная строка-спейсер — повтор паттерна `"\xa0‎‏"`: U+00A0 NO-BREAK SPACE ×93, U+200E LEFT-TO-RIGHT MARK ×83, U+200F RIGHT-TO-LEFT MARK ×83.
+- **Корневая причина:** whitespace-класс `_TG_HSPACE = [^\S\n]` (round-39) матчит `\xa0` (он whitespace в Unicode-смысле), **но НЕ** матчит U+200E / U+200F — это символы Unicode-категории **Cf** (Format), которые **не** являются whitespace. Поэтому строка-спейсер считается «непустой» (содержит не-whitespace U+200E/U+200F) → `_COLLAPSE_TG_BLANK_RE` её не схлопывает, и прогон `\n` вокруг неё не объединяется (между двумя `\n` стоит «непустой» спейсер).
+- **Почему `strip_invisible_padding` (round-12) не убрал их:** действующий набор `_INVISIBLE_PADDING_CODEPOINTS` = `{200B, 200C, 200D, 2060, FEFF}` — в нём **нет** U+200E (LRM) и U+200F (RLM). Поэтому `sanitize_telegram_html` (зовёт `strip_invisible_padding` на строке 406, до collapse) их **не удаляет**, и к моменту collapse они на месте. Подтверждено: после sanitize U+200E/U+200F остаются.
+
+**Решение (round-40): РАСШИРИТЬ существующий `_INVISIBLE_PADDING_CODEPOINTS`** двумя bidi-форматтерами — U+200E (LRM) и U+200F (RLM) — а **не** заводить новую функцию `strip_format_chars`. Тогда `strip_invisible_padding` (который уже вызывается внутри `sanitize_telegram_html` **до** collapse) удалит U+200E/U+200F; строка-спейсер `"\xa0‎‏…"` превратится в `"\xa0\xa0…"` (только NO-BREAK SPACE) → попадёт под whitespace-класс `[^\S\n]` round-39 → схлопнётся штатно вместе с соседними `\n`. **Новый код в `collapse_blank_lines_tg` и в `_format_message_body` не нужен — фикс целиком в наборе кодпоинтов.**
+
+**Выбор: расширить набор vs. `unicodedata.category=='Cf'` vs. новая функция.**
+
+| Вариант | Плюсы | Минусы | Решение |
+| --- | --- | --- | --- |
+| **(A) Расширить `_INVISIBLE_PADDING_CODEPOINTS` явным набором** (добавить 200E, 200F) | предсказуемо, детерминированно; `str.translate` (C-level, дёшево); унификация — один источник для всех 5 потребителей; не тянет `unicodedata` в hot-ish path (`normalize_preview` на каждый push) | ловит только перечисленные кодпоинты (будущие Cf-спейсеры потребуют доп. правки) | **ВЫБРАН** |
+| (B) Удалять по `unicodedata.category(ch)=='Cf'` | ловит **любые** будущие Format-символы | посимвольный Python-цикл (медленнее `translate`) на каждый body/preview; шире → риск зацепить значимые Cf; менее предсказуемо | отклонён — overkill + риск |
+| (C) Отдельная `strip_format_chars` в collapse-ветке | изоляция от прочих потребителей | дублирование; не чинит web-инбокс/preview (где тот же мусор так же безвреден); лишняя функция | отклонён — унификация предпочтительна |
+
+**Унификация с `strip_invisible_padding` безопасна для всех 5 потребителей** (проверено по всем call-site):
+
+| Call-site | Что делает | Влияние удаления LRM/RLM |
+| --- | --- | --- |
+| `sanitize_telegram_html` (строка 406) | TG-подмножество, до collapse | **целевой фикс**: спейсер → чистый `\xa0` → схлопывается round-39 |
+| `sanitize_email_html` (строка 259) | web-инбокс (`body_html`) | положительно: тот же невидимый мусор уходит и из web-вью |
+| `linkify_plain_text` (строка 432) | plain-fallback | положительно: чище preview/ссылки |
+| `worker/imap_fetcher.py:189` | `body_text` при ingest | положительно; **не конфликтует** — `body_text`-ветка `_format_message_body` зовёт `strip_invisible_padding(body_text)` ещё раз (строка 111), идемпотентно |
+| `notify_format.normalize_preview` (строка 106) | push-превью | положительно: LRM/RLM убраны до `_WHITESPACE_RUN_RE` (который их тоже не матчит как whitespace) — больше не «зависают» в превью |
+
+Ни один потребитель не ломается: bidi-форматтеры в marketing-mail — чистые spacer'ы, а вывод — plain-ish текст для Telegram/web, где направление абзаца задаётся первым сильным символом контента, а не явными LRM/RLM-маркерами. `body_text`-ветка `_format_message_body` **не затрагивается негативно** — там `strip_invisible_padding` уже стоит и просто начнёт убирать на 2 кодпоинта больше (идемпотентно с ingest-вызовом).
+
+**Точный набор round-40.** `_INVISIBLE_PADDING_CODEPOINTS` после правки:
+```
+0x200B  ZERO WIDTH SPACE
+0x200C  ZERO WIDTH NON-JOINER
+0x200D  ZERO WIDTH JOINER
+0x200E  LEFT-TO-RIGHT MARK      <- round-40 (NEW)
+0x200F  RIGHT-TO-LEFT MARK      <- round-40 (NEW)
+0x2060  WORD JOINER
+0xFEFF  ZERO WIDTH NO-BREAK SPACE / BOM
+```
+Кодпоинты задаются hex-литералами — исходник остаётся без невидимых runtime-символов (ruff PLE2515). **U+00A0 (NO-BREAK SPACE) НЕ добавляется** в набор: это **whitespace**, нужный для схлопывания (его ловит `[^\S\n]` round-39); удаление сломало бы фикс — спейсер-строки перестали бы считаться whitespace-прогоном.
+
+**Взаимодействие с `<pre>` (round-40 trade-off).** `strip_invisible_padding` через `str.translate` удаляет LRM/RLM **везде, включая содержимое `<pre>`**, т.к. вызывается внутри `sanitize_telegram_html` **до** `_TG_PRE_SPLIT_RE`-сплита (сплит защищает `<pre>` только от **collapse**, не от strip). Это **допустимо и желательно**: LRM/RLM невидимы и не несут смысла в код-блоке (`<pre>` в TG — моноширинный текст/код); их удаление **не ломает** отображение кода (переносы `\n` и значимые пробелы/`\xa0` внутри `<pre>` сохраняются — strip трогает только bidi-форматтеры). Контракт round-39 «collapse только вне `<pre>`» **не нарушается** — round-40 не добавляет collapse, только расширяет strip, который и до этого работал везде (200B/200C/… уже убирались внутри `<pre>`). Поведение `<pre>` относительно strip — без изменений (просто +2 кодпоинта).
+
+**RTL trade-off (known, отмечен).** LRM/RLM — bidi-control-символы Unicode. В **подлинно** RTL-письмах (арабский/иврит) они изредка задают направление смешанного LTR/RTL-фрагмента; безусловное удаление в **очень редком** случае может сместить визуальное направление куска текста. Оценка риска — **низкий, допустимый**:
+- основной канал — TG/web plain-ish текст-вью, где направление абзаца определяется первым сильным символом контента (Unicode bidi base direction);
+- подавляющее большинство LRM/RLM в нашем трафике — marketing-спейсеры (подтверждено Glassdoor `id=1264`), не семантические bidi-маркеры; пользователи — ru/en-mail;
+- **NB по хранению:** `worker/imap_fetcher.py:189` зовёт `strip_invisible_padding` при **ingest** для `body_text` — т.е. хранимый `body_text` будет без LRM/RLM (как уже без 4 zero-width сегодня). Это не новость семантики, но для RTL-полноты фиксируем: подлинный bidi-маркер не сохранится в `body_text`. `body_html` стрипается только на render (`sanitize_email_html`/`sanitize_telegram_html`) — хранимый `body_html` остаётся с маркерами.
+
+Заведено как **TD-040** (`100-known-tech-debt.md`): «strip LRM/RLM глобально — теоретическая потеря bidi-направления в подлинно-RTL письмах». **Не блокирует** round-40 (риск ≈0 на текущем трафике).
+
+**Порядок операций (инвариант, для backend): strip Cf → collapse.** Внутри `sanitize_telegram_html`: `strip_invisible_padding` (строка 406, теперь убирает и LRM/RLM) **→** `_COLLAPSE_BLANK_LINES_RE` (`\n{3,}`, строка 412). Затем в `_format_message_body`: `collapse_blank_lines_tg` (round-39). Порядок **strip Cf → collapse** уже соблюдён существующей архитектурой — round-40 ничего не переставляет, только наполняет набор strip'а. **Это причина, почему round-40 — правка одной константы, без изменения `collapse_blank_lines_tg`/`_format_message_body`.**
+
+**Точные правки для backend (round-40):**
+
+1. `shared/html_sanitize.py` — в `_INVISIBLE_PADDING_CODEPOINTS` (строки 41–47) добавить два элемента (между `0x200D` и `0x2060`):
+   ```python
+   _INVISIBLE_PADDING_CODEPOINTS: Final[tuple[int, ...]] = (
+       0x200B,  # ZERO WIDTH SPACE
+       0x200C,  # ZERO WIDTH NON-JOINER
+       0x200D,  # ZERO WIDTH JOINER
+       0x200E,  # LEFT-TO-RIGHT MARK (round-40: marketing preheader spacer)
+       0x200F,  # RIGHT-TO-LEFT MARK (round-40: marketing preheader spacer)
+       0x2060,  # WORD JOINER
+       0xFEFF,  # ZERO WIDTH NO-BREAK SPACE / BOM
+   )
+   ```
+   `_INVISIBLE_PADDING_TRANSLATE` (строки 48–50) пересоберётся автоматически (comprehension по кортежу) — отдельной правки **не требует**.
+2. Обновить module-docstring (строки 17–21) и комментарий-блок над `_INVISIBLE_PADDING_CODEPOINTS` (строки 34–40): упомянуть LRM/RLM в перечне удаляемых символов и зачем (bidi-спейсеры marketing-mail, мешающие collapse).
+3. Обновить комментарий round-39 в коде (где сказано «zero-width НЕ ловятся `[^\S\n]`, но уже удалены strip'ом» — комментарий-блок над `_COLLAPSE_TG_BLANK_RE`, строки ~303–326): добавить, что strip теперь покрывает и LRM/RLM (Cf-форматтеры), поэтому спейсер-строки приходят на collapse как чистый whitespace.
+4. **Никаких изменений** в `collapse_blank_lines_tg`, `_COLLAPSE_TG_BLANK_RE`, `_TG_HSPACE`, `_TG_PRE_SPLIT_RE`, `_format_message_body` (`callback_handler.py`), `imap_fetcher.py`, `notify_format.py` — все переиспользуют расширенный `strip_invisible_padding` без правок.
+
+**Edge-cases (round-40):**
+- **Эмодзи / обычный текст / ссылки.** `🔥`, буквы, цифры, URL, `<a href>` — не в наборе кодпоинтов, не трогаются. `str.translate` бьёт строго по 7 перечисленным кодпоинтам.
+- **`\xa0` (NO-BREAK SPACE).** Намеренно **НЕ** в наборе — нужен как whitespace для round-39. После удаления LRM/RLM спейсер-строка станет цепочкой `\xa0` → whitespace-прогон → схлопнется.
+- **Смешанные спейсеры.** Паттерн Glassdoor `"\xa0‎‏"×N` → после strip `"\xa0"×N` (одна длинная whitespace-строка) → `[^\S\n]*` round-39 её поглотит вокруг разрывов.
+- **Идемпотентность.** Двойной `strip_invisible_padding` (ingest `body_text` + render `body_text`-ветка) безвреден — `translate` идемпотентен.
+- **Подлинно-RTL письмо.** См. RTL trade-off / TD-040 — допустимо для plain-ish вью, риск ≈0.
+
+**Миграций нет.** round-40 — правка одной константы в `shared/html_sanitize.py` (+ комментарии). Схема БД не меняется. `body_html` хранимый не трогается (strip на render). `body_text` хранимый при будущем ingest будет без LRM/RLM (как уже без zero-width). Чинит существующие письма в TG/web-вью на каждом просмотре (render-time strip). Юнит-тесты — задача QA (вне scope architect): `strip_invisible_padding` удаляет U+200E/U+200F и **сохраняет** `\xa0`/эмодзи/текст; через полный `sanitize_telegram_html`→`collapse_blank_lines_tg` Glassdoor-подобный спейсер схлопнут; регрессия `_format_message_body` на Glassdoor-подобном HTML → нет строки-спейсера.
+
 ---
 
 ### 3. Изменения в data model (новые таблицы + новые `admin_audit.action`)
@@ -1452,6 +1536,10 @@ async def send_notification(*, chat_id: int, text_html: str, message_id: int) ->
 | **round-39:** `<pre>`-блок с переносами | unit | переносы внутри `<pre>` сохранены (collapse применён только вне `<pre>`-сегментов) |
 | **round-39:** `_format_message_body` на Apple-подобном HTML (вложенные таблицы, spacer-ячейки) | integration | после `sanitize_telegram_html`+`collapse_blank_lines_tg` нет столба пустых строк; заголовки `Тема:`/`От:` целы |
 | **round-39:** пустое тело (`body_html`=`''`/`None`) | unit | `collapse_blank_lines_tg('')==''`; fallback на body_text / `(пустое тело)` |
+| **round-40 (strip_invisible_padding):** строка с U+200E/U+200F | unit | LRM/RLM удалены; `\xa0`, эмодзи (`🔥`), обычный текст, URL сохранены |
+| **round-40:** Glassdoor-подобный спейсер `"\xa0‎‏"×N` между `\n` через полный `sanitize_telegram_html`→`collapse_blank_lines_tg` | unit | после strip спейсер → `\xa0`-прогон → схлопнут в `\n\n`; нет длинной строки-спейсера |
+| **round-40:** `_format_message_body` на Glassdoor-подобном HTML (preheader-спейсер) | integration | нет строки-спейсера в выводе; заголовки `Тема:`/`От:` целы; ссылки кликабельны |
+| **round-40:** `<pre>` с LRM/RLM внутри | unit | LRM/RLM удалены и внутри `<pre>` (невидимый мусор), переносы/значимые пробелы `<pre>` сохранены |
 
 ---
 
@@ -1491,4 +1579,6 @@ async def send_notification(*, chat_id: int, text_html: str, message_id: int) ->
 | round-34 | 2026-05-27 | Push-уведомление (§2.5): добавлены строка `Тема:` и превью тела письма (`PREVIEW_LEN=120`), обе опциональные (опускаются при пустом значении). Введены `notify_format.html_to_plain` / `normalize_preview`; превью считается **один раз на письмо** в `notify_service.dispatch_one_payload` (источник — `body_text`, fallback `body_html` через sanitiser). Срез — в Python, не в SQL. Лейбл «Отправитель» сохранён. Миграций нет. |
 | round-36 | 2026-05-31 | **Новый формат push-уведомления (§2.5), финализирован.** Карточка из 6 строк с emoji-метками: `🆔:` (ник почты `display_name`‖`email`, **всегда**), `#️⃣:` (все теги через `, ` либо fallback **«Не сортировано»**, **всегда**), пустой разделитель, `Клиент:` (был «Отправитель», **всегда**), `Тема:` (**всегда**; пустая → **«(без темы)»**), пустой разделитель, превью тела (только если непусто). Превью `PREVIEW_LEN` 120 → **100**. Значения выделяются `<b>`, emoji-метки plain; все user-controlled значения `html.escape()`. Убран ранний `if not message_tags: return` (теги опциональны). Константы `PREVIEW_LEN=100`, `SUBJECT_MAX=150` — в `notify_format.py`. Миграций нет. **Код `notify_format.py` приводится к этому формату backend-агентом** (на момент round-36 doc-финала код был на round-34). |
 | round-37 | 2026-06-01 | **Bug «множество пустых строк» при ПРОСМОТРЕ письма (§2.10, новый раздел).** При открытии `GET /messages/{id}` (web и TG `?embed=tg`) тело Apple/маркетинговых писем показывалось с 15+ подряд пустыми строками (HTML-ветка: пустые блочные элементы + прогоны `<br>` не схлопывались `sanitize_email_html`; plain-ветка: прогоны `\n\n\n` от `html2text` в `<pre>`). Решение — нормализация **на render-time** (не при ingest): две чистые функции `collapse_blank_lines_text` / `collapse_blank_lines_html` в `shared/html_sanitize.py`, применяемые в `MessageService.get` к `MessageDetail.body_text`/`.body_html`. Схлопывает 3+ пустых строк / 3+ `<br>` / пустые `<p>`/`<div>` в максимум один разделитель абзаца. Хранимое body НЕ меняется (чинит и существующие письма, не ломает tag-matching/push-превью). Общая логика для HTML-страницы и JSON-API. Миграций нет. |
+| round-39 | 2026-06-01 | **Bug «множество пустых строк» в TG «Посмотреть сообщение» (§2.10).** TG full-body view строится не через `MessageService.get`, а через `_format_message_body` → `sanitize_telegram_html`, который стрипает Apple-таблицы и рождает строки-отступы `\n`+whitespace; round-37 их не закрывал. Решение — новая `collapse_blank_lines_tg` (`shared/html_sanitize.py`), применяемая в HTML-ветке `_format_message_body` поверх `sanitize_telegram_html`. Широкий класс `[^\S\n]` (вкл. `\xa0`/em/ideographic space) + смешанные `\n`/`<br>`-разрывы; `<pre>` защищён внутренним сплитом. Web-вью — вне scope (TD-039). Миграций нет. |
+| round-40 | 2026-06-02 | **Bug «строка-спейсер не схлопывается» в TG «Посмотреть сообщение» (§2.10, Glassdoor `id=1264`).** После round-39 marketing-письма сохраняли длинную preheader-строку-спейсер `"\xa0‎‏"×N` (U+00A0 + U+200E LRM + U+200F RLM): класс `[^\S\n]` round-39 матчит `\xa0`, но НЕ Cf-форматтеры LRM/RLM → строка «непустая» → не схлопывается. Корень — `_INVISIBLE_PADDING_CODEPOINTS` не содержал 200E/200F, поэтому `strip_invisible_padding` (вызывается в `sanitize_telegram_html` до collapse) их не убирал. Решение — **расширить `_INVISIBLE_PADDING_CODEPOINTS`** на `0x200E`/`0x200F` (не новая функция; унификация — фикс для всех 5 потребителей `strip_invisible_padding`). Спейсер → чистый `\xa0` → схлопывается штатно round-39. `\xa0` НЕ добавляется (нужен как whitespace). Порядок strip Cf → collapse уже соблюдён. `collapse_blank_lines_tg`/`_format_message_body` не меняются. RTL trade-off → TD-040 (риск ≈0). Миграций нет. |
 

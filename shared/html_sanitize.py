@@ -17,8 +17,11 @@ Two sanitised flavours live here:
 Both helpers strip the rampant invisible-padding characters used by
 mass-mail engines: zero-width non-joiner (U+200C), zero-width space
 (U+200B), zero-width joiner (U+200D), word joiner (U+2060), BOM
-(U+FEFF). Without this the inbox shows rows of empty space between
-words.
+(U+FEFF) and — round-40 — the bidi formatters LRM (U+200E) and RLM
+(U+200F). Without this the inbox shows rows of empty space between
+words; the LRM/RLM additions also let the round-39 blank-line collapse
+fire on marketing-mail preheader spacers ("\xa0<LRM><RLM>" runs) that
+would otherwise be treated as non-blank.
 
 The module is import-light (single bleach import) so the worker and
 backend can both pull it in without extra dependency surface.
@@ -38,10 +41,24 @@ import bleach
 # and Telegram message length budget. Encoded as ``\uXXXX`` escapes so
 # the source file stays free of invisible runtime characters (ruff
 # PLE2515).
+#
+# round-40 (ADR-0022 §2.10): the set also covers the two bidi formatters
+# U+200E (LRM) and U+200F (RLM). Marketing mail (Glassdoor) builds a
+# preheader spacer line by repeating "\xa0<LRM><RLM>". LRM/RLM are
+# Unicode category Cf (Format) — they are NOT whitespace, so the
+# round-39 collapse class ``[^\S\n]`` does not match them and the spacer
+# line is treated as "non-blank" and never collapsed. Stripping them
+# here (strip_invisible_padding runs inside sanitize_telegram_html
+# BEFORE collapse) turns the spacer into a pure ``\xa0`` run, which the
+# round-39 whitespace class then collapses normally. U+00A0 itself is
+# deliberately NOT in the set — it is whitespace and is needed for the
+# collapse to fire.
 _INVISIBLE_PADDING_CODEPOINTS: Final[tuple[int, ...]] = (
     0x200B,  # ZERO WIDTH SPACE
     0x200C,  # ZERO WIDTH NON-JOINER
     0x200D,  # ZERO WIDTH JOINER
+    0x200E,  # LEFT-TO-RIGHT MARK (round-40: marketing preheader spacer)
+    0x200F,  # RIGHT-TO-LEFT MARK (round-40: marketing preheader spacer)
     0x2060,  # WORD JOINER
     0xFEFF,  # ZERO WIDTH NO-BREAK SPACE / BOM
 )
@@ -306,11 +323,14 @@ def collapse_blank_lines_html(html: str | None) -> str:
 # Unlike round-37 _COLLAPSE_BLANK_TEXT_LINES_RE (narrow ASCII class
 # [ \t\r\f\v]) this needs a WIDE class: Apple / marketing indent lines contain
 # U+00A0 (nbsp), U+2003 (em space), U+3000 (ideographic space) and friends.
-# Zero-width chars (U+200B/200C/200D/2060/FEFF) are NOT whitespace in the
-# Unicode sense (the [^\S\n] class does NOT match them), but by this point they
-# are already removed inside sanitize_telegram_html (strip_invisible_padding,
-# before collapse), so they are absent at the collapse input. Ordering
-# "collapse AFTER sanitize" is therefore mandatory.
+# Zero-width chars (U+200B/200C/200D/2060/FEFF) and — round-40 — the bidi
+# formatters LRM (U+200E) / RLM (U+200F) are NOT whitespace in the Unicode
+# sense (the [^\S\n] class does NOT match them), but by this point they are
+# already removed inside sanitize_telegram_html (strip_invisible_padding, before
+# collapse — its codepoint set now also covers LRM/RLM), so they are absent at
+# the collapse input. This is what makes marketing-mail preheader spacers
+# ("\xa0<LRM><RLM>" runs) arrive here as pure \xa0 whitespace and collapse
+# normally. Ordering "collapse AFTER sanitize" is therefore mandatory.
 #
 # A separator run = (optional whitespace, then a newline OR <br>), repeated so
 # that between two "content" lines there are 2+ breaks. Collapse such a run to
