@@ -360,6 +360,32 @@ _TG_PRE_SPLIT_RE: Final[re.Pattern[str]] = re.compile(
     r"(<pre\b.*?</pre>)", re.DOTALL | re.IGNORECASE
 )
 
+# --- Per-line edge trim (ADR-0022 §2.10, round-41) --------------------------
+#
+# Per-line trim of LEADING/TRAILING horizontal whitespace OUTSIDE <pre>.
+# Table-layout mail (App Store Connect id=1267) keeps cell indentation as
+# leading whitespace of NON-blank lines after sanitize_telegram_html strips
+# <table>/<tr>/<td>. round-39 collapse only removes BLANK-line runs, never
+# trims inside a content line. We strip h-whitespace adjacent to each line
+# boundary (\n / <br> / segment start / segment end) WITHOUT touching the
+# \n itself and WITHOUT collapsing INNER runs ("May 29,  2026" mid-line
+# double space is preserved -- inner spaces may be significant; edges are
+# table-indent noise).
+#
+# Class [^\S\n] = the round-39 _TG_HSPACE (all Unicode whitespace EXCEPT \n,
+# incl. \xa0/em/ideographic). Breaks are \n OR <br> (round-39 _TG_BREAK)
+# -- sanitize_telegram_html emits \n, but stay robust to <br> for direct
+# callers.
+#
+# (1) trailing: h-whitespace immediately BEFORE a break or at segment end.
+_TG_TRIM_TRAILING_RE: Final[re.Pattern[str]] = re.compile(rf"{_TG_HSPACE}+(?={_TG_BREAK}|\Z)")
+# (2) leading: h-whitespace immediately AFTER a fixed-width break or at
+#     segment start. Python lookbehind must be fixed-width, so we anchor on
+#     \n (+ \A) only; the real post-sanitize input is \n-only (<br> was
+#     converted to \n before bleach), and trailing-trim already removes
+#     h-whitespace BEFORE any <br>.
+_TG_TRIM_LEADING_RE: Final[re.Pattern[str]] = re.compile(rf"(?:\A|(?<=\n)){_TG_HSPACE}+")
+
 
 def collapse_blank_lines_tg(text: str | None) -> str:
     """Collapse blank lines in ALREADY-sanitised Telegram HTML.
@@ -372,11 +398,23 @@ def collapse_blank_lines_tg(text: str | None) -> str:
     break and a single blank line are left untouched (the rule only fires on
     3+ breaks). Leading / trailing blank lines are stripped.
 
+    round-41 additionally trims the LEADING and TRAILING horizontal whitespace
+    of EVERY line outside ``<pre>`` (the ``[^\\S\\n]`` class -- ASCII spaces
+    plus ``\\xa0``/em/ideographic, but NOT ``\\n``), while PRESERVING inner
+    spaces (``"May 29,  2026"`` mid-line double space is kept) and the line
+    breaks themselves. This removes the table-cell indentation that survives
+    ``sanitize_telegram_html`` (it strips ``<table>``/``<tr>``/``<td>`` but
+    leaves their inner whitespace text nodes as leading spaces of content
+    lines). Trim runs PER even segment and BEFORE the collapse step
+    (order trim -> collapse: a whitespace-only line becomes ``''`` after trim,
+    feeding a cleaner blank-line run into collapse).
+
     ``<pre>`` content is NOT touched: the input is split on ``<pre>...</pre>``
     via ``_TG_PRE_SPLIT_RE`` (the capturing group puts <pre> blocks into the
-    ODD segments), collapse is applied ONLY to the even (outside-<pre>)
-    segments; newlines inside ``<pre>`` are preserved verbatim. Segments are
-    joined back together.
+    ODD segments), trim+collapse are applied ONLY to the even (outside-<pre>)
+    segments; newlines AND indentation inside ``<pre>`` are preserved verbatim
+    (significant for code/preformatted text). Segments are joined back
+    together.
 
     Applied ONLY in the TG full-body view (``_format_message_body``) on top of
     :func:`sanitize_telegram_html`. Empty / ``None`` input -> ''. The STORED
@@ -384,9 +422,12 @@ def collapse_blank_lines_tg(text: str | None) -> str:
     if not text:
         return ""
     parts = _TG_PRE_SPLIT_RE.split(text)
-    # even segments = text outside <pre> (collapse); odd = <pre>...</pre> (as-is)
+    # even segments = text outside <pre> (trim+collapse); odd = <pre>...</pre>
+    # (verbatim). round-41: per-line edge trim BEFORE round-39 collapse.
     for i in range(0, len(parts), 2):
-        parts[i] = _COLLAPSE_TG_BLANK_RE.sub("\n\n", parts[i])
+        seg = _TG_TRIM_TRAILING_RE.sub("", parts[i])  # round-41: trim trailing h-ws
+        seg = _TG_TRIM_LEADING_RE.sub("", seg)  # round-41: trim leading h-ws
+        parts[i] = _COLLAPSE_TG_BLANK_RE.sub("\n\n", seg)  # round-39 collapse
     return "".join(parts).strip("\n")
 
 

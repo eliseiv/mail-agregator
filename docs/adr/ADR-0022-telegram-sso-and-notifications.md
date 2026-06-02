@@ -1184,6 +1184,157 @@ round-39 (выше) добавил `collapse_blank_lines_tg` и применил
 
 **Миграций нет.** round-40 — правка одной константы в `shared/html_sanitize.py` (+ комментарии). Схема БД не меняется. `body_html` хранимый не трогается (strip на render). `body_text` хранимый при будущем ingest будет без LRM/RLM (как уже без zero-width). Чинит существующие письма в TG/web-вью на каждом просмотре (render-time strip). Юнит-тесты — задача QA (вне scope architect): `strip_invisible_padding` удаляет U+200E/U+200F и **сохраняет** `\xa0`/эмодзи/текст; через полный `sanitize_telegram_html`→`collapse_blank_lines_tg` Glassdoor-подобный спейсер схлопнут; регрессия `_format_message_body` на Glassdoor-подобном HTML → нет строки-спейсера.
 
+##### round-41 — построчный trim ведущего/замыкающего horizontal-whitespace в TG «Посмотреть сообщение» (bug «большие отступы перед значениями полей», App Store Connect `id=1267`)
+
+**Постановка проблемы (баг, подтверждён на проде — письмо App Store Connect `id=1267`).**
+
+round-39 (`collapse_blank_lines_tg`) + round-40 (strip LRM/RLM) убрали **пустые** строки и строки-спейсеры в TG full-body view. Осталась **новая** проблема: в transactional/marketing-письмах с **табличной вёрсткой** значения полей выводятся с **большим ведущим горизонтальным отступом** (десятки пробелов перед текстом).
+
+Диагноз на письме App Store Connect `id=1267`:
+- после `sanitize_telegram_html` + `collapse_blank_lines_tg` текст **без пустых строк**, но **21 из 65** непустых строк имеют 4+ ведущих whitespace. Пример (`repr`):
+  ```
+  'Submitted: '
+  '                                            May 29, 2026 at 06:10 AM P'   (44 пробела)
+  'Submitted by:'
+  '                                            Jekaterina Kolesnik'
+  'App Name:'
+  '                                            ТinЕуе АI:Reverse Image Se'
+  ```
+- **Корневая причина:** `sanitize_telegram_html` стрипает `<table>/<tr>/<td>`, но **HTML-исходник содержит индентацию внутри ячеек** — whitespace-текст-узлы между тегами и значением (`<td>\n  …May 29…</td>`). После стрипа тегов этот ведущий whitespace остаётся **внутри непустой строки**. `collapse_blank_lines_tg` (round-39) схлопывает только **пустые** строки (прогоны разрывов с whitespace **между** ними), но **НЕ тримит** ведущий/замыкающий whitespace **внутри** непустых строк — между двумя непустыми строками стоит ровно один разрыв `\n`, который под правило «3+ разрыва» не попадает, а сам ведущий whitespace стоит **после** разрыва внутри контентной строки и регулярка его не трогает.
+
+**Решение (round-41): построчный trim ведущего И замыкающего horizontal-whitespace у КАЖДОЙ строки ВНЕ `<pre>`.**
+
+1. **Что тримим:** ведущий и замыкающий horizontal-whitespace (`[^\S\n]` — тот же класс, что round-39: ASCII ` `/`\t`/`\r`/`\f`/`\v` **+** Unicode-пробелы `\xa0`/` `/`　`/Zs; **кроме** `\n`) на **краях** каждой строки.
+2. **Что НЕ трогаем:** **внутренние** множественные пробелы внутри строки (`"May 29,  2026"` — двойной пробел в середине **сохраняется**). **Обоснование:** внутренние пробелы могут быть значимы (намеренное выравнивание/разделение слов отправителем, числовые группировки), отличить «значимый» от «мусорного» внутреннего пробела без рендера невозможно; края же строк — детерминированно мусор от табличной индентации (отступ ячейки всегда стоит на краю строки после стрипа тегов). Trim только краёв — консервативная, безопасная нормализация.
+3. **`\n` сохраняем:** trim **не** удаляет сами разрывы строк — структура «строка на поле» (`Submitted:` / значение на следующей строке) сохраняется, уходит только горизонтальный отступ.
+
+**ГДЕ — внутри `collapse_blank_lines_tg` (НЕ отдельная функция, НЕ в `_format_message_body`).**
+
+| Критерий | (а) trim **внутри** `collapse_blank_lines_tg` — **ВЫБРАН** | (б) отдельная функция, вызов в `_format_message_body` после collapse |
+| --- | --- | --- |
+| `<pre>`-защита | переиспользует **тот же** `_TG_PRE_SPLIT_RE`-сплит (один проход, единый источник правды о границах `<pre>`) | дублирует split-логику ИЛИ тримит и внутри `<pre>` (ломает преформат) |
+| Порядок | один контролируемый pipeline trim→collapse внутри функции | две функции, две call-site, риск рассинхрона порядка |
+| blast-radius | 0 новых публичных функций, 0 новых call-site (`_format_message_body` уже зовёт `collapse_blank_lines_tg`) | +1 публичная функция, +1 импорт, +1 строка в `callback_handler.py` |
+| Семантика | `collapse_blank_lines_tg` = «нормализовать вертикальную **и краевую горизонтальную** пустоту TG full-body view» — связная ответственность | размазывает нормализацию по двум функциям |
+
+**Выбран (а).** `collapse_blank_lines_tg` **уже** делает `<pre>`-split — переиспользуем его: для **чётных** сегментов (вне `<pre>`) добавляем per-line trim; **нечётные** (`<pre>…</pre>`) не трогаем (отступы внутри `<pre>` значимы — код/преформат). `_format_message_body` и его call-site **не меняются** — фикс целиком внутри `collapse_blank_lines_tg`.
+
+**Порядок: trim → collapse (внутри обработки каждого чётного сегмента).**
+
+Сначала per-line trim, затем collapse пустых прогонов. **Обоснование порядка:**
+- trim может **породить** новые пустые строки: строка, состоящая **только** из horizontal-whitespace (`'                '`), после trim станет `''`. Это **улучшает** последующий collapse — две соседние строки-только-из-пробелов после trim превращаются в чистый `\n\n…\n`-прогон, который `_COLLAPSE_TG_BLANK_RE` (round-39) гарантированно схлопнет. Если бы порядок был обратный (collapse→trim), collapse работал бы по `[^\S\n]*`-классу (он и так ловит whitespace вокруг разрывов), но trim после него мог бы оставить одиночную пустую строку нетронутой — порядок trim→collapse даёт более компактный детерминированный результат и согласован: «сначала нормализуем края строк, потом схлопываем то, что стало пустым».
+- collapse round-39 идемпотентен и устойчив к уже-тримленному входу — повторного мусора не вносит.
+
+**Точный алгоритм/regex (round-41).**
+
+Per-line trim реализуется **двумя** regex-подстановками на чётном сегменте, **до** `_COLLAPSE_TG_BLANK_RE`:
+
+```python
+# shared/html_sanitize.py — round-41 (ADR-0022 §2.10)
+#
+# Per-line trim of LEADING/TRAILING horizontal whitespace OUTSIDE <pre>.
+# Table-layout mail (App Store Connect id=1267) keeps cell indentation as
+# leading whitespace of NON-blank lines after sanitize_telegram_html strips
+# <table>/<tr>/<td>. round-39 collapse only removes BLANK-line runs, never
+# trims inside a content line. We strip h-whitespace adjacent to each line
+# boundary (\n / <br> / segment start / segment end) WITHOUT touching the
+# \n itself and WITHOUT collapsing INNER runs ("May 29,  2026" mid-line
+# double space is preserved — inner spaces may be significant; edges are
+# table-indent noise).
+#
+# Class [^\S\n] = the round-39 _TG_HSPACE (all Unicode whitespace EXCEPT \n,
+# incl. \xa0/em/ideographic). Breaks are \n OR <br> (round-39 _TG_BREAK)
+# — sanitize_telegram_html emits \n, but stay robust to <br> for direct calls.
+#
+# (1) trailing: h-whitespace immediately BEFORE a break or at segment end.
+_TG_TRIM_TRAILING_RE: Final[re.Pattern[str]] = re.compile(
+    rf"{_TG_HSPACE}+(?={_TG_BREAK}|\Z)"
+)
+# (2) leading: h-whitespace immediately AFTER a break or at segment start.
+#     Lookbehind for the fixed \n / segment-start; <br>-adjacent leading
+#     h-whitespace is handled by (1)+(2) chained (the <br> match in (1)
+#     leaves the break, then start-of-next via the \n path) — but <br> has
+#     no fixed-width lookbehind, so leading-after-<br> is covered by first
+#     normalising <br>→\n is NOT done here; instead we anchor leading on
+#     (?:\A|(?<=\n)). In practice the post-sanitize input is \n-only.
+_TG_TRIM_LEADING_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?:\A|(?<=\n)){_TG_HSPACE}+"
+)
+```
+
+Применение внутри `collapse_blank_lines_tg` для каждого чётного сегмента `seg`:
+```python
+seg = _TG_TRIM_TRAILING_RE.sub("", seg)   # trim trailing h-ws before break / end
+seg = _TG_TRIM_LEADING_RE.sub("", seg)    # trim leading h-ws after break / start
+seg = _COLLAPSE_TG_BLANK_RE.sub("\n\n", seg)  # round-39 collapse (unchanged)
+```
+
+**Замечание о `<br>` и leading-trim.** Lookbehind в Python `re` должен быть фиксированной ширины — `<br\s*/?>` переменной длины, поэтому в `_TG_TRIM_LEADING_RE` lookbehind только на `\n` (+ `\A`). Это **достаточно и корректно**, потому что:
+- вход `collapse_blank_lines_tg` — выход `sanitize_telegram_html`, где `<br>` уже сконвертированы в `\n` **до** bleach (`_BR_TO_NL_RE`), т.е. в реальном pipeline `<br>` в чётных сегментах **нет** — все разрывы суть `\n`;
+- `_TG_TRIM_TRAILING_RE` (lookahead `(?={_TG_BREAK}|\Z)`) **всё равно** уберёт horizontal-whitespace **перед** любым `<br>` (lookahead допускает переменную ширину), так что замыкающий мусор у `<br>`-строк снят при любом входе;
+- единственный неперекрытый случай — **ведущий** whitespace сразу **после** `<br>` при **прямом** вызове `collapse_blank_lines_tg` с `<br>` (не через `sanitize_telegram_html`). Это не путь продакшена; trailing-trim предыдущей строки + collapse частично его сгладят. Идеальная семантика для всех входов не требуется (контракт функции — «над выходом `sanitize_telegram_html`»). Усложнять `<br>`→`\n`-нормализацией внутри collapse не вводим (overkill; round-39 уже трактует их как разрывы для схлопывания).
+
+**Edge-cases (round-41):**
+- **`<pre>`-блоки.** Ведущий/замыкающий whitespace строк **внутри** `<pre>` **СОХРАНЯЕТСЯ** (значимо — код/преформат). trim применяется **только** к чётным сегментам `_TG_PRE_SPLIT_RE`-сплита; нечётные (`<pre>…</pre>`) переносятся **дословно** — тот же контракт, что round-39 для collapse. Один сплит обслуживает и trim, и collapse.
+- **Ссылки `<a href>` (в т.ч. многострочные).** После sanitize встречается многострочный `<a>`: открывающий тег, текст-URL, закрывающий `</a>` на **разных** строках с отступами (пример: `'                https://apps.apple…'` и `'                </a>'`). trim убирает ведущий/замыкающий whitespace **строк** — но **не содержимое** тега и **не** атрибут `href`: trim матчит whitespace **по краям строки** (после `\n`/перед `\n`), а не внутри `href="…"` (там нет `\n`-границ). Telegram `parse_mode=HTML` допускает `\n` **внутри** `<a href="">…</a>`; trim ведущего/замыкающего whitespace строк внутри `<a>` **не ломает** ни `href`, ни валидность тега для Telegram-парсера — структура `<a href="url">text</a>` остаётся синтаксически целой, меняется лишь количество пробелов вокруг переносов внутри неё. **Подтверждено:** trim по краям строк не вставляет/не удаляет символы внутри `href` и не рвёт пару открывающий/закрывающий тег.
+- **Строка только из пробелов/`\xa0`.** `'                '` → `''` (после trim). Затем `_COLLAPSE_TG_BLANK_RE` схлопнёт получившийся пустой прогон — улучшенное схлопывание (см. порядок trim→collapse).
+- **Пустая строка (`''`).** Остаётся `''` — trim no-op, collapse обработает.
+- **Обычный текст без отступа.** `'Submitted:'` → без изменений (нет краевого whitespace).
+- **Эмодзи / содержимое.** `🔥`, буквы, цифры, URL — не whitespace, не трогаются; внутренние множественные пробелы (`"May 29,  2026"`) **сохранены** — trim только края.
+- **Ведущий/замыкающий whitespace всего тела.** Финальный `.strip("\n")` (round-39, остаётся) + краевой trim строк дают компактный вход/выход без ведущих/замыкающих пустот.
+
+**Совместимость с предыдущими раундами (не сломать).**
+- **round-37** (`collapse_blank_lines_text`/`_html` в `MessageService.get`) — **другие** функции, **другой** call-site (web/JSON). round-41 их не касается.
+- **round-38** (self-heal telegram_link) — не связано с форматированием тела.
+- **round-39** (`collapse_blank_lines_tg`) — round-41 **дополняет** её trim-шагом перед collapse-шагом; сам `_COLLAPSE_TG_BLANK_RE`/`_TG_HSPACE`/`_TG_BREAK`/`_TG_PRE_SPLIT_RE` **не меняются**; collapse-поведение для уже-пустых прогонов идентично, trim лишь добавляет краевую нормализацию контентных строк.
+- **round-40** (strip LRM/RLM в `_INVISIBLE_PADDING_CODEPOINTS`) — не трогается; LRM/RLM уже убраны до collapse, на trim не влияют.
+- **notify preview** (`html_to_plain`/`notify_format.normalize_preview`) — **не затронут**: они **не** зовут `collapse_blank_lines_tg` и выравнивают весь whitespace в один пробел через `_WHITESPACE_RUN_RE`. round-41 локализован в `collapse_blank_lines_tg`, единственный потребитель — `_format_message_body` (HTML-ветка).
+- **body_text-ветка** `_format_message_body` (`linkify_plain_text(strip_invisible_padding(body_text))`) — **не меняется** (как и в round-39): `body_text` проблемных писем чистый, ветка не зовёт `collapse_blank_lines_tg`. Scope round-41 — только HTML-ветка.
+
+**Scope round-41:** только **HTML-ветка** `_format_message_body` (через `collapse_blank_lines_tg`), под подтверждённый баг App Store Connect `id=1267`. Web-вью (`message_view.html`) — **вне scope** (TD-039, таблицы рендерятся целиком намеренно). body_text-ветка — вне scope.
+
+**Точные правки для backend (round-41):**
+
+1. `shared/html_sanitize.py` — добавить **две** скомпилированные regex-константы рядом с `_COLLAPSE_TG_BLANK_RE` (после её определения, ~строка 351), переиспользуя существующие `_TG_HSPACE` и `_TG_BREAK`:
+   ```python
+   _TG_TRIM_TRAILING_RE: Final[re.Pattern[str]] = re.compile(
+       rf"{_TG_HSPACE}+(?={_TG_BREAK}|\Z)"
+   )
+   _TG_TRIM_LEADING_RE: Final[re.Pattern[str]] = re.compile(
+       rf"(?:\A|(?<=\n)){_TG_HSPACE}+"
+   )
+   ```
+2. `shared/html_sanitize.py` — в `collapse_blank_lines_tg`, в цикле по чётным сегментам, **перед** `_COLLAPSE_TG_BLANK_RE.sub(...)` добавить **две** строки trim (порядок trailing→leading→collapse; trailing/leading между собой коммутативны, важно лишь, что обе **до** collapse):
+   ```python
+   for i in range(0, len(parts), 2):
+       seg = _TG_TRIM_TRAILING_RE.sub("", parts[i])   # round-41: trim trailing h-ws
+       seg = _TG_TRIM_LEADING_RE.sub("", seg)          # round-41: trim leading h-ws
+       parts[i] = _COLLAPSE_TG_BLANK_RE.sub("\n\n", seg)  # round-39 collapse (unchanged)
+   ```
+3. `shared/html_sanitize.py` — обновить docstring `collapse_blank_lines_tg`: добавить, что функция дополнительно тримит ведущий/замыкающий horizontal-whitespace **каждой** строки вне `<pre>` (round-41), **сохраняя** внутренние пробелы и переносы; trim применяется **до** collapse и **только** к сегментам вне `<pre>`.
+4. **Никаких других правок.** `_format_message_body` (`callback_handler.py`), импорт `collapse_blank_lines_tg`, `_TG_PRE_SPLIT_RE`, `_COLLAPSE_TG_BLANK_RE`, `sanitize_telegram_html`, `strip_invisible_padding`, `notify_format.py`, `imap_fetcher.py` — **без изменений** (переиспользуют расширенную `collapse_blank_lines_tg`). Миграций нет, render-time, хранимое тело не меняется.
+
+**Test-matrix (round-41, для QA — вне scope architect):**
+
+| # | Вход (после sanitize, чётный сегмент) | Ожидаемый выход | Проверяет |
+| --- | --- | --- | --- |
+| 1 | `'Submitted:\n                                            May 29, 2026'` | `'Submitted:\nMay 29, 2026'` | базовый: ведущий отступ значения снят |
+| 2 | `'App Name:   \n   Value   '` | `'App Name:\nValue'` | trailing+leading на обеих строках |
+| 3 | `'May 29,  2026 at 06:10'` (двойной пробел в середине) | `'May 29,  2026 at 06:10'` | внутренние пробелы **сохранены** |
+| 4 | `'\xa0\xa0\xa0Value'` (ведущий NBSP) | `'Value'` | Unicode-whitespace класс `[^\S\n]` ловит `\xa0` |
+| 5 | `'                '` (строка только из пробелов) | `''` (после collapse в составе прогона) | whitespace-only строка → `''` |
+| 6 | `'<a href="https://apps.apple.com/x">\n                https://apps.apple.com/x\n                </a>'` | `'<a href="https://apps.apple.com/x">\nhttps://apps.apple.com/x\n</a>'` | многострочный `<a>`: trim строк не ломает `href`/тег |
+| 7 | `'<pre>\n    indented code\n        deeper\n</pre>'` | без изменений (отступы `<pre>` сохранены) | `<pre>` не тримится (нечётный сегмент) |
+| 8 | `'text\n\n\n\n   \n   value'` (пустые строки + отступ) | `'text\n\nvalue'` | trim→collapse: пустые схлопнуты, отступ value снят |
+| 9 | `'🔥 Promo\n   🎉 Deal'` | `'🔥 Promo\n🎉 Deal'` | эмодзи сохранены, ведущий отступ снят |
+| 10 | `''` / `None` | `''` | пустой/None-вход |
+| 11 | `'plain line'` (без краевого ws) | `'plain line'` | no-op для чистой строки |
+| 12 | Полный App Store Connect `id=1267` HTML через `sanitize_telegram_html`→`collapse_blank_lines_tg` | нет строк с 4+ ведущим whitespace; нет пустых прогонов; `<a>`/значения компактны | интеграционный регресс |
+| 13 | round-39 кейс (Apple `id=1252`) | пустые строки по-прежнему схлопнуты (round-39 не сломан) | регресс round-39 |
+| 14 | round-40 кейс (Glassdoor `id=1264` спейсер) | спейсер по-прежнему схлопнут (round-40 не сломан) | регресс round-40 |
+
+**Миграций нет.** round-41 — две regex-константы + две строки в `collapse_blank_lines_tg` + docstring в `shared/html_sanitize.py`. Схема БД и хранимые `body_text`/`body_html` не меняются (render-time). Чинит существующие письма в TG full-body view на каждом просмотре.
+
 ---
 
 ### 3. Изменения в data model (новые таблицы + новые `admin_audit.action`)
