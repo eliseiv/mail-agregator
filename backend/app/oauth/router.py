@@ -34,9 +34,9 @@ log = get_logger(__name__)
 
 api = APIRouter(prefix="/api/oauth/outlook", tags=["oauth-outlook"])
 
-# Rate-limits per docs/04-api-contracts.md §8: authorize 10/h per user;
+# Rate-limits per docs/04-api-contracts.md §8: authorize 30/h per user;
 # callback 30/min per IP.
-LIMIT_OAUTH_AUTHORIZE = Limit(name="oauth_authorize", capacity=10, window_seconds=60 * 60)
+LIMIT_OAUTH_AUTHORIZE = Limit(name="oauth_authorize", capacity=30, window_seconds=60 * 60)
 LIMIT_OAUTH_CALLBACK = Limit(name="oauth_callback", capacity=30, window_seconds=60)
 
 

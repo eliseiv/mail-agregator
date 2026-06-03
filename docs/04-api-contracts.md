@@ -1132,6 +1132,7 @@ Payload (`event="message_tagged"`):
 | Auth | session cookie. |
 | Логика | Генерит `state` (32B urlsafe) + PKCE `code_verifier`/`code_challenge` (S256), сохраняет в Redis `oauth_state:{state}` = `{user_id, code_verifier}` TTL `OUTLOOK_OAUTH_STATE_TTL_SECONDS` (default 600), привязка к `session.user_id`. Строит Microsoft authorize URL. |
 | 200 | `{"authorize_url": "https://login.microsoftonline.com/common/oauth2/v2.0/authorize?...", "state": "<32B urlsafe>"}` (`OAuthAuthorizeResponse`) — фронт показывает ссылку «открыть в OctoBrowser» (НЕ auto-redirect — пользователь открывает в нужном профиле). `state` отдаётся для отображения/трекинга на клиенте. |
+| Rate-limit | 30 / час per user (token-bucket, ключ = `user_id`). Запас на подключение/переподключение нескольких Outlook-ящиков подряд. Расход на старте authorize, без refund при успешном callback — см. ADR-0025 §5. |
 | 404 | `not_found` если `OUTLOOK_OAUTH_ENABLED=false`. |
 
 ### `GET /api/oauth/outlook/callback`
@@ -1267,7 +1268,7 @@ FastAPI автогенерит OpenAPI 3.1. UI:
 | DELETE | `/api/telegram/links/{tg_user_id}` | user | yes | 10/h | yes | отвязать конкретный TG (ADR-0024) |
 | POST | `/api/telegram/links/{tg_user_id}/delete` | user | yes | 10/h | yes | form-fallback delete (`_method=DELETE`) |
 | PATCH | `/api/me/settings` | user | yes | — | — | user preferences (tg_notifications_enabled); см. ADR-0022 |
-| GET | `/api/oauth/outlook/authorize` | user | — | 10/h | — | сгенерить Microsoft authorize URL + state (ADR-0025) |
+| GET | `/api/oauth/outlook/authorize` | user | — | 30/h | — | сгенерить Microsoft authorize URL + state (ADR-0025) |
 | GET | `/api/oauth/outlook/callback` | state in Redis | exempt | 30/min per IP | — | OAuth callback: code→токены, create mail_account (ADR-0025) |
 | GET | `/my/integrations` | group_leader \| super_admin | — | — | — | webhook config page (ADR-0023) |
 | GET | `/api/webhooks/me` | group_leader \| super_admin | — | — | — | get webhook config (no secret) |
