@@ -25,8 +25,9 @@ import asyncio
 import contextlib
 import datetime as _dt
 import uuid
+from collections.abc import Awaitable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, cast
 
 import structlog
 from cryptography.exceptions import InvalidTag
@@ -54,6 +55,7 @@ from shared.redis_client import get_redis
 from shared.storage import get_storage
 from worker.app.error_classify import classify, error_prefix, is_explicit_permanent
 from worker.app.imap_fetcher import FetchedBox, fetch_blocking
+from worker.app.push_notify_dispatch import _QUEUE_KEY as _PUSH_NOTIFY_QUEUE_KEY
 
 log = get_logger(__name__)
 
@@ -366,6 +368,33 @@ async def sync_one_account(
                 detail=str(exc)[:200],
                 count=len(notified_message_ids),
             )
+
+        # ADR-0027 §3.1: enqueue push-only per-team bot deliveries for the
+        # same message_ids onto the separate ``push_notify_queue``. Third
+        # independent try/except — a push-enqueue failure must not affect the
+        # main TG channel or webhooks (and vice versa). The actual bot is
+        # selected later (by account.group_id) in ``push_notify_dispatch``.
+        if settings.push_team_bots_enabled:
+            try:
+                from backend.app.telegram.notify_service import _QueuePayload
+
+                redis = get_redis()
+                items = [
+                    _QueuePayload(message_id=int(mid), source="sync").to_json()
+                    for mid in notified_message_ids
+                ]
+                await cast(Awaitable[int], redis.lpush(_PUSH_NOTIFY_QUEUE_KEY, *items))
+                cycle_log.info(
+                    "push_notify_enqueued",
+                    count=len(items),
+                    mail_account_id=account.id,
+                )
+            except Exception as exc:
+                cycle_log.warning(
+                    "push_notify_enqueue_error",
+                    detail=str(exc)[:200],
+                    count=len(notified_message_ids),
+                )
 
     cycle_log.info(
         "sync_account_finish",

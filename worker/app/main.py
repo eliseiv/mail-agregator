@@ -35,6 +35,7 @@ from shared.logging import configure_logging, get_logger
 from shared.redis_client import close_redis
 from shared.storage import get_storage
 from worker.app.cleanup import retention_cleanup
+from worker.app.push_notify_dispatch import push_notify_dispatch
 from worker.app.sync_cycle import force_sync_dispatch, sync_cycle
 from worker.app.tg_notify_dispatch import tg_notify_dispatch
 from worker.app.tg_notify_recovery import tg_notify_recovery_scan
@@ -110,6 +111,18 @@ async def _safe_tg_notify_recovery() -> None:
     except Exception as exc:
         log.error(
             "tg_notify_recovery_unhandled",
+            detail=str(exc)[:300],
+            exc_info=True,
+        )
+
+
+async def _safe_push_notify_dispatch() -> None:
+    """Wrapper for the push-only per-team bot dispatcher (ADR-0027 §3)."""
+    try:
+        await push_notify_dispatch()
+    except Exception as exc:
+        log.error(
+            "push_notify_dispatch_unhandled",
             detail=str(exc)[:300],
             exc_info=True,
         )
@@ -210,6 +223,18 @@ async def main() -> None:
         max_instances=1,
         misfire_grace_time=600,
     )
+    # ADR-0027 §3.3: push-only per-team bot dispatcher (drains Redis queue).
+    # Registered ONLY when the feature is configured (>=1 push bot AND admin
+    # recipients) — no recovery job (fire-and-forget, ADR-0027 §5).
+    if settings.push_team_bots_enabled:
+        scheduler.add_job(
+            _safe_push_notify_dispatch,
+            trigger=IntervalTrigger(seconds=settings.PUSH_NOTIFY_DISPATCH_INTERVAL_SECONDS),
+            id="push_notify_dispatch",
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=30,
+        )
     # ADR-0023 §3.3: outbound-webhook dispatcher (drains Redis queue).
     scheduler.add_job(
         _safe_webhook_dispatch,
@@ -241,6 +266,7 @@ async def main() -> None:
         max_concurrent_imap=settings.MAX_CONCURRENT_IMAP,
         tg_notify_dispatch_seconds=settings.TG_NOTIFY_DISPATCH_INTERVAL_SECONDS,
         tg_notify_recovery_seconds=settings.TG_NOTIFY_RECOVERY_INTERVAL_SECONDS,
+        push_team_bots_enabled=settings.push_team_bots_enabled,
         webhook_dispatch_seconds=settings.WEBHOOK_DISPATCH_INTERVAL_SECONDS,
         webhook_recovery_seconds=settings.WEBHOOK_RECOVERY_INTERVAL_SECONDS,
     )

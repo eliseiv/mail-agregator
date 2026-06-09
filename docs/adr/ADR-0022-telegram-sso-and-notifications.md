@@ -697,39 +697,42 @@ Your subscription will renew soon. Tap to review the details and manage your pla
 
 **Следствие для dispatcher (round-31):** ранний `if not message_tags: return` в `dispatch_one_payload` (§2.4) **убирается** — при пустом списке тегов продолжаем с `tag_names=[]` (round-36: `format_notification` сам рендерит «Не сортировано»). Дедуп тегов по `(name, color)` (round-21) сохраняется и выполняется в `notify_service` до вызова `format_notification`.
 
-**Inline keyboard:** одна кнопка `Посмотреть сообщение`. Реализация — **WebApp button** (не обычный URL), чтобы открытие происходило внутри Telegram-WebView, а не в системном браузере (UX → пользователь остаётся в Telegram):
+**Inline keyboard:** одна кнопка `Посмотреть сообщение`. Реализация — **`callback_data`-кнопка** (Bug-fix #5 — заменила прежний `web_app` Mini-App opener). Кнопка несёт `callback_data = "msg:{message_id}"` (≤ 64 байта — лимит Bot API для `callback_data`). Тап шлёт `callback_query` на webhook `/api/telegram/webhook/{secret}`, который **отвечает в том же чате** полным телом письма (см. §2.6). Источник истины — `backend/app/telegram/bot.py::send_notification` (формирует payload ниже) и `backend/app/telegram/callback_handler.py` (обрабатывает `callback_query`).
 
 ```python
 reply_markup = {
     "inline_keyboard": [[
         {
             "text": "Посмотреть сообщение",
-            "web_app": {"url": f"{TELEGRAM_WEBAPP_URL}/messages/{message_id}?embed=tg"}
+            "callback_data": f"msg:{message_id}"   # Bug-fix #5: callback, НЕ web_app
         }
     ]]
 }
 ```
 
-Почему web_app, а не url:
-- `web_app` открывает страницу как Telegram WebApp — `Telegram.WebApp.initData` доступна → срабатывает Persistent SSO (§1.3) → пользователь сразу видит письмо без логина.
-- `url` открыл бы тот же URL в внешнем браузере (отдельный WebView без cookies Telegram-WebApp) — пришлось бы заново логиниться или Persistent SSO бы не сработал.
+Почему `callback_data`, а не `web_app`/`url` (Bug-fix #5):
+- `callback_data` обрабатывается **тем же webhook'ом**, что и `/start` (`callback_handler.py`): по `msg:{id}` бот резолвит TG-user → `users` через `telegram_links`, грузит письмо под visibility-scope этого user'а (ADR-0019) и шлёт **полное тело письма прямо в чат** (`send_html_message`, `parse_mode=HTML`, chunk-сплит по границам строк при длине > 4096). Пользователь остаётся в Telegram, без открытия WebView/Mini-App и без зависимости от cookie-синхронизации Telegram-WebApp.
+- `answerCallbackQuery` сразу гасит спиннер у пользователя; ошибки (нет/dead линковки, потеря visibility → 404) surfacing'ятся дружелюбным callback-ответом, webhook всегда отвечает 200 (update снимается с retry-очереди Telegram).
+- Прежний `web_app`-opener (открывал `/messages/{id}?embed=tg` как Mini-App) **отменён**: он требовал рабочей cookie-сессии в Telegram-WebView и срабатывания Persistent SSO; при любом рассинхроне cookie пользователь видел /login вместо письма. `callback_data` доставляет тело письма безусловно (резолв владельца — серверный, по подписанному Telegram `from.id` в `callback_query`). `url`-кнопка тоже отвергнута — открыла бы внешний браузер без контекста Telegram (см. Alternatives §8).
 
-#### 2.6. Просмотр без вложений — `?embed=tg` query parameter
+> **Не путать с launcher-кнопкой `/start`.** Кнопка «Открыть Mail Aggregator», которую бот шлёт на `/start` (`bot.py::send_message_with_webapp_button`), **остаётся** `web_app`-кнопкой (`web_app.url = TELEGRAM_WEBAPP_URL`) — она открывает приложение как Telegram WebApp и запускает Persistent SSO (§1.3). Bug-fix #5 затронул **только** кнопку уведомления «Посмотреть сообщение», не launcher.
 
-Архитектурное решение: **добавить query-параметр `embed=tg`** на существующий route `GET /messages/{id}` (HTML-страница, рендерится `message_view.html`). НЕ создаём новый шаблон.
+#### 2.6. Просмотр письма по кнопке «Посмотреть сообщение» — callback `msg:{message_id}` (Bug-fix #5)
 
-Обоснование:
-- Один HTML-шаблон проще поддерживать. Логика «скрыть attachments» — одна if-ветка в Jinja2.
-- `body.tg-app` (уже выставляется `tg.js`) уже скрывает topbar nav и применяет тёмную тему — что хорошо в Telegram WebApp. Bottom-nav же — оставляем, чтобы пользователь мог перейти в Inbox/Tags/Logout (см. ADR-0018 + frontend §11).
-- Если query `embed=tg` присутствует — backend выставляет в Jinja-контекст `embed_tg = True`. Шаблон при `embed_tg=True`:
-  - Скрывает раздел `<section class="attachments">…</section>`.
-  - **Не скрывает** bottom-nav (она и так есть в `tg-app` для logout кнопки).
-  - Действие `mark-read` остаётся доступным.
-- Параметр query — для server-side ветки; класс body.tg-app — для client-side ветки. Независимы: пользователь, открывший `/messages/{id}?embed=tg` в обычном браузере, увидит письмо без вложений (это OK — edge case, не security-issue). Class `tg-app` выставляется только когда страница реально в Telegram WebApp.
+**Текущая реализация (источник истины — код).** Кнопка уведомления «Посмотреть сообщение» (§2.5) — `callback_data`-кнопка `"msg:{message_id}"`. Тап шлёт `callback_query` на webhook `/api/telegram/webhook/{secret}` (ADR-0018), который обрабатывается `backend/app/telegram/callback_handler.py`. Алгоритм handler'а:
 
-Frontend-агент изменения (см. Implementation plan §F):
-- `templates/message_view.html`: обернуть секцию `attachments` в `{% if not embed_tg %} … {% endif %}`.
-- Backend `messages.router` → handler `GET /messages/{id}` принимает `embed: str | None = Query(default=None)`; передаёт `embed_tg = (embed == 'tg')` в context.
+1. `answerCallbackQuery` — мгновенно гасит спиннер у пользователя.
+2. Резолв `callback_query.from.id` (telegram_user_id, подписан Telegram) → `users.id` через `telegram_links` (живая линковка, `dead_at IS NULL`; отсутствует/dead → дружелюбный отказ).
+3. Загрузка письма под visibility-scope этого user'а (ADR-0019): если user потерял доступ (например, сменил группу) — 404, бот вежливо сообщает.
+4. **Полное тело письма отправляется обратно в тот же чат** (`bot.py::send_html_message`, `parse_mode=HTML`). Длинное тело режется на чанки ≤ `MAX_TELEGRAM_TEXT_LEN` (4096) по границам строк. Нормализация пустых строк — `_format_message_body` (см. §2.10, round-37/39/40/41).
+
+Webhook **всегда** отвечает 200 (любой exit-path — либо `answerCallbackQuery` с краткой причиной, либо chat-reply + ack), чтобы Telegram снял update с retry-очереди.
+
+**Почему body-in-chat, а не открытие WebApp-страницы (Bug-fix #5).** Прежний механизм (`web_app`-кнопка → открытие `/messages/{id}?embed=tg` как Mini-App) зависел от рабочей cookie-сессии в Telegram-WebView и срабатывания Persistent SSO. При рассинхроне cookie пользователь видел /login вместо письма. Резолв владельца **в callback'е серверный** (по подписанному `from.id`), поэтому тело доставляется безусловно, без зависимости от cookie/SSO/WebView. Обоснование выбора `callback_data` против `web_app`/`url` — см. §2.5.
+
+**Residual route `GET /messages/{id}?embed=tg` (не путь кнопки уведомления).** Server-route с query `embed=tg` (рендер `message_view.html` без секции `attachments`) **сохраняется в коде** (`messages.router`, handler `GET /messages/{id}`, `embed_tg = (embed == 'tg')`; шаблон оборачивает `attachments` в `{% if message.attachments and not embed_tg %}`). Однако кнопка уведомления «Посмотреть сообщение» **больше не ведёт** на этот URL — её путь — callback (выше). Маршрут остаётся доступным как обычная web-страница (его может открыть launcher-WebApp при навигации внутри приложения); это **не** push-кнопочный flow и для уведомлений не используется. Поведение страницы:
+- При `embed=tg` backend выставляет `embed_tg=True` → шаблон скрывает `<section class="attachments">`, **не** скрывает bottom-nav (нужна для Inbox/Tags/Logout в `tg-app`), `mark-read` остаётся доступным.
+- Пользователь, открывший `/messages/{id}?embed=tg` в обычном браузере, увидит письмо без вложений — OK (edge case, не security-issue). Класс `body.tg-app` (`tg.js`) выставляется только в реальном Telegram WebApp.
 
 #### 2.7. Opt-out — таблица `users_settings`
 
@@ -874,7 +877,7 @@ if needs_retry:                                     # ТОЛЬКО retry_after /
 
 #### 2.10. Нормализация пустых строк при ПРОСМОТРЕ письма (round-37, bug «множество пустых строк»)
 
-**Проблема.** При открытии письма на web-странице `GET /messages/{id}` (шаблон `message_view.html`) — и, как следствие, в TG «Посмотреть сообщение», т.к. кнопка ведёт на ту же страницу через `?embed=tg` (см. §2.6, §2.5 inline-keyboard) — тело письма показывается с **множеством подряд идущих пустых строк**. Типичный кейс — Apple/маркетинговые письма (например, «Your Apple Account information has been updated»): 15+ пустых строк между абзацами.
+**Проблема.** Тело письма показывается с **множеством подряд идущих пустых строк** — как при открытии письма на web-странице `GET /messages/{id}` (шаблон `message_view.html`), так и в TG «Посмотреть сообщение». TG-канал — это callback `msg:{message_id}`: тело письма рендерится `callback_handler.py::_format_message_body` и шлётся в чат (см. §2.5, §2.6, Bug-fix #5); это **отдельный** от web-страницы render-path (callback-ветка чистится в `_format_message_body`, web-ветка — в `message_view.html`). Типичный кейс — Apple/маркетинговые письма (например, «Your Apple Account information has been updated»): 15+ пустых строк между абзацами.
 
 **Это НЕ относится к тексту push-уведомления** (§2.5): там превью уже схлопывает любой whitespace в один пробел через `normalize_preview`. Баг — только в **полном** отображении тела письма при просмотре.
 
@@ -947,7 +950,7 @@ if needs_retry:                                     # ТОЛЬКО retry_after /
 
 **Где встраивается (backend):**
 
-- `backend/app/messages/service.py` → `MessageService.get(...)`: перед сборкой `MessageDetail` пропустить `msg.body_text` через `collapse_blank_lines_text(...)` и `msg.body_html` через `collapse_blank_lines_html(...)`. То есть `MessageDetail.body_text` / `.body_html` несут **уже нормализованные для отображения** значения. Это автоматически чинит и HTML-страницу (`message_view.html`), и JSON `GET /api/messages/{id}`, и TG-view (`?embed=tg`) — все три потребляют `MessageDetail`.
+- `backend/app/messages/service.py` → `MessageService.get(...)`: перед сборкой `MessageDetail` пропустить `msg.body_text` через `collapse_blank_lines_text(...)` и `msg.body_html` через `collapse_blank_lines_html(...)`. То есть `MessageDetail.body_text` / `.body_html` несут **уже нормализованные для отображения** значения. Это автоматически чинит HTML-страницу (`message_view.html`) и JSON `GET /api/messages/{id}` — оба потребляют `MessageDetail`. **TG «Посмотреть сообщение» этим round-37'ом НЕ покрывается** — её тело рендерится отдельным путём `callback_handler._format_message_body` (callback `msg:{id}`, Bug-fix #5), а не через `MessageService.get`; нормализацию TG-ветки добавляет round-39 (см. ниже). Residual web-route `?embed=tg` использует тот же `MessageService.get`/`MessageDetail`, поэтому нормализуется round-37'ом наравне с обычной web-страницей.
 - **`message_view.html` не меняется** — он рендерит `message.body_html | safe` / `message.body_text | e` как раньше; нормализация уже произошла в service.
 - **Хранимое НЕ трогаем:** `worker/app/imap_fetcher.py`, `messages`-repo, миграции — без изменений. tag-matching (`body_contains`) и push-превью продолжают читать сырое `messages.body_text`/`body_html` из БД (они идут через repo/worker, не через `MessageService.get`).
 
@@ -1449,7 +1452,7 @@ CSP `frame-ancestors 'none'` остаётся неизменной — Telegram 
 - Идемпотентность доставки гарантируется БД (Postgres UNIQUE), не Redis.
 - Bot API rate-limit (~30 msg/sec) обрабатывается отдельным dispatcher'ом, не блокирует sync_cycle.
 - Notification text формируется в Python (`html.escape`), новый Jinja2-шаблон не нужен.
-- Просмотр в WebApp — переиспользование `message_view.html` через `?embed=tg`, экономит ~150 строк нового кода.
+- Просмотр письма по кнопке уведомления — тело шлётся прямо в чат через `callback_data` `"msg:{message_id}"` (Bug-fix #5, §2.5/§2.6); резолв владельца серверный (по подписанному `from.id`), без зависимости от cookie/WebView/SSO. Residual web-страница `?embed=tg` переиспользует `message_view.html` (без отдельного шаблона).
 - Opt-out в отдельной таблице → расширяемая для будущих preferences.
 
 ### Negative / risks
@@ -1489,13 +1492,13 @@ CSP `frame-ancestors 'none'` остаётся неизменной — Telegram 
 
 4. **Использовать MarkdownV2 вместо HTML.** Отвергнуто — обоснование §2.5.
 
-5. **Создать отдельный шаблон `_tg_view.html`** для просмотра без вложений. Отвергнуто — `?embed=tg` flag на существующий `message_view.html` проще и DRY. См. §2.6.
+5. **Создать отдельный шаблон `_tg_view.html`** для просмотра без вложений. Отвергнуто — `?embed=tg` flag на существующий `message_view.html` проще и DRY. (Историческое решение для прежнего `web_app`-opener'а; после Bug-fix #5 кнопка уведомления стала `callback_data` и тело письма рендерится в чат через `callback_handler._format_message_body`, а не на этой странице — см. §2.5/§2.6. Route `?embed=tg` сохранён как residual web-страница.)
 
 6. **Хранить opt-out флагом в `users.tg_notifications_enabled`**. Отвергнуто — отдельная таблица `users_settings` лучше расширяема (будущие preferences).
 
 7. **TTL initData 24 часа** (Telegram default). Отвергнуто — 5 минут жёстче и адекватнее для одноразового auth-запроса. См. §1.2.
 
-8. **`url`-кнопка вместо `web_app`-кнопки в inline keyboard.** Отвергнуто — `url` открыл бы вне Telegram, ломая Persistent SSO. См. §2.5.
+8. **`url`-кнопка в inline keyboard уведомления.** Отвергнуто — `url` открыл бы внешний браузер вне контекста Telegram. Также отвергнут прежний `web_app`-opener (зависел от cookie-сессии WebView + Persistent SSO; ломался при рассинхроне cookie). Принято — `callback_data` `"msg:{message_id}"`: тело письма доставляется в чат webhook'ом (`callback_handler`), резолв владельца серверный по подписанному `from.id`, без зависимости от cookie/WebView (Bug-fix #5). См. §2.5/§2.6.
 
 9. **Создать новый процесс/контейнер для notification dispatcher.** Отвергнуто — лишний deploy-overhead. APScheduler-job в существующем worker достаточен. См. §2.4.
 
@@ -1566,7 +1569,9 @@ CSP `frame-ancestors 'none'` остаётся неизменной — Telegram 
 - `backend/app/telegram/bot.py` — добавить:
   ```python
   async def send_notification(chat_id: int, text_html: str, message_id: int) -> int | None:
-      # POST sendMessage parse_mode=HTML + inline_keyboard с web_app кнопкой
+      # POST sendMessage parse_mode=HTML + inline_keyboard с callback_data-кнопкой
+      #   callback_data="msg:{message_id}" (Bug-fix #5; НЕ web_app — см. §2.5/§2.6).
+      #   callback_query обрабатывается webhook'ом (callback_handler.py): тело письма в чат.
       # returns telegram_message_id или None при non-retriable error (403/400 mark-dead)
       # raises RetryAfter для 429, TelegramTransient для 5xx
   ```
@@ -1729,7 +1734,8 @@ async def send_notification(*, chat_id: int, text_html: str, message_id: int) ->
 | round-33 | 2026-05-26 | **CRITICAL fix: recovery per-recipient (§2.8/§2.9).** Прежний `recovery_scan` отбирал письма по per-**message** `NOT EXISTS (telegram_notifications WHERE message_id=m.id)`. При частичной доставке (письмо видно A и B; A доставлен → строка `(mid,A)` есть; B throttled → строки `(mid,B)` нет) `NOT EXISTS` возвращал FALSE из-за строки A → `mid` не подбирался → B терял уведомление **навсегда**. Это делало путь throttled→recovery (§2.9) недостижимым для частично-доставленных писем и активировало pre-existing хрупкость частичной доставки при крашах. Исправлено (Опция A, без миграции): recovery-SQL теперь переиспользует recipient-логику §2.2 (visibility/link/opt-out/`internal_date` + условный тег-предикат) и отбирает `DISTINCT m.id`, у которых есть видимый получатель без строки `(message_id,user_id)` (`NOT EXISTS tn WHERE message_id=m.id AND user_id=u.id`). Побочно: recovery стал visibility-aware → **TD-025 закрыт**; TD-027 переформулирован (причина недоставки за 24ч — устойчивый throttle, а не маскированная частичная доставка). Идемпотентность (`try_reserve`) и hot-path `retry_after`/`transient` не тронуты. Обновлены §2.8 (новый recovery-SQL), §2.9 (механизм throttled→recovery), `05-modules.md` §14.1. Миграций нет. |
 | round-34 | 2026-05-27 | Push-уведомление (§2.5): добавлены строка `Тема:` и превью тела письма (`PREVIEW_LEN=120`), обе опциональные (опускаются при пустом значении). Введены `notify_format.html_to_plain` / `normalize_preview`; превью считается **один раз на письмо** в `notify_service.dispatch_one_payload` (источник — `body_text`, fallback `body_html` через sanitiser). Срез — в Python, не в SQL. Лейбл «Отправитель» сохранён. Миграций нет. |
 | round-36 | 2026-05-31 | **Новый формат push-уведомления (§2.5), финализирован.** Карточка из 6 строк с emoji-метками: `🆔:` (ник почты `display_name`‖`email`, **всегда**), `#️⃣:` (все теги через `, ` либо fallback **«Не сортировано»**, **всегда**), пустой разделитель, `Клиент:` (был «Отправитель», **всегда**), `Тема:` (**всегда**; пустая → **«(без темы)»**), пустой разделитель, превью тела (только если непусто). Превью `PREVIEW_LEN` 120 → **100**. Значения выделяются `<b>`, emoji-метки plain; все user-controlled значения `html.escape()`. Убран ранний `if not message_tags: return` (теги опциональны). Константы `PREVIEW_LEN=100`, `SUBJECT_MAX=150` — в `notify_format.py`. Миграций нет. **Код `notify_format.py` приводится к этому формату backend-агентом** (на момент round-36 doc-финала код был на round-34). |
-| round-37 | 2026-06-01 | **Bug «множество пустых строк» при ПРОСМОТРЕ письма (§2.10, новый раздел).** При открытии `GET /messages/{id}` (web и TG `?embed=tg`) тело Apple/маркетинговых писем показывалось с 15+ подряд пустыми строками (HTML-ветка: пустые блочные элементы + прогоны `<br>` не схлопывались `sanitize_email_html`; plain-ветка: прогоны `\n\n\n` от `html2text` в `<pre>`). Решение — нормализация **на render-time** (не при ingest): две чистые функции `collapse_blank_lines_text` / `collapse_blank_lines_html` в `shared/html_sanitize.py`, применяемые в `MessageService.get` к `MessageDetail.body_text`/`.body_html`. Схлопывает 3+ пустых строк / 3+ `<br>` / пустые `<p>`/`<div>` в максимум один разделитель абзаца. Хранимое body НЕ меняется (чинит и существующие письма, не ломает tag-matching/push-превью). Общая логика для HTML-страницы и JSON-API. Миграций нет. |
+| round-37 | 2026-06-01 | **Bug «множество пустых строк» при ПРОСМОТРЕ письма (§2.10, новый раздел).** При открытии web-страницы `GET /messages/{id}` (а также в TG full-body view; TG-канал — это callback `msg:{id}` → `_format_message_body`, **не** `?embed=tg`, см. §2.5/§2.6 Bug-fix #5) тело Apple/маркетинговых писем показывалось с 15+ подряд пустыми строками (HTML-ветка: пустые блочные элементы + прогоны `<br>` не схлопывались `sanitize_email_html`; plain-ветка: прогоны `\n\n\n` от `html2text` в `<pre>`). Решение — нормализация **на render-time** (не при ingest): две чистые функции `collapse_blank_lines_text` / `collapse_blank_lines_html` в `shared/html_sanitize.py`, применяемые в `MessageService.get` к `MessageDetail.body_text`/`.body_html`. Схлопывает 3+ пустых строк / 3+ `<br>` / пустые `<p>`/`<div>` в максимум один разделитель абзаца. Хранимое body НЕ меняется (чинит и существующие письма, не ломает tag-matching/push-превью). Общая логика для HTML-страницы и JSON-API. Миграций нет. |
 | round-39 | 2026-06-01 | **Bug «множество пустых строк» в TG «Посмотреть сообщение» (§2.10).** TG full-body view строится не через `MessageService.get`, а через `_format_message_body` → `sanitize_telegram_html`, который стрипает Apple-таблицы и рождает строки-отступы `\n`+whitespace; round-37 их не закрывал. Решение — новая `collapse_blank_lines_tg` (`shared/html_sanitize.py`), применяемая в HTML-ветке `_format_message_body` поверх `sanitize_telegram_html`. Широкий класс `[^\S\n]` (вкл. `\xa0`/em/ideographic space) + смешанные `\n`/`<br>`-разрывы; `<pre>` защищён внутренним сплитом. Web-вью — вне scope (TD-039). Миграций нет. |
 | round-40 | 2026-06-02 | **Bug «строка-спейсер не схлопывается» в TG «Посмотреть сообщение» (§2.10, Glassdoor `id=1264`).** После round-39 marketing-письма сохраняли длинную preheader-строку-спейсер `"\xa0‎‏"×N` (U+00A0 + U+200E LRM + U+200F RLM): класс `[^\S\n]` round-39 матчит `\xa0`, но НЕ Cf-форматтеры LRM/RLM → строка «непустая» → не схлопывается. Корень — `_INVISIBLE_PADDING_CODEPOINTS` не содержал 200E/200F, поэтому `strip_invisible_padding` (вызывается в `sanitize_telegram_html` до collapse) их не убирал. Решение — **расширить `_INVISIBLE_PADDING_CODEPOINTS`** на `0x200E`/`0x200F` (не новая функция; унификация — фикс для всех 5 потребителей `strip_invisible_padding`). Спейсер → чистый `\xa0` → схлопывается штатно round-39. `\xa0` НЕ добавляется (нужен как whitespace). Порядок strip Cf → collapse уже соблюдён. `collapse_blank_lines_tg`/`_format_message_body` не меняются. RTL trade-off → TD-040 (риск ≈0). Миграций нет. |
+| doc-fix (2026-06-09) | 2026-06-09 | **Sync docs↔code: кнопка уведомления «Посмотреть сообщение» = `callback_data`, НЕ `web_app` (§2.5/§2.6).** Только-документация; кода/миграций нет. ADR-0022 §2.5 исторически описывал кнопку уведомления как `web_app` Mini-App opener (`/messages/{id}?embed=tg`); реальный код (`backend/app/telegram/bot.py::send_notification`, Bug-fix #5) давно перешёл на `callback_data="msg:{message_id}"` — `callback_query` обрабатывается webhook'ом (`callback_handler.py`), который шлёт **полное тело письма в чат** (резолв владельца по подписанному `from.id`, visibility ADR-0019). Приведены к реальности: §2.5 (inline-keyboard + обоснование callback vs web_app/url), §2.6 (переименован/переписан в «callback `msg:{id}`»; route `?embed=tg` помечен как **residual** web-страница, **не** путь push-кнопки), §2.10 intro (TG-канал = callback, не `?embed=tg`), Alternatives §5/§8, Implementation-plan note `send_notification`, Positive consequences, changelog round-37. **Launcher-кнопка `/start`** (`send_message_with_webapp_button`) **остаётся** `web_app` — не затронута. Это устраняет противоречие ADR-0027 §7 ↔ ADR-0022 §2.5 в правильную сторону: рационал ADR-0027 (push-боты без кнопки, т.к. callback `msg:{id}` некому обработать без webhook) **корректен** и не менялся. |
 

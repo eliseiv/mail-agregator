@@ -14,6 +14,7 @@ Invariants (``docs/05-modules.md`` sec. 1):
 from __future__ import annotations
 
 import base64
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Literal
 
@@ -21,6 +22,22 @@ from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 AppEnv = Literal["dev", "prod"]
+
+
+@dataclass(frozen=True, slots=True)
+class PushTeamBot:
+    """A single configured push-only per-team Telegram bot (ADR-0027 §1/§2).
+
+    ``name`` is the team label (``ivan`` / ``alexandra`` / ``andrei``),
+    ``token`` the BotFather token used to call the Bot API, ``group_id`` the
+    team's ``mail_accounts.group_id`` (ADR-0019) this bot is bound to. Only
+    fully-configured bots (non-empty token AND ``group_id > 0``) are
+    materialised — see :pyattr:`Settings.push_team_bots`.
+    """
+
+    name: str
+    token: str
+    group_id: int
 
 
 class Settings(BaseSettings):
@@ -159,6 +176,30 @@ class Settings(BaseSettings):
     # skipped this tick and picked up later by the recovery scan.
     TG_SEND_PER_CHAT_PER_MINUTE: int = Field(default=20, ge=1, le=60)
 
+    # --- Push-only per-team Telegram bots (ADR-0027) ----------------------
+    # Three additional push-only bots (ivan / alexandra / andrei); each
+    # delivers notifications about ALL messages of ITS team (bound by an
+    # explicit ``group_id``) to the fixed ``ADMIN_TELEGRAM_IDS``. Worker
+    # container reads these; the main bot (``BOT_TOKEN``) is unaffected.
+    # Tokens are marked redact in ``shared/logging.py`` alongside BOT_TOKEN.
+    # A bot is "configured" only when its token is non-empty AND its
+    # group_id > 0 (see ``push_team_bots``). Prod mapping (ADR-0027 §1):
+    # ivan=1, alexandra=2, andrei=3.
+    BOT_IVAN_TOKEN: str = ""
+    BOT_IVAN_GROUP_ID: int = Field(default=0, ge=0)
+    BOT_ALEXANDRA_TOKEN: str = ""
+    BOT_ALEXANDRA_GROUP_ID: int = Field(default=0, ge=0)
+    BOT_ANDREI_TOKEN: str = ""
+    BOT_ANDREI_GROUP_ID: int = Field(default=0, ge=0)
+    # CSV of the two fixed administrator Telegram chat ids that every
+    # push-bot delivers to (e.g. ``11111111,22222222``). Not a secret
+    # (chat ids), but parsed defensively — see ``admin_telegram_ids``.
+    ADMIN_TELEGRAM_IDS: str = ""
+    # How often ``push_notify_dispatch`` drains the Redis ``push_notify_queue``.
+    PUSH_NOTIFY_DISPATCH_INTERVAL_SECONDS: int = Field(default=5, ge=1, le=600)
+    # Per-tick LPOP batch size (cap on push dispatcher throughput / tick).
+    PUSH_NOTIFY_BATCH_SIZE: int = Field(default=30, ge=1, le=500)
+
     # --- Outlook OAuth2 (ADR-0025, Sprint B) ------------------------------
     # Azure App (Personal Microsoft accounts only) credentials. When BOTH
     # client id and secret are set, ``outlook_oauth_enabled`` flips on and the
@@ -243,6 +284,26 @@ class Settings(BaseSettings):
         # Hardcoded prod policy: docs disabled regardless of env value.
         if self.APP_ENV == "prod":
             object.__setattr__(self, "ENABLE_DOCS", False)
+
+        # ADR-0027 §2 invariant: one group_id must not be bound to two
+        # different push bots — otherwise a team's mail would ship twice
+        # (once per bot). Fail-fast at startup; only CONFIGURED bots (token
+        # set AND group_id > 0) participate. Built inline (the property is
+        # not yet available during validation, and it filters identically).
+        configured_group_ids: list[int] = []
+        for token, group_id in (
+            (self.BOT_IVAN_TOKEN, self.BOT_IVAN_GROUP_ID),
+            (self.BOT_ALEXANDRA_TOKEN, self.BOT_ALEXANDRA_GROUP_ID),
+            (self.BOT_ANDREI_TOKEN, self.BOT_ANDREI_GROUP_ID),
+        ):
+            if token and group_id > 0:
+                configured_group_ids.append(group_id)
+        if len(configured_group_ids) != len(set(configured_group_ids)):
+            raise ValueError(
+                "Duplicate push-bot group_id: each configured push bot "
+                "(BOT_IVAN/BOT_ALEXANDRA/BOT_ANDREI) must map to a distinct "
+                "group_id (ADR-0027 §2)"
+            )
         return self
 
     @property
@@ -274,6 +335,48 @@ class Settings(BaseSettings):
         lets us wire the routes in dev/CI without a real Azure App.
         """
         return bool(self.OUTLOOK_CLIENT_ID and self.OUTLOOK_CLIENT_SECRET)
+
+    @property
+    def admin_telegram_ids(self) -> list[int]:
+        """Parsed ``ADMIN_TELEGRAM_IDS`` CSV (ADR-0027 §2).
+
+        Splits on commas, trims whitespace and drops any element that is
+        not a (optionally negative) integer — empty / malformed entries are
+        silently discarded so an operator typo never aborts the worker.
+        """
+        ids: list[int] = []
+        for raw in self.ADMIN_TELEGRAM_IDS.split(","):
+            token = raw.strip()
+            if token.lstrip("-").isdigit():
+                ids.append(int(token))
+        return ids
+
+    @property
+    def push_team_bots(self) -> list[PushTeamBot]:
+        """Configured push-only per-team bots (ADR-0027 §2).
+
+        A bot is included only when its token is non-empty AND its
+        ``group_id`` is positive. If ``admin_telegram_ids`` is empty an empty
+        list is returned — a bot with no recipients is meaningless, so the
+        whole channel stays off.
+        """
+        if not self.admin_telegram_ids:
+            return []
+        bots: list[PushTeamBot] = []
+        for name, token, group_id in (
+            ("ivan", self.BOT_IVAN_TOKEN, self.BOT_IVAN_GROUP_ID),
+            ("alexandra", self.BOT_ALEXANDRA_TOKEN, self.BOT_ALEXANDRA_GROUP_ID),
+            ("andrei", self.BOT_ANDREI_TOKEN, self.BOT_ANDREI_GROUP_ID),
+        ):
+            if token and group_id > 0:
+                bots.append(PushTeamBot(name=name, token=token, group_id=group_id))
+        return bots
+
+    @property
+    def push_team_bots_enabled(self) -> bool:
+        """True when at least one push-only per-team bot is configured AND
+        there is at least one admin recipient (ADR-0027 §2)."""
+        return bool(self.push_team_bots)
 
     @property
     def outlook_authorize_endpoint(self) -> str:

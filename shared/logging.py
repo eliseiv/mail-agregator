@@ -47,6 +47,11 @@ REDACT_KEYS: frozenset[str] = frozenset(
         # ``TELEGRAM_BOT_TOKEN`` covers any place still using the docs name.
         "BOT_TOKEN",
         "TELEGRAM_BOT_TOKEN",
+        # ADR-0027 §8: push-only per-team bot tokens — same leak risk as
+        # BOT_TOKEN (attacker could impersonate the bot to the admins).
+        "BOT_IVAN_TOKEN",
+        "BOT_ALEXANDRA_TOKEN",
+        "BOT_ANDREI_TOKEN",
         "TELEGRAM_WEBHOOK_SECRET",
         "X-Telegram-Bot-Api-Secret-Token",
         # OAuth2 Outlook (ADR-0025 §1.11, docs/06-security.md): never log the

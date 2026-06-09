@@ -247,7 +247,7 @@ flowchart LR
 - **Аккаунт** показывается через `effective_account_label(account)` (ADR-0020).
 - **Владелец** (`owner.display_name | username`) показывается только если текущий пользователь — `super_admin` или лидер/участник группы и `owner.id != current_user.id` (ADR-0019). Если письмо своё (owner = self) — поле скрыто.
 - **Теги**: рядом с темой показываются chip'ы тегов **владельца ящика** (per-user, см. ADR-0017 + ADR-0019 §7.4). Это важно: если лидер видит письмо участника, теги — участника, а не лидера.
-- **`?embed=tg` режим (ADR-0022 §2.6)**: если query-параметр `embed=tg` присутствует (страница открыта по inline-keyboard кнопке из push-уведомления Telegram), backend выставляет в Jinja-контекст `embed_tg=True`. Шаблон при `embed_tg=True` **скрывает** всю секцию `Вложения` (включая список и кнопки «Скачать»). Остальное (header, body, mark-read, bottom-nav, logout) — без изменений. Класс `body.tg-app` выставляется независимо от query — через `tg.js` при `window.Telegram?.WebApp` detected; в комбинации с `embed=tg` получается чистый view без topbar nav и без attachments, удобный для просмотра внутри Telegram WebApp.
+- **`?embed=tg` режим (ADR-0022 §2.6)**: если query-параметр `embed=tg` присутствует, backend выставляет в Jinja-контекст `embed_tg=True`. (**Bug-fix #5:** push-кнопка «Посмотреть сообщение» **больше не** ведёт на этот URL — она `callback_data "msg:{id}"`, тело письма приходит в чат через webhook `callback_handler`. Route остаётся residual web-страницей.) Шаблон при `embed_tg=True` **скрывает** всю секцию `Вложения` (включая список и кнопки «Скачать»). Остальное (header, body, mark-read, bottom-nav, logout) — без изменений. Класс `body.tg-app` выставляется независимо от query — через `tg.js` при `window.Telegram?.WebApp` detected; в комбинации с `embed=tg` получается чистый view без topbar nav и без attachments, удобный для просмотра внутри Telegram WebApp.
 
 ### 4.5 Compose (`compose.html`)
 
@@ -709,7 +709,7 @@ Telegram WebApp adaptation — см. секцию 10 ниже.
 Источники истины — [ADR-0018](./adr/ADR-0018-telegram-launcher.md) (тема + body.tg-app) + [ADR-0022](./adr/ADR-0022-telegram-sso-and-notifications.md) (Persistent SSO + push-notif inline). Когда страница открыта внутри Telegram WebApp, мы:
 1. Применяем тему Telegram и скрываем дублирующую navigation (ADR-0018).
 2. Если страница рендерится анонимно (`<body data-anonymous>`), JS делает попытку Persistent SSO через `POST /api/telegram/auth` (ADR-0022 §1.3). При успехе и наличии линковки — auto-login без формы.
-3. Если страница открыта по push-нотификации (`?embed=tg`), backend скрывает секцию вложений в `message_view.html` (см. секцию 4.4 выше).
+3. Если страница открыта с `?embed=tg`, backend скрывает секцию вложений в `message_view.html` (см. секцию 4.4 выше). **Примечание (Bug-fix #5):** push-кнопка «Посмотреть сообщение» **больше не открывает** эту страницу — она `callback_data "msg:{id}"`, и полное тело письма приходит сообщением в чат через webhook `callback_handler` (ADR-0022 §2.5/§2.6). Route `?embed=tg` остаётся residual web-страницей.
 
 ### 10.1 Подключение SDK
 

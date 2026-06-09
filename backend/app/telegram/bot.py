@@ -63,15 +63,16 @@ _HELP_REPLY: str = "Команды:\n/start — открыть приложен�
 _START_REPLY: str = "Привет! Открой mail-агрегатор:"
 
 
-def _api_url(method: str) -> str:
+def _api_url(method: str, *, token: str | None = None) -> str:
     """Build the api.telegram.org endpoint URL for ``method``.
 
-    Caller must have already verified ``settings.telegram_bot_enabled`` —
-    here we do not guard, but we do NOT log the resulting URL anywhere
-    (it embeds the bot token).
+    ``token`` defaults to ``settings.BOT_TOKEN`` (the main bot, ADR-0022);
+    push-only per-team bots (ADR-0027 §4) pass their own ``token``. Caller
+    must have already verified the bot is enabled — here we do not guard,
+    but we do NOT log the resulting URL anywhere (it embeds the bot token).
     """
-    settings = get_settings()
-    return f"https://api.telegram.org/bot{settings.BOT_TOKEN}/{method}"
+    tok = token or get_settings().BOT_TOKEN
+    return f"https://api.telegram.org/bot{tok}/{method}"
 
 
 async def _post_send_message(payload: dict[str, Any]) -> None:
@@ -255,29 +256,44 @@ async def send_notification(  # noqa: PLR0911 - each return is a distinct, docum
     chat_id: int,
     text_html: str,
     message_id: int,
+    bot_token: str | None = None,
+    with_button: bool = True,
 ) -> SendNotificationResult:
-    """POST ``sendMessage`` with HTML parse-mode + an inline WebApp button.
+    """POST ``sendMessage`` with HTML parse-mode + an inline button.
 
     Returns a :class:`SendNotificationResult`; caller dispatches the
     outcome (see :mod:`worker.app.tg_notify_dispatch`).
+
+    ``bot_token`` (ADR-0027 §4): when ``None`` (default) the main bot
+    (``BOT_TOKEN``) is used and behaviour is exactly ADR-0022 — including the
+    ``telegram_bot_enabled`` guard. When a token is passed explicitly (a
+    push-only per-team bot), that guard is skipped: push bots do not use
+    webhook / webapp, so they are "enabled" by the mere fact the dispatcher
+    only calls this for a configured ``push_team_bots`` entry.
+
+    ``with_button`` (ADR-0027 §7): when ``False`` no ``reply_markup`` is
+    attached. Push bots have no webhook, so the callback ``msg:{id}`` button
+    would lead nowhere (a hung spinner) — they pass ``False``.
     """
     settings = get_settings()
-    if not settings.telegram_bot_enabled:
-        # Bot disabled (CI / dev). Caller treats this as "skip silently".
+    if bot_token is None and not settings.telegram_bot_enabled:
+        # Main bot disabled (CI / dev). Caller treats this as "skip silently".
+        # Push bots (bot_token set) bypass this guard — see docstring.
         return SendNotificationResult(kind="disabled")
-
-    # Bug-fix #5: the «Посмотреть сообщение» button is now a
-    # callback_data button (≤ 64 bytes) — tapping it sends a
-    # callback_query to the webhook which replies in-chat with the full
-    # message body. Replaces the previous web_app Mini-App opener.
-    callback_data = f"msg:{message_id}"
 
     payload: dict[str, Any] = {
         "chat_id": chat_id,
         "text": text_html,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
-        "reply_markup": {
+    }
+    if with_button:
+        # Bug-fix #5: the «Посмотреть сообщение» button is now a
+        # callback_data button (≤ 64 bytes) — tapping it sends a
+        # callback_query to the webhook which replies in-chat with the full
+        # message body. Replaces the previous web_app Mini-App opener.
+        callback_data = f"msg:{message_id}"
+        payload["reply_markup"] = {
             "inline_keyboard": [
                 [
                     {
@@ -286,12 +302,11 @@ async def send_notification(  # noqa: PLR0911 - each return is a distinct, docum
                     }
                 ]
             ]
-        },
-    }
+        }
 
     try:
         async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_SECONDS) as client:
-            resp = await client.post(_api_url("sendMessage"), json=payload)
+            resp = await client.post(_api_url("sendMessage", token=bot_token), json=payload)
     except httpx.HTTPError as exc:
         log.warning(
             "telegram_send_notification_network_error",

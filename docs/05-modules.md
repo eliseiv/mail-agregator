@@ -155,7 +155,7 @@ backend/
 worker/
   app/
     __init__.py
-    main.py                # APScheduler entrypoint (jobs: sync_cycle, force_sync_dispatch, retention_cleanup, tg_notify_dispatch, tg_notify_recovery_scan, webhook_dispatch, webhook_recovery_scan)
+    main.py                # APScheduler entrypoint (jobs: sync_cycle, force_sync_dispatch, retention_cleanup, tg_notify_dispatch, tg_notify_recovery_scan, webhook_dispatch, webhook_recovery_scan, push_notify_dispatch)
     config.py              # shared with backend (через общий пакет, см. ниже)
     sync_cycle.py
     cleanup.py
@@ -165,6 +165,7 @@ worker/
     tg_notify_recovery.py  # ADR-0022 — recovery_scan (каждый час)
     webhook_dispatch.py    # ADR-0023 — диспатчер outbound webhooks (каждые 5 сек)
     webhook_recovery.py    # ADR-0023 — recovery_scan для webhooks (каждый час)
+    push_notify_dispatch.py # ADR-0027 — push-only боты по командам (LPOP push_notify_queue → bot по group_id → fire-and-forget; каждые 5 сек, recovery НЕТ)
   tests/
 shared/                    # общий пакет, импортируется и api, и worker
   __init__.py
@@ -1907,6 +1908,8 @@ Telegram-интеграция в трёх ролях:
 
 Источники истины — [ADR-0018](./adr/ADR-0018-telegram-launcher.md) (launcher) + [ADR-0022](./adr/ADR-0022-telegram-sso-and-notifications.md) (SSO + нотификации; partially supersedes ADR-0018 в части «нет линковки / нет initData auth»).
 
+4. **Push-only боты по командам (ADR-0027)** — 3 дополнительных бота (`ivan`/`alexandra`/`andrei`), каждый шлёт письма **только своей команды** (по `mail_accounts.group_id`) на фиксированных администраторов (`ADMIN_TELEGRAM_IDS`). Только `sendMessage`: **нет** webhook/SSO/`telegram_links`/БД-привязок/inbound-команд. Маппинг бот→команда — явным `group_id` в `.env` (прод: `ivan`=1, `alexandra`=2, `andrei`=3). Доставка — **fire-and-forget** (без idempotency/recovery/миграций). Отдельная Redis-очередь `push_notify_queue` + worker-job `push_notify_dispatch`. Основной бот (`BOT_TOKEN`) **не тронут**. Reuse `format_notification` (round-36, без метки команды) + `send_notification` (токен-параметризован). См. [ADR-0027](./adr/ADR-0027-push-team-bots.md).
+
 ### Публичный API
 - HTTP routes (см. `04-api-contracts.md` секция 4a):
   - `POST /api/telegram/webhook/{secret}` — webhook launcher (ADR-0018).
@@ -1928,7 +1931,10 @@ async def handle_update(update: TelegramUpdate) -> None
 async def send_notification(*, chat_id: int, text_html: str, message_id: int) -> SendNotificationResult
     # POST sendMessage parse_mode=HTML с inline_keyboard:
     #   [[{text: "Посмотреть сообщение",
-    #      web_app: {url: f"{TELEGRAM_WEBAPP_URL}/messages/{message_id}?embed=tg"}}]]
+    #      callback_data: f"msg:{message_id}"}]]   # Bug-fix #5 (ADR-0022 §2.5): callback, НЕ web_app.
+    #   callback_query обрабатывается основным webhook'ом (callback_handler.py): резолв
+    #   telegram_user_id→users через telegram_links, загрузка письма под visibility-scope,
+    #   полное тело письма шлётся в тот же чат (send_html_message). НЕ открывает WebApp-страницу.
     # Returns:
     #   SendNotificationResult(kind: 'ok'|'dead'|'retry_after'|'transient',
     #                          telegram_message_id: int|None, retry_after_sec: int|None)
@@ -2272,8 +2278,8 @@ body_safe = collapse_blank_lines_tg(body_safe)       # round-39: post-sanitize c
 - sync_cycle не падает при ошибке LPUSH в очередь (try/except + warn log).
 - recovery_scan находит message с видимым залинкованным чатом без строки `telegram_notifications` по `(message_id, telegram_user_id)` (per-chat, round-35 / ADR-0024 §7) в окне 24ч → LPUSH в очередь → доставлено недоставленным чатам на следующем тике (уже доставленные пропускаются `try_reserve` per-chat). Частный случай: у user'а два TG, в один доставлено, второй throttled → recovery подберёт письмо для второго чата.
 - HTML escape: tag name `<script>x</script>` или email `<x@y>` корректно экранированы в notification text.
-- inline_keyboard содержит ровно одну кнопку с `web_app.url` равным `{TELEGRAM_WEBAPP_URL}/messages/{mid}?embed=tg`.
-- `GET /messages/{id}?embed=tg` → HTML не содержит секции `<section class="attachments">`; mark-read button присутствует.
+- inline_keyboard уведомления содержит ровно одну кнопку с `callback_data == "msg:{mid}"` (Bug-fix #5, ADR-0022 §2.5 — callback, НЕ web_app). Тап → `callback_query` на основной webhook → `callback_handler` шлёт полное тело письма в чат.
+- `GET /messages/{id}?embed=tg` (residual web-route, НЕ путь кнопки уведомления) → HTML не содержит секции `<section class="attachments">`; mark-read button присутствует.
 - `PATCH /api/me/settings {tg_notifications_enabled: false}` → upsert в `users_settings`; следующие нотификации тому же user'у не шлются.
 - `GET /api/me` возвращает `tg_notifications_enabled` (default `true`, либо актуальное значение) и `telegram_linked: bool`.
 
