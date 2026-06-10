@@ -12,15 +12,24 @@ architectural fix for root cause B (an ``auth_failed``-looking message such as
 
 Order of evaluation is strict top-to-bottom; the **first match wins**. The
 transient block (rules 1-7, incl. rule 3b -- sporadic IMAP "authenticated but
-not connected" / "not connected" flake, ADR-0026 update) is checked **entirely
-before** the permanent block (rules 8-9): any transient marker beats any
-auth/permanent marker in the same text. Rule 10 (unrecognised, incl.
-programming errors) is fail-open -> transient.
+not connected" / "not connected" flake, ADR-0026 update -- and rule 7b -- the
+OAuth IMAP "login failed" flake, ADR-0028) is checked **entirely before** the
+permanent block (rules 8-9): any transient marker beats any auth/permanent
+marker in the same text. Rule 10 (unrecognised, incl. programming errors) is
+fail-open -> transient.
+
+Context (ADR-0028): the three public functions take a keyword-only
+``auth_type: str | None = None``. The default reproduces the legacy behaviour
+for every existing call; ``"oauth_outlook"`` activates rule 7b (OAuth IMAP auth
+flake -> transient / ``network``). The classifier stays a pure function of
+(text, exc, auth_type) -- the kill-switch
+(``SYNC_OAUTH_LOGIN_FAILED_TRANSIENT``) is applied by the caller, which passes
+``auth_type=None`` when the flag is off.
 
 Usage::
 
-    cls = classify(exc)            # "transient" | "permanent"
-    prefix = error_prefix(exc)     # "invalid_host" | "auth_failed" | ...
+    cls = classify(exc, auth_type=account.auth_type)   # "transient" | "permanent"
+    prefix = error_prefix(exc, auth_type=account.auth_type)
 """
 
 from __future__ import annotations
@@ -135,6 +144,21 @@ _AUTH_SUBSTRINGS: tuple[str, ...] = (
     "account has been blocked",
 )
 
+# Rule 7b (ADR-0028) -- OAuth IMAP auth flakes. For ``auth_type='oauth_outlook'``
+# accounts these substrings are TRANSIENT, not permanent: the XOAUTH2 access
+# token was obtained via a SUCCESSFUL refresh BEFORE IMAP (sync_cycle
+# ``get_valid_access_token``), so a "login failed" / "authenticationfailed"
+# arriving at the IMAP step is a Microsoft server flake on a valid token, never
+# a real auth failure (a real OAuth failure surfaces as ``invalid_grant`` on the
+# refresh endpoint -> needs-consent, IMAP is never reached). A literal set: if
+# Microsoft surfaces other wordings on prod, extend it here (ADR-0028
+# Consequences). ``invalid_grant`` is deliberately excluded (it stays permanent,
+# rule 8) -- see ``_matches_transient``.
+_OAUTH_IMAP_AUTH_FLAKE_SUBSTRINGS: tuple[str, ...] = (
+    "login failed",
+    "authenticationfailed",
+)
+
 # Auth markers used by rule 3 to pick the UI prefix (auth_failed vs network)
 # WITHOUT changing the transient class. A subset focused on "this text smells
 # like a login response".
@@ -201,11 +225,32 @@ def _is_oauth_transient(exc: BaseException | None, text: str) -> bool:
     return _has_any(text, _OAUTH_TRANSIENT_SUBSTRINGS)
 
 
-def _matches_transient(exc: BaseException | None, text: str) -> bool:
-    """True if any transient rule (1-7) matches.
+def _is_oauth_imap_auth_flake(text: str, auth_type: str | None) -> bool:
+    """Rule 7b (ADR-0028) -- sporadic Microsoft IMAP auth flake on OAuth.
+
+    True only for ``auth_type == "oauth_outlook"`` when the text carries a
+    flake substring (``login failed`` / ``authenticationfailed``) AND does NOT
+    carry ``invalid_grant`` (a real refresh failure, which stays permanent via
+    rule 8). For ``password`` / ``None`` this is always False, so the legacy
+    rule-8 permanent path is unchanged.
+    """
+    if auth_type != "oauth_outlook":
+        return False
+    if "invalid_grant" in text:
+        return False
+    return _has_any(text, _OAUTH_IMAP_AUTH_FLAKE_SUBSTRINGS)
+
+
+def _matches_transient(
+    exc: BaseException | None, text: str, *, auth_type: str | None = None
+) -> bool:
+    """True if any transient rule (1-7, incl. 7b) matches.
 
     First-match-wins is preserved because the permanent block is only consulted
-    when this returns False.
+    when this returns False. Rule 7b (ADR-0028) is evaluated as part of the
+    transient block, i.e. BEFORE the permanent rule 8: for an ``oauth_outlook``
+    account an IMAP "login failed" is caught here (transient) and never reaches
+    rule 8 (permanent).
     """
     return (
         # Rules 1 / 2 / 5 -- timeout / gaierror / connection-TLS instances.
@@ -224,14 +269,22 @@ def _matches_transient(exc: BaseException | None, text: str) -> bool:
         or (isinstance(exc, OSError) and exc.errno in _NETWORK_ERRNOS)
         # Rule 7 -- transient OAuth token errors.
         or _is_oauth_transient(exc, text)
+        # Rule 7b -- OAuth IMAP auth flake (login failed / authenticationfailed).
+        or _is_oauth_imap_auth_flake(text, auth_type)
     )
 
 
-def _matches_permanent(exc: BaseException | None, text: str) -> bool:
+def _matches_permanent(
+    exc: BaseException | None, text: str, *, auth_type: str | None = None
+) -> bool:
     """True if a permanent rule (8-9) matches.
 
-    Only consulted after the whole transient block (1-7) failed.
+    Only consulted after the whole transient block (1-7, incl. 7b) failed. The
+    ``auth_type`` parameter is accepted for signature symmetry with
+    :func:`_matches_transient`; rule 8/9 markers are auth-type-independent (the
+    OAuth carve-out happens earlier in the transient block via rule 7b).
     """
+    del auth_type  # rule 8/9 are context-independent; carve-out is rule 7b.
     return (
         # Rule 8 -- explicit auth / account-state failures + oauth invalid_grant.
         _has_any(text, _AUTH_SUBSTRINGS)
@@ -243,27 +296,36 @@ def _matches_permanent(exc: BaseException | None, text: str) -> bool:
     )
 
 
-def classify(exc_or_text: object) -> ErrorClass:
+def classify(exc_or_text: object, *, auth_type: str | None = None) -> ErrorClass:
     """Classify an exception or error text as ``"transient"`` or ``"permanent"``.
 
-    Contract: ADR-0026 sec. 1 table. Transient block (rules 1-7) is evaluated in
-    full before the permanent block (rules 8-9); rule 10 (anything else,
-    including programming errors) is fail-open -> ``"transient"``.
+    Contract: ADR-0026 sec. 1 table (+ ADR-0028 rule 7b). Transient block
+    (rules 1-7, incl. 7b) is evaluated in full before the permanent block
+    (rules 8-9); rule 10 (anything else, including programming errors) is
+    fail-open -> ``"transient"``.
+
+    ``auth_type`` (keyword-only, default ``None`` = legacy behaviour) enables
+    the ADR-0028 context branch: for ``"oauth_outlook"`` an IMAP "login failed"
+    / "authenticationfailed" (without ``invalid_grant``) is TRANSIENT (rule 7b).
     """
     text, exc = _normalise(exc_or_text)
-    if _matches_transient(exc, text):
+    if _matches_transient(exc, text, auth_type=auth_type):
         return "transient"
-    if _matches_permanent(exc, text):
+    if _matches_permanent(exc, text, auth_type=auth_type):
         return "permanent"
     # Rule 10 -- fail-open.
     return "transient"
 
 
-def error_prefix(exc_or_text: object) -> str:  # noqa: PLR0911 -- one return per rule (ADR-0026 sec. 1 table)
+def error_prefix(exc_or_text: object, *, auth_type: str | None = None) -> str:  # noqa: PLR0911 -- one return per rule (ADR-0026 sec. 1 table)
     """Compute the UI prefix for ``last_sync_error`` from the SAME table.
 
     Returns one of: ``invalid_host`` | ``auth_failed`` | ``timeout`` |
     ``network`` | ``oauth_token_error`` | ``decrypt_fail`` | ``error``.
+
+    ``auth_type`` (keyword-only, default ``None`` = legacy behaviour) selects
+    the ADR-0028 rule 7b branch: an OAuth IMAP auth flake returns ``network``
+    (a transient, not the scary ``auth_failed``), checked BEFORE rule 8.
     """
     text, exc = _normalise(exc_or_text)
 
@@ -292,6 +354,11 @@ def error_prefix(exc_or_text: object) -> str:  # noqa: PLR0911 -- one return per
     # Rule 7 -- transient OAuth token errors.
     if _is_oauth_transient(exc, text):
         return "oauth_token_error"
+    # Rule 7b (ADR-0028) -- OAuth IMAP auth flake -> network (transient prefix),
+    # checked BEFORE rule 8 so an oauth_outlook "login failed" is not surfaced
+    # as auth_failed. password / None never reach this (auth_type guard).
+    if _is_oauth_imap_auth_flake(text, auth_type):
+        return "network"
     # Rule 8 -- explicit auth / account-state failures.
     if _has_any(text, _AUTH_SUBSTRINGS) or "invalid_grant" in text:
         return "auth_failed"
@@ -302,14 +369,19 @@ def error_prefix(exc_or_text: object) -> str:  # noqa: PLR0911 -- one return per
     return "error"
 
 
-def is_explicit_permanent(exc_or_text: object) -> bool:
+def is_explicit_permanent(exc_or_text: object, *, auth_type: str | None = None) -> bool:
     """True for rule 8 (auth) / rule 9 (decrypt) -- the "instant disable"
     permanents (no consecutive-failures threshold needed, ADR-0026 sec. 2/3).
 
     Only meaningful when :func:`classify` already returned ``"permanent"``.
+
+    ``auth_type`` (keyword-only, default ``None`` = legacy behaviour) feeds the
+    same transient guard: for ``"oauth_outlook"`` an IMAP auth flake matches
+    rule 7b (transient), so this returns ``False`` -- the OAuth flake can never
+    trigger an instant disable (ADR-0028 sec. 1).
     """
     text, exc = _normalise(exc_or_text)
     # An explicit permanent must not be shadowed by a transient rule.
-    if _matches_transient(exc, text):
+    if _matches_transient(exc, text, auth_type=auth_type):
         return False
-    return _matches_permanent(exc, text)
+    return _matches_permanent(exc, text, auth_type=auth_type)

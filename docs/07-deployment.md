@@ -196,7 +196,9 @@ Healthcheck не настроен — это бесконечный sleep-цик
 | `SYNC_MAX_CONSECUTIVE_FAILURES` | `3` | no | ADR-0026: порог PERMANENT-ошибок подряд → auto-disable (`ge=1, le=20`). Заменяет хардкод `_DISABLE_AFTER_FAILS`. |
 | `SYNC_MASS_FAILURE_RATIO` | `0.5` | no | ADR-0026: доля PERMANENT-падений за цикл, при которой circuit-breaker подавляет массовый disable (`ge=0.0, le=1.0`). |
 | `SYNC_MASS_FAILURE_MIN` | `5` | no | ADR-0026: минимум аккаунтов в цикле для активации circuit-breaker (`ge=1, le=10000`). |
-| `SYNC_CONNECT_RETRIES` | `2` | no | ADR-0026: повторы открытия IMAP-соединения/login на DNS/connection-ошибках, backoff 0.5s/1.0s (`ge=0, le=10`). |
+| `SYNC_CONNECT_RETRIES` | `3` | no | ADR-0026 (update): повторы открытия IMAP-соединения/login на DNS/connection-ошибках И спорадических transient IMAP-ошибках, backoff 0.5s/1.0s/2.0s (`ge=0, le=10`). Также число retry OAuth-`login failed` (ADR-0028 §3). |
+| `SYNC_TRANSIENT_SUPPRESS_MINUTES` | `60` | no | ADR-0026 (update): подавлять запись TRANSIENT `last_sync_error` в UI, если последний успешный sync был в пределах окна (`ge=0, le=10080`; `0` отключает). Распространяется на OAuth-`login failed` (ADR-0028 §6). |
+| `SYNC_OAUTH_LOGIN_FAILED_TRANSIENT` | `true` | no | ADR-0028 §7: **обязательный** kill-switch (default-on; `no` = переопределять не требуется, дефолт активирует фикс). При `true` (дефолт) IMAP-`login failed`/`authenticationfailed` у `oauth_outlook` = transient (retry + no-disable). `false` возвращает старое permanent-поведение (откат без редеплоя кода). |
 
 ### Sessions / auth
 

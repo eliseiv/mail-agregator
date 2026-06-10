@@ -127,6 +127,14 @@ class Settings(BaseSettings):
     # transient error IS written (the sync is genuinely stuck). The
     # consecutive-failures counter is never touched either way.
     SYNC_TRANSIENT_SUPPRESS_MINUTES: int = Field(default=60, ge=0, le=10_080)
+    # ADR-0028 kill-switch: when True (default), a sporadic Microsoft IMAP
+    # "login failed" / "authenticationfailed" on an ``oauth_outlook`` account is
+    # classified TRANSIENT (rule 7b) and retried instead of permanently
+    # disabling the mailbox — the refresh already proved the token valid BEFORE
+    # IMAP, so it is a server flake, not an auth failure. Set False to revert to
+    # the pre-fix behaviour (OAuth "login failed" -> permanent instant-disable)
+    # without a code redeploy. Password accounts are unaffected either way.
+    SYNC_OAUTH_LOGIN_FAILED_TRANSIENT: bool = Field(default=True)
 
     # --- Sessions / auth ---
     SESSION_TTL_SECONDS: int = Field(default=43_200, ge=60)

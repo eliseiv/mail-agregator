@@ -75,10 +75,18 @@ def _install_mailbox(
 
 
 def _set_retries(monkeypatch: pytest.MonkeyPatch, n: int) -> None:
-    """Force SYNC_CONNECT_RETRIES regardless of env/.env."""
+    """Force SYNC_CONNECT_RETRIES regardless of env/.env.
+
+    ADR-0028: ``_connect_and_login`` now also reads
+    ``SYNC_OAUTH_LOGIN_FAILED_TRANSIENT`` to gate the OAuth login-failed retry.
+    These ADR-0026 cases exercise the password / connect-flake path (where the
+    flag is irrelevant), so we pin it to the production default ``True`` to keep
+    the stub faithful and avoid an ``AttributeError`` on the new attribute.
+    """
 
     class _S:
         SYNC_CONNECT_RETRIES = n
+        SYNC_OAUTH_LOGIN_FAILED_TRANSIENT = True
 
     monkeypatch.setattr(fetcher, "get_settings", lambda: _S())
 

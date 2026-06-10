@@ -3,6 +3,7 @@
 - **Статус:** accepted
 - **Дата:** 2026-05-28
 - **Связь:** extends [ADR-0008](./ADR-0008-sync-strategy.md) (стратегия синхронизации), уточняет error-handling из [ADR-0013](./ADR-0013-concurrency-model.md). НЕ supersede.
+- **Уточнён** [ADR-0028](./ADR-0028-oauth-login-failed-transient.md) (2026-06-10): для `auth_type='oauth_outlook'` IMAP-`login failed`/`authenticationfailed` = **transient** (rule 7b, контекст по `auth_type`), не permanent — refresh подтверждает токен ДО IMAP. Таблица §1 ниже остаётся в силе для password-аккаунтов; OAuth-ветка — в ADR-0028 §1.
 
 ---
 
@@ -100,7 +101,8 @@ def error_prefix(exc_or_text) -> str   # UI-текст: "invalid_host" | "auth_f
 | 5 | `isinstance(exc, (ConnectionError, ssl.SSLError))` ; либо подстрока `connection refused` / `connection reset` / `broken pipe` / `network is unreachable` / `no route to host` / `ssl` | transient | `network` |
 | 6 | `isinstance(exc, OSError)` с сетевым `errno` (`ECONNREFUSED, ECONNRESET, ETIMEDOUT, EHOSTUNREACH, ENETUNREACH, EPIPE`) | transient | `network` |
 | 7 | OAuth: httpx `5xx` / `429` / network-исключение httpx (см. `oauth.service.OAuthError` с соответствующим `code`). Worker оборачивает в `oauth_token_error: <code>`; подстроки rule 7: `5xx` / `429` / `token_network` / `network` / `timeout` / `unexpected` / `oauth_exchange_failed`. `oauth_exchange_failed` — это `OAuthError.code` для ЛЮБОГО non-200 от Microsoft, кроме `invalid_grant` (реальный провайдерский 5xx/429/non-JSON на refresh-пути). `invalid_grant` сюда НЕ попадает (поднимается как `OAuthRefreshInvalidError` → clean skip; если текст всё же встретится — ловится rule 8, permanent) — поэтому голый маркер-префикс `oauth_token_error` в подстроки rule 7 НЕ добавляется. | transient | `oauth_token_error` |
-| 8 | подстрока `authenticationfailed` / `invalid credentials` / `login failed` / `[alert]` / `account is disabled` / `account has been blocked` ; либо oauth `invalid_grant` | **permanent** | `auth_failed` |
+| 7b | **(ADR-0028)** `auth_type=='oauth_outlook'` И подстрока `login failed` / `authenticationfailed` И НЕ `invalid_grant` — спорадик Microsoft на валидном XOAUTH2 (refresh подтверждён ДО IMAP). Только для OAuth-контекста; для password/None не активируется. | transient | `network` |
+| 8 | подстрока `authenticationfailed` / `invalid credentials` / `login failed` / `[alert]` / `account is disabled` / `account has been blocked` ; либо oauth `invalid_grant`. **Для `oauth_outlook` `login failed`/`authenticationfailed` перехватываются rule 7b (ADR-0028) — сюда у OAuth доходят только `invalid_grant` / `invalid credentials` / disabled / blocked.** | **permanent** | `auth_failed` |
 | 9 | decrypt-fail (`InvalidTag`, `AssertionError` при `decrypt_mail_password`) | **permanent** | `decrypt_fail` |
 | 10 | всё остальное (нераспознанное — **в т.ч. программные исключения** `TypeError`/`KeyError`/`AttributeError`/`ValueError`, не входящие в network/IMAP/OAuth-наборы выше) | **transient** (fail-open) | `error` |
 
@@ -297,6 +299,12 @@ sync_one_account(...) -> tuple[int, int, AccountSyncOutcome]   # (new, conflicts
 сначала исключает permanent-маркеры (`authenticationfailed` / `login failed` / `invalid credentials` /
 `account is disabled` / `account has been blocked`) и только потом проверяет transient-подстроки. Так
 `AUTHENTICATIONFAILED` никогда не матчит широкое `not connected` и propagate'ится как permanent.
+
+> **Уточнение [ADR-0028](./ADR-0028-oauth-login-failed-transient.md):** для **XOAUTH2-пути**
+> (`access_token is not None`, `auth_type='oauth_outlook'`) `login failed` / `authenticationfailed`
+> **ретраятся** (`_is_retryable_imap_error(exc, oauth=True)` исключает их из permanent-набора и
+> добавляет в retryable) — это спорадик Microsoft на валидном токене, не реальный auth-fail. Для
+> **password-пути** поведение этого абзаца неизменно (login failed = неверный пароль = не ретраим).
 
 Единичный DNS-глюк / спорадик не должен становиться ошибкой вообще.
 

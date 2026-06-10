@@ -416,6 +416,24 @@ async def sync_one_account(
 # ---------------------------------------------------------------------------
 
 
+def _classifier_auth_type(account: MailAccount) -> str | None:
+    """Return the ``auth_type`` to hand to the error classifier (ADR-0028).
+
+    Normally the account's own ``auth_type``. The
+    ``SYNC_OAUTH_LOGIN_FAILED_TRANSIENT`` kill-switch (default True) gates the
+    OAuth rule 7b: when it is False we pass ``None`` for ``oauth_outlook``
+    accounts so the classifier falls back to the legacy permanent path for an
+    IMAP "login failed" (no code redeploy needed to revert). Password accounts
+    are unaffected — their ``auth_type`` never triggers rule 7b anyway.
+    """
+    if (
+        account.auth_type == "oauth_outlook"
+        and not get_settings().SYNC_OAUTH_LOGIN_FAILED_TRANSIENT
+    ):
+        return None
+    return account.auth_type
+
+
 async def _handle_sync_error(
     account: MailAccount,
     exc: BaseException,
@@ -432,9 +450,16 @@ async def _handle_sync_error(
     ``last_sync_error`` too (so the operator always sees the cause even when the
     breaker later suppresses the disable), but the bump/disable itself happens in
     phase 2 under the circuit-breaker decision.
+
+    ADR-0028: the account's ``auth_type`` is forwarded to the classifier so an
+    IMAP "login failed" on an ``oauth_outlook`` account is treated as a
+    transient Microsoft flake (rule 7b), not a permanent instant-disable. The
+    ``SYNC_OAUTH_LOGIN_FAILED_TRANSIENT`` kill-switch reverts to the legacy
+    behaviour by passing ``auth_type=None`` (the classifier stays pure).
     """
-    cls = classify(exc)
-    prefix = error_prefix(exc)
+    auth_type = _classifier_auth_type(account)
+    cls = classify(exc, auth_type=auth_type)
+    prefix = error_prefix(exc, auth_type=auth_type)
     detail_clean = detail.replace("\r", " ").replace("\n", " ")[:200]
     error_text = f"{prefix}: {detail_clean}"
 
@@ -489,7 +514,7 @@ async def _handle_sync_error(
         outcome="permanent",
         error=error_text,
         prefix=prefix,
-        explicit_permanent=is_explicit_permanent(exc),
+        explicit_permanent=is_explicit_permanent(exc, auth_type=auth_type),
     )
 
 

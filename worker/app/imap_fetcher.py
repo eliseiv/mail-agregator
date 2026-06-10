@@ -66,12 +66,34 @@ _RETRYABLE_IMAP_SUBSTRINGS: tuple[str, ...] = (
 # matches the broad "not connected" family. (``"authenticated but not
 # connected"`` contains "authenticated" but is NOT one of these — order +
 # specificity keep them apart.)
-_PERMANENT_IMAP_SUBSTRINGS: tuple[str, ...] = (
+#
+# ADR-0028 splits this into a PASSWORD set (unchanged — a wrong password is a
+# real permanent failure, never retried) and an OAUTH set that DROPS
+# "login failed" / "authenticationfailed": on the XOAUTH2 path the refresh
+# already proved the token valid BEFORE IMAP, so those are Microsoft server
+# flakes worth retrying (they live in ``_RETRYABLE_IMAP_SUBSTRINGS_OAUTH``).
+_PERMANENT_IMAP_SUBSTRINGS_PASSWORD: tuple[str, ...] = (
     "authenticationfailed",
     "login failed",
     "invalid credentials",
     "account is disabled",
     "account has been blocked",
+)
+# OAUTH path: "login failed" / "authenticationfailed" removed (they are flakes
+# we retry). A disabled / blocked mailbox is still genuinely permanent, as is
+# "invalid credentials" (an OAuth account should never raise it, but if it does
+# it is not a refresh-verified flake).
+_PERMANENT_IMAP_SUBSTRINGS_OAUTH: tuple[str, ...] = (
+    "invalid credentials",
+    "account is disabled",
+    "account has been blocked",
+)
+# Retryable transient IMAP substrings for the OAUTH path = the base transient
+# set plus the OAuth auth flakes (ADR-0028 rule 7b mirror).
+_RETRYABLE_IMAP_SUBSTRINGS_OAUTH: tuple[str, ...] = (
+    *_RETRYABLE_IMAP_SUBSTRINGS,
+    "login failed",
+    "authenticationfailed",
 )
 
 
@@ -92,27 +114,37 @@ def _is_retryable_connect_error(exc: BaseException) -> bool:
     return False
 
 
-def _is_retryable_imap_error(exc: BaseException) -> bool:
+def _is_retryable_imap_error(exc: BaseException, *, oauth: bool = False) -> bool:
     """True for SPORADIC transient IMAP errors worth an in-cycle retry.
 
     Only ``imaplib.IMAP4.error`` / ``imaplib.IMAP4.abort`` instances qualify
     (these wrap an IMAP ``NO``/``BAD`` reply or a dropped server connection).
-    Real auth failures (``AUTHENTICATIONFAILED`` / ``LOGIN failed`` / invalid
-    credentials / disabled account) are explicitly EXCLUDED — they are
-    permanent and must propagate so the classifier disables the account; a
-    retry there only wastes the cycle budget.
 
-    The canonical case (ADR-0026 update) is Microsoft personal Outlook IMAP
-    returning ``User is authenticated but not connected`` on a healthy mailbox:
-    it is transient (the next attempt succeeds), so we retry it.
+    ``oauth`` (keyword-only, default ``False``) selects the substring sets
+    (ADR-0028):
+
+    * ``oauth=False`` (password path, default — UNCHANGED): real auth failures
+      (``AUTHENTICATIONFAILED`` / ``LOGIN failed`` / invalid credentials /
+      disabled account) are EXCLUDED from retry — a wrong password is permanent
+      and must propagate so the classifier disables the account.
+    * ``oauth=True`` (XOAUTH2 path): "login failed" / "authenticationfailed" are
+      treated as Microsoft server flakes and RETRIED (the refresh proved the
+      token valid before IMAP — see ADR-0028). Only disabled / blocked / invalid
+      credentials stay permanent.
+
+    The canonical password-path case (ADR-0026 update) is Microsoft personal
+    Outlook IMAP returning ``User is authenticated but not connected`` on a
+    healthy mailbox: it is transient (the next attempt succeeds), so we retry it.
     """
     if not isinstance(exc, imaplib.IMAP4.error | imaplib.IMAP4.abort):
         return False
+    permanent = _PERMANENT_IMAP_SUBSTRINGS_OAUTH if oauth else _PERMANENT_IMAP_SUBSTRINGS_PASSWORD
+    retryable = _RETRYABLE_IMAP_SUBSTRINGS_OAUTH if oauth else _RETRYABLE_IMAP_SUBSTRINGS
     text = str(exc).lower()
     # Permanent auth/account-state markers win — never retry these.
-    if any(needle in text for needle in _PERMANENT_IMAP_SUBSTRINGS):
+    if any(needle in text for needle in permanent):
         return False
-    return any(needle in text for needle in _RETRYABLE_IMAP_SUBSTRINGS)
+    return any(needle in text for needle in retryable)
 
 
 @dataclass(slots=True)
@@ -291,7 +323,12 @@ def _connect_and_login(
     credentials / disabled account) propagate immediately (no retry). On success
     the open, authenticated mailbox is returned (caller owns logout).
     """
-    retries = get_settings().SYNC_CONNECT_RETRIES
+    settings = get_settings()
+    retries = settings.SYNC_CONNECT_RETRIES
+    # ADR-0028 §3: on the XOAUTH2 path an IMAP "login failed" is a Microsoft
+    # flake worth retrying (refresh proved the token valid). Gated by the
+    # kill-switch so retry behaviour reverts together with classification.
+    oauth = access_token is not None and settings.SYNC_OAUTH_LOGIN_FAILED_TRANSIENT
     attempt = 0
     while True:
         mailbox = _open_mailbox(host=host, port=port, ssl_on=ssl_on, timeout=timeout)
@@ -307,7 +344,9 @@ def _connect_and_login(
             # Best-effort close the half-open socket before retrying.
             with contextlib.suppress(Exception):
                 mailbox.logout()
-            retryable = _is_retryable_connect_error(exc) or _is_retryable_imap_error(exc)
+            retryable = _is_retryable_connect_error(exc) or _is_retryable_imap_error(
+                exc, oauth=oauth
+            )
             if attempt >= retries or not retryable:
                 raise
             backoff = _RETRY_BACKOFFS[min(attempt, len(_RETRY_BACKOFFS) - 1)]
