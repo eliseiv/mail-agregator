@@ -64,7 +64,10 @@ from backend.app.repositories.telegram_links import TelegramLinksRepo
 from backend.app.repositories.users import UsersRepo
 from backend.app.sessions import SessionStore
 from backend.app.telegram.bot import handle_update
-from backend.app.telegram.callback_handler import handle_callback_query
+from backend.app.telegram.callback_handler import (
+    handle_callback_query,
+    handle_push_callback_query,
+)
 from backend.app.telegram.schemas import (
     TelegramAuthRequest,
     TelegramAuthResponse,
@@ -171,6 +174,78 @@ async def telegram_webhook(secret: str, request: Request, db: DbSession) -> Resp
         return Response(status_code=200)
 
     await handle_update(update)
+    return Response(status_code=200)
+
+
+@router.post("/api/telegram/push-webhook/{bot_name}")
+async def telegram_push_webhook(bot_name: str, request: Request, db: DbSession) -> Response:
+    """Push-only per-team bot webhook (ADR-0027 round-42 §10).
+
+    Symmetric to :func:`telegram_webhook` but with three narrowings:
+
+    1. Routed by ``bot_name`` (``ivan`` / ``alexandra`` / ``andrei``).
+    2. The secret lives **only** in the ``X-Telegram-Bot-Api-Secret-Token``
+       header (header-only transport — Q-0027-1, the default). FAIL-CLOSED:
+       a missing OR mismatched header is rejected as ``not_found`` — unlike
+       the main webhook there is no URL-path secret to fall back on, so the
+       header is the single proof and its absence is a failure, not tolerance.
+    3. Only ``callback_query`` updates are handled; ``/start`` / ``message`` /
+       anything else is ignored with a 200 (push bots are not launchers).
+
+    Unknown / unconfigured ``bot_name`` (no ``webhook_secret``) and a bad
+    secret both return ``not_found`` (404-equivalent, unenumerable — STRIDE-S,
+    ``docs/06-security.md`` §1.12). Always returns 200 on a valid secret so
+    Telegram drops the update from its retry queue.
+    """
+    # Rate-limit FIRST (spoofed-flood defence) — same bucket as the main
+    # webhook, before any secret work.
+    await consume(_LIMIT_TG_WEBHOOK, f"ip:{client_ip(request)}")
+
+    settings = get_settings()
+
+    # Route by name to a CONFIGURED bot (token + group_id) that also has a
+    # non-empty webhook_secret. ``None`` -> not_found (unconfigured /
+    # unknown name is indistinguishable from a wrong secret — STRIDE-S).
+    bot = next(
+        (b for b in settings.push_team_bots if b.name == bot_name and b.webhook_secret),
+        None,
+    )
+    if bot is None:
+        log.info("push_webhook_unknown_or_unconfigured_bot")
+        raise NotFoundError()
+
+    # Header-only secret check. FAIL-CLOSED: absence is a failure (unlike the
+    # main webhook, which tolerates a missing header because the URL-path
+    # secret already proved the caller). ``_secret_matches`` is constant-time
+    # and returns False for an empty ``provided``.
+    header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not _secret_matches(header_secret, bot.webhook_secret):
+        log.info("push_webhook_invalid_secret", bot=bot.name)
+        raise NotFoundError()
+
+    # Body parse — malformed JSON / invalid update → log + 200 (drop from
+    # Telegram's retry queue), exactly like the main webhook.
+    try:
+        body = await request.json()
+    except ValueError:
+        log.warning("push_webhook_invalid_json", bot=bot.name)
+        return Response(status_code=200)
+
+    try:
+        update = TelegramUpdate.model_validate(body)
+    except PydanticValidationError:
+        top_keys = sorted(body.keys()) if isinstance(body, dict) else []
+        log.warning("push_webhook_invalid_update", bot=bot.name, top_keys=top_keys)
+        return Response(status_code=200)
+
+    # Push bots accept ONLY callback_query. Any other update (message,
+    # /start, edited_message, …) is silently dropped (200) — inbound surface
+    # is reduced to a single update type (ADR-0027 §10).
+    if update.callback_query is None:
+        log.info("push_webhook_ignored_non_callback", bot=bot.name)
+        return Response(status_code=200)
+
+    await handle_push_callback_query(update.callback_query, bot, db)
     return Response(status_code=200)
 
 

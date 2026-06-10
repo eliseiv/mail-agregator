@@ -51,7 +51,13 @@ EXEMPT_PATHS: frozenset[str] = frozenset(
 # - ``/api/telegram/webhook/`` (ADR-0018): Telegram webhook; no user session
 #   exists, secret-in-URL + ``X-Telegram-Bot-Api-Secret-Token`` header are
 #   the proof-of-Telegram (see ``backend/app/telegram/router.py``).
-EXEMPT_PATH_PREFIXES: tuple[str, ...] = ("/api/telegram/webhook/",)
+# - ``/api/telegram/push-webhook/`` (ADR-0027 §10, round-42): push-only per-team
+#   bot webhook; no user session, per-bot ``X-Telegram-Bot-Api-Secret-Token``
+#   header is the proof-of-Telegram.
+EXEMPT_PATH_PREFIXES: tuple[str, ...] = (
+    "/api/telegram/webhook/",
+    "/api/telegram/push-webhook/",
+)
 
 
 def _is_exempt(path: str) -> bool:

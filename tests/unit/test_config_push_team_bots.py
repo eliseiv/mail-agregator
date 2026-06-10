@@ -105,7 +105,9 @@ class TestPushTeamBotsMatrix:
             BOT_IVAN_GROUP_ID=1,
             ADMIN_TELEGRAM_IDS=_ADMINS,
         )
-        assert s.push_team_bots == [PushTeamBot(name="ivan", token="IVAN_TOK", group_id=1)]
+        assert s.push_team_bots == [
+            PushTeamBot(name="ivan", token="IVAN_TOK", group_id=1, webhook_secret="")
+        ]
 
     def test_all_three_configured_distinct_groups(self) -> None:
         s = _settings(
@@ -118,9 +120,9 @@ class TestPushTeamBotsMatrix:
             ADMIN_TELEGRAM_IDS=_ADMINS,
         )
         assert s.push_team_bots == [
-            PushTeamBot(name="ivan", token="A", group_id=1),
-            PushTeamBot(name="alexandra", token="B", group_id=2),
-            PushTeamBot(name="andrei", token="C", group_id=3),
+            PushTeamBot(name="ivan", token="A", group_id=1, webhook_secret=""),
+            PushTeamBot(name="alexandra", token="B", group_id=2, webhook_secret=""),
+            PushTeamBot(name="andrei", token="C", group_id=3, webhook_secret=""),
         ]
 
     def test_partially_configured_only_returns_configured(self) -> None:
@@ -144,6 +146,63 @@ class TestPushTeamBotsMatrix:
             ADMIN_TELEGRAM_IDS="",
         )
         assert s.push_team_bots == []
+
+
+# ---------------------------------------------------------------------------
+# round-42 (ADR-0027 §2/§7/§10) — webhook_secret field on PushTeamBot
+# ---------------------------------------------------------------------------
+
+
+class TestPushTeamBotWebhookSecret:
+    def test_secret_is_carried_through_to_push_team_bot(self) -> None:
+        s = _settings(
+            BOT_IVAN_TOKEN="IVAN_TOK",
+            BOT_IVAN_GROUP_ID=1,
+            BOT_IVAN_WEBHOOK_SECRET="deadbeefdeadbeefdeadbeefdeadbeef",
+            ADMIN_TELEGRAM_IDS=_ADMINS,
+        )
+        assert s.push_team_bots == [
+            PushTeamBot(
+                name="ivan",
+                token="IVAN_TOK",
+                group_id=1,
+                webhook_secret="deadbeefdeadbeefdeadbeefdeadbeef",
+            )
+        ]
+
+    def test_bot_stays_in_list_with_empty_secret(self) -> None:
+        # A configured bot with NO webhook secret is still materialised — it
+        # still delivers notifications; only the callback button + push-webhook
+        # route deactivate (graceful degradation, ADR-0027 §2/§7 round-42).
+        s = _settings(
+            BOT_IVAN_TOKEN="IVAN_TOK",
+            BOT_IVAN_GROUP_ID=1,
+            BOT_IVAN_WEBHOOK_SECRET="",
+            ADMIN_TELEGRAM_IDS=_ADMINS,
+        )
+        ivan = next(b for b in s.push_team_bots if b.name == "ivan")
+        assert ivan.webhook_secret == ""
+
+    def test_with_button_predicate_matches_bool_secret(self) -> None:
+        # ADR-0027 §7: the dispatcher attaches the button iff bool(secret).
+        # We assert the predicate the worker uses (``with_button = bool(secret)``)
+        # tracks the config exactly: empty -> no button, set -> button.
+        empty = _settings(
+            BOT_IVAN_TOKEN="IVAN_TOK",
+            BOT_IVAN_GROUP_ID=1,
+            BOT_IVAN_WEBHOOK_SECRET="",
+            ADMIN_TELEGRAM_IDS=_ADMINS,
+        )
+        filled = _settings(
+            BOT_IVAN_TOKEN="IVAN_TOK",
+            BOT_IVAN_GROUP_ID=1,
+            BOT_IVAN_WEBHOOK_SECRET="abc123",
+            ADMIN_TELEGRAM_IDS=_ADMINS,
+        )
+        empty_bot = next(b for b in empty.push_team_bots if b.name == "ivan")
+        filled_bot = next(b for b in filled.push_team_bots if b.name == "ivan")
+        assert bool(empty_bot.webhook_secret) is False
+        assert bool(filled_bot.webhook_secret) is True
 
 
 # ---------------------------------------------------------------------------

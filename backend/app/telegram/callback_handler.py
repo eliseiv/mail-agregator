@@ -40,6 +40,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.deps import build_scope
 from backend.app.exceptions import NotFoundError
 from backend.app.messages.service import MessageService
+from backend.app.repositories.mail_accounts import MailAccountsRepo
 from backend.app.repositories.telegram_links import TelegramLinksRepo
 from backend.app.repositories.users import UsersRepo
 from backend.app.telegram.bot import (
@@ -47,6 +48,7 @@ from backend.app.telegram.bot import (
     send_html_message,
 )
 from backend.app.telegram.schemas import TelegramCallbackQuery
+from shared.config import PushTeamBot, get_settings
 from shared.html_sanitize import (
     collapse_blank_lines_tg,
     linkify_plain_text,
@@ -54,6 +56,7 @@ from shared.html_sanitize import (
     strip_invisible_padding,
 )
 from shared.logging import get_logger
+from shared.models import Message
 
 log = get_logger(__name__)
 
@@ -280,3 +283,163 @@ async def handle_callback_query(
     # Step 6: clear the spinner. No text → silent ack (the body is
     # already in the chat as a regular message above).
     await answer_callback_query(callback_id)
+
+
+async def handle_push_callback_query(
+    query: TelegramCallbackQuery,
+    bot: PushTeamBot,
+    db: AsyncSession,
+) -> None:
+    """Process a callback_query from a push-only per-team bot (ADR-0027 §11).
+
+    This is a **separate** path from :func:`handle_callback_query`: push bots
+    have no ``telegram_links``/visibility model. Authorisation is membership
+    in ``settings.admin_telegram_ids`` (from ``.env``) plus a DEFENSIVE
+    group-match — the loaded message must belong to ``bot.group_id`` so an
+    admin of team X cannot pull a team-Y message by forging ``msg:{id}``
+    through bot X's webhook.
+
+    Every reply (body chunks + the final ack) is sent with **this bot's**
+    token (``bot.token``), not the main ``BOT_TOKEN``.
+
+    Like the main callback, this never raises — the webhook returns 200 to
+    Telegram regardless. The DB is read-only (``Message`` / ``MailAccount``).
+    """
+    callback_id = query.id
+    data = query.data or ""
+    settings = get_settings()
+
+    # Step 1: validate the callback_data payload shape (reuse the contract).
+    match = _CALLBACK_PATTERN.match(data)
+    if match is None:
+        log.info(
+            "push_callback_invalid_data",
+            data_excerpt=data[:64],
+            bot=bot.name,
+            telegram_user_id=query.from_.id,
+        )
+        await answer_callback_query(
+            callback_id,
+            text="Неподдерживаемое действие.",
+            show_alert=False,
+            bot_token=bot.token,
+        )
+        return
+    message_id = int(match.group(1))
+
+    # Step 2: authorise the tapper — must be a configured push admin. This is
+    # the key difference from the main callback: rights = membership in
+    # ``admin_telegram_ids``, NOT telegram_links → user → visibility. ``from.id``
+    # is signed by Telegram (proven before the webhook).
+    telegram_user_id = query.from_.id
+    if telegram_user_id not in settings.admin_telegram_ids:
+        log.info(
+            "push_callback_not_admin",
+            bot=bot.name,
+            telegram_user_id=telegram_user_id,
+            message_id=message_id,
+        )
+        await answer_callback_query(
+            callback_id,
+            text="Нет доступа.",
+            show_alert=True,
+            bot_token=bot.token,
+        )
+        return
+
+    # Step 3: resolve the chat to reply into. For a private chat with the bot
+    # ``message.chat.id`` equals ``from.id``; ``message`` can be absent for very
+    # old messages, in which case we can ack but cannot reply.
+    if query.message is None or query.message.chat is None:
+        log.warning(
+            "push_callback_no_chat",
+            bot=bot.name,
+            telegram_user_id=telegram_user_id,
+            message_id=message_id,
+        )
+        await answer_callback_query(
+            callback_id,
+            text="Не удалось ответить в чат.",
+            bot_token=bot.token,
+        )
+        return
+    chat_id = query.message.chat.id
+
+    # Step 4: load the message + account (unscoped — push uses group-match,
+    # not per-user visibility).
+    message = await db.get(Message, message_id)
+    if message is None:
+        log.info(
+            "push_callback_message_missing",
+            bot=bot.name,
+            telegram_user_id=telegram_user_id,
+            message_id=message_id,
+        )
+        await answer_callback_query(
+            callback_id,
+            text="Сообщение больше не доступно.",
+            show_alert=True,
+            bot_token=bot.token,
+        )
+        return
+
+    account = await MailAccountsRepo(db).get_by_id(message.mail_account_id)
+    if account is None:
+        log.info(
+            "push_callback_account_missing",
+            bot=bot.name,
+            telegram_user_id=telegram_user_id,
+            message_id=message_id,
+            mail_account_id=message.mail_account_id,
+        )
+        await answer_callback_query(
+            callback_id,
+            text="Сообщение больше не доступно.",
+            show_alert=True,
+            bot_token=bot.token,
+        )
+        return
+
+    # Step 5: DEFENSIVE group-match — the message must belong to THIS bot's
+    # team. Blocks an admin forging ``msg:{id}`` of another team's message
+    # through this bot's webhook (ADR-0027 §11).
+    if account.group_id != bot.group_id:
+        log.info(
+            "push_callback_group_mismatch",
+            bot=bot.name,
+            telegram_user_id=telegram_user_id,
+            message_id=message_id,
+            bot_group_id=bot.group_id,
+            account_group_id=account.group_id,
+        )
+        await answer_callback_query(
+            callback_id,
+            text="Сообщение недоступно.",
+            show_alert=True,
+            bot_token=bot.token,
+        )
+        return
+
+    # Step 6: build + send the full body using the SAME formatter / splitter
+    # as the main callback (round-39/41 sanitize). Reply with this bot's token.
+    from_label = message.from_name or message.from_addr
+    text_html = _format_message_body(
+        subject=message.subject,
+        from_label=from_label,
+        body_text=message.body_text or "",
+        body_html=message.body_html,
+    )
+    chunks = _split_for_telegram(text_html)
+    for chunk in chunks:
+        await send_html_message(chat_id, chunk, bot_token=bot.token)
+
+    log.info(
+        "push_callback_message_sent",
+        bot=bot.name,
+        telegram_user_id=telegram_user_id,
+        message_id=message_id,
+        chunks=len(chunks),
+    )
+
+    # Step 7: silent ack (body already delivered) — via this bot.
+    await answer_callback_query(callback_id, bot_token=bot.token)

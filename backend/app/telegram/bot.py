@@ -75,14 +75,18 @@ def _api_url(method: str, *, token: str | None = None) -> str:
     return f"https://api.telegram.org/bot{tok}/{method}"
 
 
-async def _post_send_message(payload: dict[str, Any]) -> None:
+async def _post_send_message(payload: dict[str, Any], *, bot_token: str | None = None) -> None:
     """POST ``sendMessage`` and absorb any failure as a warning.
 
     Why swallow: see module docstring — webhook must always return 200.
+
+    ``bot_token`` (ADR-0027 §11): when ``None`` (default) the main bot
+    (``BOT_TOKEN``) is used; push-only per-team bots pass their own token so
+    the reply is sent through the same bot that rendered the callback button.
     """
     try:
         async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_SECONDS) as client:
-            resp = await client.post(_api_url("sendMessage"), json=payload)
+            resp = await client.post(_api_url("sendMessage", token=bot_token), json=payload)
     except httpx.HTTPError as exc:
         # Network-level failure (timeout, DNS, TLS, etc.) — log and move on.
         log.warning(
@@ -134,7 +138,7 @@ async def send_message(chat_id: int, text: str) -> None:
     await _post_send_message({"chat_id": chat_id, "text": text})
 
 
-async def send_html_message(chat_id: int, text_html: str) -> None:
+async def send_html_message(chat_id: int, text_html: str, *, bot_token: str | None = None) -> None:
     """Send an HTML-formatted message (parse_mode=HTML) to ``chat_id``.
 
     Used by the callback-query handler (bug-fix #5) to deliver the full
@@ -142,6 +146,10 @@ async def send_html_message(chat_id: int, text_html: str) -> None:
     body often contains URLs we don't want auto-expanded. Network /
     Bot-API failures are absorbed as warnings — the webhook must return
     200 to Telegram regardless.
+
+    ``bot_token`` (ADR-0027 §11): when ``None`` (default) the main bot
+    sends; push-callback (``handle_push_callback_query``) passes the
+    per-team bot token so the body lands via the same bot.
     """
     await _post_send_message(
         {
@@ -149,7 +157,8 @@ async def send_html_message(chat_id: int, text_html: str) -> None:
             "text": text_html,
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
-        }
+        },
+        bot_token=bot_token,
     )
 
 
@@ -158,6 +167,7 @@ async def answer_callback_query(
     *,
     text: str | None = None,
     show_alert: bool = False,
+    bot_token: str | None = None,
 ) -> None:
     """POST ``answerCallbackQuery`` for ``callback_query_id``.
 
@@ -166,6 +176,10 @@ async def answer_callback_query(
     button they tapped. ``text`` is optional (None → just dismiss the
     spinner); ``show_alert=True`` pops a modal instead of a transient
     toast (used for error feedback like "session expired").
+
+    ``bot_token`` (ADR-0027 §11): when ``None`` (default) the main bot
+    acknowledges; push-callback passes the per-team bot token so the ack
+    is sent through the same bot that owns the callback_query.
 
     Errors are swallowed at warning level for the same reason as
     :func:`_post_send_message` — the webhook must return 200.
@@ -179,7 +193,7 @@ async def answer_callback_query(
         payload["show_alert"] = True
     try:
         async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_SECONDS) as client:
-            resp = await client.post(_api_url("answerCallbackQuery"), json=payload)
+            resp = await client.post(_api_url("answerCallbackQuery", token=bot_token), json=payload)
     except httpx.HTTPError as exc:
         log.warning(
             "telegram_answer_callback_network_error",

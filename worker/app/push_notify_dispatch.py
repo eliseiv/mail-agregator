@@ -172,13 +172,18 @@ async def _dispatch_one(raw: str) -> None:
 
     # Fire-and-forget delivery: NO DB writes, NO reserve/mark_sent, NO recovery
     # or re-enqueue (ADR-0027 §5). Outcomes are only logged.
+    # round-42 (ADR-0027 §7): attach the «Посмотреть сообщение» button only
+    # when this bot has a webhook_secret — otherwise the callback msg:{id}
+    # would have no push-webhook to land on (a hung spinner). Graceful
+    # degradation: an unconfigured secret simply sends without the button.
+    with_button = bool(bot.webhook_secret)
     for admin_id in settings.admin_telegram_ids:
         outcome = await send_notification(
             chat_id=admin_id,
             text_html=text_html,
             message_id=payload.message_id,
             bot_token=bot.token,
-            with_button=False,
+            with_button=with_button,
         )
         if outcome.kind == "ok":
             log.info(

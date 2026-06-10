@@ -33,11 +33,19 @@ class PushTeamBot:
     team's ``mail_accounts.group_id`` (ADR-0019) this bot is bound to. Only
     fully-configured bots (non-empty token AND ``group_id > 0``) are
     materialised — see :pyattr:`Settings.push_team_bots`.
+
+    ``webhook_secret`` (round-42, ADR-0027 §2/§10) is the per-bot secret that
+    authenticates the push-webhook (``X-Telegram-Bot-Api-Secret-Token`` header)
+    and gates the «Посмотреть сообщение» callback button. It may be ``""``:
+    the bot still delivers notifications (worker ignores this field), but
+    without a button (the callback would have no webhook to land on — see
+    :pyattr:`Settings.push_team_bots` / ``worker.app.push_notify_dispatch``).
     """
 
     name: str
     token: str
     group_id: int
+    webhook_secret: str
 
 
 class Settings(BaseSettings):
@@ -187,10 +195,17 @@ class Settings(BaseSettings):
     # ivan=1, alexandra=2, andrei=3.
     BOT_IVAN_TOKEN: str = ""
     BOT_IVAN_GROUP_ID: int = Field(default=0, ge=0)
+    # round-42 (ADR-0027 §2/§10): per-bot webhook secret (32 hex,
+    # ``openssl rand -hex 16``). Authenticates the push-webhook header and
+    # enables the callback button. Empty -> bot delivers without a button.
+    # Marked redact in ``shared/logging.py`` alongside the tokens.
+    BOT_IVAN_WEBHOOK_SECRET: str = ""
     BOT_ALEXANDRA_TOKEN: str = ""
     BOT_ALEXANDRA_GROUP_ID: int = Field(default=0, ge=0)
+    BOT_ALEXANDRA_WEBHOOK_SECRET: str = ""
     BOT_ANDREI_TOKEN: str = ""
     BOT_ANDREI_GROUP_ID: int = Field(default=0, ge=0)
+    BOT_ANDREI_WEBHOOK_SECRET: str = ""
     # CSV of the two fixed administrator Telegram chat ids that every
     # push-bot delivers to (e.g. ``11111111,22222222``). Not a secret
     # (chat ids), but parsed defensively — see ``admin_telegram_ids``.
@@ -359,17 +374,39 @@ class Settings(BaseSettings):
         ``group_id`` is positive. If ``admin_telegram_ids`` is empty an empty
         list is returned — a bot with no recipients is meaningless, so the
         whole channel stays off.
+
+        round-42 (ADR-0027 §2): each bot also carries its ``webhook_secret``.
+        A bot stays in the list even with an empty ``webhook_secret`` — it is
+        still needed for delivery; the callback button (and the push-webhook
+        route, §10) only activate when the secret is non-empty.
         """
         if not self.admin_telegram_ids:
             return []
         bots: list[PushTeamBot] = []
-        for name, token, group_id in (
-            ("ivan", self.BOT_IVAN_TOKEN, self.BOT_IVAN_GROUP_ID),
-            ("alexandra", self.BOT_ALEXANDRA_TOKEN, self.BOT_ALEXANDRA_GROUP_ID),
-            ("andrei", self.BOT_ANDREI_TOKEN, self.BOT_ANDREI_GROUP_ID),
+        for name, token, group_id, webhook_secret in (
+            ("ivan", self.BOT_IVAN_TOKEN, self.BOT_IVAN_GROUP_ID, self.BOT_IVAN_WEBHOOK_SECRET),
+            (
+                "alexandra",
+                self.BOT_ALEXANDRA_TOKEN,
+                self.BOT_ALEXANDRA_GROUP_ID,
+                self.BOT_ALEXANDRA_WEBHOOK_SECRET,
+            ),
+            (
+                "andrei",
+                self.BOT_ANDREI_TOKEN,
+                self.BOT_ANDREI_GROUP_ID,
+                self.BOT_ANDREI_WEBHOOK_SECRET,
+            ),
         ):
             if token and group_id > 0:
-                bots.append(PushTeamBot(name=name, token=token, group_id=group_id))
+                bots.append(
+                    PushTeamBot(
+                        name=name,
+                        token=token,
+                        group_id=group_id,
+                        webhook_secret=webhook_secret,
+                    )
+                )
         return bots
 
     @property

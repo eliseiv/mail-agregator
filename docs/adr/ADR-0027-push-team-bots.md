@@ -3,8 +3,10 @@
 | | |
 | --- | --- |
 | Статус | accepted |
-| Дата | 2026-06-09 |
+| Дата | 2026-06-09 (round-42: добавлен webhook + callback-кнопка push-ботам) |
 | Заменяет / отменён | нет; **расширяет** ADR-0022 §2 (push-уведомления) — добавляет параллельный, упрощённый канал доставки. Не трогает основной бот (`BOT_TOKEN`). |
+
+> **Round-42 update.** Исходная редакция (round-31) слала push-уведомления **без** inline-кнопки «Посмотреть сообщение» (`with_button=False`), потому что у push-ботов не было webhook и callback `msg:{id}` некому было обработать. **Подтверждено** (round-42): webhook на `postapp.store` достижим для Telegram-инфраструктуры (основной бот webhook `…/webhook/{secret}` работает: Telegram резолвит `postapp.store → 132.243.113.117`, `pending=0`, без ошибок; DNS-парковка ломает только браузеры). Поэтому push-боты теперь **получают собственный webhook + callback-кнопку**: §7 пересмотрен (`with_button=True`), добавлен §10 (webhook + callback-маршрут push-ботов) и §11 (авторизация push-callback по `admin_telegram_ids` + group-match). TD-041 (fire-and-forget доставки уведомлений) **не меняется** — webhook касается только inbound-callback, не исходящей доставки.
 
 ## Context
 
@@ -19,7 +21,9 @@
 - Bot-API клиент — `backend/app/telegram/bot.py::send_notification` (использует токен из `settings.BOT_TOKEN` через `_api_url`).
 - Bot-токен маскируется в логах через `REDACT_KEYS` в `shared/logging.py`.
 
-Ключевое отличие новой фичи от ADR-0022: эти 3 бота **не имеют** ни webhook, ни SSO, ни `telegram_links`, ни привязок в БД, ни inbound-команд. Получатели **фиксированы** (2 chat id из `.env`), команда определяется **самим ботом** (явный `group_id` из `.env`), а не правами видимости пользователя. Это позволяет резко упростить доставку.
+Ключевое отличие новой фичи от ADR-0022: эти 3 бота **не имеют** SSO, `telegram_links`, привязок в БД, ни inbound-команд `/start`/`/help`. Получатели **фиксированы** (2 chat id из `.env`), команда определяется **самим ботом** (явный `group_id` из `.env`), а не правами видимости пользователя. Это позволяет резко упростить доставку.
+
+**Round-42:** push-боты получают **один** inbound-канал — webhook, который принимает **только `callback_query`** от кнопки «Посмотреть сообщение» (всё остальное — `/start`, `message`, прочие update — игнорируется). Это не возвращает SSO/`telegram_links`/привязки: callback-нажатие авторизуется по `from.id ∈ admin_telegram_ids` (push-админы известны из `.env`, у них может не быть `user`-строки в БД) + защитная проверка принадлежности письма группе этого бота. См. §10–§11.
 
 ---
 
@@ -59,12 +63,19 @@
 ```
 BOT_IVAN_TOKEN: str = ""
 BOT_IVAN_GROUP_ID: int | None = None
+BOT_IVAN_WEBHOOK_SECRET: str = ""          # round-42
 BOT_ALEXANDRA_TOKEN: str = ""
 BOT_ALEXANDRA_GROUP_ID: int | None = None
+BOT_ALEXANDRA_WEBHOOK_SECRET: str = ""     # round-42
 BOT_ANDREI_TOKEN: str = ""
 BOT_ANDREI_GROUP_ID: int | None = None
+BOT_ANDREI_WEBHOOK_SECRET: str = ""        # round-42
 ADMIN_TELEGRAM_IDS: str = ""   # CSV chat id
 ```
+
+**round-42 — `BOT_*_WEBHOOK_SECRET`.** Каждый push-бот, у которого нужна callback-кнопка, получает **явный** per-бот webhook-secret (32 hex, `openssl rand -hex 16`), **симметрично** основному боту (`TELEGRAM_WEBHOOK_SECRET`, ADR-0018). Secret используется и в URL-path push-webhook'а, и в header `X-Telegram-Bot-Api-Secret-Token` (двойная проверка как в основном webhook — `backend/app/telegram/router.py::_secret_matches`).
+
+**Почему явный secret в `.env`, а не детерминированный, выведенный из токена.** Детерминированный secret (`HMAC(token)` или `sha256(token)`) соблазнителен (одно поле меньше), но: (а) **асимметричен** основному боту — оператор не сможет ротировать secret независимо от токена и наоборот; (б) **связывает** компрометацию secret и токена (знание одного выводит другое при известном алгоритме); (в) усложняет аудит/ротацию (в `.env` не видно, что выставлено). Явная пара «token + webhook_secret» в `.env` — тот же проверенный паттерн, что у основного бота; ровно один лишний `.env`-ключ на бота.
 
 Derived (computed) свойства — единый источник истины для воркера:
 
@@ -77,8 +88,9 @@ def admin_telegram_ids(self) -> list[int]:
 @property
 def push_team_bots(self) -> list[PushTeamBot]:
     """Список НАСТРОЕННЫХ push-ботов: только пары (token непустой И group_id задан).
-    PushTeamBot = (name: str, token: str, group_id: int).
-    Бот без токена или без group_id в список НЕ попадает (тихо игнорируется)."""
+    PushTeamBot = (name: str, token: str, group_id: int, webhook_secret: str).
+    Бот без токена или без group_id в список НЕ попадает (тихо игнорируется).
+    webhook_secret может быть "" — тогда у бота нет callback-кнопки (см. §7/§10)."""
     ...
 
 @property
@@ -87,7 +99,11 @@ def push_team_bots_enabled(self) -> bool:
     return bool(self.push_team_bots) and bool(self.admin_telegram_ids)
 ```
 
-`PushTeamBot` — маленький frozen-dataclass / NamedTuple (`name`, `token`, `group_id`).
+`PushTeamBot` — маленький frozen-dataclass / NamedTuple. **round-42:** добавлено поле `webhook_secret: str` (`name`, `token`, `group_id`, `webhook_secret`). Worker (доставка) поле игнорирует; webhook-роут в `api` (§10) использует его для маршрутизации + secret-валидации.
+
+**round-42 — связь `with_button` и `webhook_secret`.** Push-уведомление получает кнопку «Посмотреть сообщение» **только если у бота задан `webhook_secret`** (иначе callback `msg:{id}` некому обработать — спиннер зависнет). Диспатчер вычисляет `with_button = bool(bot.webhook_secret)` на бот (§7). Production-инвариант: все три push-бота настраиваются с `webhook_secret` (devops), но fallback на `with_button=False` при пустом secret сохраняется — фича деградирует gracefully, а не ломается, если оператор забыл secret.
+
+**Lookup-инвариант для webhook (round-42):** имя бота в URL push-webhook'а (`/api/telegram/push-webhook/{bot_name}`) — это фиксированный `name` (`ivan`/`alexandra`/`andrei`). `push_team_bots` уже даёт стабильный `name`; webhook-роут резолвит `PushTeamBot` по `name` и сверяет `webhook_secret`. Несуществующее имя / бот без secret → `not_found` (§10).
 
 **Инвариант (валидируется в `model_validator`, не допускать):** один `group_id` не должен быть привязан к двум разным ботам. При коллизии `group_id` среди настроенных ботов — **fail-fast** на старте (`ValueError`), потому что иначе письмо одной команды ушло бы дважды (двумя ботами) — это конфигурационная ошибка оператора, а не runtime-edge. Боты с пустым токеном/без `group_id` в проверке не участвуют (они просто не настроены).
 
@@ -136,7 +152,7 @@ flowchart TD
      - `group_id = account.group_id`; если `group_id is None` → skip (письмо вне команды);
      - найти push-бота с этим `group_id` (lookup по `settings.push_team_bots`); нет → skip (группа без настроенного бота);
      - собрать текст: `format_notification(round-36)` — те же `acc_label` / `from_label` / `tag_names` / `subject` / `body_preview`, что и в основном диспатчере (теги/превью резолвятся теми же helper'ами — допустимо переиспользовать query-методы; **без** метки команды);
-     - для каждого `admin_id` в `settings.admin_telegram_ids`: `send_notification(chat_id=admin_id, text_html=..., message_id=..., bot_token=bot.token)` — **fire-and-forget**;
+     - для каждого `admin_id` в `settings.admin_telegram_ids`: `send_notification(chat_id=admin_id, text_html=..., message_id=..., bot_token=bot.token, with_button=bool(bot.webhook_secret))` — **fire-and-forget** (round-42: кнопка только при настроенном `webhook_secret`);
      - результат `send_notification` **только логируется** (ok / dead / retry_after / transient) — **никаких** записей в БД, **никакого** re-enqueue, **никакого** mark-dead.
    - Любая ошибка обработки одного item — `catch` + log + продолжить (как в `tg_notify_dispatch`); job никогда не пробрасывает исключение наружу (обёртка `_safe_push_notify_dispatch` в `main.py`, как у остальных job'ов).
 
@@ -200,16 +216,19 @@ async def send_notification(*, chat_id: int, text_html: str, message_id: int,
 | Recovery / retry | recovery-scan + re-enqueue на 429/transient | **нет** — дроп при сбое |
 | Mark-dead | да (`telegram_links.dead_at`) | **нет** — только log `push_team_dead` |
 | Throttle | per-chat `TG_SEND_PER_CHAT_PER_MINUTE` | нет отдельного (поток мал: ≤2 admin × писем/мин); глобальный лимит Bot API per-бот достаточен |
-| Inline-кнопка | «Посмотреть сообщение» (callback) | наследуется от `send_notification` (та же кнопка); callback обрабатывается **основным** webhook'ом — для push-ботов callback не настроен, кнопка ведёт в никуда → **в push-варианте кнопку отключить** (`send_notification` параметр или отдельный текст-only путь) |
+| Webhook / inbound | да (`/api/telegram/webhook/{secret}`, `/start`, `/help`, callback) | **round-42:** да, **но только callback** (`/api/telegram/push-webhook/{bot_name}`, per-бот secret); `/start`/`message`/прочее — игнорируется |
+| Inline-кнопка | «Посмотреть сообщение» (callback `msg:{id}`) | **round-42:** да (`with_button=True`); callback обрабатывается **push-webhook'ом** этого же бота (§10–§11), не основным; авторизация по `admin_telegram_ids` + group-match |
 
-> **Решение по inline-кнопке:** push-боты **не** имеют webhook, поэтому callback `msg:{id}` от их кнопки никто не обработает (спиннер у пользователя зависнет). Backend-агент должен слать push-уведомления **без** inline-кнопки — либо добавить в `send_notification` флаг `with_button: bool = True` и передавать `False` из push-диспатчера, либо использовать отдельный текст-only `sendMessage`. Предпочтительно — флаг `with_button=False` (минимальная правка, переиспользует всю обработку статусов).
+> **Решение по inline-кнопке (round-42, пересмотр round-31).** Исходно push-боты не имели webhook → callback `msg:{id}` некому было обработать → кнопка отключалась (`with_button=False`). Теперь webhook подтверждён достижимым (см. round-42 update в шапке), и каждый push-бот получает **собственный** webhook + callback-маршрут (§10). Push-уведомления снова шлются **с** кнопкой «Посмотреть сообщение» (`with_button=True`), `callback_data="msg:{message_id}"` — тот же контракт кнопки, что у основного бота (`bot.py::send_notification`, ≤64 байта). Нажатие показывает **тело письма** прямо в чате (§11). Кнопка добавляется, только если у бота задан `webhook_secret` (§2 round-42); при пустом secret диспатчер шлёт `with_button=False` (graceful degradation).
 
 ### §8. Security
 
 - **Токены ботов** (`BOT_IVAN_TOKEN` / `BOT_ALEXANDRA_TOKEN` / `BOT_ANDREI_TOKEN`) — только в `.env` (`chmod 600`), как `BOT_TOKEN`. Передаются в контейнер **worker** (диспатчер живёт в worker'е). В `api` они не нужны.
-- **Redact в логах:** добавить три новых ключа в `REDACT_KEYS` (`shared/logging.py`) рядом с `BOT_TOKEN`: `BOT_IVAN_TOKEN`, `BOT_ALEXANDRA_TOKEN`, `BOT_ANDREI_TOKEN`. `_api_url` уже не логирует URL (см. ADR-0022 §2 / docstring `bot.py`) — токен в логи не попадает по построению; redact — defence-in-depth для случайного дампа settings.
+- **Redact в логах:** добавить три новых ключа в `REDACT_KEYS` (`shared/logging.py`) рядом с `BOT_TOKEN`: `BOT_IVAN_TOKEN`, `BOT_ALEXANDRA_TOKEN`, `BOT_ANDREI_TOKEN`. **round-42:** добавить ещё три — `BOT_IVAN_WEBHOOK_SECRET`, `BOT_ALEXANDRA_WEBHOOK_SECRET`, `BOT_ANDREI_WEBHOOK_SECRET` (симметрично `TELEGRAM_WEBHOOK_SECRET`, который уже в списке). `_api_url` уже не логирует URL (см. ADR-0022 §2 / docstring `bot.py`) — токен в логи не попадает по построению; redact — defence-in-depth для случайного дампа settings. push-webhook **не** логирует ни secret из URL-path, ни header (как основной webhook, `router.py::telegram_webhook`).
 - `ADMIN_TELEGRAM_IDS` — не секрет (Telegram chat id), но логировать его в каждом событии не нужно; в structured-логах оставлять только конкретный `chat_id` доставки.
 - Компрометация токена push-бота → атакующий может слать сообщения **от имени бота** двум известным admin'ам (фишинг), но **не** получает доступа к письмам/системе (бот push-only, без БД/SSO). Митигация: ротация токена через BotFather + обновление `.env`.
+- **round-42 — авторизация push-callback** (§11). Тело письма по callback `msg:{id}` отдаётся **только** если нажавший `from.id ∈ admin_telegram_ids` **и** письмо принадлежит группе именно этого бота (`account.group_id == bot.group_id`). Это закрывает два вектора: (а) чужой пользователь, узнавший токен бота и приславший себе кнопку, не получит тело (не админ → deny); (б) админ не сможет вытащить письмо чужой команды, подделав `msg:{id}` от чужой группы (group-mismatch → ignore). Webhook-secret (per-бот) отсекает spoofed-update'ы на уровне маршрута до любой БД-работы (§10).
+- **round-42 — push-webhook secret.** Каждый push-webhook валидирует per-бот `webhook_secret` (URL-path + опциональный header), как основной webhook. Неверный secret → `not_found` (роут неперечислим — STRIDE-S, симметрично основному, `06-security.md` §1.8). Push-боты **не** обрабатывают `/start`/`message` → даже при валидном secret любой не-callback update тихо дропается (200), inbound-поверхность сведена к одному типу update.
 
 ### §9. Edge cases
 
@@ -225,6 +244,66 @@ async def send_notification(*, chat_id: int, text_html: str, message_id: int,
 | Message/Account удалены к моменту dispatch (retention) | skip + debug-log (как в `tg_notify_dispatch`). |
 | Redis недоступен на enqueue | LPUSH-ошибка проглочена в `sync_cycle` (как для основной очереди); push-уведомления по этому циклу не отправятся, письма сохранены. |
 | `push_notify_queue` потеряна при рестарте Redis | items пропадают (fire-and-forget); recovery нет — осознанный trade-off (§5). |
+| **round-42:** push-webhook secret неверный (URL-path или header) | `not_found` (404-эквивалент, неперечислимо), как основной webhook. БД не трогается. |
+| **round-42:** push-webhook для несуществующего `bot_name` или бота без `webhook_secret` | `not_found` (не настроен) — до secret-проверки/БД. |
+| **round-42:** push-webhook получил не-`callback_query` update (`/start`, `message`, прочее) | тихо дропается, `200 OK` (push-боты не принимают inbound-команд, §10). |
+| **round-42:** callback `msg:{id}`, нажавший `from.id ∉ admin_telegram_ids` | `answerCallbackQuery` «Нет доступа» (`show_alert`), тело **не** показывается (§11). |
+| **round-42:** callback `msg:{id}`, но письмо принадлежит другой группе (`account.group_id != bot.group_id`) | ignore: `answerCallbackQuery` «Сообщение недоступно», тело **не** показывается (защита от подделки id, §11). |
+| **round-42:** callback `msg:{id}`, письмо/аккаунт удалены (retention) | `answerCallbackQuery` «Сообщение больше не доступно» (как у основного callback). |
+| **round-42:** callback `msg:{id}`, `callback_data` не матчит `^msg:(\d+)$` | `answerCallbackQuery` «Неподдерживаемое действие» (reuse `_CALLBACK_PATTERN`). |
+
+### §10. Push-webhook (round-42) — приём callback_query от push-ботов
+
+Каждый настроенный push-бот с непустым `webhook_secret` получает собственный webhook-эндпоинт в **api**-контейнере. Это **симметрия** основному боту (`router.py::telegram_webhook`), но с тремя сужениями: (а) маршрутизация по `bot_name`; (б) принимается **только** `callback_query` (никаких `/start`/`/help`/`message`); (в) авторизация callback по `admin_telegram_ids` + group-match (§11), а не по `telegram_links`.
+
+**Эндпоинт:**
+
+```
+POST /api/telegram/push-webhook/{bot_name}
+```
+
+- `bot_name` ∈ `{ivan, alexandra, andrei}` (стабильный `PushTeamBot.name`).
+- Authn — **тот же двойной механизм**, что у основного webhook (`router.py::_secret_matches`, `secrets.compare_digest`):
+  1. URL-path `{secret}` **не** в пути — secret передаётся **только** в header `X-Telegram-Bot-Api-Secret-Token` (Telegram шлёт его, т.к. `setWebhook` вызывается с `secret_token=…`). **Решение по транспорту secret:** в отличие от основного бота (secret и в path, и в header), у push-webhook secret кладётся **в header**, а в path — только `bot_name`. Причина: один публичный путь `/push-webhook/{bot_name}` проще зарегистрировать и аудировать; перечислимость пути не повышает риск, т.к. без верного header-secret запрос отклоняется до любой работы. Если CI-фикстуры не шлют header — допускается тот же tolerance, что у основного (header отсутствует → принять, header présent но неверный → отклонить); но в проде Telegram **всегда** шлёт header при `setWebhook(secret_token=…)`. **Альтернатива (симметрия):** secret и в path (`/push-webhook/{bot_name}/{secret}`), и в header — оставлено на усмотрение backend-агента (ровно тот же `_secret_matches`); рекомендуется header-only для простоты, но path-вариант приемлем и строго симметричен основному. **Q-0027-1** (non-blocking).
+  2. Header `X-Telegram-Bot-Api-Secret-Token` == `bot.webhook_secret` → иначе `NotFoundError` (404-эквивалент, неперечислимо).
+- Маршрутизация: `bot = next((b for b in settings.push_team_bots if b.name == bot_name and b.webhook_secret), None)`; `None` → `NotFoundError` (несуществующий/не настроенный бот неотличим от неверного secret — STRIDE-S).
+- Парсинг тела: reuse `TelegramUpdate.model_validate` (schemas.py); malformed JSON / invalid update → log + `200` (как основной webhook — снять с retry-очереди Telegram).
+- **Только `callback_query`:** если `update.callback_query is None` → log `push_webhook_ignored_non_callback` + `200`. `/start`/`message`/`edited_message`/прочее **не** маршрутизируются в `handle_update` (push-боты не launcher). Это сужает inbound-поверхность.
+- При `update.callback_query is not None` → `handle_push_callback_query(query, bot, db)` (§11) → `200`.
+- Rate-limit: тот же `_LIMIT_TG_WEBHOOK` (60/min per IP) **до** secret-проверки (spoofed-flood defence), как у основного.
+
+**Регистрация `setWebhook` (round-42).** Основной бот регистрирует webhook **не в коде**, а **вручную при деплое** curl-командой (`docs/07-deployment.md` §14.3: `curl -F url=… -F secret_token=… …/setWebhook`). Симметрично, push-webhook'и регистрируются **тем же deployment-шагом** — отдельный curl на каждый настроенный push-бот:
+
+```bash
+source /opt/mail-aggregator/.env
+for pair in "ivan:${BOT_IVAN_TOKEN}:${BOT_IVAN_WEBHOOK_SECRET}" \
+            "alexandra:${BOT_ALEXANDRA_TOKEN}:${BOT_ALEXANDRA_WEBHOOK_SECRET}" \
+            "andrei:${BOT_ANDREI_TOKEN}:${BOT_ANDREI_WEBHOOK_SECRET}"; do
+  name="${pair%%:*}"; rest="${pair#*:}"; token="${rest%%:*}"; secret="${rest##*:}"
+  [ -n "$token" ] && [ -n "$secret" ] && curl -F "url=https://postapp.store/api/telegram/push-webhook/${name}" \
+       -F "secret_token=${secret}" \
+       "https://api.telegram.org/bot${token}/setWebhook"
+done
+```
+
+- **Идемпотентно:** повторный `setWebhook` на тот же URL+secret — no-op в смысле эффекта (Telegram перезаписывает). Безопасно гонять при каждом деплое.
+- **Можно ли переиспользовать механизм основного `setWebhook`?** Да — это **тот же** Bot-API метод `setWebhook`, отличаются только токен (per-бот), URL (`/push-webhook/{name}`) и `secret_token` (per-бот `webhook_secret`). Никакого нового кода; расширяется существующий deployment-раздел §14.3 (см. `07-deployment.md`). **Программная регистрация при старте `api` не вводится** — оставляем симметрию (основной бот тоже регистрируется руками; deployment-step единообразен, без скрытого сетевого вызова в lifespan).
+- **Контейнер:** push-webhook-роут живёт в **api** (как все webhook-роуты). Значит `api`-контейнеру теперь нужны `BOT_*_TOKEN` (для `answerCallbackQuery`/`sendMessage` по callback) и `BOT_*_WEBHOOK_SECRET` (для secret-валидации). **Изменение по сравнению с round-31** (§8 гласил «токены только в worker»): теперь токены и webhook-secret push-ботов передаются **и в api, и в worker** (worker — для доставки уведомлений, api — для обработки callback). `07-deployment.md` обновляется соответствующе.
+
+### §11. Авторизация и обработка push-callback (round-42)
+
+Обработка callback от push-бота — **отдельный путь** `handle_push_callback_query`, **не** общий `callback_handler.handle_callback_query` (тот резолвит права через `telegram_links` + visibility — у push-админов привязок в БД может не быть). Контракт:
+
+1. **Парсинг `callback_data`** — reuse `_CALLBACK_PATTERN = ^msg:(\d+)$` (callback_handler.py). Не матчит → `answerCallbackQuery` «Неподдерживаемое действие» + return.
+2. **Авторизация нажавшего:** `from.id` должен быть ∈ `settings.admin_telegram_ids`. Иначе → `answerCallbackQuery(text="Нет доступа.", show_alert=True)` + return. **Это ключевое отличие** от основного callback: права = членство в `admin_telegram_ids` из `.env`, **не** `telegram_links`→`user`→visibility. Push-админ идентифицируется по `from.id`, у него может не быть `users`-строки.
+3. **Резолв чата для ответа:** `chat_id = query.message.chat.id` (или, эквивалентно, `from.id` — для приватного чата с ботом они совпадают). `query.message is None` (очень старое сообщение) → `answerCallbackQuery` + return (не можем ответить в чат).
+4. **Загрузка письма (unscoped):** `message = session.get(Message, message_id)`; `None` → `answerCallbackQuery("Сообщение больше не доступно.")` + return. Затем `account = MailAccountsRepo.get_by_id(message.mail_account_id)`; `None` → то же.
+5. **DEFENSIVE group-match:** `account.group_id == bot.group_id`? Нет → `answerCallbackQuery("Сообщение недоступно.")` + return + log `push_callback_group_mismatch`. Это отсекает подделку `msg:{id}` от чужой команды (админ команды ivan не вытащит письмо команды andrei, послав себе `msg:{id}` чужого письма через бота ivan). **Замена** visibility-резолва основного callback: у push нет per-user scope, право видеть = «письмо моей команды».
+6. **Показ тела:** reuse `callback_handler._format_message_body(subject, from_label, body_text, body_html)` — тот же sanitize+collapse pipeline (round-39/41, `sanitize_telegram_html` + `collapse_blank_lines_tg`). Затем `_split_for_telegram` (chunk-split, ≤3800 char/chunk, ≤4 chunks) — **тот же** splitter. Каждый chunk шлётся через `send_html_message`, но **с токеном этого push-бота** (`bot.token`), а не основного. → **Backend-импликация:** `send_html_message(chat_id, text_html)` сейчас хардкодит `BOT_TOKEN` через `_api_url("sendMessage")`; для push нужно параметризовать токеном — либо добавить `bot_token: str | None = None` в `send_html_message` + `_post_send_message` (симметрично `send_notification`, §4), либо отдельный helper. Рекомендуется параметризация `bot_token` (минимальная правка, reuse статус-обработки). Аналогично `answer_callback_query` — добавить `bot_token: str | None = None` (callback подтверждается **через того же бота**, что прислал кнопку).
+7. **Ack:** финальный `answer_callback_query(callback_id, bot_token=bot.token)` (без текста — тело уже в чате) — снять спиннер.
+8. **Никаких БД-записей / re-raise:** путь, как и основной callback, **никогда** не пробрасывает исключение (webhook возвращает 200). БД используется только на чтение (`Message`/`MailAccount`).
+
+**Почему отдельный путь, а не расширение `handle_callback_query`:** основной callback намертво завязан на `telegram_links`→`user`→`build_scope`→`MessageService.get(scope=…)` (visibility). Push-callback имеет **другую** модель прав (admin-id + group-match) и **другой** токен ответа. Ветвление внутри одного хэндлера запутало бы оба пути; отдельная функция (≈реюз `_format_message_body`/`_split_for_telegram`/`_CALLBACK_PATTERN`) чище и тестируется изолированно.
 
 ---
 
@@ -235,12 +314,15 @@ async def send_notification(*, chat_id: int, text_html: str, message_id: int,
 - Минимально-инвазивно: основной бот, его pipeline, БД-схема, миграции — **не тронуты**. Вся новая логика — один enqueue-блок, один worker-job, токен-параметризация клиента, новые config-поля.
 - Переиспользует формат (round-36) и Bot-клиент → консистентный внешний вид уведомлений, минимум нового кода.
 - Фича полностью управляется `.env`: нет ботов/`ADMIN_TELEGRAM_IDS` → канал выключен, остальное работает как раньше.
+- **round-42:** push-уведомления снова **с кнопкой** «Посмотреть сообщение» — паритет с основным ботом; нажатие показывает тело письма прямо в чате. Reuse `_format_message_body`/`_split_for_telegram`/`_CALLBACK_PATTERN` → нулевой новый форматтер.
 
 **Минусы / принятые компромиссы:**
 - Fire-and-forget → редкая потеря push-уведомления при рестарте worker (TD-041, low). Письма не теряются.
 - Маппинг команд через `.env` (не через UI/БД) → изменение состава команд требует правки `.env` + рестарта worker. На текущем масштабе (3 фиксированные команды) приемлемо.
 - Дублирование доставки между основным ботом и push-ботами (одно письмо команды может прийти и через основной бот по visibility, и через push-бот) — это by design (разные каналы/чаты); если в будущем избыточно — отдельный ADR.
 - Нет per-chat throttle у push-ботов → при всплеске писем одной команды теоретически возможен 429 (тогда уведомление дропается). На текущем потоке (≤2 admin) риск низкий.
+- **round-42:** push-токены и `webhook_secret` теперь нужны **и в api** (не только worker) — для обработки callback. Расширяет поверхность секретов в api-контейнере. Митигация: redact-list + per-бот secret + `chmod 600 .env` + group-match авторизация.
+- **round-42:** ещё три `.env`-ключа (`BOT_*_WEBHOOK_SECRET`) + `setWebhook`-шаги в деплое (по одному на бот). Без secret кнопка деградирует в `with_button=False` (не ломается). Приемлемо при 3 фиксированных ботах.
 
 ---
 
@@ -261,8 +343,23 @@ async def send_notification(*, chat_id: int, text_html: str, message_id: int,
 5. **Раздельная фильтрация на стороне `sync_cycle` (класть в очередь только письма команд с настроенными ботами).**
    Отвергнуто: усложняет enqueue знанием о маппинге ботов и `group_id` каждого аккаунта в горячем sync-пути. Дешевле положить все `message_id` (как для основной очереди/webhook) и отфильтровать в диспатчере, где `MailAccount` всё равно загружается.
 
+6. **round-42 — детерминированный webhook-secret push-бота (`HMAC(token)`/`sha256(token)`), без отдельного `.env`-ключа.**
+   Отвергнуто: асимметрично основному боту, связывает компрометацию secret и токена, не ротируется независимо, непрозрачно в аудите. Явный `BOT_*_WEBHOOK_SECRET` — тот же паттерн, что `TELEGRAM_WEBHOOK_SECRET` (§2 round-42).
+
+7. **round-42 — программная регистрация push-`setWebhook` при старте `api` (lifespan).**
+   Отвергнуто (для симметрии): основной бот регистрируется **вручную** curl-командой в деплое (§14.3), не в коде. Программная регистрация в lifespan создала бы асимметрию (один бот — руками, три — в коде), скрытый сетевой вызов при старте и проблему идемпотентности/таймаутов на boot. Push-`setWebhook` — тот же deployment-шаг, тот же Bot-API метод, по curl-строке на бот (§10).
+
+8. **round-42 — переиспользовать `callback_handler.handle_callback_query` для push-callback (ветвление внутри).**
+   Отвергнуто: основной callback завязан на `telegram_links`→`user`→visibility-scope и `BOT_TOKEN`-ответ. Push имеет другую модель прав (`admin_telegram_ids` + group-match) и отвечает токеном своего бота. Отдельная `handle_push_callback_query` (реюз только `_format_message_body`/`_split_for_telegram`/`_CALLBACK_PATTERN`) чище и изолированно тестируема (§11).
+
 ---
 
 ## Open questions
 
 Нет блокирующих. Прод-значения подтверждены пользователем: `ivan`=1, `alexandra`=2, `andrei`=3; получатели — 2 фиксированных admin chat id. Реальные токены ботов и chat id заполняет devops в prod `.env` (не хранятся в репозитории).
+
+**round-42 (non-blocking):**
+
+- **Q-0027-1** — транспорт push-webhook secret: header-only (`/push-webhook/{bot_name}` + `X-Telegram-Bot-Api-Secret-Token`) **или** path+header строго симметрично основному (`/push-webhook/{bot_name}/{secret}`)? Решение делегировано backend-агенту; рекомендация — header-only (проще регистрация/аудит, та же защита через `_secret_matches`). Не блокирует: оба варианта используют существующий механизм валидации. По умолчанию принимается header-only.
+
+Прод-токены push-ботов и их `webhook_secret` (`openssl rand -hex 16` на бота) заполняет devops в prod `.env` (api + worker) и регистрирует webhook'и шагом деплоя (§10, `07-deployment.md` §14.3-push). Если у бота `webhook_secret` пуст — push-уведомления этого бота шлются **без** кнопки (graceful degradation), фича не блокируется.

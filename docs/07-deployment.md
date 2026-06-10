@@ -230,12 +230,15 @@ Healthcheck не настроен — это бесконечный sleep-цик
 | `TG_NOTIFY_ALL_MESSAGES` | `true` | no | round-31: `true` — уведомлять по ВСЕМ новым письмам; `false` — только письма с ≥1 тегом (историческое поведение). Откат — смена env + рестарт `worker` (lru-cache `get_settings`), без редеплоя кода (ADR-0022 §2.1/§2.2). |
 | `TG_SEND_PER_CHAT_PER_MINUTE` | `20` | no | round-31: per-chat троттлинг доставки уведомлений (Redis `rl:tg_send:<chat_id>`, окно 60 сек). Диапазон 1..60. Защита от flood/429 при `TG_NOTIFY_ALL_MESSAGES=true` (ADR-0022 §2.9). |
 | `TG_MAX_LINKS_PER_USER` | `10` | no | **ADR-0024 (Спринт A):** мягкий потолок числа активных TG-привязок на один internal user. Проверяется в `link_pending`/`POST /api/telegram/links` (`COUNT(active) < limit`); при достижении — `409 tg_link_limit`, audit `telegram_link_limit_reached`. Не DB-констрейнт. |
-| `BOT_IVAN_TOKEN` | (none) | no | **ADR-0027:** токен push-only бота команды `ivan` (BotFather). Только в **worker**. Маскируется в structlog redact-list. Пустой → бот не настроен (тихо игнорируется). |
+| `BOT_IVAN_TOKEN` | (none) | no | **ADR-0027:** токен push-only бота команды `ivan` (BotFather). **round-42:** нужен **и в worker** (доставка), **и в api** (обработка callback). Маскируется в structlog redact-list. Пустой → бот не настроен (тихо игнорируется). |
 | `BOT_IVAN_GROUP_ID` | (none) | no | **ADR-0027:** `mail_accounts.group_id` команды `ivan`. Прод: `1`. Без него бот в `push_team_bots` не попадает. |
-| `BOT_ALEXANDRA_TOKEN` | (none) | no | **ADR-0027:** токен push-only бота команды `alexandra`. Только в **worker**. Redact. |
+| `BOT_IVAN_WEBHOOK_SECRET` | (none) | no | **ADR-0027 round-42 §2/§10:** 32 hex (`openssl rand -hex 16`) — secret push-webhook'а бота `ivan` (header `X-Telegram-Bot-Api-Secret-Token`). Нужен **в api** (валидация callback). Пустой → у бота нет callback-кнопки (`with_button=False`, graceful degradation). Redact (рядом с `TELEGRAM_WEBHOOK_SECRET`). |
+| `BOT_ALEXANDRA_TOKEN` | (none) | no | **ADR-0027:** токен push-only бота команды `alexandra`. **round-42:** в **worker + api**. Redact. |
 | `BOT_ALEXANDRA_GROUP_ID` | (none) | no | **ADR-0027:** `group_id` команды `alexandra`. Прод: `2`. |
-| `BOT_ANDREI_TOKEN` | (none) | no | **ADR-0027:** токен push-only бота команды `andrei`. Только в **worker**. Redact. |
+| `BOT_ALEXANDRA_WEBHOOK_SECRET` | (none) | no | **ADR-0027 round-42:** webhook-secret бота `alexandra` (см. `BOT_IVAN_WEBHOOK_SECRET`). Redact. |
+| `BOT_ANDREI_TOKEN` | (none) | no | **ADR-0027:** токен push-only бота команды `andrei`. **round-42:** в **worker + api**. Redact. |
 | `BOT_ANDREI_GROUP_ID` | (none) | no | **ADR-0027:** `group_id` команды `andrei`. Прод: `3`. |
+| `BOT_ANDREI_WEBHOOK_SECRET` | (none) | no | **ADR-0027 round-42:** webhook-secret бота `andrei` (см. `BOT_IVAN_WEBHOOK_SECRET`). Redact. |
 | `ADMIN_TELEGRAM_IDS` | (none) | no | **ADR-0027:** CSV Telegram chat id двух администраторов-получателей push-ботов, напр. `11111111,22222222`. Пусто → push-каналы выключены (`push_team_bots_enabled=false`). Не секрет, но в логах оставлять только конкретный `chat_id` доставки. |
 | `PUSH_NOTIFY_DISPATCH_INTERVAL_SECONDS` | `5` | no | **ADR-0027:** интервал APScheduler-job `push_notify_dispatch` (drain `push_notify_queue`). |
 | `PUSH_NOTIFY_BATCH_SIZE` | `30` | no | **ADR-0027:** размер `LPOP`-батча `push_notify_dispatch` за тик. |
@@ -723,17 +726,47 @@ curl "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo"
 
 Поля `url` (без secret_token — Telegram его не показывает) и `pending_update_count: 0` — webhook работает.
 
+#### 14.3-push Регистрация push-webhook'ов (ADR-0027 round-42 §10)
+
+Для каждого настроенного push-бота с непустым `BOT_*_WEBHOOK_SECRET` регистрируется собственный webhook (callback-кнопка «Посмотреть сообщение»). Это **тот же** Bot-API метод `setWebhook`, отличаются токен, URL (`/push-webhook/{name}`) и `secret_token`. Идемпотентно — безопасно гонять при каждом деплое.
+
+Предусловие: `BOT_*_TOKEN` и `BOT_*_WEBHOOK_SECRET` присутствуют в `.env` **api**-контейнера (callback) и **worker** (доставка); `api` перезапущен после правки `.env`.
+
+```bash
+source /opt/mail-aggregator/.env
+for pair in "ivan:${BOT_IVAN_TOKEN}:${BOT_IVAN_WEBHOOK_SECRET}" \
+            "alexandra:${BOT_ALEXANDRA_TOKEN}:${BOT_ALEXANDRA_WEBHOOK_SECRET}" \
+            "andrei:${BOT_ANDREI_TOKEN}:${BOT_ANDREI_WEBHOOK_SECRET}"; do
+  name="${pair%%:*}"; rest="${pair#*:}"; token="${rest%%:*}"; secret="${rest##*:}"
+  if [ -n "$token" ] && [ -n "$secret" ]; then
+    curl -F "url=https://postapp.store/api/telegram/push-webhook/${name}" \
+         -F "secret_token=${secret}" \
+         "https://api.telegram.org/bot${token}/setWebhook"
+  fi
+done
+```
+
+Проверка каждого (например ivan):
+```bash
+curl "https://api.telegram.org/bot${BOT_IVAN_TOKEN}/getWebhookInfo"
+```
+`url` оканчивается на `/push-webhook/ivan`, `pending_update_count: 0` — push-webhook работает.
+
+Если у бота `BOT_*_WEBHOOK_SECRET` **не** задан — `setWebhook` для него пропускается; push-уведомления этого бота шлются **без** кнопки (фича деградирует gracefully, не ломается).
+
 ### 14.4 Smoke-test
 
 1. В Telegram открыть бота → `/start` → должна появиться кнопка `Open Mail Aggregator`.
 2. Нажать — открывается WebApp с обычной login-страницей.
 3. Логин под существующим пользователем (созданным админом) — попадает в inbox.
 4. Логи `api` должны содержать `event=telegram_webhook_received` (level INFO) и НЕ должны содержать значение `TELEGRAM_BOT_TOKEN` ни на одном уровне.
+5. **round-42 (push-callback):** в чате push-бота команды прийти уведомление с кнопкой «Посмотреть сообщение»; нажатие админом (chat id ∈ `ADMIN_TELEGRAM_IDS`) → в чат приходит **тело письма**. Логи `api`: `event=push_callback_message_sent`, без значений `BOT_*_TOKEN`/`BOT_*_WEBHOOK_SECRET`. Нажатие НЕ-админом → toast «Нет доступа», тело не показывается.
 
 ### 14.5 Ротация secret / token
 
 - **Webhook secret**: сгенерировать новый, обновить `.env`, перезапустить `api`, повторить `setWebhook` (см. 14.3) с новым значением. Старый сразу перестаёт работать.
 - **Bot token**: в BotFather `/revoke` → новый token, повторить шаги 14.1–14.3. Старый token немедленно невалиден.
+- **round-42 — push-webhook secret / push-bot token**: сгенерировать новый `BOT_*_WEBHOOK_SECRET` (`openssl rand -hex 16`) или ротировать `BOT_*_TOKEN` (BotFather `/revoke`), обновить `.env` (**api + worker**), перезапустить `api` (+ `worker` при смене токена), повторить push-`setWebhook` (см. 14.3-push) для этого бота. Боты независимы — ротация одного не влияет на другие.
 
 ### 14.6 Отключение бота
 

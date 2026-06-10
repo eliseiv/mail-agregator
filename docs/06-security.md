@@ -173,6 +173,23 @@
 
 > SSRF к Outlook IMAP/SMTP не релевантен (хосты фиксированы Microsoft'ом, не вводятся пользователем). Per-account proxy (`proxy_url`) заложен, но не используется (TD-029) — трафик идёт напрямую.
 
+### 1.12 Push-only боты по командам + push-callback (ADR-0027, round-42)
+
+3 push-бота (`ivan`/`alexandra`/`andrei`) шлют письма своей команды (по `group_id`) на `ADMIN_TELEGRAM_IDS`. round-42 добавил каждому собственный webhook для callback-кнопки «Посмотреть сообщение». Модель прав push-callback **отличается** от основного бота (§1.9): авторизация по членству в `ADMIN_TELEGRAM_IDS` (`.env`), а не по `telegram_links`→`user`→visibility.
+
+| Угроза | Описание | Митигация |
+| --- | --- | --- |
+| S | Поддельный push-webhook от чужого процесса | Per-бот `BOT_{NAME}_WEBHOOK_SECRET` (32 hex), проверяется в header `X-Telegram-Bot-Api-Secret-Token` (constant-time, `secrets.compare_digest`), симметрично основному webhook. Несовпадение / ненастроенный бот / неизвестный `bot_name` → `not_found` (неперечислимо — роут неотличим от «нет такого пути»). Rate-limit 60/min per IP до secret-проверки. |
+| E | Не-админ открывает тело письма по callback | Тело отдаётся **только** если `callback_query.from.id ∈ admin_telegram_ids`. `from.id` подписан Telegram (доказан до webhook'а). Не админ → `answerCallbackQuery` «Нет доступа», тело не показывается. Push-админ идентифицируется по id в `.env`, **не** по `telegram_links` (у него может не быть `user`-строки). |
+| E | Админ вытягивает письмо чужой команды подделкой `msg:{id}` | DEFENSIVE group-match: загруженное письмо обязано принадлежать группе этого бота (`mail_accounts.group_id == BOT_{NAME}_GROUP_ID`); mismatch → ignore («Сообщение недоступно»), лог `push_callback_group_mismatch`. Кнопку шлёт бот команды X → через webhook бота X можно достать только письма команды X. |
+| T | Подмена контента / HTML-injection в теле письма | Тело проходит `sanitize_telegram_html` + `collapse_blank_lines_tg` (round-39/41, тот же pipeline, что основной callback `_format_message_body`); Bot API принимает только whitelist-теги. |
+| I | Утечка токена / webhook-secret push-бота через логи | `BOT_{IVAN,ALEXANDRA,ANDREI}_TOKEN` и `BOT_{…}_WEBHOOK_SECRET` — в structlog redact-list рядом с `TELEGRAM_WEBHOOK_SECRET`. push-webhook не логирует secret (ни URL, ни header). |
+| I | Компрометация токена push-бота | Атакующий может слать сообщения от имени бота 2 известным админам (фишинг) и прислать себе callback-кнопку, но: тело письма не отдаётся (не админ → deny), доступа к системе/письмам нет (бот push-only, без БД/SSO). Митигация: ротация токена (BotFather `/revoke`) + `webhook_secret` (`openssl rand -hex 16`), обновление `.env` (api+worker), повтор push-`setWebhook`. |
+| D | Шквал spoofed push-webhook'ов | Rate-limit 60/min per IP (тот же `_LIMIT_TG_WEBHOOK`), `not_found` на secret-fail — после rate-limit. |
+| E | Inbound-команды (`/start`) к push-боту | push-webhook обрабатывает **только** `callback_query`; любой `message`/`/start`/прочее тихо дропается (200). Inbound-поверхность сведена к одному типу update — нет launcher/SSO-вектора. |
+
+> Доставка уведомлений остаётся fire-and-forget (TD-041) — webhook касается только inbound-callback, не исходящей доставки. См. [ADR-0027](./adr/ADR-0027-push-team-bots.md) §8/§10/§11.
+
 ---
 
 ## 2. Шифрование почтовых паролей (схема)
