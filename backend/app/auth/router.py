@@ -649,17 +649,14 @@ async def logout(request: Request, db: DbSession) -> Response:
     ua = request.headers.get("user-agent", "")
     svc = AuthService(db)
     async with db.begin():
+        # ADR-0022 §1.5 (round-43): logout ends ONLY the web session.
+        # telegram_links are intentionally NOT revoked here — persistent push
+        # is decoupled from the web-session lifecycle. Explicit unlink is the
+        # sole user path (DELETE /api/telegram/links/{tg_user_id} -> revoke_one).
         await svc.logout(
             session_token=token,
             actor_user_id=sess.user_id,
             is_admin=(sess.role == "super_admin"),
-            ip=ip,
-            user_agent=ua,
-        )
-        # ADR-0022 §1.5: logout drops the persistent Telegram link.
-        await TelegramSSOService(db).revoke_for_user(
-            user_id=sess.user_id,
-            reason="logout",
             ip=ip,
             user_agent=ua,
         )

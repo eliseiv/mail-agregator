@@ -1,8 +1,16 @@
 """ADR-0022 §1.5 — revocation paths: logout / admin reset / cascade-delete.
 
-After each path the ``telegram_links`` row is gone, and (for logout / reset)
-an audit row ``telegram_link_revoked`` with the right ``reason`` is written.
-Cascade-delete additionally wipes ``telegram_notifications`` + ``users_settings``.
+round-43 (ADR-0022 §1.5): ``POST /logout`` was DECOUPLED from the Telegram
+linkage. Logout now ends ONLY the web session — it no longer revokes
+``telegram_links`` and no longer writes a ``telegram_link_revoked`` audit with
+``reason="logout"``. The forced-revoke paths (admin password-reset,
+cascade-delete) are UNCHANGED and still wipe all linkage.
+
+This module asserts:
+
+- logout KEEPS the link alive + writes NO ``telegram_link_revoked`` audit;
+- admin reset still DROPS all target-user links (audit ``reason=password_reset``);
+- cascade-delete additionally wipes ``telegram_notifications`` + ``users_settings``.
 """
 
 from __future__ import annotations
@@ -11,7 +19,7 @@ from typing import Any
 
 import httpx
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from shared.config import get_settings
@@ -44,8 +52,15 @@ async def _login_admin_two_step(client: httpx.AsyncClient) -> str:
     return csrf
 
 
-class TestLogoutRevokes:
-    async def test_logout_drops_link_and_writes_audit(
+class TestLogoutKeepsLink:
+    """round-43 (ADR-0022 §1.5): logout is DECOUPLED from the Telegram link.
+
+    The pre-round-43 assertion (logout DROPS the link + writes a
+    ``telegram_link_revoked reason=logout`` audit) is INVERTED here: the link
+    must survive logout and NO revoke audit may be written for the logout.
+    """
+
+    async def test_logout_keeps_link_and_writes_no_revoke_audit(
         self,
         client: httpx.AsyncClient,
         db_engine: AsyncEngine,
@@ -64,31 +79,103 @@ class TestLogoutRevokes:
         csrf = await _login_admin_two_step(client)
         resp = await client.post("/logout", headers={"X-CSRF-Token": csrf})
         assert resp.status_code in (302, 303), resp.text
+        assert resp.headers.get("location") == "/login", resp.headers
 
-        # Link row gone.
+        # Session cookies cleared (mas_session / mas_csrf / mas_login emptied).
+        set_cookies = resp.headers.get_list("set-cookie")
+        for name in ("mas_session", "mas_csrf", "mas_login"):
+            cleared = [c for c in set_cookies if c.startswith(f"{name}=")]
+            assert cleared, f"{name} must be cleared on logout; got {set_cookies}"
+            # A cleared cookie carries an empty value (``name=;``) / Max-Age=0.
+            assert any(
+                c.startswith(f"{name}=;") or "Max-Age=0" in c or "max-age=0" in c for c in cleared
+            ), f"{name} not actually cleared: {cleared}"
+
+        async with factory() as ses:
+            # round-43: the link row SURVIVES logout.
+            link = (
+                await ses.execute(
+                    select(TelegramLink).where(TelegramLink.telegram_user_id == tg_id)
+                )
+            ).scalar_one_or_none()
+            assert link is not None, "round-43: logout must NOT delete telegram_links"
+            assert link.user_id == admin.id
+            assert link.dead_at is None, "link must stay live (push must keep working)"
+
+            # round-43: NO telegram_link_revoked audit is written by logout.
+            revokes = (
+                await ses.execute(
+                    select(func.count())
+                    .select_from(AdminAudit)
+                    .where(AdminAudit.action == "telegram_link_revoked")
+                )
+            ).scalar_one()
+            assert revokes == 0, "round-43: logout must NOT write telegram_link_revoked"
+
+    async def test_logout_without_link_succeeds(
+        self,
+        client: httpx.AsyncClient,
+        db_engine: AsyncEngine,
+    ) -> None:
+        """Logout with no Telegram link at all → session revoked, no errors,
+        302 → /login, and (trivially) no revoke audit."""
+        csrf = await _login_admin_two_step(client)
+        resp = await client.post("/logout", headers={"X-CSRF-Token": csrf})
+        assert resp.status_code in (302, 303), resp.text
+        assert resp.headers.get("location") == "/login"
+
+        factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
+        async with factory() as ses:
+            revokes = (
+                await ses.execute(
+                    select(func.count())
+                    .select_from(AdminAudit)
+                    .where(AdminAudit.action == "telegram_link_revoked")
+                )
+            ).scalar_one()
+            assert revokes == 0
+
+    async def test_session_invalid_after_logout(
+        self,
+        client: httpx.AsyncClient,
+        db_engine: AsyncEngine,
+        make_link: Any,
+    ) -> None:
+        """After logout the web session is revoked: a session-protected
+        endpoint (``GET /api/telegram/links``) answers 401 with the stale
+        cookies, even though the Telegram link itself survives."""
+        s = get_settings()
+        factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
+        async with factory() as ses:
+            admin = (
+                await ses.execute(select(User).where(User.username == s.ADMIN_LOGIN))
+            ).scalar_one()
+        tg_id = 70102
+        await make_link(tg_id, admin.id)
+
+        await _login_admin_two_step(client)
+        # Sanity: the protected endpoint works WHILE logged in.
+        ok = await client.get("/api/telegram/links")
+        assert ok.status_code == 200, ok.text
+
+        resp = await client.post(
+            "/logout",
+            headers={"X-CSRF-Token": client.cookies.get("mas_csrf") or ""},
+        )
+        assert resp.status_code in (302, 303), resp.text
+
+        # The client jar now has the cleared cookies → session is dead.
+        after = await client.get("/api/telegram/links")
+        assert after.status_code == 401, after.text
+
+        # …but the link is still there (push decoupled from web session).
         async with factory() as ses:
             link = (
                 await ses.execute(
                     select(TelegramLink).where(TelegramLink.telegram_user_id == tg_id)
                 )
             ).scalar_one_or_none()
-            assert link is None
-
-            # Audit row with reason=logout.
-            revokes = (
-                (
-                    await ses.execute(
-                        select(AdminAudit).where(AdminAudit.action == "telegram_link_revoked")
-                    )
-                )
-                .scalars()
-                .all()
-            )
-            assert len(revokes) == 1
-            assert (revokes[0].details or {}).get("reason") == "logout"
-            # ADR-0024 §5: logout revokes ALL links and records them as a single
-            # ``telegram_user_ids`` array (not the pre-ADR-0024 scalar field).
-            assert (revokes[0].details or {}).get("telegram_user_ids") == [tg_id]
+            assert link is not None and link.dead_at is None
 
 
 class TestAdminResetRevokes:

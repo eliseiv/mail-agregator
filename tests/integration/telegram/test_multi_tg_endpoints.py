@@ -295,17 +295,21 @@ class TestDeleteLink:
 
 
 # ---------------------------------------------------------------------------
-# H. logout / admin-reset revoke ALL links with array audit
+# H. round-43 (ADR-0022 §1.5): logout KEEPS all links (decoupled); admin-reset
+#    still revokes ALL links with a single array audit (forced revoke path).
 # ---------------------------------------------------------------------------
 
 
 class TestRevokeAllAudit:
-    async def test_logout_revokes_all_links_with_array_audit(
+    async def test_logout_keeps_all_links_and_writes_no_revoke_audit(
         self,
         client: httpx.AsyncClient,
         db_engine: AsyncEngine,
         make_link: Any,
     ) -> None:
+        """round-43: logout no longer revokes ``telegram_links``. A
+        multi-linked user keeps ALL chats alive after logout, and NO
+        ``telegram_link_revoked`` audit is written for the logout."""
         admin_id = await _admin_id(db_engine)
         await make_link(460001, admin_id)
         await make_link(460002, admin_id)
@@ -316,32 +320,26 @@ class TestRevokeAllAudit:
 
         factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
         async with factory() as ses:
-            # All links gone.
-            n = int(
-                (
-                    await ses.execute(
-                        select(func.count())
-                        .select_from(TelegramLink)
-                        .where(TelegramLink.user_id == admin_id)
-                    )
-                ).scalar_one()
-            )
-            assert n == 0
-            # Single revoke audit carrying the array of removed chats.
-            revokes = (
-                (
-                    await ses.execute(
-                        select(AdminAudit).where(AdminAudit.action == "telegram_link_revoked")
-                    )
-                )
+            # round-43: ALL links survive logout.
+            remaining = (
+                (await ses.execute(select(TelegramLink).where(TelegramLink.user_id == admin_id)))
                 .scalars()
                 .all()
             )
-            assert len(revokes) == 1
-            ids = (revokes[0].details or {}).get("telegram_user_ids")
-            assert ids is not None
-            assert sorted(ids) == [460001, 460002]
-            assert (revokes[0].details or {}).get("reason") == "logout"
+            assert {link.telegram_user_id for link in remaining} == {460001, 460002}
+            assert all(link.dead_at is None for link in remaining)
+
+            # No revoke audit for logout.
+            n_revokes = int(
+                (
+                    await ses.execute(
+                        select(func.count())
+                        .select_from(AdminAudit)
+                        .where(AdminAudit.action == "telegram_link_revoked")
+                    )
+                ).scalar_one()
+            )
+            assert n_revokes == 0
 
     async def test_admin_reset_revokes_all_target_links(
         self,

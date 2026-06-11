@@ -540,7 +540,7 @@ Many-to-many линки тегов и сообщений. Создаются wor
 
 ### `telegram_links`
 
-Источник истины — [ADR-0022](./adr/ADR-0022-telegram-sso-and-notifications.md) + [ADR-0024](./adr/ADR-0024-multi-telegram-links.md). Связка `telegram_user_id` (внешний ID в Telegram Bot API) с внутренним `users.id`. Создаётся при первом успешном `POST /login`/`POST /set-password` после открытия WebApp через бот, либо через `POST /api/telegram/links` при активной сессии (добавление второго TG, ADR-0024 §4); удаляется при `POST /logout` (все), `POST /api/admin/users/{id}/reset` (все), `DELETE /api/telegram/links/{telegram_user_id}` (конкретный), `DELETE /api/admin/users/{id}` (каскад). Активная линковка обеспечивает persistent SSO и доставку push-уведомлений.
+Источник истины — [ADR-0022](./adr/ADR-0022-telegram-sso-and-notifications.md) + [ADR-0024](./adr/ADR-0024-multi-telegram-links.md). Связка `telegram_user_id` (внешний ID в Telegram Bot API) с внутренним `users.id`. Создаётся при первом успешном `POST /login`/`POST /set-password` после открытия WebApp через бот, либо через `POST /api/telegram/links` при активной сессии (добавление второго TG, ADR-0024 §4); удаляется при `POST /api/admin/users/{id}/reset` (все), `DELETE /api/telegram/links/{telegram_user_id}` (конкретный), `DELETE /api/admin/users/{id}` (каскад). **round-43 (ADR-0022 §1.5):** `POST /logout` более **НЕ** удаляет привязки — расцеплено (logout = только веб-сессия; push переживает выход; отвязка — кнопкой «Отвязать»). Активная линковка обеспечивает persistent SSO и доставку push-уведомлений.
 
 **ADR-0024:** инвариант «один user — один TG» снят. Один `user_id` может иметь **несколько** активных `telegram_user_id` (мягкий потолок `TG_MAX_LINKS_PER_USER`, default 10). Направление `telegram_user_id` (PK) → `user_id` остаётся 1:1, поэтому SSO-резолв однозначен.
 
@@ -553,7 +553,7 @@ Many-to-many линки тегов и сообщений. Создаются wor
 
 **Индексы:**
 - PK на `telegram_user_id` — обслуживает lookup при SSO (`/api/telegram/auth`).
-- `telegram_links_user_id_idx` на `(user_id)` (**неуникальный**, ADR-0024) — обслуживает logout (`DELETE WHERE user_id=:uid`), список «мои привязки» и SQL получателей нотификаций (`JOIN telegram_links tl ON tl.user_id = u.id` — теперь даёт по строке на каждый живой TG).
+- `telegram_links_user_id_idx` на `(user_id)` (**неуникальный**, ADR-0024) — обслуживает форс-отзыв (admin reset / link_user_missing — `DELETE WHERE user_id=:uid`), список «мои привязки» и SQL получателей нотификаций (`JOIN telegram_links tl ON tl.user_id = u.id` — теперь даёт по строке на каждый живой TG).
 
 **Объём:** ≤ 5 пользователей × ≤ `TG_MAX_LINKS_PER_USER` (10) = ≤ 50 строк.
 

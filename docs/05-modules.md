@@ -1920,7 +1920,7 @@ WHITELIST_PATHS = [
 ### Назначение
 Telegram-интеграция в трёх ролях:
 1. **Bot launcher (ADR-0018)** — `/start` → inline-keyboard с WebApp-кнопкой на `TELEGRAM_WEBAPP_URL`.
-2. **Persistent SSO + self-heal привязки (ADR-0022 §1, §1.6)** — при открытии WebApp с валидным `init_data` и существующей `telegram_links`-записью **анонимный** пользователь логинится без ввода username+password. При первом login через бот линковка `telegram_user_id ↔ user_id` создаётся автоматически и удаляется при logout. **round-38 (self-heal):** если на момент открытия WebApp пользователь **уже залогинен** (есть `mas_session`), тот же `POST /api/telegram/auth` делает idempotent upsert привязки `telegram_user_id → current_session.user_id` (без создания второй сессии и без `mas_tg_pending`). Это устраняет баг «после logout привязка не пересоздаётся» — привязка самовосстанавливается при каждом заходе в Telegram WebApp. logout по-прежнему рвёт **все** привязки (явный выбор пользователя «Выйти»). См. ADR-0022 §1.6.
+2. **Persistent SSO + self-heal привязки (ADR-0022 §1, §1.6)** — при открытии WebApp с валидным `init_data` и существующей `telegram_links`-записью **анонимный** пользователь логинится без ввода username+password. При первом login через бот линковка `telegram_user_id ↔ user_id` создаётся автоматически ~~и удаляется при logout~~ **(пересмотрено round-43, ADR-0022 §1.5: logout более НЕ удаляет привязку — расцеплено)**. **round-38 (self-heal):** если на момент открытия WebApp пользователь **уже залогинен** (есть `mas_session`), тот же `POST /api/telegram/auth` делает idempotent upsert привязки `telegram_user_id → current_session.user_id` (без создания второй сессии и без `mas_tg_pending`). Это устраняет баг «после logout привязка не пересоздаётся» — привязка самовосстанавливается при каждом заходе в Telegram WebApp. ~~logout по-прежнему рвёт **все** привязки (явный выбор пользователя «Выйти»).~~ **(пересмотрено round-43, ADR-0022 §1.5):** logout завершает только веб-сессию и **НЕ** трогает привязки; отвязка — только явной кнопкой «Отвязать» (`DELETE /api/telegram/links/{id}`). См. ADR-0022 §1.5/§1.6.
 3. **Push-нотификации (ADR-0022 §2)** — диспатчер в worker'е шлёт `sendMessage` всем получателям, у которых: (а) активная линковка, (б) право видеть письмо (super_admin/group/owner) + при `TG_NOTIFY_ALL_MESSAGES=false` на письме есть любой тег; при `true` (default, round-31) — по всем письмам, (в) включены уведомления. Доставка под per-chat throttle (§2.9).
 
 Источники истины — [ADR-0018](./adr/ADR-0018-telegram-launcher.md) (launcher) + [ADR-0022](./adr/ADR-0022-telegram-sso-and-notifications.md) (SSO + нотификации; partially supersedes ADR-0018 в части «нет линковки / нет initData auth»).
@@ -2013,10 +2013,15 @@ class TelegramSSOService:
         # BEST-EFFORT: метод НЕ поднимает исключений наружу (лимит → no-op; внутренняя ошибка → лог
         #   telegram_self_heal_failed, router отвечает healed:false). НЕ создаёт сессию, НЕ трогает cookies.
 
-    async def revoke_for_user(user_id: int, reason: str = 'logout') -> None
+    async def revoke_for_user(user_id: int, reason: str) -> None
         # delete_all_by_user_id(user_id) — удаляет ВСЕ привязки user'а (ADR-0024 §5);
         #   audit telegram_link_revoked с details={telegram_user_ids: [...], reason}.
-        # Вызывается из AuthService.logout и AdminService.reset_password.
+        # round-43: БОЛЬШЕ НЕ вызывается из logout. Вызывается из AdminService.reset_password
+        #   (reason='password_reset') и telegram/router link_user_missing (reason='link_user_missing').
+    async def revoke_one(user_id: int, telegram_user_id: int) -> bool
+        # delete_one(user_id, telegram_user_id) — отвязывает ОДИН TG (WHERE по обоим полям);
+        #   audit telegram_link_revoked с details={telegram_user_id, reason='user_unlink'}.
+        # round-43: ЕДИНСТВЕННЫЙ пользовательский путь отвязки — DELETE /api/telegram/links/{tid}.
 
     async def mark_link_dead(telegram_user_id: int, reason: str) -> None
         # UPDATE telegram_links SET dead_at=now() WHERE telegram_user_id=:tid AND dead_at IS NULL
@@ -2237,17 +2242,26 @@ body_safe = collapse_blank_lines_tg(body_safe)       # round-39: post-sanitize c
 
 > **Единообразие (round-38 §1.6 edge-3):** этот же decision-table (NO-OP для уже-живой привязки того же user; upsert только при INSERT / реактивации dead / rebound) реализован в общем `TelegramSSOService._link(...)` и применяется **одинаково** к `login_flow`, `session_add` (POST /api/telegram/links) и `self_heal`. Различие между entry-point'ами только в обработке rebound/лимита (login_flow и self_heal — best-effort/rebind-allowed; session_add — raise `TelegramLinkOwnedByOtherError`/`TelegramLinkLimitError`), но правило «не сдвигать `created_at` живой привязки» — общее для всех.
 
-### Алгоритм logout-revoke — ADR-0024 §5 (сбрасывает ВСЕ привязки)
+### Алгоритм logout — ADR-0022 §1.5 / ADR-0024 §5 (round-43: НЕ трогает привязки)
 ```text
-В AuthService.logout(session_token) ПЕРЕД revoke session:
-1. user_id = current_session.user_id
-2. await telegram_auth_service.revoke_for_user(user_id, reason='logout')
-   а. deleted_tids = await telegram_links_repo.delete_all_by_user_id(user_id)  # DELETE ВСЕ, returning list[telegram_user_id]
-   b. if deleted_tids: await audit.log(action='telegram_link_revoked', actor_user_id=user_id, target_user_id=user_id,
-                       details={'telegram_user_ids': deleted_tids, 'reason': 'logout'}, …)
-3. revoke session как обычно (Redis DEL session:{token}; SREM user_sessions:{uid})
+В POST /logout (auth/router.py) — завершает ТОЛЬКО веб-сессию:
+1. resolve current session/token из request.state (нет сессии → просто clear cookies + 302 /login).
+2. await AuthService.logout(session_token, actor_user_id, is_admin, ip, ua)
+   # revoke session (Redis DEL session:{token}; SREM user_sessions:{uid}); если is_admin → audit 'admin_logout'.
+3. clear cookies (mas_session, mas_csrf, mas_login); 302 → /login.
+# round-43: блок `await TelegramSSOService(db).revoke_for_user(reason="logout")` УДАЛЁН.
+#           telegram_links НЕ трогаются — push продолжает идти (привязка самодостаточна).
 ```
-Обоснование «сбрасываем ВСЕ» (а не только текущий TG) — ADR-0024 §5 (Q-MTG-1): явный выход из аккаунта системы прекращает persistent SSO во всех привязанных TG. То же для `AdminService.reset_password` (reason='password_reset').
+**round-43 — расцепление logout и привязки.** Прежнее правило «logout рвёт ВСЕ привязки» **отменено** (вызывало «само-разлогинивание» push из-за фантомного/мульти-вкладочного logout, диагностировано на проде). Logout = только веб-сессия. Отвязка TG пользователем — **единственный путь** — явная кнопка «Отвязать»:
+```text
+DELETE /api/telegram/links/{telegram_user_id}  (cookie-auth + CSRF; revoke_one):
+1. deleted = await telegram_auth_service.revoke_one(user_id=session.user_id, telegram_user_id, ip, ua)
+   а. deleted = await telegram_links_repo.delete_one(user_id, telegram_user_id)  # WHERE по ОБОИМ полям (нельзя чужой)
+   b. if deleted: await audit.log(action='telegram_link_revoked', actor_user_id=user_id, target_user_id=user_id,
+                  details={'telegram_user_id': telegram_user_id, 'reason': 'user_unlink'}, …)
+2. → {"deleted": bool}  (идемпотентно: {deleted:false} если строки не было / чужой TG)
+```
+Принудительный отзыв **всех** привязок остаётся у `AdminService.reset_password` → `revoke_for_user(reason='password_reset')` → `delete_all_by_user_id` (смена пароля = новый владелец/компрометация). `revoke_for_user`/`delete_all_by_user_id` также вызывается `link_user_missing` (чистка сирота-привязки в `/api/telegram/auth`).
 
 ### Edge cases
 - Bot API временно недоступен (timeout/5xx от api.telegram.org) — `send_message_with_webapp_button` логирует warn и возвращает None; webhook возвращает 200 (Telegram не должен ретраить — пользователь и так увидит, что бот молчит, и отправит /start ещё раз).
@@ -2273,8 +2287,9 @@ body_safe = collapse_blank_lines_tg(body_safe)       # round-39: post-sanitize c
 - Повторный SSO под тем же tg_user_id → 200 `linked=true` без повторного login (использует существующую линковку).
 - Один tg_user_id логинится под user X, затем (logout + повторный SSO + login) под user Y → `telegram_links.user_id` обновлён на Y; audit `telegram_link_created` `replaced=true`.
 - Два разных tg_user_id привязываются к одному user_id (ADR-0024): вторая привязка **успешна** (до потолка `TG_MAX_LINKS_PER_USER`) → обе строки `telegram_links` существуют, обе active; audit `telegram_link_created`. При попытке привязать сверх потолка через `POST /api/telegram/links` → `409 tg_link_limit`, audit `telegram_link_limit_reached`, строка не создаётся.
-- `POST /logout` → `telegram_links` строка удалена; audit `telegram_link_revoked`.
-- `POST /api/admin/users/{id}/reset` → `telegram_links` строка удалена для target user'а; audit `telegram_link_revoked` `reason='password_reset'`.
+- **(round-43)** `POST /logout` → `telegram_links` пользователя **НЕ** удаляются; веб-сессия revoked, cookies очищены, 302 `/login`; audit `telegram_link_revoked` с `reason='logout'` **НЕ** пишется. Активная привязка переживает logout — push продолжает идти.
+- **(round-43)** `DELETE /api/telegram/links/{tid}` (явная отвязка, `revoke_one`) → указанная строка `telegram_links` удалена (только если принадлежит текущему user); audit `telegram_link_revoked` `reason='user_unlink'`; `{"deleted": true}`. Чужой/несуществующий TG → `{"deleted": false}`, без audit. Остальные привязки того же user живут.
+- `POST /api/admin/users/{id}/reset` → **ВСЕ** `telegram_links` target user'а удалены (`reason='password_reset'`) — **не меняется** (round-43); audit `telegram_link_revoked` `reason='password_reset'`.
 - `DELETE /api/admin/users/{id}` → `telegram_links` строка каскадно удалена.
 - Rate-limit: 31-й запрос `/api/telegram/auth` с одного IP в течение минуты → 429.
 - `mas_tg_pending` cookie expired (>15min) или Redis ключ исчез → login проходит без линковки (no-op в `link_pending`, no audit).
@@ -2320,7 +2335,7 @@ body_safe = collapse_blank_lines_tg(body_safe)       # round-39: post-sanitize c
 - **auth** — расширен (ADR-0022):
   - `AuthService.login` (step-2) после успешного verify password проверяет cookie `mas_tg_pending` → если есть, вызывает `TelegramSSOService.link_pending(...)`.
   - `AuthService.complete_set_password` — то же.
-  - `AuthService.logout` ПЕРЕД revoke session вызывает `TelegramSSOService.revoke_for_user(user_id, reason='logout')`.
+  - **(round-43)** `AuthService.logout` / `POST /logout` завершает **только** веб-сессию (revoke session + clear cookies + 302 `/login`) и **НЕ** трогает `telegram_links` — вызов `TelegramSSOService.revoke_for_user(user_id, reason='logout')` **удалён** (ADR-0022 §1.5 / ADR-0024 §5, round-43). Отвязка TG — только явной кнопкой «Отвязать» (`DELETE /api/telegram/links/{id}` → `revoke_one`, `reason='user_unlink'`). Push не зависит от веб-сессии — привязка самодостаточна.
   - Cookies `mas_session`/`mas_csrf` ставятся ровно как в браузере. Telegram WebView shares cookies with system WebView (на iOS WKWebView, на Android system WebView), `SameSite=Lax` + `Secure` поверх HTTPS работают.
 - **admin** — `AdminService.reset_password` дополнительно вызывает `TelegramSSOService.revoke_for_user(user_id, reason='password_reset')`. `AdminService.delete_user` НЕ требует явного вызова — `telegram_links` каскадно удаляется через FK `ON DELETE CASCADE`.
 - **redis** — два новых ключа:
