@@ -148,6 +148,23 @@ class Settings(BaseSettings):
     SAFE_REDIRECT_AFTER_LOGIN: str = "/"
     LOGIN_PATH: str = "/login"
 
+    # --- External PULL-API (ADR-0029) -------------------------------------
+    # Static API key authenticating ``GET /api/external/messages`` (the B2B
+    # partner incrementally pulls ALL system messages). OPTIONAL: empty means
+    # the feature is OFF — the endpoint then returns 401 unenumerably (it must
+    # NOT be added to ``_enforce_required``). Generate with
+    # ``openssl rand -hex 32`` (256-bit). Compared via constant-time
+    # ``secrets.compare_digest``; redacted in ``shared/logging.py`` alongside
+    # ``X-API-Key`` / ``Authorization``. Passed only to the ``api`` container.
+    EXTERNAL_API_KEY: str = ""
+    # Operator-tunable rate limit for ``GET /api/external/messages`` (ADR-0029
+    # §1/§4): requests per minute, per client IP. Overrides the static
+    # ``LIMIT_EXTERNAL_API`` capacity at consume-time (same pattern as
+    # ``WEBHOOK_TEST_LIMIT`` / ``TG_SEND_PER_CHAT_PER_MINUTE``) so the cap can
+    # be retuned without a code redeploy. Numeric (requests/60s), NOT a
+    # ``"120/minute"`` string. Window is fixed at 60 s.
+    EXTERNAL_API_RATE_LIMIT_PER_MINUTE: int = Field(default=120, ge=1, le=10000)
+
     # --- Telegram launcher bot (ADR-0018) + persistent SSO / notifications
     #     (ADR-0022) ---
     # NOTE: ADR-0018 + docs/05-modules.md sec. 18 reference the env name
@@ -348,6 +365,18 @@ class Settings(BaseSettings):
         BotFather setup.
         """
         return bool(self.BOT_TOKEN and self.TELEGRAM_WEBHOOK_SECRET and self.TELEGRAM_WEBAPP_URL)
+
+    @property
+    def external_api_enabled(self) -> bool:
+        """True only when ``EXTERNAL_API_KEY`` is configured (ADR-0029 §4).
+
+        Derived flag — symmetric with :pyattr:`telegram_bot_enabled` /
+        :pyattr:`outlook_oauth_enabled`. When false the
+        ``GET /api/external/messages`` endpoint returns 401 unenumerably
+        (feature off is indistinguishable from a wrong key — the config is
+        never disclosed). Lets us register the route in dev/CI without a key.
+        """
+        return bool(self.EXTERNAL_API_KEY)
 
     @property
     def outlook_oauth_enabled(self) -> bool:

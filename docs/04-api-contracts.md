@@ -77,6 +77,7 @@
 | 401 | `init_data_expired` | `POST /api/telegram/auth`: `auth_date` в `init_data` старше 5 минут. |
 | 400 | `webhook_url_private_ip` | `POST/PATCH /api/webhooks/me`: URL резолвится в приватный CIDR / localhost. SSRF-защита. См. [ADR-0023](./adr/ADR-0023-outbound-webhooks.md) §4.3. |
 | 409 | `webhook_already_exists` | `POST /api/webhooks/me`: у группы уже есть webhook (`UNIQUE(group_id)`). Используется `PATCH` для update или `DELETE` + `POST` для пересоздания. |
+| 401 | `not_authenticated` (external) | `GET /api/external/messages`: нет/неверный `X-API-Key`/`Bearer`, **или** фича выключена (`EXTERNAL_API_KEY` пуст). Неперечислимо — «выключено» неотличимо от «неверный ключ». См. [ADR-0029](./adr/ADR-0029-external-pull-api.md) §3/§4. |
 
 ---
 
@@ -1188,6 +1189,69 @@ Payload (`event="message_tagged"`):
 
 ---
 
+## 4d. External pull-API (ADR-0029)
+
+Источник истины — [ADR-0029](./adr/ADR-0029-external-pull-api.md). **PULL-канал** для доверенного B2B-партнёра: его сервис периодически опрашивает endpoint и инкрементально забирает новые письма. Отличие от ADR-0023 (push, per-team, tagged-only): здесь **pull**, **ВСЕ** письма системы (super_admin visibility), **сырое полное тело**.
+
+### Авторизация
+
+- Static `EXTERNAL_API_KEY` в заголовке `X-API-Key: <key>` **или** `Authorization: Bearer <key>` (`X-API-Key` имеет приоритет). Сравнение constant-time (`secrets.compare_digest`).
+- Без cookie-сессии и `VisibilityScope`. API-key = доверенный сервис, видит все письма всех ящиков. Единственный read-фильтр — canonical-дедуп дубль-ящиков (`mail_account_id IN list_canonical_account_ids()`, `MIN(id)` per `LOWER(email)`): если один email подключён двумя командами, внешний сервис получает **одну** копию каждого письма (консистентно с super_admin inbox, round-18).
+- Фича включена ⇔ `EXTERNAL_API_KEY` непустой. Пусто → endpoint отдаёт `401` (неперечислимо).
+- CSRF — **exempt** (нет cookie-auth; GET-only). Rate-limit `LIMIT_EXTERNAL_API` (env `EXTERNAL_API_RATE_LIMIT_PER_MINUTE`, `int`, default `120`, `ge=1`; запросов в минуту на IP) — consume **до** проверки ключа (anti-flood).
+
+### `GET /api/external/messages`
+
+| | |
+| --- | --- |
+| Доступ | `EXTERNAL_API_KEY` (`X-API-Key` / `Bearer`). |
+| Query `since_id` | `int ≥ 0`, default `0`. Семантика `WHERE id > since_id`. |
+| Query `limit` | `int`, `1..200`, default `50` (hard cap 200). |
+| Семантика | `WHERE m.id > :since_id AND m.mail_account_id IN (:canonical_ids) ORDER BY m.id ASC LIMIT :limit` — keyset по `messages.id BIGSERIAL` (монотонный insert-order; без пропусков/дублей курсора) + canonical-дедуп дубль-ящиков. Внешний сервис хранит `last_id` = `next_since_id`. |
+| 200 | `{messages:[ExternalMessageDTO], next_since_id:int, has_more:bool}` (см. ниже). |
+| 200 (пусто) | `{messages:[], next_since_id:<входной since_id>, has_more:false}`. |
+| 401 | `not_authenticated` — нет/неверный ключ **или** фича выключена (неперечислимо). |
+| 429 | `rate_limited` (+`Retry-After`). |
+| 400 | `validation_error` — `since_id<0`/нечисловой, `limit` вне `1..200`. |
+
+`ExternalMessageDTO` (отдельный от UI `MessageDetail` — стабильный версионируемый контракт; **сырое stored** `body_text`/`body_html` без `collapse_blank_lines_*`):
+
+```json
+{
+  "messages": [
+    {
+      "id": 12345,
+      "subject": "Тема письма",
+      "internal_date": "2026-06-11T09:30:00Z",
+      "from_addr": "sender@example.com",
+      "from_name": "Sender Name",
+      "to_addrs": "a@example.com, b@example.com",
+      "cc_addrs": "c@example.com",
+      "mail_account": {"id": 7, "email": "support@corp.example", "display_name": "Support"},
+      "body_text": "<raw stored>",
+      "body_html": "<raw stored or null>",
+      "body_present": true,
+      "body_truncated": false,
+      "tags": [{"id": 7, "name": "Urgent", "color": "#dc2626"}]
+    }
+  ],
+  "next_since_id": 12345,
+  "has_more": true
+}
+```
+
+- `next_since_id` = `id` последнего элемента (`max(id)`); пусто → входной `since_id`.
+- `has_more` = `len(messages) == limit`.
+- `to_addrs` — всегда строка (БД `NOT NULL DEFAULT ''`); `cc_addrs`/`from_name`/`subject`/`body_html`/`mail_account.display_name` — nullable.
+- Вложения **не передаются** (Q-0029-1). `tags` — `[]` если нет тегов. `body_present=false` → `body_text=""`, `body_html=null`.
+- Возвращаются **только** поля письма — никаких паролей/токенов/secret'ов/IMAP-UID.
+
+> **Версионирование:** текущий путь `/api/external/` (неявная v1), поля добавляются аддитивно. Breaking change → `/api/external/v1/` + новый ADR.
+>
+> **id-gaps:** retention-cleanup (ADR-0011, 30д) удаляет старые письма → безвредные пропуски в `id` (keyset `id > since_id` их игнорирует). Контракт: внешний сервис поллит **чаще** окна ретенции.
+
+---
+
 ## 5. Health & ops
 
 ### `GET /healthz`
@@ -1300,6 +1364,7 @@ FastAPI автогенерит OpenAPI 3.1. UI:
 | PATCH | `/api/me/settings` | user | yes | — | — | user preferences (tg_notifications_enabled); см. ADR-0022 |
 | GET | `/api/oauth/outlook/authorize` | user | — | 30/h | — | сгенерить Microsoft authorize URL + state (ADR-0025) |
 | GET | `/api/oauth/outlook/callback` | state in Redis | exempt | 30/min per IP | — | OAuth callback: code→токены, create mail_account (ADR-0025) |
+| GET | `/api/external/messages` | `EXTERNAL_API_KEY` (X-API-Key \| Bearer) | exempt | 120/min per IP (`LIMIT_EXTERNAL_API`) | — | **ADR-0029:** external pull-API — инкрементальный keyset по `messages.id` (`since_id`/`limit`), ВСЕ письма системы, сырое полное тело, no attachments |
 | GET | `/my/integrations` | group_leader \| super_admin | — | — | — | webhook config page (ADR-0023) |
 | GET | `/api/webhooks/me` | group_leader \| super_admin | — | — | — | get webhook config (no secret) |
 | POST | `/api/webhooks/me` | group_leader \| super_admin | yes | 10/h per group | yes | create webhook + one-shot secret reveal |

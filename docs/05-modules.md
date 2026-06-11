@@ -83,6 +83,11 @@ backend/
       dispatch_service.py  # WebhookDispatchService.enqueue_message_ids, dispatch_one_payload — копируется по паттерну telegram/sso_service+notify_format
       schemas.py           # WebhookCreate, WebhookUpdate, WebhookDTO (no secret), WebhookCreatedDTO (with one-shot secret), TestResultDTO
       payload.py           # build_message_tagged_payload(ctx, team_tags, webhook_id, delivery_id) — формирование dict для json.dumps
+    external/              # ADR-0029 — external PULL-API (B2B-партнёр забирает письма инкрементально)
+      __init__.py
+      router.py            # GET /api/external/messages (csrf-exempt, no session)
+      service.py           # ExternalMessagesService.list_messages(api_key, since_id, limit) — auth-флоу + сборка page
+      schemas.py           # ExternalMessageDTO, ExternalMailAccountDTO, ExternalTagDTO, ExternalMessagesPage (отдельные от UI MessageDetail)
     audit/
       service.py
     models/                # SQLAlchemy ORM
@@ -2741,7 +2746,121 @@ WHITELIST_PATHS = [
 
 ---
 
-## 20. QA / тесты — обязательный набор для backend/worker
+## 20. external (модуль) — pull-API
+
+Источник истины — [ADR-0029](./adr/ADR-0029-external-pull-api.md). **PULL-канал** для доверенного B2B-партнёра: его сервис опрашивает `GET /api/external/messages` и инкрементально забирает новые письма (keyset по `messages.id`). Отличие от webhooks (ADR-0023): pull (не push), ВСЕ письма системы (super_admin visibility, без сессии), сырое полное тело (`body_text`+`body_html`, **без** `collapse_blank_lines_*`), вложения нет.
+
+### Назначение
+1. **Инкрементальная выдача писем** — keyset `WHERE id > :since_id ORDER BY id ASC LIMIT :limit`. Курсор (`last_id`) хранит внешний сервис.
+2. **Stateless** на нашей стороне — нет очередей/диспатчеров/recovery/таблиц состояния. Чистый read-only GET.
+
+### Публичный API
+- HTTP route (см. `04-api-contracts.md` §4d): `GET /api/external/messages?since_id&limit` (csrf-exempt, без сессии).
+- Service (`backend/app/external/service.py`):
+```python
+class ExternalMessagesService:
+    async def list_messages(self, *, api_key: str | None, since_id: int, limit: int) -> ExternalMessagesPage:
+        # auth-флоу (ADR-0029 §4), порядок строгий:
+        #   (rate-limit consume делается в router ДО вызова service — anti-flood)
+        # 1. if not settings.external_api_enabled: raise NotAuthenticatedError   # bool(EXTERNAL_API_KEY)
+        # 2. if api_key is None or not secrets.compare_digest(api_key, settings.EXTERNAL_API_KEY):
+        #        raise NotAuthenticatedError                                       # 401 not_authenticated
+        # 3a. canonical_ids = await MailAccountsRepo.list_canonical_account_ids()  # MIN(id) per LOWER(email) — дедуп дубль-ящиков (round-18)
+        # 3b. rows = await ExternalMessagesRepo.list_since_id(
+        #              mail_account_ids=canonical_ids, since_id=since_id, limit=limit)   # keyset + tags batch
+        # 4. next_since_id = rows[-1].id if rows else since_id
+        # 5. has_more = len(rows) == limit
+        # 6. return ExternalMessagesPage(messages=[ExternalMessageDTO...], next_since_id, has_more)
+        # Лог: client_ip, since_id, limit, returned_count — БЕЗ api_key (redact).
+```
+- Router (`backend/app/external/router.py`):
+```python
+# consume(LIMIT_EXTERNAL_API, key=client_ip) ПЕРВЫМ (anti-flood до auth) → 429 rate_limited (+Retry-After)
+# извлечь ключ: X-API-Key (приоритет) или Authorization: Bearer <token>
+# валидация query (since_id>=0, 1<=limit<=200) → 400 validation_error
+# delegate → ExternalMessagesService.list_messages(...)
+```
+- Repository (`backend/app/repositories/messages.py` — расширение существующего, или `external_messages.py`):
+```python
+class ExternalMessagesRepo:                 # или метод в MessagesRepo
+    async def list_since_id(
+        self, *, mail_account_ids: list[int], since_id: int, limit: int
+    ) -> list[ExternalMessageRow]:
+        # SELECT m.id, m.subject, m.internal_date, m.from_addr, m.from_name,
+        #        m.to_addrs, m.cc_addrs, m.body_text, m.body_html,
+        #        m.body_present, m.body_truncated,
+        #        ma.id, ma.email, ma.display_name
+        # FROM messages m JOIN mail_accounts ma ON ma.id = m.mail_account_id
+        # WHERE m.id > :since_id
+        #   AND m.mail_account_id IN (:mail_account_ids)   # canonical-дедуп дубль-ящиков (round-18)
+        # ORDER BY m.id ASC LIMIT :limit
+        # + второй запрос tags: SELECT mt.message_id, t.id, t.name, t.color
+        #   FROM message_tags mt JOIN tags t ON t.id=mt.tag_id WHERE mt.message_id = ANY(:ids)
+        #   → группировка в Python в tags[] на письмо (DISTINCT t.id; письмо без тегов → []).
+        # БЕЗ collapse-нормализации — body_text/body_html отдаются сырыми.
+        # mail_account_ids приходит из MailAccountsRepo.list_canonical_account_ids() (service-слой).
+        #   Empty mail_account_ids → возврат [] без запроса.
+        # Фильтр group_id НЕ применяется (все команды; super_admin visibility) — единственный
+        #   фильтр это canonical mail_account_id (исключение контентных дублей дубль-ящиков).
+        # Индексы: PK id (keyset) + INDEX(mail_account_id, internal_date DESC) (покрывает IN-фильтр).
+```
+- Schemas (`backend/app/external/schemas.py` — **отдельные** от UI `MessageDetail`):
+```python
+class ExternalTagDTO(BaseModel):
+    id: int; name: str; color: str
+
+class ExternalMailAccountDTO(BaseModel):
+    id: int; email: str; display_name: str | None
+
+class ExternalMessageDTO(BaseModel):
+    id: int
+    subject: str | None
+    internal_date: datetime
+    from_addr: str
+    from_name: str | None
+    to_addrs: str                            # БД NOT NULL DEFAULT '' → всегда строка
+    cc_addrs: str | None
+    mail_account: ExternalMailAccountDTO
+    body_text: str                           # СЫРОЕ stored (без collapse)
+    body_html: str | None                    # СЫРОЕ stored
+    body_present: bool
+    body_truncated: bool
+    tags: list[ExternalTagDTO]               # [] если нет тегов
+
+class ExternalMessagesPage(BaseModel):
+    messages: list[ExternalMessageDTO]
+    next_since_id: int                       # max(id) выданной страницы; пусто → входной since_id
+    has_more: bool                           # len(messages) == limit
+```
+
+### Зависимости
+- config: `EXTERNAL_API_KEY` (str, default `""`), derived `external_api_enabled := bool(EXTERNAL_API_KEY)`, `EXTERNAL_API_RATE_LIMIT_PER_MINUTE` (int, default `120`, `ge=1`; запросов в минуту на IP).
+- rate_limit: `LIMIT_EXTERNAL_API` (cap = `settings.EXTERNAL_API_RATE_LIMIT_PER_MINUTE`, override на consume-time, паттерн `TG_SEND_PER_CHAT_PER_MINUTE`), consume per client IP **до** auth.
+- repositories: `messages` (или `external_messages`), `mail_accounts` (через JOIN + `MailAccountsRepo.list_canonical_account_ids()` для canonical-дедупа дубль-ящиков, round-18), `tags`/`message_tags` (для `tags[]`).
+- logging: `EXTERNAL_API_KEY`/`X-API-Key`/`Authorization` в redact-list.
+- CSRF: путь `/api/external/*` — в exempt allowlist (`backend/app/main.py`), как Telegram webhooks.
+- НЕ зависит от: сессий, `VisibilityScope`, worker, очередей, MinIO.
+
+### Edge cases
+- `messages[]` пуст → `next_since_id` = входной `since_id`, `has_more=false` (см. ADR-0029 §Edge).
+- `since_id` «в будущем» / `since_id=0` / id-gap от retention → keyset `id > since_id` корректно обрабатывает (без ошибок).
+- `limit` вне `1..200` / `since_id<0` → `400 validation_error`.
+- `body_present=false` → `body_text=""`, `body_html=null` (поля присутствуют).
+- `cc_addrs` nullable; `to_addrs` всегда строка.
+- **Дубль-ящик** (один email в двух командах → два `mail_accounts`) → canonical-фильтр (`MIN(id)`) отдаёт **одну** копию письма, не обе. Консистентно с super_admin inbox (round-18).
+- Фича выключена (`EXTERNAL_API_KEY` пуст) → `401 not_authenticated` (неотличимо от «неверный ключ»).
+
+### Инварианты
+- **Read-only.** Только `GET`, только поля письма — никаких паролей/токенов/secret'ов/IMAP-UID/owner-структур.
+- **Сырое тело.** `body_text`/`body_html` НЕ проходят `collapse_blank_lines_*` (отличие от модуля 10 UI-DTO).
+- **Keyset без пропусков/дублей курсора** по монотонному `messages.id BIGSERIAL`.
+- **Canonical-дедуп дубль-ящиков** — фильтр `mail_account_id IN (list_canonical_account_ids())` исключает контентные дубли (один email в двух командах); внешний сервис получает одну копию. Тот же механизм, что в super_admin inbox (round-18) — единая семантика.
+- **Ключ никогда не логируется** (redact). Сравнение constant-time (`compare_digest`).
+- **Отдельный DTO** — `ExternalMessageDTO` не делит код с UI `MessageDetail`; эволюционирует независимо (версионирование `/api/external/` → `/api/external/v1/` при breaking change).
+
+---
+
+## 21. QA / тесты — обязательный набор для backend/worker
 
 Это не отдельный модуль кода, а сводный список тестов, которые QA-агент обязан реализовать. Backend-агент покрывает unit-тестами доменные функции, QA-агент — integration/e2e.
 
@@ -2756,6 +2875,7 @@ WHITELIST_PATHS = [
 - tags (ADR-0017): `ensure_builtin_tags` идемпотентен; per-user изоляция (cross-user — нет утечек); DELETE builtin → `CannotDeleteBuiltinTagError`; UNIQUE `(user_id, name)` — race на create возвращает 409.
 - telegram (ADR-0018): `POST /api/telegram/webhook/<wrong>` → 403; правильный secret + `/start` → 200 и Bot API получил `sendMessage` с inline-keyboard и web_app.url; правильный secret + `/help` или произвольный текст или body без `message` → 200 без вызова Bot API; `TELEGRAM_BOT_TOKEN` отсутствует во всех логах (redact-test).
 - webhooks (ADR-0023): `encrypt_webhook_secret`/`decrypt_webhook_secret` round-trip с `webhook_id` AAD; decrypt с другим `webhook_id` → `InvalidTag`; URL validation (https only, lexical localhost reject, SSRF DNS-резолв с приватными CIDR → 400); idempotency `try_reserve` (повторный вызов → None); `find_active_for_message` отсеивает inactive/dead/history-filter; `secret` plaintext отсутствует во всех логах (redact-test); FSM transitions (4xx×10 → dead, 410 → dead, 5xx → rollback, 2xx → success); `POST /test` не пишет `webhook_deliveries`.
+- external pull-API (ADR-0029): auth-флоу — нет ключа → 401; неверный ключ → 401 (`compare_digest`); `EXTERNAL_API_KEY` пуст (фича выключена) → 401 (неотличимо от неверного ключа); `X-API-Key` и `Authorization: Bearer` оба принимаются, `X-API-Key` приоритетнее; rate-limit consume **до** auth (исчерпание → 429 `Retry-After`, ключ не сравнивается); query validation (`since_id<0` → 400, `limit=0`/`limit=201` → 400, defaults `since_id=0`/`limit=50`); ключ/заголовок отсутствуют во всех логах (redact-test); `body_text`/`body_html` отдаются **сырыми** (без `collapse_blank_lines_*` — сравнить с UI-DTO на письме с пустыми строками); **canonical-дедуп** — `ExternalMessagesRepo.list_since_id` вызывается с `mail_account_ids` из `list_canonical_account_ids()` (mock возвращает только canonical id), не-канонические `mail_account_id` отсутствуют в SQL-фильтре; пустой `mail_account_ids` → пустой результат без SQL-запроса.
 
 ### Integration (с реальными Postgres/Redis/MinIO в test-compose)
 - POST mail-account с замоканным IMAP/SMTP (через mock-server) — успех/fail; шифрование сохраняется/расшифровывается.
@@ -2765,11 +2885,12 @@ WHITELIST_PATHS = [
 - Admin delete user — каскад до MinIO (объекты удалены).
 - Force sync — маркер обработан в течение следующего тика.
 - Tags: первый login создаёт 4 builtin-тега; повторный login не дублирует. Sync с письмом subject="DPLA report" → автоматически прицепляется builtin "DPLA.PLA". Создание custom тега с `apply_to_existing=true` — новые linkы появились в `message_tags`. DELETE message → CASCADE удаляет `message_tags` (нет orphan). DELETE user → CASCADE удаляет `tags`/`tag_rules`/`message_tags`.
+- External pull-API (ADR-0029): seed N писем → `GET /api/external/messages?since_id=0&limit=K` отдаёт первые K по `id ASC`, `next_since_id`=max(id), `has_more=true` при N>K; повторный запрос с `next_since_id` отдаёт следующую страницу без дублей/пропусков; пустой хвост → `{messages:[], next_since_id:<входной>, has_more:false}`; новое письмо (insert) появляется с `id>курсор` (поздняя `internal_date` не теряется — keyset по id); удаление письма (retention) даёт id-gap, keyset не падает и не пропускает соседние; `tags[]` корректны (письмо без тегов → `[]`); поля письма только из whitelist (нет паролей/токенов). Без `EXTERNAL_API_KEY` в env → 401 на любой запрос. **Дубль-ящик (canonical-дедуп):** seed два `mail_accounts`-ряда с одним `LOWER(email)` (две команды), каждый с письмом одинакового контента под **разными** `messages.id` → `GET /api/external/messages` отдаёт **ОДНУ** копию (письмо канонического `MIN(id)`-аккаунта), не обе; вторая копия (не-канонический аккаунт) **отсутствует** в выдаче; результат консистентен с super_admin inbox на тех же данных.
 - Webhooks (ADR-0023): создание webhook → audit `webhook_created`, response с plaintext secret; GET без secret. Письмо с тегом → POST на receiver (mock httpx) с правильным payload + `X-Webhook-Secret` + `X-Webhook-Delivery-Id`. Идемпотентность: повторный sync_cycle того же message — POST НЕ повторяется. Receiver 5xx → row отсутствует (rollback), recovery_scan через час → LPUSH back, POST повторён. Receiver 4xx × 10 → `dead_at`, audit. Receiver 410 → немедленный `dead_at`. `DELETE /api/admin/groups/{id}` → CASCADE удаляет webhooks + webhook_deliveries. DELETE message (retention) → CASCADE удаляет webhook_deliveries. История: сообщение `internal_date < webhook.created_at` НЕ доставляется (фильтр). Опт-out по группе через `is_active=false` — POST НЕ выполняется. Cross-group isolation: webhook команды A не получает POST для письма в команде B.
 
 ### E2E (через httpx + Browser-less)
 - Полный flow: admin создаёт user -> user logs in -> set password -> add account -> sync (триггер вручную) -> читает inbox -> отвечает -> sent_messages инкрементится.
 
 ### Coverage
-- Минимум 75% по модулям 1–11, 14, 14.1, 14.2, 15, 17, 18, 19.
+- Минимум 75% по модулям 1–11, 14, 14.1, 14.2, 15, 17, 18, 19, 20 (external).
 - Никаких `# pragma: no cover` без обоснования в комментарии.

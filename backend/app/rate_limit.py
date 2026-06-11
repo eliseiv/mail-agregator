@@ -110,6 +110,14 @@ LIMIT_WEBHOOK_TEST = Limit(name="webhook_test", capacity=10, window_seconds=60 *
 # Consumed via the non-raising :func:`try_consume` (a throttled recipient is
 # skipped this tick, not rejected with an error). Key: ``rl:tg_send:<chat_id>``.
 LIMIT_TG_SEND_PER_CHAT = Limit(name="tg_send", capacity=20, window_seconds=60)
+# External PULL-API (ADR-0029 §1/§4): 120 req / 60 s per client IP. Consumed
+# FIRST in the router — before any work with the API key — so a brute-force /
+# flood of failed-auth attempts is rate-limited too (anti-bruteforce + DoS).
+# ``capacity`` is overridden at consume-time from
+# ``settings.EXTERNAL_API_RATE_LIMIT_PER_MINUTE`` (same pattern as
+# ``LIMIT_WEBHOOK_TEST`` / ``LIMIT_TG_SEND_PER_CHAT``) so operators can tune the
+# cap without a code redeploy. The static value here is the default fallback.
+LIMIT_EXTERNAL_API = Limit(name="external_api", capacity=120, window_seconds=60)
 
 
 async def consume(limit: Limit, key: str) -> None:

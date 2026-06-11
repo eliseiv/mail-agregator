@@ -57,6 +57,10 @@ EXEMPT_PATHS: frozenset[str] = frozenset(
 EXEMPT_PATH_PREFIXES: tuple[str, ...] = (
     "/api/telegram/webhook/",
     "/api/telegram/push-webhook/",
+    # ADR-0029 §1: external PULL-API. No cookie session — auth is a static
+    # ``X-API-Key`` / ``Bearer`` key (constant-time compare); GET-only,
+    # read-only, so CSRF (a cookie-session defence) does not apply.
+    "/api/external/",
 )
 
 

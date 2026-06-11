@@ -252,6 +252,13 @@ Healthcheck не настроен — это бесконечный sleep-цик
 
 OAuth включён (`OUTLOOK_OAUTH_ENABLED`, derived), когда заданы `OUTLOOK_CLIENT_ID` + `OUTLOOK_CLIENT_SECRET`; иначе `/api/oauth/outlook/*` отдают `404` (route скрыт). `OUTLOOK_CLIENT_SECRET` передаётся в **api** (authorize/callback/SMTP) и **worker** (refresh перед IMAP). `TELEGRAM_BOT_TOKEN` хранится в `.env` (`chmod 600`). **Изменение от ADR-0018:** `worker` теперь использует Telegram API для доставки push-нотификаций (ADR-0022 §2) — `TELEGRAM_BOT_TOKEN` передаётся **и** в `api`, **и** в `worker` контейнеры. Маскировка в логах гарантируется redact-list'ом structlog (одинаково для обоих контейнеров). **ADR-0027:** токены push-only ботов по командам (`BOT_IVAN_TOKEN` / `BOT_ALEXANDRA_TOKEN` / `BOT_ANDREI_TOKEN`) + их `*_GROUP_ID` + `ADMIN_TELEGRAM_IDS` передаются **только** в `worker` (диспатчер `push_notify_dispatch` живёт там; `api` их не использует). Три новых токена добавлены в structlog redact-list рядом с `TELEGRAM_BOT_TOKEN`.
 
+### External pull-API (ADR-0029)
+
+| Переменная | Default | Required | Описание |
+| --- | --- | --- | --- |
+| `EXTERNAL_API_KEY` | `""` (пусто) | no | **ADR-0029:** статический ключ для `GET /api/external/messages` (доверенный B2B-партнёр забирает все письма pull'ом). Генерация: `openssl rand -hex 32` (256 бит). **Опционально**: пусто ⇒ фича выключена (`external_api_enabled=false`) ⇒ endpoint отдаёт `401` неперечислимо. Передаётся **только** в `api` (worker не использует). Маскируется в structlog redact-list (рядом с `MAIL_ENCRYPTION_KEY`/`TELEGRAM_BOT_TOKEN`); `X-API-Key`/`Authorization` тоже в redact. Ротация — см. `06-security.md` §10. |
+| `EXTERNAL_API_RATE_LIMIT_PER_MINUTE` | `120` | no | **ADR-0029:** лимит запросов в минуту на IP к `GET /api/external/messages` (`LIMIT_EXTERNAL_API`). Consume до проверки ключа (anti-flood). Числовой (`int`, `ge=1`; `0` не допускается). Override на consume-time (паттерн `TG_SEND_PER_CHAT_PER_MINUTE`). |
+
 ### CI / Build
 
 | Переменная | Default | Required | Описание |

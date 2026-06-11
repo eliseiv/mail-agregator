@@ -70,6 +70,12 @@ REDACT_KEYS: frozenset[str] = frozenset(
         "oauth_access_token",
         "oauth_refresh_token",
         "id_token",
+        # External PULL-API (ADR-0029 §Security): the static partner key must
+        # never appear in logs in any header / env form. ``Authorization``
+        # (Bearer transport) is already covered above.
+        "EXTERNAL_API_KEY",
+        "X-API-Key",
+        "x-api-key",
     }
 )
 

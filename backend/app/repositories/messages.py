@@ -183,6 +183,41 @@ class MessagesRepo:
         rows = (await self._s.execute(stmt)).all()
         return [(row[0], row[1]) for row in rows]
 
+    async def list_since_id(
+        self,
+        *,
+        mail_account_ids: list[int],
+        since_id: int,
+        limit: int,
+    ) -> list[tuple[Message, MailAccount]]:
+        """Keyset listing for the external PULL-API (ADR-0029 §1).
+
+        Returns ``[(Message, MailAccount)]`` for messages whose ``id`` is
+        strictly greater than ``since_id`` and whose ``mail_account_id`` is in
+        ``mail_account_ids`` (the canonical-deduped set — see
+        :meth:`MailAccountsRepo.list_canonical_account_ids`), ordered by
+        ``messages.id ASC`` and capped at ``limit``. The monotonic
+        ``messages.id BIGSERIAL`` keyset guarantees no gaps/dupes in the
+        cursor between successive pages.
+
+        ``mail_account_ids=[]`` (the system has no mailboxes at all) returns
+        ``[]`` WITHOUT issuing a query. The ``IN`` is parameterised.
+        """
+        if not mail_account_ids:
+            return []
+        stmt = (
+            select(Message, MailAccount)
+            .join(MailAccount, MailAccount.id == Message.mail_account_id)
+            .where(
+                Message.id > since_id,
+                Message.mail_account_id.in_(mail_account_ids),
+            )
+            .order_by(Message.id.asc())
+            .limit(limit)
+        )
+        rows = (await self._s.execute(stmt)).all()
+        return [(row[0], row[1]) for row in rows]
+
     async def count_unread_for_user_ids(self, mail_account_ids: list[int] | None) -> int:
         stmt = select(func.count(Message.id)).where(Message.is_read.is_(False))
         if mail_account_ids is not None:

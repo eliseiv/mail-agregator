@@ -190,6 +190,25 @@
 
 > Доставка уведомлений остаётся fire-and-forget (TD-041) — webhook касается только inbound-callback, не исходящей доставки. См. [ADR-0027](./adr/ADR-0027-push-team-bots.md) §8/§10/§11.
 
+### 1.13 External pull-API для стороннего сервиса (ADR-0029)
+
+**Trusted external pull.** Доверенный B2B-партнёр опрашивает `GET /api/external/messages` и забирает ВСЕ письма системы (super_admin visibility). Аутентификация — **single-factor static `EXTERNAL_API_KEY`** (`X-API-Key` / `Authorization: Bearer`, constant-time `secrets.compare_digest`). Read-only, без cookie-сессии/`VisibilityScope`. См. [ADR-0029](./adr/ADR-0029-external-pull-api.md).
+
+| Угроза | Описание | Митигация |
+| --- | --- | --- |
+| S | Атакующий выдаёт себя за партнёра без ключа | Каждый запрос требует валидный `EXTERNAL_API_KEY` (256 бит, `openssl rand -hex 32`); `compare_digest` constant-time. Без/неверный ключ → `401 not_authenticated`. |
+| S | Brute-force ключа | `LIMIT_EXTERNAL_API` (`120/min` per IP) consume **ДО** сравнения ключа — anti-flood. 256-битный ключ практически неперебираем. |
+| T | Подмена данных в транзите | Только через nginx :443 (TLS), как остальной API. |
+| R | Скрытие доступа | structlog-событие на каждый запрос: `client_ip`, `since_id`, `limit`, `returned_count` (без ключа). Audit-таблица **не** пишется (нет per-user actor; это machine-to-machine read; достаточно application-логов — симметрично решению по `group_leader`/`group_member` read-actions, §8). |
+| I | Утечка ключа через логи | `EXTERNAL_API_KEY`, `X-API-Key`, `Authorization` — в structlog redact-list (рядом с `MAIL_ENCRYPTION_KEY`/`TELEGRAM_BOT_TOKEN`). Значение ключа не логируется ни в каком виде. |
+| I | Партнёр видит ВСЕ письма (single-factor, broad scope) | **Accepted risk** (явное требование). Mitigations: ключ в env (`chmod 600`), read-only (только поля письма — нет паролей/токенов/IMAP-UID/secret'ов), ротация при подозрении (смена `EXTERNAL_API_KEY` + `force-recreate api`). Single-factor — компрометация ключа = доступ ко всем письмам; нет per-client-ключей / отзыва в MVP (один партнёр). Несколько партнёров / отзыв → отдельный ADR (таблица hash-ключей). |
+| I | Утечка чувствительных полей (пароли/токены) через payload | DTO `ExternalMessageDTO` whitelist'ит **только** поля письма (`id`/`subject`/`internal_date`/`from_*`/`to_addrs`/`cc_addrs`/`mail_account.{id,email,display_name}`/`body_*`/`tags`). Не делит код с UI-DTO и не имеет доступа к `encrypted_password`/`oauth_*`. |
+| D | DoS опросом | `LIMIT_EXTERNAL_API` + `limit≤200` cap; read-only keyset по PK (`messages.id`) — дешёвый запрос, без фоновой работы на нашей стороне. |
+| E | Enumeration «включена ли фича» | «Фича выключена» (`EXTERNAL_API_KEY` пуст) и «неверный ключ» возвращают **одинаковый** `401 not_authenticated` — конфиг неперечислим. |
+| E | Replay перехваченного запроса | Static-key схема не защищает от replay (как ADR-0023). Accepted risk MVP — запрос read-only (идемпотентен, не меняет состояние); TLS защищает транзит. HMAC/nonce — отдельный ADR при необходимости. |
+
+> Ротация ключа: смена `EXTERNAL_API_KEY` в `.env` → `docker compose up -d --force-recreate api`; партнёр обновляет ключ синхронно. Старый ключ немедленно недействителен (нет grace-периода). См. §10 (таблица ротации).
+
 ---
 
 ## 2. Шифрование почтовых паролей (схема)
@@ -395,6 +414,9 @@ CSP запрещает inline JS — все скрипты только из `/s
 - `POST /api/webhooks/me/rotate-secret` — `5/час per webhook_id` (защита от accidental DoS на receiver-side rotation logic).
 - `POST /api/webhooks/me/test` — `10/час per webhook_id` (env `WEBHOOK_TEST_LIMIT=10`; защита от использования теста как ad-hoc HTTP probe).
 
+**Дополнительно (ADR-0029):**
+- `GET /api/external/messages` — `LIMIT_EXTERNAL_API` (env `EXTERNAL_API_RATE_LIMIT_PER_MINUTE`, `int`, default `120`, `ge=1`; лимит запросов в минуту на IP). Consume **до** проверки `EXTERNAL_API_KEY` (anti-flood / anti-brute-force). 429 → `Retry-After`.
+
 ---
 
 ## 8. Audit log
@@ -468,6 +490,7 @@ CSP запрещает inline JS — все скрипты только из `/s
 | `MAIL_ENCRYPTION_KEY` | Раз в 12 месяцев или при компрометации | См. ADR-0005 (`mas-cli reencrypt`) |
 | `ADMIN_PASSWORD` | По требованию | Обновить `.env` → `docker compose restart api worker`. `seed_super_admin` идемпотентно перезапишет `users.password_hash` (см. `07-deployment.md` sec. 11.1). UI смены пароля для супер-админа сознательно не предусмотрен. |
 | Session cookie name / domain | По требованию | Через env, разовая настройка |
+| `EXTERNAL_API_KEY` (ADR-0029) | По требованию / при компрометации | Сгенерировать `openssl rand -hex 32` → заменить в `.env` → `docker compose up -d --force-recreate api`. Партнёр обновляет ключ синхронно. Старый ключ немедленно недействителен (нет grace-периода). Пустое значение = фича выключена. |
 
 `MAIL_ENCRYPTION_KEY` ротация (детально):
 1. Сгенерировать новый: `python -c "import os, base64; print(base64.b64encode(os.urandom(32)).decode())"`.
