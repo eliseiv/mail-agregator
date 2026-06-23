@@ -237,6 +237,35 @@
       <p class="field__hint">Если задан — будет показываться вместо email-адреса в списках. До 100 символов.</p>
     </div>
 
+    {# ── Команда ящика (ADR-0031 §2/§5) ────────────────────────────────────
+       Селектор показывается ТОЛЬКО при добавлении (не в edit — ADR-0031 §4.7)
+       и ТОЛЬКО когда доступных команд больше одной. При одной команде ящик
+       молча уходит в неё (домашнюю) — group_id не отправляется, backend сам
+       проставит домашнюю (полная обратная совместимость).
+
+       super_admin: к командам из API добавляется опция «Без команды»
+       (value="" ⇒ group_id=NULL, персональный ящик); у него вариантов всегда
+       больше одного, поэтому селектор виден. Источник опций — серверный рендер
+       из того же сервиса, что и GET /api/my/groups (источник истины один). #}
+    {% if not account and teams is defined
+          and ((teams | length) > 1 or is_super_admin) %}
+    <div class="field">
+      <label class="field__label" for="acc-group">Команда</label>
+      <select class="field__input" id="acc-group" name="group_id" data-account-group>
+        {% if is_super_admin %}
+          <option value="" {% if home_group_id is none %}selected{% endif %}>Без команды</option>
+        {% endif %}
+        {% for team in teams %}
+          <option value="{{ team.id }}"
+                  {% if home_group_id is not none and team.id == home_group_id %}selected{% endif %}>
+            {{ team.name | e }}
+          </option>
+        {% endfor %}
+      </select>
+      <p class="field__hint">Ящик будет добавлен в выбранную команду.</p>
+    </div>
+    {% endif %}
+
     <div class="field" data-account-credentials>
       <label class="field__label" for="acc-password">
         Пароль

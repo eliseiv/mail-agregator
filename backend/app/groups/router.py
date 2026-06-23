@@ -35,6 +35,7 @@ from backend.app.groups.schemas import (
     GroupDetailDTO,
     GroupsListResponse,
     GroupUpdateRequest,
+    MyGroupsDTO,
 )
 from backend.app.groups.service import GroupsService
 from backend.app.rate_limit import LIMIT_ADMIN_WRITE, client_ip, consume
@@ -45,6 +46,10 @@ from shared.models import ROLE_GROUP_MEMBER
 
 api = APIRouter(prefix="/api/admin/groups", tags=["groups"])
 html = APIRouter(prefix="/admin/groups", tags=["groups-html"])
+# ADR-0031 §5: lightweight, user-scope selector source (any role). Separate
+# router because its path (``/api/my/groups``) is not under the admin prefix
+# and it is deliberately NOT super-admin gated.
+my_api = APIRouter(prefix="/api/my", tags=["my"])
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +140,20 @@ async def list_groups(
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
 ) -> GroupsListResponse:
     return await GroupsService(db).list_for_scope(scope, q=q, page=page, limit=limit)
+
+
+@my_api.get("/groups", response_model=MyGroupsDTO)
+async def my_groups(db: DbSession, scope: CurrentScope) -> MyGroupsDTO:
+    """Teams the caller may target for a mailbox (ADR-0031 §5).
+
+    Thin wrapper over :meth:`GroupsService.selectable_teams` — the single
+    source of truth shared with the server-rendered account pages (no-JS
+    ``<option>``s). super_admin sees every group; everyone else sees their own
+    memberships (``scope.group_ids`` = home + additional, ADR-0030). Sorted by
+    name; ``home_group_id`` pre-selects the default option. Available to all
+    roles (user-scope), unlike admin-only ``GET /api/admin/groups``.
+    """
+    return await GroupsService(db).selectable_teams(scope)
 
 
 @api.get("/{group_id}", response_model=GroupDetailDTO)
@@ -475,4 +494,5 @@ async def groups_edit_page(
 
 router = APIRouter()
 router.include_router(api)
+router.include_router(my_api)
 router.include_router(html)

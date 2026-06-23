@@ -107,6 +107,15 @@ class MailAccountCreateRequest(BaseModel):
     smtp_password: str | None = Field(default=None, max_length=256)
     display_name: str | None = Field(default=None, max_length=100)
     target_user_id: int | None = Field(default=None, ge=1)
+    # ADR-0031 §2: optional target team for the new mailbox. ``None`` (the
+    # default — key omitted) preserves the pre-ADR-0031 behaviour: the box
+    # lands in the owner's home group (or NULL for super_admin self). When a
+    # value is supplied the service validates it via ``_validate_target_group``
+    # (ADR-0031 §4). The key is genuinely optional, so "not sent" and "sent
+    # null" are indistinguishable here — that is intentional: create has no
+    # "personal box" form path for non-super_admin, and super_admin-self
+    # already defaults to NULL when the key is omitted.
+    group_id: int | None = Field(default=None, ge=1)
 
     @model_validator(mode="after")
     def _validate(self) -> MailAccountCreateRequest:
@@ -162,6 +171,29 @@ class MailAccountUpdateRequest(BaseModel):
     smtp_starttls: bool | None = None
     smtp_username: str | None = Field(default=None, max_length=254)
     smtp_password: str | None = Field(default=None, max_length=256)
+    # ADR-0031 §3: team transfer. ``group_id`` carries the target team and
+    # ``set_group_id`` is the presence sentinel (cf. ``clear_display_name``)
+    # that distinguishes "field not sent" (leave the team untouched) from
+    # "sent" (move, possibly to NULL for a super_admin personal box). The
+    # router populates ``set_group_id`` from the presence of the JSON key /
+    # form field — see ``_set_group_id_from_presence``.
+    group_id: int | None = Field(default=None, ge=1)
+    set_group_id: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _set_group_id_from_presence(cls, data: object) -> object:
+        """Infer ``set_group_id`` from the presence of a JSON ``group_id`` key.
+
+        Mirrors the documented JSON contract (ADR-0031 §3): the mere presence
+        of ``group_id`` in the request body means "change the team" — even
+        when its value is ``null``. The router's form-fallback path passes
+        ``set_group_id`` explicitly, so callers that already set it (or that
+        validate a model copy) are left untouched.
+        """
+        if isinstance(data, dict) and "group_id" in data and "set_group_id" not in data:
+            data = {**data, "set_group_id": True}
+        return data
 
     @field_validator("display_name")
     @classmethod

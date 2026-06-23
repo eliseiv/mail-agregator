@@ -25,6 +25,7 @@ from backend.app.accounts.testers import (
     smtp_test_login,
     smtp_test_oauth,
 )
+from backend.app.audit import AuditWriter
 from backend.app.deps import VisibilityScope
 from backend.app.exceptions import (
     ConflictError,
@@ -34,6 +35,7 @@ from backend.app.exceptions import (
     ValidationError,
 )
 from backend.app.oauth.service import OAuthRefreshInvalidError, OutlookTokenService
+from backend.app.repositories.groups import GroupsRepo
 from backend.app.repositories.mail_accounts import MailAccountsRepo
 from backend.app.repositories.messages import MessagesRepo
 from backend.app.repositories.users import UsersRepo
@@ -93,6 +95,8 @@ class MailAccountService:
         self._repo = MailAccountsRepo(session)
         self._messages = MessagesRepo(session)
         self._users = UsersRepo(session)
+        self._groups = GroupsRepo(session)
+        self._audit = AuditWriter(session)
         self._storage = get_storage()
 
     # --- Visibility helpers ------------------------------------------------
@@ -337,6 +341,63 @@ class MailAccountService:
         # Defensive — unknown role.
         raise ForbiddenError()
 
+    async def _validate_target_group(
+        self,
+        scope: VisibilityScope,
+        target_user_id: int,
+        group_id: int | None,
+    ) -> int | None:
+        """Validate the target team for a mailbox (ADR-0031 §4).
+
+        Single source of truth for both create (§2) and transfer (§3). The
+        ``target_user_id`` is the resolved *owner* of the box (already vetted
+        by :meth:`_resolve_target_user_id`); ``group_id`` is the requested
+        team. Returns the validated ``group_id`` (possibly ``None``) on
+        success.
+
+        Raises (never 500):
+
+        - ``ForbiddenError("user_not_in_group_scope")`` — the role may not put
+          a box in this team (or may not detach it to ``NULL``).
+        - ``NotFoundError("group_not_found")`` — ``group_id`` does not exist.
+        """
+        # NULL target — personal box. Only super_admin may have one.
+        if group_id is None:
+            if scope.is_super_admin:
+                return None
+            raise ForbiddenError("user_not_in_group_scope")
+
+        # The team must exist before any role-specific authorisation.
+        group = await self._groups.get_by_id(group_id)
+        if group is None:
+            raise NotFoundError("group_not_found")
+
+        if scope.is_super_admin:
+            return group_id
+
+        if scope.is_group_member:
+            # Own teams only, and only on self (defence-in-depth — the owner
+            # resolution already pins ``target_user_id`` to self for members).
+            if target_user_id != scope.user_id or group_id not in scope.group_ids:
+                raise ForbiddenError("user_not_in_group_scope")
+            return group_id
+
+        if scope.is_group_leader:
+            if target_user_id == scope.user_id:
+                # Leader acting on self: any of their own memberships.
+                if group_id not in scope.group_ids:
+                    raise ForbiddenError("user_not_in_group_scope")
+                return group_id
+            # Leader acting on a member of their team: only the team the
+            # leader runs (their home group). Cannot file a member's box into
+            # any other team.
+            if scope.group_id is None or group_id != scope.group_id:
+                raise ForbiddenError("user_not_in_group_scope")
+            return group_id
+
+        # Defensive — unknown role.
+        raise ForbiddenError()
+
     async def create(
         self,
         *,
@@ -355,15 +416,29 @@ class MailAccountService:
             raise ConflictError("Email already added", field="email")
         await self.test(payload.as_test_request())
 
-        # FE-FIX round-10: bind the new account to the owner's CURRENT
-        # group at insert time. Subsequent owner-group changes do NOT move
-        # the account (see ``MailAccountsRepo.attach_orphans_to_group`` for
-        # the orphan-attach exception when going from "no group" to a real
-        # group via PATCH /api/admin/users).
+        # FE-FIX round-10: bind the new account to a group at insert time.
+        # Subsequent owner-group changes do NOT move the account (see
+        # ``MailAccountsRepo.attach_orphans_to_group`` for the orphan-attach
+        # exception when going from "no group" to a real group via
+        # PATCH /api/admin/users).
         owner = await self._users.get_by_id(target_user_id)
         if owner is None:
             raise NotFoundError()
-        owner_group_id = owner.group_id
+
+        # ADR-0031 §2: team selection. ``group_id`` omitted (None) keeps the
+        # pre-ADR-0031 behaviour — the box lands in the owner's home group,
+        # or NULL for a super_admin creating a personal box on themselves.
+        # When supplied, the target team is validated against the initiator's
+        # role via the shared ``_validate_target_group`` (ADR-0031 §4).
+        if payload.group_id is None:
+            if scope.is_super_admin and target_user_id == scope.user_id:
+                owner_group_id: int | None = None
+            else:
+                owner_group_id = owner.group_id
+        else:
+            owner_group_id = await self._validate_target_group(
+                scope, target_user_id, payload.group_id
+            )
 
         new_id = await self._repo.next_account_id()
         encrypted = encrypt_mail_password(payload.password, new_id)
@@ -396,6 +471,49 @@ class MailAccountService:
 
     # --- Update ------------------------------------------------------------
 
+    async def _transfer_group(
+        self,
+        scope: VisibilityScope,
+        acc: MailAccount,
+        requested_group_id: int | None,
+    ) -> None:
+        """Move a visible mailbox to another team (ADR-0031 §3/§4).
+
+        ``acc`` is already confirmed visible to the initiator. ``group_member``
+        may never transfer an existing box — even one they can see — so the
+        attempt is rejected before any team lookup. For ``group_leader`` /
+        ``super_admin`` the target team is validated against the box *owner*
+        (``acc.user_id``) by the shared :meth:`_validate_target_group`. The
+        UPDATE + ``mail_account_group_change`` audit row are written only when
+        the team actually changes (a no-op resubmit stays silent).
+        """
+        if scope.is_group_member:
+            # Transfer of an existing box is administratively significant and
+            # off-limits to members (ADR-0031 §4) — they may only pick a team
+            # at create time.
+            raise ForbiddenError("forbidden")
+
+        target_group_id = await self._validate_target_group(scope, acc.user_id, requested_group_id)
+        if target_group_id == acc.group_id:
+            # No-op resubmit (e.g. the form pre-selected the current team):
+            # neither write nor audit.
+            return
+
+        from_group_id = acc.group_id
+        await self._repo.update_group(acc.id, target_group_id)
+        # Keep the in-memory row consistent for any later reads in this call.
+        acc.group_id = target_group_id
+        await self._audit.log(
+            actor_user_id=scope.user_id,
+            action="mail_account_group_change",
+            target_user_id=acc.user_id,
+            details={
+                "mail_account_id": acc.id,
+                "from_group_id": from_group_id,
+                "to_group_id": target_group_id,
+            },
+        )
+
     async def update(
         self,
         *,
@@ -407,6 +525,14 @@ class MailAccountService:
         acc = await self._repo.get_for_user_ids(visible, account_id)
         if acc is None:
             raise NotFoundError()
+
+        # ADR-0031 §3/§4: team transfer is orthogonal to credentials and
+        # applies to password *and* oauth accounts (it never touches hosts /
+        # secrets, so no IMAP/SMTP re-test is required). Handle it up-front so
+        # the early-return oauth branch below also benefits. ``set_group_id``
+        # is the presence sentinel — only act when the field was sent.
+        if payload.set_group_id:
+            await self._transfer_group(scope, acc, payload.group_id)
 
         # ADR-0025 §4c: oauth_outlook accounts have fixed Microsoft host/port
         # and token-based auth — only ``display_name`` may be edited. Any

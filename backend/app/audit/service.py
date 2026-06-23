@@ -54,6 +54,8 @@ ALLOWED_ACTIONS: Final[frozenset[str]] = frozenset(
         "oauth_refresh_invalidated",
         # ADR-0026 §3 — sync circuit-breaker mass-failure suppression.
         "sync_mass_failure_suppressed",
+        # ADR-0031 §6 — mailbox team transfer (PATCH group_id).
+        "mail_account_group_change",
     }
 )
 

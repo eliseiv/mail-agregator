@@ -58,6 +58,19 @@ class GroupsRepo:
         stmt = select(Group).where(Group.id.in_(ids)).order_by(Group.id)
         return list((await self._s.execute(stmt)).scalars().all())
 
+    async def list_all_groups(self) -> list[Group]:
+        """Every group, unpaginated (ADR-0031 §5 — ``GET /api/my/groups`` for
+        super_admin).
+
+        Distinct from the paginated :meth:`list_all` (``q``/``page``/``limit``,
+        returns a ``(rows, total)`` tuple for the admin grid): this flat list
+        feeds the lightweight team selector, where the project caps total
+        groups at ≤ 5 so no pagination is needed. Ordered by id; the
+        ``my/groups`` service re-sorts by name.
+        """
+        stmt = select(Group).order_by(Group.id)
+        return list((await self._s.execute(stmt)).scalars().all())
+
     async def get_leaders_bulk(self, group_ids: list[int]) -> dict[int, User]:
         """Return ``{group_id: leader_user}`` for the given groups."""
         if not group_ids:

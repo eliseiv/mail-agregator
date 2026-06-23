@@ -389,6 +389,19 @@ class MailAccountsRepo:
             .values(oauth_needs_consent=True, updated_at=datetime.now(UTC))
         )
 
+    async def update_group(self, account_id: int, group_id: int | None) -> None:
+        """Re-assign ``mail_accounts.group_id`` (ADR-0031 §3 team transfer).
+
+        ``group_id`` may be ``None`` to detach the box from any team
+        (super_admin personal box). Authorization + target-team validation
+        live in :class:`MailAccountService`; this is pure data access.
+        """
+        await self._s.execute(
+            update(MailAccount)
+            .where(MailAccount.id == account_id)
+            .values(group_id=group_id, updated_at=datetime.now(UTC))
+        )
+
     async def update_fields(self, account_id: int, **fields: object) -> None:
         if not fields:
             return

@@ -22,6 +22,8 @@ from backend.app.groups.schemas import (
     GroupDetailDTO,
     GroupDTO,
     GroupsListResponse,
+    MyGroupItemDTO,
+    MyGroupsDTO,
     UserBriefDTO,
 )
 from backend.app.repositories.groups import GroupsRepo
@@ -69,6 +71,28 @@ class GroupsService:
         self._sessions = SessionStore()
 
     # --- Reads -------------------------------------------------------------
+
+    async def selectable_teams(self, scope: VisibilityScope) -> MyGroupsDTO:
+        """Teams the caller may target for a mailbox (ADR-0031 §5).
+
+        Single source of truth for the mailbox team selector. Used both by the
+        JSON endpoint ``GET /api/my/groups`` (AJAX form) and by the server-side
+        rendered account pages (no-JS ``<option>`` rendering) — so the two never
+        drift apart.
+
+        - super_admin: every group (``GroupsRepo.list_all_groups``);
+        - group_leader / group_member: the caller's memberships
+          (``scope.group_ids`` = home + additional, ADR-0030).
+
+        ``groups`` is sorted by ``name``. ``home_group_id`` (= ``users.group_id``)
+        pre-selects the default option; ``None`` for super_admin.
+        """
+        if scope.is_super_admin:
+            groups = await self._repo.list_all_groups()
+        else:
+            groups = await self._repo.list_by_ids(sorted(scope.group_ids))
+        items = [MyGroupItemDTO(id=g.id, name=g.name) for g in sorted(groups, key=lambda g: g.name)]
+        return MyGroupsDTO(groups=items, home_group_id=scope.group_id)
 
     async def list_for_scope(
         self,

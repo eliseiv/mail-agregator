@@ -748,7 +748,29 @@ class GroupsRepo:
     async def insert(name: str, leader_user_id: int) -> Group
     async def rename(group_id: int, name: str) -> Group
     async def delete(group_id: int) -> None  # БД CASCADE/RESTRICT обработает
+    async def list_all_groups() -> list[Group]               # ADR-0031 — flat-список всех групп для super_admin (GET /api/my/groups). Отдельный flat-метод, т.к. paginated list_paginated(q, page, limit) → (rows, total) для admin-списка /admin/groups не подходит.
+    async def list_by_ids(group_ids: list[int]) -> list[Group]  # ADR-0031 — для не-admin (GET /api/my/groups), сорт по name
 ```
+
+### 8a.1 `GET /api/my/groups` — источник списка команд для селектора (ADR-0031 §5)
+
+Лёгкий user-scope endpoint: команды, доступные текущему пользователю как **целевые** для селектора команды mail-аккаунта (форма добавления / действие «Сменить команду»). Контракт — `04-api-contracts.md` §3 «Self». Доступен **всем** ролям (в отличие от admin-only `GET /api/admin/groups`, который тяжелее: `members_count`, leader).
+
+Реализация — тонкая обёртка, **переиспользует** `GroupsRepo` без нового сервиса и без дублирования групп-логики:
+```python
+async def my_groups(scope: VisibilityScope) -> MyGroupsDTO:
+    if scope.role == 'super_admin':
+        groups = await groups_repo.list_all_groups()       # flat-список всех существующих групп
+    else:
+        groups = await groups_repo.list_by_ids(scope.group_ids)  # домашняя + доп. членства (ADR-0030)
+    return MyGroupsDTO(
+        groups=[{"id": g.id, "name": g.name} for g in sorted(groups, key=lambda g: g.name)],
+        home_group_id=scope.group_id,                      # домашняя команда = users.group_id (ADR-0019/0030); null для super_admin
+    )
+```
+- `home_group_id` отдаётся для предвыбора default-опции в селекторе (домашняя команда для multi-team).
+- Опция «Без команды» (`group_id=null`) для `super_admin` — **чисто фронтовая**, из API не приходит (см. `08-frontend.md` §4.7).
+- CSRF не требуется (GET); rate-limit не требуется (≤ 5 групп).
 
 ### Зависимости
 - repositories.users, repositories.groups, repositories.audit, redis.SessionStore (для revoke_all_for_user при role/group changes).
@@ -816,8 +838,8 @@ class MailAccountService:
     async def list_for_scope(scope: VisibilityScope, group_id_filter: int | None = None, user_id_filter: int | None = None) -> list[MailAccountDTO]
     async def get_in_scope(scope: VisibilityScope, account_id: int) -> MailAccountDTO  # 404 если вне scope
     async def test(scope: VisibilityScope, payload: MailAccountTestRequest) -> TestResult
-    async def create(scope: VisibilityScope, payload: MailAccountCreateRequest) -> MailAccountDTO  # учитывает target_user_id
-    async def update(scope: VisibilityScope, account_id: int, payload: MailAccountUpdateRequest) -> MailAccountDTO  # включает display_name
+    async def create(scope: VisibilityScope, payload: MailAccountCreateRequest) -> MailAccountDTO  # учитывает target_user_id + group_id (ADR-0031)
+    async def update(scope: VisibilityScope, account_id: int, payload: MailAccountUpdateRequest) -> MailAccountDTO  # включает display_name + group_id-перенос (ADR-0031)
     async def delete(scope: VisibilityScope, account_id: int) -> None
     async def force_sync(scope: VisibilityScope, account_id: int) -> None
 ```
@@ -860,7 +882,74 @@ elif scope.role == 'group_member':
     target_user_id = scope.user_id
 ```
 
-Далее — стандартный flow (тест IMAP/SMTP, AES-GCM шифрование, INSERT с явным id через `nextval` — см. модуль 5 crypto). UNIQUE `(user_id, email)` по-прежнему действует — на одного владельца не более одной записи с данным email.
+После резолва владельца — резолв **целевой команды** `group_id` (ADR-0031 §2/§4, ортогонально target_user_id, валидируется **после** владельца):
+
+```python
+# payload.group_id: int | None — опционально (ADR-0031 §2)
+if not payload.group_id_present:           # ключ не передан → обратная совместимость
+    if scope.role == 'super_admin' and target_user_id == scope.user_id:
+        group_id = None                    # super_admin на себя: домашней группы нет → персональный ящик
+    else:
+        group_id = owner.group_id          # домашняя группа владельца (как до ADR-0031)
+else:
+    group_id = _validate_target_group(scope, target_user_id, payload.group_id)
+    # _validate_target_group — ЕДИНАЯ функция допустимости команды для create и transfer (ADR-0031 §4)
+```
+
+`_validate_target_group(scope, target_user_id, group_id)` (единые правила §4 ADR-0031 — общие для create и transfer):
+1. `group_id is None`: допустимо **только** для `super_admin` (персональный ящик); иначе `403 user_not_in_group_scope`.
+2. Иначе проверить существование `groups.id = group_id` → нет → `404 group_not_found`.
+3. Авторизация цели по роли инициатора:
+   - `super_admin` — любая существующая группа (или `None`). OK.
+   - `group_member` — `group_id ∈ scope.group_ids` (его `user_groups`) И `target_user_id == scope.user_id` (только на себя). Иначе `403 user_not_in_group_scope`.
+   - `group_leader`, создавая/перенося **себе** (`target_user_id == scope.user_id`) — `group_id ∈ scope.group_ids` (домашняя + доп. членства). Иначе `403 user_not_in_group_scope`.
+   - `group_leader`, создавая/перенося **участнику своей команды** (`target_user_id != self`) — `group_id == scope.group_id` (домашняя команда лидера = команда, которую он ведёт). Положить ящик участника в другую команду лидер не может. Иначе `403 user_not_in_group_scope`.
+
+Любое нарушение → `ValidationError`(400) / `ForbiddenError`(403 `user_not_in_group_scope`) / `NotFoundError`(404 `group_not_found`) — **никогда `500`**.
+
+Далее — стандартный flow (тест IMAP/SMTP, AES-GCM шифрование, INSERT с явным id через `nextval` + резолвнутым `group_id` — см. модуль 5 crypto). UNIQUE `(user_id, email)` по-прежнему действует — на одного владельца не более одной записи с данным email; команда в ключ не входит (round-18: дубликаты по email в разных командах раздельны). Создание ящика с выбором команды **не** пишет отдельного audit (часть обычного create-flow, как и до ADR-0031).
+
+#### update — перенос ящика между командами (ADR-0031 §3/§4)
+
+`MailAccountUpdateRequest` получает поле `group_id: int | None` плюс sentinel `set_group_id: bool` (по образцу `clear_display_name`), чтобы отличить «поле не передано» (команду не менять) от «передано» (сменить, в т.ч. на `NULL`). Источник sentinel:
+- **JSON**: присутствие ключа `group_id` в теле ⇒ `set_group_id=True`.
+- **form-fallback**: присутствие form-поля `group_id` ⇒ `set_group_id=True`; пустое значение ⇒ `NULL` (допустимо только для `super_admin`).
+
+```python
+async def update(scope, account_id, payload):
+    account = await repo.get_in_scope(scope, account_id)   # 404 если ящик вне видимости инициатора
+    ...                                                     # display_name / хосты / пароль — как раньше
+    if payload.set_group_id:                               # перенос команды запрошен
+        if scope.role == 'group_member':
+            raise ForbiddenError("forbidden")             # 403 — transfer запрещён для group_member (ADR-0031 §4)
+        target_group = _validate_target_group(scope, account.user_id, payload.group_id)
+        if target_group != account.group_id:
+            await repo.update_group(account_id, target_group)   # MailAccountsRepo.update_group
+            await audit.log(
+                action="mail_account_group_change",
+                actor_user_id=scope.user_id,
+                target_user_id=account.user_id,           # владелец ящика
+                details={"mail_account_id": account_id,
+                         "from_group_id": account.group_id,
+                         "to_group_id": target_group},
+            )
+    return await repo.get_in_scope(scope, account_id)
+```
+
+Правила (ADR-0031 §4):
+- **`group_member`** — менять команду существующего ящика **НЕЛЬЗЯ** (даже свой) → `403 forbidden`. (Выбрать команду он может только при **создании** своего ящика.)
+- **`group_leader`** — переносит ящики **в пределах своей видимости** (`get_in_scope` уже это гарантирует) в допустимую целевую команду: себе → его `user_groups`; ящику участника своей команды → его команда (`scope.group_id`). Иначе `403 user_not_in_group_scope`.
+- **`super_admin`** — любой видимый ящик в любую существующую группу ИЛИ `NULL` (персональный).
+- Несуществующая целевая `group_id` → `404 group_not_found`; вне scope → `403 user_not_in_group_scope`. **Никогда `500`.**
+
+Перенос **не требует** повторного IMAP/SMTP-теста (credentials/хосты не трогаются — меняется только принадлежность команде). Если в том же PATCH меняются хосты/порты/пароль — тест выполняется по существующим правилам (см. ниже «Edge cases»). Дубликаты по email в разных командах остаются раздельными (round-18) — `UNIQUE(user_id, email)` на команде не завязан, перенос его не нарушает.
+
+Новый repo-метод:
+```python
+class MailAccountsRepo:
+    async def update_group(self, account_id: int, group_id: int | None) -> None  # UPDATE mail_accounts SET group_id=:g, updated_at=now() WHERE id=:id
+```
+Видимость ящика для участников считается на каждом запросе из `mail_accounts.group_id ∈ scope.group_ids` (не кэшируется в сессии) — поэтому перенос **не требует** revoke сессий (в отличие от смены `users.group_id`, ADR-0030). Эффект переноса для зрителей мгновенный.
 
 #### display_name (ADR-0020)
 
@@ -876,7 +965,7 @@ def suggest_provider_defaults(email: str) -> ProviderHint | None
 Поддерживаемые домены (на старт): `gmail.com`, `googlemail.com`, `yandex.ru`, `yandex.com`, `mail.ru`, `inbox.ru`, `bk.ru`, `list.ru`, `outlook.com`, `hotmail.com`, `live.com`. Хардкод-таблица в `accounts/providers.py`.
 
 ### Зависимости
-- repositories.mail_accounts, crypto, imap-tools (для теста), aiosmtplib (для теста), redis (force_sync маркер).
+- repositories.mail_accounts, repositories.groups (ADR-0031 — валидация целевой команды через `GroupsRepo`), repositories.audit (ADR-0031 — `mail_account_group_change` при переносе), crypto, imap-tools (для теста), aiosmtplib (для теста), redis (force_sync маркер).
 
 ### Состояния mail-аккаунта (worker-side)
 ```mermaid

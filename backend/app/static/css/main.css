@@ -968,6 +968,42 @@ a:hover { color: var(--color-primary-hover); text-decoration: underline; }
   word-break: break-word;
 }
 
+/* ---------- Transfer mailbox to another team (ADR-0031) ------------------ */
+.account-list__transfer {
+  margin: var(--space-3) 0 0;
+}
+/* The <summary> doubles as the trigger button. Remove the default disclosure
+   marker so it reads as a normal action button. */
+.account-list__transfer > summary {
+  list-style: none;
+  cursor: pointer;
+  display: inline-flex;
+  width: auto;
+}
+.account-list__transfer > summary::-webkit-details-marker {
+  display: none;
+}
+.account-list__transfer[open] > summary {
+  margin-bottom: var(--space-3);
+}
+.account-transfer-form {
+  max-width: 28rem;
+  padding: var(--space-3);
+  background: var(--color-surface-muted, var(--color-bg));
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+.account-transfer-form__error {
+  margin: var(--space-2) 0 0;
+  padding: var(--space-2) var(--space-3);
+  background: var(--color-error-bg);
+  color: var(--color-danger);
+  border: 1px solid var(--color-danger);
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-sm);
+  word-break: break-word;
+}
+
 .account-test-result {
   font-size: var(--font-size-sm);
   font-weight: 500;

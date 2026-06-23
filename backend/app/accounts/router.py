@@ -26,13 +26,14 @@ from backend.app.accounts.schemas import (
     TestResult,
 )
 from backend.app.accounts.service import MailAccountService
-from backend.app.deps import CurrentScope, CurrentUser, DbSession, is_form_request
+from backend.app.deps import CurrentScope, DbSession, is_form_request
 from backend.app.exceptions import (
     DomainError,
     NotFoundError,
     ValidationError,
 )
 from backend.app.flash import flash
+from backend.app.groups.service import GroupsService
 from backend.app.rate_limit import (
     LIMIT_ACCOUNT_SYNC,
     LIMIT_ACCOUNT_TEST,
@@ -104,6 +105,10 @@ async def _parse_create_form(request: Request) -> MailAccountCreateRequest:
                 "smtp_username": _form_str_or_none(form, "smtp_username"),
                 "smtp_password": _form_str_or_none(form, "smtp_password"),
                 "target_user_id": _form_int_or_none(form, "target_user_id"),
+                # ADR-0031 §2: optional target team. An empty / missing
+                # ``group_id`` form field leaves this None → service falls back
+                # to the owner's home group (full backward compatibility).
+                "group_id": _form_int_or_none(form, "group_id"),
             }
         )
     except PydanticValidationError as exc:
@@ -137,6 +142,15 @@ async def _parse_update_form(request: Request) -> MailAccountUpdateRequest:
             payload_kw["display_name"] = raw_dn
         else:
             payload_kw["clear_display_name"] = True
+    # ADR-0031 §3: team transfer via form. Presence of the ``group_id`` form
+    # field means "change the team" (mirrors the JSON key-presence rule). An
+    # empty value clears it to NULL (service authorises that for super_admin
+    # only). We set ``set_group_id`` explicitly so the schema's presence
+    # inference (driven by the JSON key) does not also need the key here.
+    has_group_field = any(k == "group_id" for k, _ in form.multi_items())
+    if has_group_field:
+        payload_kw["set_group_id"] = True
+        payload_kw["group_id"] = _form_int_or_none(form, "group_id")
     try:
         return MailAccountUpdateRequest.model_validate(payload_kw)
     except PydanticValidationError as exc:
@@ -161,6 +175,7 @@ async def _form_values_for_rerender(request: Request) -> dict[str, object]:
         "smtp_starttls": _form_bool(form, "smtp_starttls", default=False),
         "smtp_username": _form_str_or_none(form, "smtp_username"),
         "target_user_id": _form_int_or_none(form, "target_user_id"),
+        "group_id": _form_int_or_none(form, "group_id"),
     }
 
 
@@ -215,6 +230,7 @@ async def create_account(
     except DomainError as exc:
         if is_form:
             await flash(request, "error", exc.message)
+            team_ctx = await _team_selector_context(db, scope)
             return await render(
                 request,
                 "accounts/form.html",
@@ -224,6 +240,7 @@ async def create_account(
                     "session": request.state.session,
                     "form": await _form_values_for_rerender(request),
                     "error_message": exc.message,
+                    **team_ctx,
                 },
                 status_code=exc.status_code,
             )
@@ -380,26 +397,66 @@ async def sync_now(
 # ---------------------------------------------------------------------------
 
 
+async def _team_selector_context(db: DbSession, scope: CurrentScope) -> dict[str, object]:
+    """Team-selector data for the account form / list (ADR-0031 §5).
+
+    Single source of truth is :meth:`GroupsService.selectable_teams` — the same
+    method that backs ``GET /api/my/groups`` (used by the AJAX path). Rendering
+    these ``<option>``s server-side keeps the selector working without JS.
+
+    Returns:
+      - ``teams``        : ``[{id, name}]`` sorted by name (the caller's teams).
+      - ``home_group_id``: default pre-selected team (``None`` for super_admin).
+      - ``team_names``   : ``{group_id: name}`` lookup for labelling current team.
+      - ``is_super_admin``/``is_group_member``: role flags driving UI rules.
+    """
+    my = await GroupsService(db).selectable_teams(scope)
+    teams = [{"id": g.id, "name": g.name} for g in my.groups]
+    return {
+        "teams": teams,
+        "home_group_id": my.home_group_id,
+        "team_names": {g.id: g.name for g in my.groups},
+        "is_super_admin": scope.is_super_admin,
+        "is_group_member": scope.is_group_member,
+    }
+
+
 @html.get("/accounts", response_class=HTMLResponse)
 async def accounts_page(request: Request, db: DbSession, scope: CurrentScope) -> Response:
     accounts = await MailAccountService(db).list_for_scope(scope)
     sess = request.state.session
+    team_ctx = await _team_selector_context(db, scope)
+    # The list/PATCH JSON DTO intentionally omits ``group_id`` (04-api-contracts
+    # §"GET /api/mail-accounts"); the HTML page needs each account's current team
+    # to label the transfer dialog. Read it straight from the rows (page-only
+    # presentation data, not part of the JSON API shape).
+    repo = MailAccountsRepo(db)
+    visible_ids = await MailAccountService(db).visible_user_ids(scope)
+    account_group: dict[int, int | None] = {}
+    if accounts:
+        if visible_ids is None:
+            rows = await repo.list_by_ids([a.id for a in accounts])
+        else:
+            rows = await repo.list_by_ids(visible_ids)
+        account_group = {r.id: r.group_id for r in rows}
     return await render(
         request,
         "accounts/list.html",
         {
             "accounts": accounts,
+            "account_group": account_group,
             "scope": scope,
             "csrf_token": sess.csrf_token,
             "session": sess,
+            **team_ctx,
         },
     )
 
 
 @html.get("/accounts/new", response_class=HTMLResponse)
-async def accounts_new_page(request: Request, db: DbSession, user: CurrentUser) -> Response:
+async def accounts_new_page(request: Request, db: DbSession, scope: CurrentScope) -> Response:
     sess = request.state.session
-    _ = (db, user)  # auth dependencies
+    team_ctx = await _team_selector_context(db, scope)
     return await render(
         request,
         "accounts/form.html",
@@ -407,6 +464,7 @@ async def accounts_new_page(request: Request, db: DbSession, user: CurrentUser) 
             "account": None,
             "csrf_token": sess.csrf_token,
             "session": sess,
+            **team_ctx,
         },
     )
 
@@ -423,6 +481,8 @@ async def accounts_edit_page(
     if acc is None:
         raise NotFoundError()
     sess = request.state.session
+    # Edit form intentionally does NOT render the team selector (ADR-0031 §4.7);
+    # team changes go through the dedicated "transfer" dialog on the list page.
     return await render(
         request,
         "accounts/form.html",

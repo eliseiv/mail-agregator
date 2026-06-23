@@ -190,6 +190,19 @@
       const smtpPass = (fd.get('smtp_password') || '').toString();
       if (smtpUser) payload.smtp_username = smtpUser;
       if (smtpPass) payload.smtp_password = smtpPass;
+      // Team selector (ADR-0031 §2). Only rendered on create when the user has
+      // >1 selectable team (or is super_admin). When present, we always send
+      // group_id: a non-empty value is the chosen team id; an empty value is
+      // the super_admin "Без команды" option ⇒ group_id: null (personal box).
+      // When the selector is absent (single-team user) we omit group_id so the
+      // backend falls back to the home team (full backward compatibility).
+      if (!isEdit) {
+        const groupSel = form.querySelector('[data-account-group]');
+        if (groupSel) {
+          const raw = (groupSel.value || '').toString().trim();
+          payload.group_id = raw ? Number(raw) : null;
+        }
+      }
       // For edit mode: empty password means "keep existing"; do not send it.
       if (isEdit && !payload.password) delete payload.password;
       return payload;
@@ -301,6 +314,46 @@
         }
       } catch (_e) {
         window.MAS.flash('Сетевая ошибка. Попробуйте ещё раз.', 'error');
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    });
+  });
+
+  // ---- List page: transfer mailbox to another team (ADR-0031 §3) -----------
+  // Sends PATCH /api/mail-accounts/{id} with ONLY group_id. Empty value
+  // (super_admin "Без команды") maps to group_id: null. On success the list is
+  // reloaded so the row reflects its new team. On 403/404 (member / missing
+  // team / out-of-scope) the inline error is shown — never a stack trace.
+  document.querySelectorAll('[data-account-transfer-form]').forEach(function (f) {
+    const errorPane = f.querySelector('[data-account-transfer-error]');
+    function setTransferError(text) {
+      if (!errorPane) return;
+      if (!text) { errorPane.hidden = true; errorPane.textContent = ''; return; }
+      errorPane.hidden = false;
+      errorPane.textContent = text;
+    }
+    f.addEventListener('submit', async function (event) {
+      event.preventDefault();
+      setTransferError('');
+      const action = f.getAttribute('action');
+      if (!action) return;
+      const sel = f.querySelector('[data-account-transfer-group]');
+      const raw = sel ? (sel.value || '').toString().trim() : '';
+      const payload = { group_id: raw ? Number(raw) : null };
+      const btn = f.querySelector('button[type="submit"]');
+      if (btn) btn.disabled = true;
+      try {
+        const resp = await window.MAS.csrfFetch(action, { method: 'PATCH', body: payload });
+        if (resp.ok) {
+          window.MAS.flash('Ящик перенесён в другую команду.', 'success');
+          window.location.reload();
+          return;
+        }
+        const err = await window.MAS.readJsonError(resp);
+        setTransferError(err.message || 'Не удалось перенести ящик.');
+      } catch (_e) {
+        setTransferError('Сетевая ошибка. Попробуйте ещё раз.');
       } finally {
         if (btn) btn.disabled = false;
       }

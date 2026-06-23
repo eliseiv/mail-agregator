@@ -112,3 +112,22 @@ class EligibleUserDTO(BaseModel):
 
 class EligibleUsersResponse(BaseModel):
     items: list[EligibleUserDTO]
+
+
+class MyGroupItemDTO(BaseModel):
+    """Minimal team option for the mailbox team selector (ADR-0031 §5)."""
+
+    id: int
+    name: str
+
+
+class MyGroupsDTO(BaseModel):
+    """``GET /api/my/groups`` — teams the caller may target for a mailbox.
+
+    ``groups`` is sorted by ``name``. ``home_group_id`` is the caller's home
+    team (``users.group_id``) for pre-selecting the default option; ``None``
+    for super_admin (and for users without a home team).
+    """
+
+    groups: list[MyGroupItemDTO]
+    home_group_id: int | None = None

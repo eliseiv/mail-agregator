@@ -5,6 +5,16 @@
 {% block body_class %}accounts-list{% endblock %}
 
 {% block content %}
+{# Перенос ящика в другую команду (ADR-0031 §4.6). Действие доступно ТОЛЬКО:
+   • не для group_member (перенос ему запрещён, backend вернёт 403 — UI не
+     предлагает это действие; ADR-0031 §4);
+   • и при ≥ 2 доступных целевых командах. Для super_admin к командам из API
+     добавляется опция «Без команды», поэтому ≥ 1 группы уже даёт ≥ 2 варианта. #}
+{% set _teams = teams if teams is defined else [] %}
+{% set _is_member = is_group_member if is_group_member is defined else false %}
+{% set _is_super = is_super_admin if is_super_admin is defined else false %}
+{% set can_transfer = (not _is_member)
+      and (((_teams | length) > 1) or (_is_super and (_teams | length) >= 1)) %}
 <section class="accounts" aria-labelledby="accounts-heading">
   <header class="accounts__toolbar">
     <h1 id="accounts-heading" class="accounts__title">Email-аккаунты</h1>
@@ -91,6 +101,55 @@
               </form>
             </span>
           </div>
+
+          {# ── Перенос в другую команду (ADR-0031 §3/§4.6) ────────────────────
+             Компактная форма, скрытая в <details> (работает без JS, CSP-safe —
+             без inline-обработчиков). Шлёт PATCH /api/mail-accounts/{id} только
+             с group_id (no-JS: POST + _method=PATCH). Не затрагивает хосты/пароль
+             ⇒ повторный IMAP/SMTP-тест не выполняется. account_form.js
+             перехватывает submit и шлёт настоящий PATCH (JSON). #}
+          {% if can_transfer %}
+            {% set _current_group = account_group.get(acc.id) if account_group is defined else None %}
+            <details class="account-list__transfer">
+              <summary class="btn btn--secondary btn--small">Перенести в другую команду</summary>
+              <form
+                method="POST"
+                action="/api/mail-accounts/{{ acc.id }}"
+                class="form account-transfer-form"
+                data-account-transfer-form
+                data-account-id="{{ acc.id }}">
+                {{ m.csrf_input() }}
+                <input type="hidden" name="_method" value="PATCH">
+                <div class="field">
+                  <label class="field__label" for="transfer-group-{{ acc.id }}">
+                    Перенести ящик «{{ _label | e }}» в команду
+                  </label>
+                  <select
+                    class="field__input"
+                    id="transfer-group-{{ acc.id }}"
+                    name="group_id"
+                    data-account-transfer-group>
+                    {% if _is_super %}
+                      <option value="" {% if _current_group is none %}selected{% endif %}>
+                        Без команды{% if _current_group is none %} (текущая){% endif %}
+                      </option>
+                    {% endif %}
+                    {% for team in _teams %}
+                      <option value="{{ team.id }}"
+                              {% if _current_group is not none and team.id == _current_group %}selected{% endif %}>
+                        {{ team.name | e }}{% if _current_group is not none and team.id == _current_group %} (текущая){% endif %}
+                      </option>
+                    {% endfor %}
+                  </select>
+                </div>
+                <div class="form-actions">
+                  <button type="submit" class="btn btn--primary btn--small">Перенести</button>
+                </div>
+                <p class="form-error account-transfer-form__error" role="alert"
+                   data-account-transfer-error hidden></p>
+              </form>
+            </details>
+          {% endif %}
 
           {% if _has_nick %}
             <p class="account-list__email-secondary">
