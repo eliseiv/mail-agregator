@@ -87,15 +87,25 @@
                   <div class="admin-users-table__name-row">
                     <span class="admin-users-table__name-text">{{ m.effective_user_name(u) }}</span>
                     {% if not _is_super %}
+                      {# ADR-0030: «+» opens a small actions chooser (shared
+                         dialog) with «Переместить» / «Добавить в команду».
+                         For a group_leader the «Переместить» action is
+                         disabled — a leader's home team can't be moved
+                         (backend also rejects with 409). The list of teams
+                         the user already belongs to is embedded so the "Add"
+                         dialog can exclude them. #}
                       <button
                         type="button"
                         class="admin-users-table__add-group"
-                        title="Перенести в другую команду"
-                        aria-label="Перенести {{ u.username | e }} в другую команду"
-                        data-admin-move-group
+                        title="Управление командами"
+                        aria-label="Управление командами пользователя {{ u.username | e }}"
+                        aria-haspopup="dialog"
+                        data-admin-menu-trigger
                         data-user-id="{{ u.id }}"
                         data-username="{{ u.username | e }}"
-                        data-current-gid="{{ _gid }}">+</button>
+                        data-current-gid="{{ _gid }}"
+                        data-is-leader="{{ '1' if u.role == 'group_leader' else '0' }}"
+                        data-member-gids="{{ (u.memberships | map(attribute='id') | list) | tojson | e }}">+</button>
                     {% endif %}
                   </div>
                 </td>
@@ -109,8 +119,42 @@
                   {% endif %}
                 </td>
                 <td class="admin-users-table__group">
-                  {% if u.group %}
-                    {{ _gname | e }}
+                  {# ADR-0030: show ALL teams the user belongs to as chips.
+                     The home team (== u.group.id) has no remove control;
+                     additional memberships carry a «×» that DELETEs the
+                     membership. No-JS fallback: each «×» is a real form
+                     POSTing to .../groups/{gid}/delete with _method=DELETE
+                     + csrf. JS (admin_users.js) intercepts for AJAX. #}
+                  {% set _home_gid = u.group.id if u.group else 0 %}
+                  {% if u.memberships %}
+                    <ul class="team-chips" data-team-chips>
+                      {% for mem in u.memberships %}
+                        {% set _is_home = (mem.id == _home_gid) %}
+                        <li class="team-chip {% if _is_home %}team-chip--home{% endif %}">
+                          <span class="team-chip__name">{{ mem.name | e }}</span>
+                          {% if _is_home %}
+                            <span class="visually-hidden">(домашняя команда)</span>
+                          {% else %}
+                            <form method="POST"
+                                  action="/api/admin/users/{{ u.id }}/groups/{{ mem.id }}/delete"
+                                  class="inline-form team-chip__remove-form"
+                                  data-admin-remove-membership
+                                  data-username="{{ u.username | e }}"
+                                  data-group-name="{{ mem.name | e }}">
+                              {{ m.csrf_input() }}
+                              <input type="hidden" name="_method" value="DELETE">
+                              <button type="submit" class="team-chip__remove"
+                                      title="Убрать из команды «{{ mem.name | e }}»"
+                                      aria-label="Убрать {{ u.username | e }} из команды «{{ mem.name | e }}»">&times;</button>
+                            </form>
+                          {% endif %}
+                        </li>
+                      {% endfor %}
+                    </ul>
+                  {% elif u.group %}
+                    {# Defensive: membership row not yet backfilled — fall
+                       back to the home-team name without a remove control. #}
+                    <span class="team-chip team-chip--home"><span class="team-chip__name">{{ _gname | e }}</span></span>
                   {% else %}
                     <span class="admin-users-table__muted">без команды</span>
                   {% endif %}
@@ -321,10 +365,32 @@
     </form>
   </dialog>
 
-  {# Move-to-group dialog (FE-FIX round-4 #3). Opened by clicking the «+»
-     button in a row's name cell. PATCH /api/admin/users/{id} with
-     {group_id: N} reassigns the user. The user's current group is
-     pre-selected so the admin sees the starting state. #}
+  {# Actions chooser (ADR-0030). Opened by the «+» button. Rendered as a
+     <dialog> (top layer — never clipped by the table's overflow:hidden),
+     consistent with the existing dialog pattern. Two choices route to the
+     move / add dialogs below. «Переместить» is disabled for leaders. #}
+  <dialog class="dialog dialog--menu" id="dialog-group-actions" data-admin-actions-dialog>
+    <form method="dialog" class="dialog__form-cancel">
+      <button type="submit" class="btn btn--link" aria-label="Закрыть">&times;</button>
+    </form>
+    <h2 class="dialog__title">Команды пользователя <span data-admin-actions-username></span></h2>
+    <div class="dialog__menu" role="group" aria-label="Действия с командами">
+      <button type="button" class="dialog__menu-item" data-admin-actions-move>
+        Переместить в другую команду
+      </button>
+      <p class="field__hint" data-admin-actions-move-disabled hidden>
+        Лидера команды нельзя перенести — доступно только добавление в команду.
+      </p>
+      <button type="button" class="dialog__menu-item" data-admin-actions-add>
+        Добавить в другую команду
+      </button>
+    </div>
+  </dialog>
+
+  {# Move-to-group dialog (FE-FIX round-4 #3). Opened from the actions
+     chooser. PATCH /api/admin/users/{id} with {group_id: N} reassigns the
+     user. The user's current group is pre-selected so the admin sees the
+     starting state. #}
   <dialog class="dialog" id="dialog-move-group" data-admin-move-dialog>
     <form method="dialog" class="dialog__form-cancel">
       <button type="submit" class="btn btn--link" aria-label="Закрыть">&times;</button>
@@ -349,6 +415,45 @@
       <div class="form-actions">
         <button type="button" class="btn btn--secondary" data-admin-move-cancel>Отмена</button>
         <button type="submit" class="btn btn--primary" data-admin-move-go>Перенести</button>
+      </div>
+    </form>
+  </dialog>
+
+  {# Add-to-group dialog (ADR-0030). Opened from the «+» menu →
+     «Добавить в другую команду». Submits via JS to
+     POST /api/admin/users/{id}/groups {group_id}. Mirrors the move-dialog
+     pattern (JS-only form — the user id is only known at click time, so the
+     menu trigger is JS-gated anyway). The <select> below is server-rendered
+     with the full team list; on open JS removes the options for teams the
+     user already belongs to. If none remain, the field is hidden and the
+     submit disabled with an explanatory note. #}
+  <dialog class="dialog" id="dialog-add-group" data-admin-add-dialog>
+    <form method="dialog" class="dialog__form-cancel">
+      <button type="submit" class="btn btn--link" aria-label="Закрыть">&times;</button>
+    </form>
+    <h2 class="dialog__title">Добавить в команду</h2>
+    <p>Пользователь <strong data-admin-add-username></strong></p>
+    <p class="form-error" role="alert" data-admin-add-error hidden></p>
+    <p class="field__hint" data-admin-add-empty hidden>
+      Пользователь уже состоит во всех доступных командах.
+    </p>
+    <form class="form" data-admin-add-form>
+      <div class="field" data-admin-add-field>
+        <label class="field__label" for="add-group-id">Команда</label>
+        <select
+          class="field__input"
+          id="add-group-id"
+          name="group_id"
+          required
+          data-admin-add-select>
+          {% for grp in groups | default([]) %}
+            <option value="{{ grp.id }}" data-group-id="{{ grp.id }}">{{ grp.name | e }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn btn--secondary" data-admin-add-cancel>Отмена</button>
+        <button type="submit" class="btn btn--primary" data-admin-add-go>Добавить</button>
       </div>
     </form>
   </dialog>

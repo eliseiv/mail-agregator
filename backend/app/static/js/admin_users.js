@@ -30,6 +30,16 @@
      - <input id="delete-confirm-input">          : the type-username input.
      - <button data-admin-delete-go>              : final delete button.
      - <button data-admin-delete-cancel>          : cancel button.
+
+   Group membership (ADR-0030 multi-group):
+     - <button data-admin-menu-trigger>           : the «+» button — opens the
+                                                    shared actions chooser.
+     - <dialog data-admin-actions-dialog>         : actions chooser (Move/Add).
+     - <button data-admin-actions-move>           : «Переместить» (hidden for leaders).
+     - <button data-admin-actions-add>            : «Добавить в команду».
+     - <dialog data-admin-move-dialog> + form     : move-to-group (PATCH).
+     - <dialog data-admin-add-dialog>  + form     : add-to-group (POST .../groups).
+     - <form data-admin-remove-membership>        : «×» chip — DELETE .../groups/{gid}.
    ========================================================================== */
 (function () {
   'use strict';
@@ -491,7 +501,97 @@
     });
   }
 
-  // ---- Move-to-group (FE-FIX round-4 #3) -----------------------------------
+  // ---- Group actions + move/add/remove membership (ADR-0030) ---------------
+  //
+  // The «+» button next to a user's name opens a shared actions dialog with
+  // two choices: «Переместить в другую команду» (PATCH /api/admin/users/{id})
+  // and «Добавить в другую команду» (POST /api/admin/users/{id}/groups). For
+  // a group_leader the «Переместить» choice is disabled (a leader's home team
+  // can't be moved; backend also rejects with 409). The team chips in the
+  // «Команда» column carry a «×» that removes an additional membership
+  // (DELETE /api/admin/users/{id}/groups/{gid}).
+  //
+  // The chooser is a <dialog> (top layer) rather than an inline popup so it
+  // is never clipped by the table's overflow:hidden.
+
+  // Context captured when a «+» trigger is clicked, shared by both dialogs.
+  let menuUserId = 0;
+  let menuUsername = '';
+  let menuCurrentGid = '0';
+  let menuMemberGids = [];
+  let menuIsLeader = false;
+
+  function parseGidList(raw) {
+    if (!raw) return [];
+    try {
+      const arr = JSON.parse(raw);
+      if (!Array.isArray(arr)) return [];
+      return arr.map(function (n) { return parseInt(n, 10); })
+                .filter(function (n) { return Number.isFinite(n) && n > 0; });
+    } catch (_e) {
+      return [];
+    }
+  }
+
+  // -- actions chooser dialog ------------------------------------------------
+
+  const actionsDialog       = document.querySelector('[data-admin-actions-dialog]');
+  const actionsUsernameSpan = document.querySelector('[data-admin-actions-username]');
+  const actionsMoveBtn      = document.querySelector('[data-admin-actions-move]');
+  const actionsMoveDisabled = document.querySelector('[data-admin-actions-move-disabled]');
+  const actionsAddBtn       = document.querySelector('[data-admin-actions-add]');
+
+  function closeActionsDialog() {
+    if (!actionsDialog) return;
+    if (typeof actionsDialog.close === 'function') actionsDialog.close();
+    else actionsDialog.removeAttribute('open');
+  }
+
+  document.querySelectorAll('[data-admin-menu-trigger]').forEach(function (trigger) {
+    trigger.addEventListener('click', function () {
+      menuUserId = parseInt(trigger.getAttribute('data-user-id') || '0', 10);
+      menuUsername = trigger.getAttribute('data-username') || '';
+      menuCurrentGid = trigger.getAttribute('data-current-gid') || '0';
+      menuMemberGids = parseGidList(trigger.getAttribute('data-member-gids'));
+      menuIsLeader = trigger.getAttribute('data-is-leader') === '1';
+      if (!menuUserId || !actionsDialog) return;
+
+      if (actionsUsernameSpan) actionsUsernameSpan.textContent = '@' + menuUsername;
+      // «Переместить» is unavailable for leaders.
+      if (actionsMoveBtn) {
+        actionsMoveBtn.disabled = menuIsLeader;
+        actionsMoveBtn.hidden = menuIsLeader;
+      }
+      if (actionsMoveDisabled) actionsMoveDisabled.hidden = !menuIsLeader;
+
+      if (typeof actionsDialog.showModal === 'function') {
+        actionsDialog.showModal();
+      } else {
+        actionsDialog.setAttribute('open', 'open');
+      }
+      // Focus the first available action for keyboard users.
+      const firstAction = (actionsMoveBtn && !actionsMoveBtn.hidden)
+        ? actionsMoveBtn
+        : actionsAddBtn;
+      if (firstAction) firstAction.focus();
+    });
+  });
+
+  if (actionsMoveBtn) {
+    actionsMoveBtn.addEventListener('click', function () {
+      if (menuIsLeader) return;
+      closeActionsDialog();
+      openMoveDialog();
+    });
+  }
+  if (actionsAddBtn) {
+    actionsAddBtn.addEventListener('click', function () {
+      closeActionsDialog();
+      openAddDialog();
+    });
+  }
+
+  // -- Move-to-group dialog (existing flow, now opened from the chooser) -----
 
   const moveDialog       = document.querySelector('[data-admin-move-dialog]');
   const moveForm         = document.querySelector('[data-admin-move-form]');
@@ -509,27 +609,23 @@
     moveError.hidden = !text;
   }
 
-  document.querySelectorAll('[data-admin-move-group]').forEach(function (btn) {
-    btn.addEventListener('click', function () {
-      pendingMoveUserId = parseInt(btn.getAttribute('data-user-id') || '0', 10);
-      const username = btn.getAttribute('data-username') || '';
-      const currentGid = btn.getAttribute('data-current-gid') || '0';
-      if (!pendingMoveUserId || !moveDialog || !moveSelect) return;
-      if (moveUsernameSpan) moveUsernameSpan.textContent = '@' + username;
-      // Pre-select the current group (if any) so the admin sees current state.
-      if (currentGid && currentGid !== '0') {
-        moveSelect.value = currentGid;
-      } else {
-        moveSelect.selectedIndex = 0;
-      }
-      showMoveError('');
-      if (typeof moveDialog.showModal === 'function') {
-        moveDialog.showModal();
-      } else {
-        moveDialog.setAttribute('open', 'open');
-      }
-    });
-  });
+  function openMoveDialog() {
+    pendingMoveUserId = menuUserId;
+    if (!pendingMoveUserId || !moveDialog || !moveSelect) return;
+    if (moveUsernameSpan) moveUsernameSpan.textContent = '@' + menuUsername;
+    // Pre-select the current home group (if any) so the admin sees state.
+    if (menuCurrentGid && menuCurrentGid !== '0') {
+      moveSelect.value = menuCurrentGid;
+    } else {
+      moveSelect.selectedIndex = 0;
+    }
+    showMoveError('');
+    if (typeof moveDialog.showModal === 'function') {
+      moveDialog.showModal();
+    } else {
+      moveDialog.setAttribute('open', 'open');
+    }
+  }
 
   if (moveCancelBtn && moveDialog) {
     moveCancelBtn.addEventListener('click', function () {
@@ -568,4 +664,139 @@
       }
     });
   }
+
+  // -- Add-to-group dialog (ADR-0030 POST .../groups) -----------------------
+
+  const addDialog       = document.querySelector('[data-admin-add-dialog]');
+  const addForm         = document.querySelector('[data-admin-add-form]');
+  const addSelect       = document.querySelector('[data-admin-add-select]');
+  const addField        = document.querySelector('[data-admin-add-field]');
+  const addUsernameSpan = document.querySelector('[data-admin-add-username]');
+  const addEmptyNote    = document.querySelector('[data-admin-add-empty]');
+  const addCancelBtn    = document.querySelector('[data-admin-add-cancel]');
+  const addGoBtn        = document.querySelector('[data-admin-add-go]');
+  const addError        = document.querySelector('[data-admin-add-error]');
+
+  let pendingAddUserId = 0;
+
+  function showAddError(text) {
+    if (!addError) return;
+    addError.textContent = text || '';
+    addError.hidden = !text;
+  }
+
+  // Capture the full team option set once so we can restore it on each open
+  // (each user excludes a different subset of teams already joined).
+  let allAddOptions = [];
+  if (addSelect) {
+    allAddOptions = Array.prototype.slice.call(addSelect.options).map(function (opt) {
+      return { value: opt.value, label: opt.textContent };
+    });
+  }
+
+  function openAddDialog() {
+    pendingAddUserId = menuUserId;
+    if (!pendingAddUserId || !addDialog || !addSelect) return;
+    if (addUsernameSpan) addUsernameSpan.textContent = '@' + menuUsername;
+    showAddError('');
+
+    // Rebuild the select excluding teams the user already belongs to.
+    const joined = {};
+    menuMemberGids.forEach(function (g) { joined[String(g)] = true; });
+    while (addSelect.firstChild) addSelect.removeChild(addSelect.firstChild);
+    let available = 0;
+    allAddOptions.forEach(function (o) {
+      if (!o.value || joined[o.value]) return;
+      const opt = document.createElement('option');
+      opt.value = o.value;
+      opt.textContent = o.label;
+      addSelect.appendChild(opt);
+      available += 1;
+    });
+
+    const hasAvailable = available > 0;
+    if (addField) addField.hidden = !hasAvailable;
+    if (addEmptyNote) addEmptyNote.hidden = hasAvailable;
+    if (addGoBtn) addGoBtn.disabled = !hasAvailable;
+    if (hasAvailable) addSelect.selectedIndex = 0;
+
+    if (typeof addDialog.showModal === 'function') {
+      addDialog.showModal();
+    } else {
+      addDialog.setAttribute('open', 'open');
+    }
+  }
+
+  if (addCancelBtn && addDialog) {
+    addCancelBtn.addEventListener('click', function () {
+      if (typeof addDialog.close === 'function') addDialog.close();
+      else addDialog.removeAttribute('open');
+    });
+  }
+
+  if (addForm) {
+    addForm.addEventListener('submit', async function (event) {
+      event.preventDefault();
+      if (!pendingAddUserId || !addSelect) return;
+      const gid = parseInt((addSelect.value || '').toString(), 10);
+      if (!Number.isFinite(gid) || gid < 1) {
+        showAddError('Выберите команду.');
+        return;
+      }
+      if (addGoBtn) addGoBtn.disabled = true;
+      try {
+        const resp = await window.MAS.csrfFetch(
+          '/api/admin/users/' + pendingAddUserId + '/groups',
+          { method: 'POST', body: { group_id: gid } }
+        );
+        if (resp.ok) {
+          window.MAS.flash('Пользователь добавлен в команду.', 'success');
+          if (typeof addDialog.close === 'function') addDialog.close();
+          window.location.reload();
+          return;
+        }
+        const err = await window.MAS.readJsonError(resp);
+        showAddError(err.message || 'Не удалось добавить пользователя в команду.');
+      } catch (_e) {
+        showAddError('Сетевая ошибка. Попробуйте ещё раз.');
+      } finally {
+        if (addGoBtn) addGoBtn.disabled = false;
+      }
+    });
+  }
+
+  // -- Remove additional membership (the «×» on a team chip) ----------------
+
+  document.querySelectorAll('[data-admin-remove-membership]').forEach(function (f) {
+    f.addEventListener('submit', async function (event) {
+      event.preventDefault();
+      const username = f.getAttribute('data-username') || '';
+      const groupName = f.getAttribute('data-group-name') || '';
+      const msg = 'Убрать пользователя @' + username +
+                  ' из команды «' + groupName + '»? ' +
+                  'Он перестанет видеть письма этой команды.';
+      if (!window.confirm(msg)) return;
+      // action is the no-JS fallback URL (.../groups/{gid}/delete); strip the
+      // trailing /delete and use the canonical DELETE verb for AJAX.
+      const action = f.getAttribute('action') || '';
+      const url = action.replace(/\/delete$/, '');
+      if (!url) return;
+      const btn = f.querySelector('button[type="submit"]');
+      if (btn) btn.disabled = true;
+      try {
+        const resp = await window.MAS.csrfFetch(url, { method: 'DELETE' });
+        if (resp.ok || resp.status === 204) {
+          window.MAS.flash('Членство в команде удалено.', 'success');
+          window.location.reload();
+          return;
+        }
+        const err = await window.MAS.readJsonError(resp);
+        window.MAS.flash(err.message || 'Не удалось удалить членство в команде.', 'error');
+      } catch (_e) {
+        window.MAS.flash('Сетевая ошибка. Попробуйте ещё раз.', 'error');
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    });
+  });
 })();

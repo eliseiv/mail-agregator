@@ -25,6 +25,7 @@ from backend.app.exceptions import (
     ValidationError,
 )
 from backend.app.repositories.tags import MessageTagsRepo, TagRulesRepo, TagsRepo
+from backend.app.repositories.user_groups import UserGroupsRepo
 from backend.app.repositories.users import UsersRepo
 from backend.app.tags.builtin import BUILTIN_TAGS
 from backend.app.tags.schemas import (
@@ -95,23 +96,17 @@ class TagsService:
         self._rules = TagRulesRepo(session)
         self._links = MessageTagsRepo(session)
         self._users = UsersRepo(session)
+        self._memberships = UserGroupsRepo(session)
 
-    async def _resolve_user_group_id(self, user_id: int) -> int | None:
-        """Look up the user's ``group_id`` for visibility-scoped tag apply.
+    async def _resolve_user_group_ids(self, user_id: int) -> list[int]:
+        """All teams the user belongs to (ADR-0030 — home + additional).
 
-        Returns ``None`` for users without a group (super-admin and
-        ungrouped users). The caller passes that NULL straight into the
-        SQL where the second branch of the visibility filter is gated by
-        ``:user_group_id IS NOT NULL``, so the apply naturally scopes
-        down to personal accounts only.
+        Read from ``user_groups`` so the ``apply_to_existing`` count guard
+        scopes to the same multi-group visibility as the apply SQL. Returns
+        ``[]`` for users without any membership (super-admin / ungrouped) —
+        the count then narrows to personal accounts only.
         """
-        user = await self._users.get_by_id(user_id)
-        if user is None:
-            # Defensive: a tag exists for a user that vanished. Treat as
-            # ungrouped — the apply will scope to that user's (now empty)
-            # account set, i.e. effectively a no-op.
-            return None
-        return user.group_id
+        return await self._memberships.list_group_ids_for_user(user_id)
 
     # --- Reads -------------------------------------------------------------
 
@@ -154,11 +149,11 @@ class TagsService:
         # count must include team-visible messages because the apply
         # itself does — otherwise the guard would under-count and let an
         # apply blow past the 100k cap.
-        user_group_id: int | None = None
+        group_ids: list[int] = []
         if apply_to_existing:
-            user_group_id = await self._resolve_user_group_id(user_id)
+            group_ids = await self._resolve_user_group_ids(user_id)
             count = await self._links.count_messages_visible(
-                user_id=user_id, user_group_id=user_group_id, is_super_admin=is_super_admin
+                user_id=user_id, group_ids=group_ids, is_super_admin=is_super_admin
             )
             if count > APPLY_TO_EXISTING_LIMIT:
                 raise TagApplyTooManyError(
@@ -187,7 +182,6 @@ class TagsService:
         if apply_to_existing and rules:
             applied = await self._apply_tag_to_existing(
                 user_id=user_id,
-                user_group_id=user_group_id,
                 tag_id=tag.id,
                 is_super_admin=is_super_admin,
             )
@@ -256,9 +250,9 @@ class TagsService:
         tag = await self._tags.get_owned(user_id, tag_id)
         if tag is None:
             raise NotFoundError()
-        user_group_id = await self._resolve_user_group_id(user_id)
+        group_ids = await self._resolve_user_group_ids(user_id)
         count = await self._links.count_messages_visible(
-            user_id=user_id, user_group_id=user_group_id, is_super_admin=is_super_admin
+            user_id=user_id, group_ids=group_ids, is_super_admin=is_super_admin
         )
         if count > APPLY_TO_EXISTING_LIMIT:
             raise TagApplyTooManyError(
@@ -267,7 +261,6 @@ class TagsService:
             )
         return await self._apply_tag_to_existing(
             user_id=user_id,
-            user_group_id=user_group_id,
             tag_id=tag_id,
             is_super_admin=is_super_admin,
         )
@@ -357,14 +350,15 @@ class TagsService:
     # --- Internal helpers --------------------------------------------------
 
     async def _apply_tag_to_existing(
-        self, *, user_id: int, user_group_id: int | None, tag_id: int, is_super_admin: bool
+        self, *, user_id: int, tag_id: int, is_super_admin: bool
     ) -> int:
         """Bulk INSERT ``message_tags`` for every visible matching message.
 
-        Visibility scope mirrors ``MailAccountsRepo.list_account_ids_visible``:
-        personal accounts plus the user's team accounts. Pass
-        ``user_group_id=None`` for users without a group — the SQL then
-        narrows to personal accounts only.
+        Visibility scope mirrors ``MailAccountsRepo.list_account_ids_visible``
+        (ADR-0030 multi-group): personal accounts plus accounts of any team
+        the owner is a member of. The SQL keys the team branch on ``:user_id``
+        via ``user_groups`` (EXISTS), so no per-group bind is needed and a
+        user without any membership narrows to personal accounts only.
 
         round-26: when ``is_super_admin=True`` the apply reaches EVERY
         message in the system (the SQL visibility filter short-circuits to
@@ -375,7 +369,6 @@ class TagsService:
             {
                 "tag_id": tag_id,
                 "user_id": user_id,
-                "user_group_id": user_group_id,
                 "is_super_admin": is_super_admin,
             },
         )

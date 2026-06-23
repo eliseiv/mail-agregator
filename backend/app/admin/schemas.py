@@ -35,6 +35,11 @@ class UserDTO(BaseModel):
     display_name: str | None
     role: str
     group: GroupBriefDTO | None
+    # ADR-0030: every team the user belongs to (home + additional). The home
+    # team equals ``group`` (== ``users.group_id``); the rest are extra
+    # memberships from ``user_groups`` and are the only ones the admin UI
+    # offers to remove. Empty for super_admin. Order: ascending group_id.
+    memberships: list[GroupBriefDTO]
     password_reset_required: bool
     lockout_until: datetime | None
     last_login_at: datetime | None
@@ -146,6 +151,21 @@ class UpdateUserRequest(BaseModel):
         return v
 
 
+class AddMembershipRequest(BaseModel):
+    """Body of ``POST /api/admin/users/{user_id}/groups`` (ADR-0030)."""
+
+    group_id: int = Field(ge=1)
+
+
+class MembershipDTO(BaseModel):
+    """Created membership returned by ``POST .../groups`` (ADR-0030)."""
+
+    user_id: int
+    group_id: int
+    group: GroupBriefDTO
+    created_at: datetime
+
+
 class DeleteUserResponse(BaseModel):
     ok: bool
     deleted_attachments: int
@@ -172,12 +192,14 @@ class AuditListResponse(BaseModel):
 
 
 __all__ = [
+    "AddMembershipRequest",
     "AuditEntryDTO",
     "AuditListResponse",
     "CreateUserRequest",
     "CreateUserResponse",
     "DeleteUserResponse",
     "GroupBriefDTO",
+    "MembershipDTO",
     "UpdateUserRequest",
     "UserBriefDTO",
     "UserDTO",

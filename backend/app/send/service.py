@@ -198,7 +198,7 @@ class SendService:
         if scope.is_super_admin:
             return None
         return await self._accounts.list_account_ids_visible(
-            group_id=scope.group_id, owner_user_id=scope.user_id
+            group_ids=scope.group_ids, owner_user_id=scope.user_id
         )
 
     async def send(

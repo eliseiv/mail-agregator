@@ -22,7 +22,7 @@ from datetime import UTC, datetime
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from shared.models import Group, User
+from shared.models import Group, User, UserGroup
 
 
 class GroupsRepo:
@@ -74,19 +74,40 @@ class GroupsRepo:
         return out
 
     async def member_counts_bulk(self, group_ids: list[int]) -> dict[int, int]:
-        """Return ``{group_id: member_count}`` (members include the leader)."""
+        """Return ``{group_id: member_count}`` (members include the leader).
+
+        ADR-0030: members are counted through ``user_groups`` (the union of
+        home + additional memberships), not ``users.group_id`` — so a user
+        added to a second team is counted in both. Home memberships are
+        always mirrored in ``user_groups`` (migration backfill + service
+        sync), so the leader is included.
+        """
         if not group_ids:
             return {}
         stmt = (
-            select(User.group_id, func.count(User.id))
-            .where(User.group_id.in_(group_ids))
-            .group_by(User.group_id)
+            select(UserGroup.group_id, func.count(UserGroup.user_id))
+            .where(UserGroup.group_id.in_(group_ids))
+            .group_by(UserGroup.group_id)
         )
         out: dict[int, int] = {gid: 0 for gid in group_ids}
         for row in (await self._s.execute(stmt)).all():
             gid = int(row[0])
             out[gid] = int(row[1])
         return out
+
+    async def list_members_in_group(self, group_id: int) -> list[User]:
+        """All users who are members of ``group_id`` via ``user_groups``.
+
+        ADR-0030: the union of home + additional memberships (the group card
+        member list). Ordered by user id for stable display.
+        """
+        stmt = (
+            select(User)
+            .join(UserGroup, UserGroup.user_id == User.id)
+            .where(UserGroup.group_id == group_id)
+            .order_by(User.id)
+        )
+        return list((await self._s.execute(stmt)).scalars().all())
 
     # --- Writes ------------------------------------------------------------
 

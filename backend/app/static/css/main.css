@@ -1312,6 +1312,95 @@ a:hover { color: var(--color-primary-hover); text-decoration: underline; }
   outline-offset: 2px;
 }
 
+/* Group-actions chooser (ADR-0030): the «+» button opens a shared <dialog>
+   with two stacked action buttons («Переместить» / «Добавить»). Rendered in
+   the top layer so it is never clipped by the table's overflow:hidden.
+   CSP-safe — no inline styles. */
+.dialog__menu {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+}
+.dialog__menu-item {
+  appearance: none;
+  border: 1px solid var(--color-border-strong);
+  background: var(--color-bg);
+  color: var(--color-text);
+  text-align: left;
+  padding: var(--space-3) var(--space-4);
+  border-radius: 8px;
+  font-size: 0.95rem;
+  cursor: pointer;
+}
+.dialog__menu-item:hover:not([disabled]) {
+  background: var(--color-bg-subtle);
+  border-color: var(--color-primary);
+}
+.dialog__menu-item:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+.dialog__menu-item[disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Team chips in the «Команда» column (ADR-0030). The home team chip has no
+   remove control; additional memberships carry a «×». */
+.team-chips {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+.team-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 2px var(--space-2);
+  border: 1px solid var(--color-border-strong);
+  border-radius: 999px;
+  background: var(--color-bg-subtle);
+  font-size: 0.85rem;
+  line-height: 1.4;
+  max-width: 100%;
+}
+.team-chip--home {
+  background: var(--color-primary-soft);
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+}
+.team-chip__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.team-chip__remove-form {
+  display: inline-flex;
+  margin: 0;
+}
+.team-chip__remove {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  padding: 0 2px;
+  border-radius: 50%;
+}
+.team-chip__remove:hover {
+  color: var(--color-danger);
+}
+.team-chip__remove:focus-visible {
+  outline: 2px solid var(--color-danger);
+  outline-offset: 1px;
+}
+
 /* Inline expand block inside the actions cell. Provides reset/delete + the
    nested mail-accounts list without taking a whole row when collapsed. */
 .admin-user-details > .admin-user-details__summary {

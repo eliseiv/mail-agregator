@@ -7,6 +7,7 @@ Special method :meth:`MailAccountsRepo.next_account_id` reserves the next
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from datetime import UTC, datetime
 
 from sqlalchemy import and_, delete, func, or_, select, text, update
@@ -88,46 +89,47 @@ class MailAccountsRepo:
         return list((await self._s.execute(stmt)).scalars().all())
 
     async def list_for_group_or_owner(
-        self, *, group_id: int | None, owner_user_id: int
+        self, *, group_ids: Collection[int] | None, owner_user_id: int
     ) -> list[MailAccount]:
-        """Visibility query for a non-super_admin caller (FE-FIX round-10).
+        """Visibility query for a non-super_admin caller (FE-FIX round-10;
+        ADR-0030 multi-group).
 
         Returns accounts that satisfy ANY of the following:
-          - ``mail_accounts.group_id == group_id`` (group-shared accounts);
+          - ``mail_accounts.group_id = ANY(group_ids)`` (accounts of any team
+            the caller is a member of — ADR-0030 replaced the single
+            ``users.group_id = mail_accounts.group_id`` predicate);
           - ``mail_accounts.user_id == owner_user_id`` (the caller's personal
             accounts — covers the case where the caller owns an account that
             was created while they had no group, so its ``group_id`` is
-            still NULL or no longer matches their current group).
+            still NULL or no longer matches any current membership).
 
-        Pass ``group_id=None`` for callers without a group: only personal
-        accounts are returned.
+        Pass an empty / ``None`` ``group_ids`` for callers without any team:
+        only personal accounts are returned.
         """
         cond = MailAccount.user_id == owner_user_id
-        if group_id is not None:
-            cond = or_(cond, MailAccount.group_id == group_id)
+        if group_ids:
+            cond = or_(cond, MailAccount.group_id.in_(list(group_ids)))
         stmt = select(MailAccount).where(cond).order_by(MailAccount.user_id, MailAccount.id)
         return list((await self._s.execute(stmt)).scalars().all())
 
     async def get_for_group_or_owner(
-        self, *, group_id: int | None, owner_user_id: int, account_id: int
+        self, *, group_ids: Collection[int] | None, owner_user_id: int, account_id: int
     ) -> MailAccount | None:
-        cond = and_(
-            MailAccount.id == account_id,
-            or_(
-                MailAccount.user_id == owner_user_id,
-                MailAccount.group_id == group_id if group_id is not None else False,  # type: ignore[arg-type]
-            ),
-        )
-        stmt = select(MailAccount).where(cond)
+        owner_cond = MailAccount.user_id == owner_user_id
+        if group_ids:
+            visibility = or_(owner_cond, MailAccount.group_id.in_(list(group_ids)))
+        else:
+            visibility = owner_cond
+        stmt = select(MailAccount).where(and_(MailAccount.id == account_id, visibility))
         return (await self._s.execute(stmt)).scalar_one_or_none()
 
     async def list_account_ids_visible(
-        self, *, group_id: int | None, owner_user_id: int
+        self, *, group_ids: Collection[int] | None, owner_user_id: int
     ) -> list[int]:
-        """``mail_accounts.id`` visible to a non-super_admin caller."""
+        """``mail_accounts.id`` visible to a non-super_admin caller (ADR-0030)."""
         cond = MailAccount.user_id == owner_user_id
-        if group_id is not None:
-            cond = or_(cond, MailAccount.group_id == group_id)
+        if group_ids:
+            cond = or_(cond, MailAccount.group_id.in_(list(group_ids)))
         stmt = select(MailAccount.id).where(cond)
         return [int(r[0]) for r in (await self._s.execute(stmt)).all()]
 

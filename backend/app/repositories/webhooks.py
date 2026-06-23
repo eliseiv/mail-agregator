@@ -121,7 +121,11 @@ class WebhooksRepo:
                        JOIN   users u ON u.id = t.user_id
                        WHERE  mt.message_id = m.id
                          AND  (
-                                 u.group_id = ma.group_id
+                                 EXISTS (
+                                     SELECT 1 FROM user_groups ug
+                                     WHERE  ug.user_id = u.id
+                                       AND  ug.group_id = ma.group_id
+                                 )
                                  OR u.id = ma.user_id
                               )
                          -- round-28: NO ``u.role = 'super_admin'`` branch.
@@ -427,7 +431,14 @@ class WebhookDeliveriesRepo:
                        JOIN   tags t ON t.id = mt.tag_id
                        JOIN   users u ON u.id = t.user_id
                        WHERE  mt.message_id = m.id
-                         AND  (u.group_id = ma.group_id OR u.id = ma.user_id)
+                         AND  (
+                                 EXISTS (
+                                     SELECT 1 FROM user_groups ug
+                                     WHERE  ug.user_id = u.id
+                                       AND  ug.group_id = ma.group_id
+                                 )
+                                 OR u.id = ma.user_id
+                              )
                        -- round-28: same team-scoped predicate as
                        -- ``find_active_for_message``. Without it, a message
                        -- tagged ONLY by a super_admin personal tag would pass

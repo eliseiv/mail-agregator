@@ -187,6 +187,58 @@ class OAuthReconsentRequiredError(DomainError):
     code = "oauth_reconsent_required"
 
 
+class CannotAddSuperAdminToGroupError(DomainError):
+    """``POST /api/admin/users/{id}/groups`` targeted a super_admin (ADR-0030).
+
+    super_admin sees everything; memberships would break the invariant
+    ``super_admin → group_id IS NULL`` and "no rows in user_groups".
+    """
+
+    status_code = 400
+    code = "cannot_add_super_admin_to_group"
+
+
+class MembershipAlreadyExistsError(DomainError):
+    """``POST /api/admin/users/{id}/groups`` for an existing membership
+    (UNIQUE ``user_groups(user_id, group_id)``) — ADR-0030."""
+
+    status_code = 409
+    code = "membership_already_exists"
+
+
+class CannotRemoveHomeMembershipError(DomainError):
+    """``DELETE /api/admin/users/{id}/groups/{group_id}`` tried to remove the
+    home membership (``group_id == users.group_id``) — ADR-0030. Change the
+    home team via "move" (``PATCH /api/admin/users/{id}``)."""
+
+    status_code = 400
+    code = "cannot_remove_home_membership"
+
+
+class MembershipNotFoundError(DomainError):
+    """``DELETE /api/admin/users/{id}/groups/{group_id}`` for a membership the
+    user does not have — ADR-0030."""
+
+    status_code = 404
+    code = "membership_not_found"
+
+
+class CannotMoveGroupLeaderError(DomainError):
+    """ "Move" (``PATCH /api/admin/users/{id}`` changing ``group_id``) attempted
+    on a ``group_leader`` — ADR-0030. Would break the leader invariant; only
+    "add to team" (additional membership) is allowed for leaders."""
+
+    status_code = 409
+    code = "cannot_move_group_leader"
+
+
+class GroupNotFoundError(DomainError):
+    """A referenced ``group_id`` does not exist (ADR-0030 membership add)."""
+
+    status_code = 404
+    code = "group_not_found"
+
+
 class WebhookUrlPrivateIpError(DomainError):
     """Outbound webhook URL would target a private/loopback/link-local
     address — ADR-0023 §4.3 SSRF protection.

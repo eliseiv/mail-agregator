@@ -25,6 +25,7 @@ from backend.app.admin.schemas import (
     CreateUserResponse,
     DeleteUserResponse,
     GroupBriefDTO,
+    MembershipDTO,
     UpdateUserRequest,
     UserDTO,
     UserMailAccountSummary,
@@ -33,10 +34,16 @@ from backend.app.admin.schemas import (
 from backend.app.audit import AuditWriter
 from backend.app.deps import VisibilityScope
 from backend.app.exceptions import (
+    CannotAddSuperAdminToGroupError,
     CannotDeleteAdminError,
+    CannotMoveGroupLeaderError,
+    CannotRemoveHomeMembershipError,
     CannotResetAdminError,
     ConflictError,
     ForbiddenError,
+    GroupNotFoundError,
+    MembershipAlreadyExistsError,
+    MembershipNotFoundError,
     NotFoundError,
     ValidationError,
 )
@@ -45,6 +52,7 @@ from backend.app.repositories.audit import AuditRepo
 from backend.app.repositories.groups import GroupsRepo
 from backend.app.repositories.mail_accounts import MailAccountsRepo
 from backend.app.repositories.messages import MessagesRepo
+from backend.app.repositories.user_groups import UserGroupsRepo
 from backend.app.repositories.users import UsersRepo
 from backend.app.sessions import SessionStore
 from backend.app.telegram.sso_service import TelegramSSOService
@@ -72,6 +80,7 @@ class AdminService:
         self._db = session
         self._users = UsersRepo(session)
         self._groups = GroupsRepo(session)
+        self._memberships = UserGroupsRepo(session)
         self._accounts = MailAccountsRepo(session)
         self._messages = MessagesRepo(session)
         self._audit_repo = AuditRepo(session)
@@ -117,8 +126,17 @@ class AdminService:
         )
         accs_map = await self._accounts.list_for_users([u.id for u in users])
 
-        # Group lookup (bulk) for the embedded brief.
-        gids = sorted({u.group_id for u in users if u.group_id is not None})
+        # ADR-0030: bulk-load every membership (home + additional) so the
+        # admin page can render team chips. Read-only — no invariant changes.
+        memberships_map = await self._memberships.list_group_ids_for_users([u.id for u in users])
+
+        # Group lookup (bulk) for the embedded brief — covers both the home
+        # group (``users.group_id``) and any additional membership group, so
+        # chip labels resolve to real names without an N+1 fetch.
+        gids = sorted(
+            {u.group_id for u in users if u.group_id is not None}
+            | {gid for gid_list in memberships_map.values() for gid in gid_list}
+        )
         groups = await self._groups.list_by_ids(gids)
         group_by_id: dict[int, Group] = {g.id: g for g in groups}
 
@@ -130,6 +148,11 @@ class AdminService:
                 display_name=u.display_name,
                 role=u.role,
                 group=_group_brief(group_by_id.get(u.group_id) if u.group_id is not None else None),
+                memberships=[
+                    brief
+                    for gid in memberships_map.get(u.id, [])
+                    if (brief := _group_brief(group_by_id.get(gid))) is not None
+                ],
                 password_reset_required=u.password_reset_required,
                 lockout_until=u.lockout_until,
                 last_login_at=u.last_login_at,
@@ -251,6 +274,12 @@ class AdminService:
             user_agent=user_agent,
         )
 
+        # ADR-0030: mirror the home membership for a freshly created member.
+        # (Leader paths below mirror inside ``create_for_leader`` /
+        # the orphan-group branch.)
+        if role == ROLE_GROUP_MEMBER and insert_group_id is not None:
+            await self._memberships.add(user_id=user.id, group_id=insert_group_id)
+
         # Auto-create / assign-to-orphan group flow for new leader.
         group: Group | None = None
         if role == ROLE_GROUP_LEADER:
@@ -271,6 +300,9 @@ class AdminService:
                         "User already leads another group",
                         field="group_id",
                     ) from exc
+                # ADR-0030: mirror the home membership for the new leader
+                # (the user was inserted with this group_id as home).
+                await self._memberships.add(user_id=user.id, group_id=group_id)
                 await self._audit.log(
                     actor_user_id=actor.user_id,
                     action="user_role_change",
@@ -379,6 +411,11 @@ class AdminService:
                         role=ROLE_GROUP_LEADER,
                         group_id=None,
                     )
+                    # ADR-0030: drop the stale home membership now (the
+                    # group_id was just nulled, so ``create_for_leader`` can no
+                    # longer see the previous home to remove it).
+                    if old_group is not None:
+                        await self._memberships.remove(user_id=target_id, group_id=old_group)
                     fresh = await self._users.get_by_id(target_id)
                     assert fresh is not None
                     await GroupsService(self._db).create_for_leader(
@@ -418,9 +455,20 @@ class AdminService:
                         role=ROLE_GROUP_MEMBER,
                         group_id=new_group_id,
                     )
+                    # ADR-0030: sync home membership on demotion.
+                    if old_group is not None and old_group != new_group_id:
+                        await self._memberships.remove(user_id=target_id, group_id=old_group)
+                    await self._memberships.add(user_id=target_id, group_id=new_group_id)
                     group_changed = old_group != new_group_id
             elif new_group_id is not None and new_group_id != old_group:
-                # Same role, change of group (allowed only for group_member).
+                # Same role, change of home team — "move" (ADR-0030).
+                # ADR-0030 §5: moving a leader would break the leader
+                # invariant (their home team must be the team they lead).
+                if old_role == ROLE_GROUP_LEADER:
+                    raise CannotMoveGroupLeaderError(
+                        "Cannot move a group leader to another team",
+                        field="group_id",
+                    )
                 if old_role != ROLE_GROUP_MEMBER:
                     raise ValidationError(
                         "Only group_member may change group_id without role change",
@@ -433,6 +481,14 @@ class AdminService:
                     target_id,
                     group_id=new_group_id,
                 )
+                # ADR-0030: keep ``user_groups`` in sync with the new home
+                # team. Drop the old home membership, add the new one
+                # (idempotent — dedups if the new home already existed as an
+                # additional membership). Additional memberships are left
+                # untouched.
+                if old_group is not None:
+                    await self._memberships.remove(user_id=target_id, group_id=old_group)
+                await self._memberships.add(user_id=target_id, group_id=new_group_id)
                 group_changed = True
 
         # Apply display_name change (any role gate already passed).
@@ -494,6 +550,11 @@ class AdminService:
             else None
         )
         accs = await self._accounts.list_for_users([refreshed.id])
+        # ADR-0030: include every team membership (home + additional) in the
+        # PATCH response, consistent with the listing DTO.
+        membership_gids = await self._memberships.list_group_ids_for_user(refreshed.id)
+        membership_groups = await self._groups.list_by_ids(sorted(set(membership_gids)))
+        membership_by_id = {g.id: g for g in membership_groups}
         return UserDTO(
             id=refreshed.id,
             username=refreshed.username,
@@ -501,6 +562,11 @@ class AdminService:
             display_name=refreshed.display_name,
             role=refreshed.role,
             group=_group_brief(group),
+            memberships=[
+                brief
+                for gid in membership_gids
+                if (brief := _group_brief(membership_by_id.get(gid))) is not None
+            ],
             password_reset_required=refreshed.password_reset_required,
             lockout_until=refreshed.lockout_until,
             last_login_at=refreshed.last_login_at,
@@ -516,6 +582,117 @@ class AdminService:
                 )
                 for a in accs.get(refreshed.id, [])
             ],
+        )
+
+    # --- Multi-group membership (ADR-0030) --------------------------------
+
+    async def add_membership(
+        self,
+        *,
+        actor: VisibilityScope,
+        target_id: int,
+        group_id: int,
+        ip: str,
+        user_agent: str | None,
+    ) -> MembershipDTO:
+        """Add an additional team membership (ADR-0030).
+
+        super_admin only. The target must not be a super_admin. Idempotent
+        via UNIQUE — a repeat add surfaces ``409 membership_already_exists``.
+        Does NOT change ``users.group_id`` (home team) or ``users.role``.
+        Revokes the target's sessions so ``VisibilityScope.group_ids`` is
+        re-read from ``user_groups``.
+        """
+        if not actor.is_super_admin:
+            raise ForbiddenError("Super-admin only")
+
+        target = await self._users.get_by_id(target_id)
+        if target is None:
+            raise NotFoundError()
+        if target.role == ROLE_SUPER_ADMIN:
+            raise CannotAddSuperAdminToGroupError(
+                "Cannot add super_admin to a team",
+                field="group_id",
+            )
+
+        group = await self._groups.get_by_id(group_id)
+        if group is None:
+            raise GroupNotFoundError("Group not found", field="group_id")
+
+        created = await self._memberships.add(user_id=target_id, group_id=group_id)
+        if not created:
+            raise MembershipAlreadyExistsError(
+                "User already belongs to this team",
+                field="group_id",
+                details={"group_id": group_id},
+            )
+
+        await self._sessions.revoke_all_for_user(target_id)
+        await self._audit.log(
+            actor_user_id=actor.user_id,
+            action="user_group_add",
+            target_user_id=target_id,
+            target_username=target.username,
+            details={"group_id": group_id},
+            ip=ip,
+            user_agent=user_agent,
+        )
+        # Re-read the membership timestamp for the response.
+        created_at = await self._memberships.get_created_at(user_id=target_id, group_id=group_id)
+        assert created_at is not None  # just inserted
+        return MembershipDTO(
+            user_id=target_id,
+            group_id=group_id,
+            group=GroupBriefDTO(id=group.id, name=group.name),
+            created_at=created_at,
+        )
+
+    async def remove_membership(
+        self,
+        *,
+        actor: VisibilityScope,
+        target_id: int,
+        group_id: int,
+        ip: str,
+        user_agent: str | None,
+    ) -> None:
+        """Remove an additional team membership (ADR-0030).
+
+        super_admin only. The home membership (``group_id == users.group_id``)
+        cannot be removed — that is what "move" is for. A non-existent
+        additional membership surfaces ``404 membership_not_found``. Revokes
+        the target's sessions on success.
+        """
+        if not actor.is_super_admin:
+            raise ForbiddenError("Super-admin only")
+
+        target = await self._users.get_by_id(target_id)
+        if target is None:
+            raise NotFoundError()
+
+        if target.group_id is not None and target.group_id == group_id:
+            raise CannotRemoveHomeMembershipError(
+                "Cannot remove the home team membership; use move instead",
+                field="group_id",
+            )
+
+        removed = await self._memberships.remove(user_id=target_id, group_id=group_id)
+        if not removed:
+            raise MembershipNotFoundError(
+                "No such additional membership",
+                field="group_id",
+                details={"group_id": group_id},
+            )
+
+        await self._sessions.revoke_all_for_user(target_id)
+        await self._audit.log(
+            actor_user_id=actor.user_id,
+            action="user_group_remove",
+            target_user_id=target_id,
+            target_username=target.username,
+            details={"group_id": group_id},
+            ip=ip,
+            user_agent=user_agent,
         )
 
     # --- Reset + delete --------------------------------------------------

@@ -6,6 +6,7 @@ SQLAlchemy. Service-layer enforces ownership; repos only do the SQL.
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from datetime import datetime
 
 from sqlalchemy import and_, delete, exists, func, or_, select, update
@@ -179,14 +180,15 @@ class MessageTagsRepo:
         return out
 
     async def count_messages_visible(
-        self, *, user_id: int, user_group_id: int | None, is_super_admin: bool
+        self, *, user_id: int, group_ids: Collection[int], is_super_admin: bool
     ) -> int:
-        """Total messages visible to ``user_id`` under the round-10 model.
+        """Total messages visible to ``user_id`` (ADR-0030 multi-group).
 
         Visibility = personal accounts (``ma.user_id = user_id``) OR
-        team accounts (``ma.group_id = user_group_id``). Pass
-        ``user_group_id=None`` for callers without a group; the second
-        branch is then omitted and only personal accounts count.
+        accounts of any team the user is a member of (``ma.group_id IN
+        group_ids``). Pass an empty ``group_ids`` for callers without any
+        membership; the team branch is then omitted and only personal
+        accounts count.
 
         round-26: when ``is_super_admin=True`` the count covers EVERY
         message in the system (no account join / filter), mirroring the
@@ -204,14 +206,14 @@ class MessageTagsRepo:
         if is_super_admin:
             stmt = select(func.count()).select_from(Message)
             return int((await self._s.execute(stmt)).scalar_one())
-        if user_group_id is None:
+        if not group_ids:
             cond = MailAccount.user_id == user_id
         else:
             cond = or_(
                 MailAccount.user_id == user_id,
                 and_(
                     MailAccount.group_id.is_not(None),
-                    MailAccount.group_id == user_group_id,
+                    MailAccount.group_id.in_(list(group_ids)),
                 ),
             )
         stmt = (

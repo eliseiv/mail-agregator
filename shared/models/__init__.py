@@ -21,6 +21,7 @@ from shared.models.user import (
     ROLE_SUPER_ADMIN,
     User,
 )
+from shared.models.user_group import UserGroup
 from shared.models.user_settings import UserSettings
 from shared.models.webhook import Webhook, WebhookDelivery
 
@@ -42,6 +43,7 @@ __all__ = [
     "TelegramLink",
     "TelegramNotification",
     "User",
+    "UserGroup",
     "UserSettings",
     "Webhook",
     "WebhookDelivery",

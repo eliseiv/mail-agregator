@@ -104,10 +104,18 @@ class MessageService:
                 # Inbox no longer shows duplicates.
                 return await self._accounts.list_canonical_account_ids()
             return await self._accounts.list_account_ids_in_group(group_id)
-        if group_id is not None and group_id != scope.group_id:
-            raise ForbiddenError("user_not_in_group_scope")
+        if group_id is not None:
+            # ADR-0030: a non-admin caller may scope the inbox to ANY team
+            # they are a member of (home or additional), not only the home
+            # team. Restrict visibility to that single requested team (plus
+            # the caller's own personal accounts, preserving prior semantics).
+            if group_id not in scope.group_ids:
+                raise ForbiddenError("user_not_in_group_scope")
+            return await self._accounts.list_account_ids_visible(
+                group_ids={group_id}, owner_user_id=scope.user_id
+            )
         return await self._accounts.list_account_ids_visible(
-            group_id=scope.group_id, owner_user_id=scope.user_id
+            group_ids=scope.group_ids, owner_user_id=scope.user_id
         )
 
     # --- List --------------------------------------------------------------
@@ -130,15 +138,16 @@ class MessageService:
 
         # Round-20: widen tag-filter visibility — super_admin may filter
         # by any tag in the system; team members may filter by any tag
-        # belonging to themselves OR another user of the same team. The
-        # previous per-user gate ``is_tag_owned`` rejected team-member
-        # tags surfaced by the cascade dropdown and returned an empty
-        # Inbox.
+        # belonging to themselves OR another member of any of their teams.
+        # ADR-0030 §2: pass the full ``group_ids`` set so the tag-filter is
+        # consistent with the (multi-group) message visibility — a member of
+        # teams [A, B] filtering by a team-B colleague's tag must not 404
+        # while the team-B messages it scopes are visible.
         if tag_id is not None and not await self._repo.is_tag_visible_to_scope(
             tag_id=tag_id,
             is_super_admin=scope.is_super_admin,
             user_id=scope.user_id,
-            user_group_id=scope.group_id,
+            group_ids=scope.group_ids,
         ):
             raise NotFoundError()
 

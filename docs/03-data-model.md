@@ -11,7 +11,9 @@
 ```mermaid
 erDiagram
     groups ||--o| users : "leader (1:1)"
-    groups ||--o{ users : "members (1:N)"
+    groups ||--o{ users : "home members (1:N via users.group_id)"
+    users ||--o{ user_groups : "memberships (ADR-0030)"
+    groups ||--o{ user_groups : "members (ADR-0030)"
     users ||--o{ mail_accounts : owns
     users ||--o{ sent_messages : sends
     users ||--o{ admin_audit : "subject_user (nullable, no FK)"
@@ -39,7 +41,7 @@ erDiagram
         text display_name "nullable; UI fallback to username"
         text password_hash "nullable, argon2id"
         text role "super_admin|group_leader|group_member"
-        bigint group_id FK "nullable; NULL only for super_admin"
+        bigint group_id FK "nullable; home/primary team; NULL only for super_admin (ADR-0030)"
         boolean password_reset_required
         timestamptz lockout_until "nullable"
         int failed_login_attempts
@@ -55,9 +57,16 @@ erDiagram
         timestamptz created_at
     }
 
+    user_groups {
+        bigint id PK
+        bigint user_id FK "ON DELETE CASCADE (ADR-0030)"
+        bigint group_id FK "ON DELETE CASCADE (ADR-0030)"
+        timestamptz created_at
+    }
+
     mail_accounts {
         bigint id PK
-        bigint user_id FK "owner; visibility computed via JOIN users.group_id"
+        bigint user_id FK "owner; visibility via user_groups (ADR-0030)"
         text email
         text display_name "nullable; UI fallback to email"
         bytea encrypted_password "AES-GCM blob"
@@ -236,7 +245,7 @@ erDiagram
 | `display_name` | TEXT | NULL, CHECK length 1..100 | Человекочитаемое имя для UI; fallback в UI на `username` если NULL. Произвольная UTF-8 (включая русский). Введено в ADR-0019 §2 — также используется как источник для авто-имени группы при создании лидера (`"Группа {display_name | username}"`). |
 | `password_hash` | VARCHAR(255) | NULL | argon2id. NULL — пароль ещё не задан или сброшен. |
 | `role` | TEXT | NOT NULL DEFAULT `'group_member'`, CHECK IN (`'super_admin'`, `'group_leader'`, `'group_member'`) | Роль пользователя. См. ADR-0019. Заменяет старую колонку `is_admin: BOOLEAN` (миграция: `is_admin=true → role='super_admin'`, иначе → `role='group_member'`). `seed_super_admin` upsert'ит `role='super_admin'` для админа из env. |
-| `group_id` | BIGINT | NULL, FK → `groups(id)` ON DELETE SET NULL, **DEFERRABLE INITIALLY DEFERRED** | Группа пользователя. NULL только для `super_admin`. См. ADR-0019 §4. DEFERRABLE — потому что при auto-create группы (новый лидер) сначала вставляется user, потом groups, потом UPDATE users.group_id; FK-проверка должна откладываться до COMMIT. |
+| `group_id` | BIGINT | NULL, FK → `groups(id)` ON DELETE SET NULL, **DEFERRABLE INITIALLY DEFERRED** | **«Домашняя»/первичная команда** пользователя (ADR-0030). NULL только для `super_admin`. См. ADR-0019 §4. С ADR-0030 источник истины для **видимости/уведомлений** — таблица `user_groups` (M:N); `users.group_id` сохраняется и нужен для: (а) инварианта лидера (CHECK + constraint-trigger остаются на `users.group_id`); (б) присвоения `mail_accounts.group_id` при добавлении ящика (ящик попадает в домашнюю команду владельца); (в) глобальной роли `users.role` (per-group роли НЕ вводятся). Домашнее членство ВСЕГДА продублировано строкой в `user_groups` (см. таблицу `user_groups` и её инварианты). DEFERRABLE — потому что при auto-create группы (новый лидер) сначала вставляется user, потом groups, потом UPDATE users.group_id; FK-проверка должна откладываться до COMMIT. |
 | `password_reset_required` | BOOLEAN | NOT NULL DEFAULT true | После seed/сброса — true; после установки пароля — false. |
 | `lockout_until` | TIMESTAMPTZ | NULL | Если заполнено и > now() — login отклоняется (см. ADR-0009). |
 | `failed_login_attempts` | INT | NOT NULL DEFAULT 0 | Сбрасывается при успешном login или истечении lockout. |
@@ -297,12 +306,40 @@ erDiagram
 
 ---
 
+### `user_groups`
+
+Источник истины — [ADR-0030](./adr/ADR-0030-multi-group-membership.md). Аддитивная M:N-таблица «пользователь ↔ команда» — **единственный источник истины для видимости ящиков/писем в веб-интерфейсе, адресации Telegram-уведомлений основного бота (ADR-0022) и outbound-webhooks (ADR-0023), а также подсчёта членов команды**. Заменяет прежний предикат `users.group_id = mail_accounts.group_id` на проверку членства. `users.group_id` при этом сохраняется как «домашняя»/первичная команда (см. колонку `users.group_id` выше).
+
+| Колонка | Тип | Constraints | Описание |
+| --- | --- | --- | --- |
+| `id` | BIGSERIAL | PRIMARY KEY | Семантически — BIGINT PK (ADR-0030); BIGSERIAL как в остальных таблицах файла (например, `groups.id`). |
+| `user_id` | BIGINT | NOT NULL, FK → `users(id)` ON DELETE CASCADE | Член команды. CASCADE → при удалении пользователя все его членства удаляются. |
+| `group_id` | BIGINT | NOT NULL, FK → `groups(id)` ON DELETE CASCADE | Команда. CASCADE → при удалении группы все членства в ней удаляются (симметрично `users.group_id ON DELETE SET NULL`, но для членств — полное удаление строки). |
+| `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | Время добавления членства. |
+
+**Constraints:**
+- UNIQUE `(user_id, group_id)` — пользователь не может состоять в одной команде дважды. Обеспечивает идемпотентность `POST /api/admin/users/{id}/groups` (повторное добавление = no-op/409).
+
+**Индексы:**
+- UNIQUE `(user_id, group_id)` — также обслуживает прямой lookup «членства пользователя».
+- `INDEX (group_id)` — обратный поиск «члены команды» (`members_count`, список участников в карточке группы).
+
+**Инварианты (ADR-0030):**
+- **Домашнее членство всегда продублировано:** для любого пользователя с `users.group_id IS NOT NULL` существует строка `user_groups(user_id, users.group_id)`. Домашнее членство удалить нельзя (его смена — только через «Переместить», `PATCH /api/admin/users/{id}` с `group_id`).
+- **`super_admin`:** `users.group_id IS NULL` И **нет** строк в `user_groups` (он видит всё без членств; добавлять его в команды запрещено).
+- **Лидер:** ровно одна команда, где он лидер (`groups.leader_user_id = users.id`), — это его домашняя команда (= `users.group_id`); плюс может иметь произвольное число **дополнительных** членств в `user_groups`. Доп. членства лидера не делают его лидером тех команд (роль глобальная, одна).
+- **Видимость = объединение всех членств:** пользователь видит ящики/письма всех команд из `user_groups` (домашняя + добавленные).
+
+**Объём:** ≤ 5 пользователей × ≤ 5 команд = ≤ 25 строк на обозримом горизонте.
+
+---
+
 ### `mail_accounts`
 
 | Колонка | Тип | Constraints | Описание |
 | --- | --- | --- | --- |
 | `id` | BIGSERIAL | PK | |
-| `user_id` | BIGINT | NOT NULL, FK → `users(id)` ON DELETE CASCADE | Владелец mail-аккаунта. Visibility (super_admin / group_leader / group_member) определяется через JOIN `mail_accounts.user_id → users.group_id` (см. ADR-0019 §7.1). |
+| `user_id` | BIGINT | NOT NULL, FK → `users(id)` ON DELETE CASCADE | Владелец mail-аккаунта. Visibility (super_admin / group_leader / group_member) с ADR-0030 определяется через **членства** зрителя: ящик виден, если `mail_accounts.group_id` входит в множество команд зрителя из `user_groups` (ранее — сравнение `mail_accounts.group_id = users.group_id`, ADR-0019 §7.1). `mail_accounts.group_id` остаётся 1:1 — ящик принадлежит одной (домашней) команде владельца. |
 | `email` | TEXT | NOT NULL | Адрес почты пользователя в этом сервисе. Для OAuth-аккаунтов — извлекается из `id_token`/Graph при consent. |
 | `display_name` | TEXT | NULL, CHECK length 1..100 | Никнейм / ярлык для UI. Если задан — показывается вместо `email` (см. ADR-0020). Не уникален. Любая UTF-8 строка 1..100 (после trim'а пустая интерпретируется как NULL). |
 | `auth_type` | TEXT | NOT NULL DEFAULT `'password'`, CHECK in (`'password'`,`'oauth_outlook'`) | **ADR-0025:** способ аутентификации. `password` — IMAP/SMTP LOGIN по зашифрованному паролю; `oauth_outlook` — XOAUTH2 по OAuth-токенам. |
@@ -446,7 +483,7 @@ erDiagram
 | --- | --- | --- | --- |
 | `id` | BIGSERIAL | PK | |
 | `actor_user_id` | BIGINT | NOT NULL | id супер-админа. **БЕЗ FK** (запись должна жить даже если случайно удалили админа из БД; см. seed-логику). |
-| `action` | TEXT | NOT NULL | Enum-string: `admin_login`, `admin_logout`, `create_user`, `reset_password`, `delete_user`, `lockout_triggered`, `account_auto_disabled`, **`group_create`**, **`group_delete`**, **`group_rename`**, **`user_role_change`**, **`user_group_change`** (новые из ADR-0019 §9), **`telegram_link_created`**, **`telegram_link_revoked`**, **`telegram_link_dead_marked`** (из ADR-0022), **`telegram_link_rebound`**, **`telegram_link_limit_reached`** (новые из ADR-0024), `telegram_link_collision` (**deprecated** ADR-0024 §3 — больше не пишется, оставлен для исторических записей), **`webhook_created`**, **`webhook_updated`**, **`webhook_deleted`**, **`webhook_secret_rotated`**, **`webhook_dead_marked`** (из ADR-0023), **`oauth_account_linked`**, **`oauth_refresh_invalidated`** (новые из ADR-0025). |
+| `action` | TEXT | NOT NULL | Enum-string: `admin_login`, `admin_logout`, `create_user`, `reset_password`, `delete_user`, `lockout_triggered`, `account_auto_disabled`, **`group_create`**, **`group_delete`**, **`group_rename`**, **`user_role_change`**, **`user_group_change`** (новые из ADR-0019 §9; `user_group_change` с ADR-0030 пишется при «Переместить» — синхронизация `users.group_id` + `user_groups`), **`user_group_add`**, **`user_group_remove`** (новые из ADR-0030 — add/remove дополнительного членства в `user_groups`), **`telegram_link_created`**, **`telegram_link_revoked`**, **`telegram_link_dead_marked`** (из ADR-0022), **`telegram_link_rebound`**, **`telegram_link_limit_reached`** (новые из ADR-0024), `telegram_link_collision` (**deprecated** ADR-0024 §3 — больше не пишется, оставлен для исторических записей), **`webhook_created`**, **`webhook_updated`**, **`webhook_deleted`**, **`webhook_secret_rotated`**, **`webhook_dead_marked`** (из ADR-0023), **`oauth_account_linked`**, **`oauth_refresh_invalidated`** (новые из ADR-0025). |
 | `target_user_id` | BIGINT | NULL | id затронутого пользователя (для user-actions). |
 | `target_username` | TEXT | NULL | snapshot username на случай delete. |
 | `details` | JSONB | NULL | Произвольная структурированная информация (например, для `account_auto_disabled` — `{mail_account_id, reason}`). |
@@ -703,11 +740,11 @@ BUILTIN_TAGS = [
 
 | Удаление чего | Что каскадно удаляется (Postgres ON DELETE CASCADE) | Что чистится приложением |
 | --- | --- | --- |
-| `users(id)` | `mail_accounts`, `sent_messages`, `sent_attachments`, `messages` (через `mail_accounts → messages → attachments`), `attachments`, `tags`, `tag_rules` (через `tags`), `message_tags` (через `tags` и `messages`), **`telegram_links`** (ADR-0022), **`telegram_notifications`** (ADR-0022), **`users_settings`** (ADR-0022) | Объекты MinIO по префиксу `{user_id}/`; все session keys (Redis); запись в `admin_audit` (action=delete_user). **Защита от удаления лидера** — `groups.leader_user_id ON DELETE RESTRICT` (см. ADR-0019 §3): нельзя удалить user'а, пока он лидер; super-admin сначала удаляет группу. |
+| `users(id)` | `mail_accounts`, `sent_messages`, `sent_attachments`, `messages` (через `mail_accounts → messages → attachments`), `attachments`, `tags`, `tag_rules` (через `tags`), `message_tags` (через `tags` и `messages`), **`telegram_links`** (ADR-0022), **`telegram_notifications`** (ADR-0022), **`users_settings`** (ADR-0022), **`user_groups`** (ADR-0030 — все членства пользователя) | Объекты MinIO по префиксу `{user_id}/`; все session keys (Redis); запись в `admin_audit` (action=delete_user). **Защита от удаления лидера** — `groups.leader_user_id ON DELETE RESTRICT` (см. ADR-0019 §3): нельзя удалить user'а, пока он лидер; super-admin сначала удаляет группу. |
 | `mail_accounts(id)` | `messages`, `attachments`, `sent_messages` (FK from_account_id), `message_tags` (через `messages`), **`telegram_notifications`** (через `messages`), **`webhook_deliveries`** (через `messages`, ADR-0023) | Объекты MinIO по префиксу `{user_id}/{mail_account_id}/` |
 | `messages(id)` (retention) | `attachments`, `message_tags`, **`telegram_notifications`** (ADR-0022), **`webhook_deliveries`** (ADR-0023) | Объекты MinIO по prefix `{user_id}/{mail_account_id}/{uid}/` |
 | `tags(id)` (user delete tag) | `tag_rules`, `message_tags` | — |
-| `groups(id)` (super-admin delete group) | `users.group_id` → SET NULL (FK ON DELETE SET NULL — см. ADR-0019 §4), **`webhooks`** (FK ON DELETE CASCADE, ADR-0023) → каскадно **`webhook_deliveries`** | Backend ОБЯЗАН в той же транзакции: проверить, что в группе нет участников (`SELECT 1 FROM users WHERE group_id = :group_id`) и нет лидера (тот же group). Если есть — `400 group_has_members`. Super-admin сначала переназначает участников / переводит лидера, потом удаляет группу. SET NULL для `users.group_id` остаётся как safety-net для прямого DDL обхода. Webhook каскад намеренно `CASCADE` (а не `RESTRICT`) — webhook привязан к группе, а не к её участникам; удаление группы должно унести и её исходящий канал. |
+| `groups(id)` (super-admin delete group) | `users.group_id` → SET NULL (FK ON DELETE SET NULL — см. ADR-0019 §4), **`user_groups`** (FK ON DELETE CASCADE, ADR-0030 — все членства в этой команде, домашние и дополнительные), **`webhooks`** (FK ON DELETE CASCADE, ADR-0023) → каскадно **`webhook_deliveries`** | Backend ОБЯЗАН в той же транзакции: проверить, что в группе нет участников (`SELECT 1 FROM users WHERE group_id = :group_id`) и нет лидера (тот же group). Если есть — `400 group_has_members`. Super-admin сначала переназначает участников / переводит лидера, потом удаляет группу. SET NULL для `users.group_id` остаётся как safety-net для прямого DDL обхода. Webhook каскад намеренно `CASCADE` (а не `RESTRICT`) — webhook привязан к группе, а не к её участникам; удаление группы должно унести и её исходящий канал. |
 | `webhooks(id)` (DELETE /api/webhooks/me) | **`webhook_deliveries`** (FK ON DELETE CASCADE, ADR-0023) | — |
 
 Приложение перед каждым DELETE собирает список s3_key заранее (одним SELECT) и удаляет объекты MinIO, потом DELETE из БД. Транзакционности между MinIO и Postgres нет; в случае сбоя возможны "осиротевшие" объекты — это допустимо (cleanup `orphan_scan` в backlog).
@@ -809,3 +846,16 @@ BUILTIN_TAGS = [
   6. `ADD CONSTRAINT ck_mail_accounts_oauth_creds CHECK (auth_type <> 'oauth_outlook' OR (oauth_refresh_token_encrypted IS NOT NULL AND oauth_provider = 'outlook'))`.
   - Никакой data-миграции: все существующие строки получают `auth_type='password'` (default), инвариант выполняется (`encrypted_password` у них NOT NULL).
   - `down`: drop constraints + columns; восстановить `encrypted_password NOT NULL` (lossy при наличии oauth-строк — требует предварительного удаления oauth-аккаунтов).
+- **Миграция `20260623_019_user_groups`** (ADR-0030) — down_revision `20260527_018`:
+  1. `CREATE TABLE user_groups` (DDL — см. секцию `user_groups` выше): `id` BIGSERIAL PRIMARY KEY, `user_id` BIGINT NOT NULL FK → `users(id)` ON DELETE CASCADE, `group_id` BIGINT NOT NULL FK → `groups(id)` ON DELETE CASCADE, `created_at` TIMESTAMPTZ NOT NULL DEFAULT now().
+  2. `ADD CONSTRAINT user_groups_user_group_uq UNIQUE (user_id, group_id)`.
+  3. `CREATE INDEX user_groups_group_id_idx ON user_groups (group_id)`.
+  4. **Backfill домашних членств** (в той же миграции): для каждого `users.group_id IS NOT NULL` → строка в `user_groups`:
+     ```sql
+     INSERT INTO user_groups (user_id, group_id)
+     SELECT id, group_id FROM users WHERE group_id IS NOT NULL
+     ON CONFLICT (user_id, group_id) DO NOTHING;
+     ```
+     После backfill каждый пользователь с группой имеет своё домашнее членство; `super_admin` (`group_id IS NULL`) строк не получает.
+  5. `users.group_id` **НЕ удаляется** — сохраняется как «домашняя» команда (см. ADR-0030 §1 и колонку `users.group_id`).
+  - `down`: `DROP TABLE user_groups` (lossy для дополнительных членств — домашние восстановимы из `users.group_id`, добавленные — нет; задокументировано в ADR-0030).

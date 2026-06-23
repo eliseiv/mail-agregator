@@ -21,10 +21,12 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import ValidationError as PydanticValidationError
 
 from backend.app.admin.schemas import (
+    AddMembershipRequest,
     AuditListResponse,
     CreateUserRequest,
     CreateUserResponse,
     DeleteUserResponse,
+    MembershipDTO,
     UpdateUserRequest,
     UserDTO,
     UsersListResponse,
@@ -429,6 +431,124 @@ async def delete_user_sibling(
 
 
 # ---------------------------------------------------------------------------
+# JSON: multi-group membership (ADR-0030)
+# ---------------------------------------------------------------------------
+
+
+@api.post(
+    "/users/{user_id}/groups",
+    response_model=None,
+    status_code=status.HTTP_201_CREATED,
+)
+async def add_user_membership(
+    request: Request,
+    db: DbSession,
+    actor: SuperAdminScope,
+    user_id: int = Path(..., ge=1),
+) -> Response:
+    """Add an additional team membership to a user (ADR-0030)."""
+    await consume(LIMIT_ADMIN_WRITE, str(actor.user_id))
+    ip = client_ip(request)
+    ua = request.headers.get("user-agent", "")
+    is_form = is_form_request(request)
+
+    if is_form:
+        form = await request.form()
+        group_id = _form_int_or_none(form, "group_id")
+        if group_id is None:
+            raise ValidationError("group_id is required", field="group_id")
+        payload = AddMembershipRequest(group_id=group_id)
+    else:
+        body = await request.json()
+        try:
+            payload = AddMembershipRequest.model_validate(body)
+        except PydanticValidationError as exc:
+            raise ValidationError("Invalid JSON payload") from exc
+
+    try:
+        async with db.begin():
+            result: MembershipDTO = await AdminService(db).add_membership(
+                actor=actor,
+                target_id=user_id,
+                group_id=payload.group_id,
+                ip=ip,
+                user_agent=ua,
+            )
+    except DomainError as exc:
+        if is_form:
+            await flash(request, "error", exc.message)
+            return RedirectResponse(url="/admin", status_code=status.HTTP_303_SEE_OTHER)
+        raise
+
+    if is_form:
+        await flash(request, "success", "Пользователь добавлен в команду")
+        return RedirectResponse(url="/admin", status_code=status.HTTP_303_SEE_OTHER)
+    return JSONResponse(
+        content=result.model_dump(mode="json"),
+        status_code=status.HTTP_201_CREATED,
+    )
+
+
+async def _remove_membership_impl(
+    request: Request,
+    db: DbSession,
+    actor: VisibilityScope,
+    user_id: int,
+    group_id: int,
+) -> Response:
+    await consume(LIMIT_ADMIN_WRITE, str(actor.user_id))
+    ip = client_ip(request)
+    ua = request.headers.get("user-agent", "")
+    is_form = is_form_request(request)
+    try:
+        async with db.begin():
+            await AdminService(db).remove_membership(
+                actor=actor,
+                target_id=user_id,
+                group_id=group_id,
+                ip=ip,
+                user_agent=ua,
+            )
+    except DomainError as exc:
+        if is_form:
+            await flash(request, "error", exc.message)
+            return RedirectResponse(url="/admin", status_code=status.HTTP_303_SEE_OTHER)
+        raise
+
+    if is_form:
+        await flash(request, "success", "Членство в команде удалено")
+        return RedirectResponse(url="/admin", status_code=status.HTTP_303_SEE_OTHER)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@api.delete("/users/{user_id}/groups/{group_id}", response_model=None)
+async def remove_user_membership(
+    request: Request,
+    db: DbSession,
+    actor: SuperAdminScope,
+    user_id: int = Path(..., ge=1),
+    group_id: int = Path(..., ge=1),
+) -> Response:
+    return await _remove_membership_impl(request, db, actor, user_id, group_id)
+
+
+@api.post(
+    "/users/{user_id}/groups/{group_id}/delete",
+    response_model=None,
+    include_in_schema=False,
+)
+async def remove_user_membership_sibling(
+    request: Request,
+    db: DbSession,
+    actor: SuperAdminScope,
+    user_id: int = Path(..., ge=1),
+    group_id: int = Path(..., ge=1),
+) -> Response:
+    """Form-fallback to DELETE (POST + ``_method=DELETE``)."""
+    return await _remove_membership_impl(request, db, actor, user_id, group_id)
+
+
+# ---------------------------------------------------------------------------
 # JSON: audit
 # ---------------------------------------------------------------------------
 
@@ -573,6 +693,8 @@ async def admin_audit_page(
                 "group_rename",
                 "user_role_change",
                 "user_group_change",
+                "user_group_add",
+                "user_group_remove",
             ],
             "query_qs": query_qs,
             "csrf_token": sess.csrf_token,

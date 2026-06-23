@@ -151,6 +151,9 @@ _OVERRIDE_REGEX_PATHS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^/api/admin/users/\d+$"),  # PATCH (override)
     re.compile(r"^/api/admin/users/\d+/reset$"),
     re.compile(r"^/api/admin/users/\d+/delete$"),  # DELETE sibling
+    # Multi-group membership (ADR-0030)
+    re.compile(r"^/api/admin/users/\d+/groups$"),  # POST add membership
+    re.compile(r"^/api/admin/users/\d+/groups/\d+/delete$"),  # DELETE sibling
     # Groups (ADR-0019)
     re.compile(r"^/api/admin/groups/\d+$"),  # PATCH (override)
     re.compile(r"^/api/admin/groups/\d+/delete$"),  # DELETE sibling

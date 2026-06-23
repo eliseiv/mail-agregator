@@ -31,6 +31,9 @@ ALLOWED_ACTIONS: Final[frozenset[str]] = frozenset(
         "group_rename",
         "user_role_change",
         "user_group_change",
+        # ADR-0030 — multi-group membership add/remove (additional memberships).
+        "user_group_add",
+        "user_group_remove",
         # ADR-0022 §1.4 — Telegram SSO + notification lifecycle.
         "telegram_link_created",
         "telegram_link_revoked",

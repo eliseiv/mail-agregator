@@ -236,7 +236,7 @@ async def handle_callback_query(
         )
         return
 
-    scope = build_scope(user)
+    scope = await build_scope(user, db)
 
     # Step 4: load the message under the resolved visibility scope.
     # ``MessageService.get`` already filters by mail-account visibility

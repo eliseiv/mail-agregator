@@ -7,6 +7,7 @@ Cursor-based pagination per ``docs/04-api-contracts.md`` (keyset by
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from datetime import datetime
 from typing import Any
 
@@ -14,7 +15,7 @@ from sqlalchemy import and_, delete, exists, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from shared.models import Attachment, MailAccount, Message, MessageTag, Tag
+from shared.models import Attachment, MailAccount, Message, MessageTag, Tag, UserGroup
 
 
 class MessagesRepo:
@@ -242,33 +243,37 @@ class MessagesRepo:
         tag_id: int,
         is_super_admin: bool,
         user_id: int,
-        user_group_id: int | None,
+        group_ids: Collection[int],
     ) -> bool:
         """Return True iff ``tag_id`` exists and is visible to the caller.
 
-        Visibility rules (round-20, mirrors mail_accounts dedup logic):
+        Visibility rules (round-20; ADR-0030 multi-group):
         - super-admin: any tag in the system;
-        - non-super-admin: tag.user_id == self OR tag belongs to a user
-          in the same team (``users.group_id``).
+        - non-super-admin: tag.user_id == self OR tag belongs to a user who
+          is a member of **any** of the caller's teams (``group_ids``,
+          resolved through ``user_groups`` — consistent with mail-account /
+          message visibility so the Inbox tag-filter is not narrower than
+          the messages it scopes; ADR-0030 §2).
 
         Foreign / unknown tags still surface as 404 in the API layer.
         """
-        from shared.models import User
-
         if is_super_admin:
             # Any tag visible.
             stmt = select(exists().where(Tag.id == tag_id))
-        elif user_group_id is None:
+        elif not group_ids:
             # Caller has no team — only own tags.
             stmt = select(exists().where(Tag.id == tag_id, Tag.user_id == user_id))
         else:
-            # Own tags OR tags of any team-member.
+            # Own tags OR tags of any member of any of the caller's teams.
+            team_member_ids = select(UserGroup.user_id).where(
+                UserGroup.group_id.in_(list(group_ids))
+            )
             stmt = select(
                 exists().where(
                     Tag.id == tag_id,
                     or_(
                         Tag.user_id == user_id,
-                        Tag.user_id.in_(select(User.id).where(User.group_id == user_group_id)),
+                        Tag.user_id.in_(team_member_ids),
                     ),
                 )
             )

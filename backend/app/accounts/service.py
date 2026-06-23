@@ -112,7 +112,7 @@ class MailAccountService:
         if scope.is_super_admin:
             return None
         return await self._repo.list_account_ids_visible(
-            group_id=scope.group_id, owner_user_id=scope.user_id
+            group_ids=scope.group_ids, owner_user_id=scope.user_id
         )
 
     async def _visible_user_ids(self, scope: VisibilityScope) -> list[int] | None:
@@ -142,7 +142,7 @@ class MailAccountService:
             rows = deduped
         else:
             rows = await self._repo.list_for_group_or_owner(
-                group_id=scope.group_id, owner_user_id=scope.user_id
+                group_ids=scope.group_ids, owner_user_id=scope.user_id
             )
         owner_ids = sorted({a.user_id for a in rows})
         owner_map = await self._users.get_many_by_ids(owner_ids)
@@ -153,7 +153,7 @@ class MailAccountService:
             acc = await self._repo.get_by_id(account_id)
         else:
             acc = await self._repo.get_for_group_or_owner(
-                group_id=scope.group_id,
+                group_ids=scope.group_ids,
                 owner_user_id=scope.user_id,
                 account_id=account_id,
             )

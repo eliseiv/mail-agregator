@@ -73,6 +73,11 @@
 | 400 | `cannot_delete_group_with_super_admin_target` | Внутренняя защита от ошибочного удаления группы, ссылающейся на super_admin как лидера (по инварианту невозможно, но defensive). |
 | 404 | `group_not_found` | Запрос про группу, которой нет (или у запрашивающего нет прав её видеть). |
 | 403 | `user_not_in_group_scope` | Лидер пытается выполнить действие на пользователя/аккаунт вне своей группы. |
+| 400 | `cannot_add_super_admin_to_group` | `POST /api/admin/users/{id}/groups`: цель — `super_admin` (он видит всё, членства запрещены). См. [ADR-0030](./adr/ADR-0030-multi-group-membership.md). |
+| 409 | `membership_already_exists` | `POST /api/admin/users/{id}/groups`: пользователь уже состоит в этой команде (UNIQUE `user_groups(user_id, group_id)`). Идемпотентность. См. ADR-0030. |
+| 400 | `cannot_remove_home_membership` | `DELETE /api/admin/users/{id}/groups/{group_id}`: попытка удалить **домашнее** членство (`= users.group_id`). Для смены домашней команды используйте «Переместить» (`PATCH /api/admin/users/{id}`). См. ADR-0030. |
+| 404 | `membership_not_found` | `DELETE /api/admin/users/{id}/groups/{group_id}`: у пользователя нет такого (дополнительного) членства. См. ADR-0030. |
+| 409 | `cannot_move_group_leader` | `PATCH /api/admin/users/{id}` со сменой `group_id` для `role='group_leader'`: перенос лидера запрещён (нарушил бы инвариант лидера). Для лидера доступно только «Добавить в команду». См. ADR-0030. |
 | 401 | `invalid_init_data` | `POST /api/telegram/auth`: HMAC-подпись Telegram `init_data` некорректна. См. [ADR-0022](./adr/ADR-0022-telegram-sso-and-notifications.md) §1.2. |
 | 401 | `init_data_expired` | `POST /api/telegram/auth`: `auth_date` в `init_data` старше 5 минут. |
 | 400 | `webhook_url_private_ip` | `POST/PATCH /api/webhooks/me`: URL резолвится в приватный CIDR / localhost. SSRF-защита. См. [ADR-0023](./adr/ADR-0023-outbound-webhooks.md) §4.3. |
@@ -109,6 +114,8 @@
 | `PATCH /api/admin/groups/{id}` (rename) | `POST /api/admin/groups/{id}` + form-поле `_method=PATCH` |
 | `DELETE /api/admin/groups/{id}` | `POST /api/admin/groups/{id}/delete` + form-поле `_method=DELETE` |
 | `PATCH /api/admin/users/{id}` (role/group/display_name) | `POST /api/admin/users/{id}` + form-поле `_method=PATCH` |
+| `POST /api/admin/users/{id}/groups` (add membership, ADR-0030) | (тот же путь и метод) |
+| `DELETE /api/admin/users/{id}/groups/{group_id}` (remove membership, ADR-0030) | `POST /api/admin/users/{id}/groups/{group_id}/delete` + form-поле `_method=DELETE` |
 | `POST /api/webhooks/me` (create) | (тот же путь и метод) |
 | `PATCH /api/webhooks/me` (edit) | `POST /api/webhooks/me` + form-поле `_method=PATCH` |
 | `DELETE /api/webhooks/me` | `POST /api/webhooks/me/delete` + form-поле `_method=DELETE` |
@@ -156,7 +163,9 @@ CSRF-проверка для override-запросов **обязательна*
 | `POST /api/admin/groups` | `/admin/groups` | "Группа создана" |
 | `PATCH /api/admin/groups/{id}` | `/admin/groups` | "Группа переименована" |
 | `DELETE /api/admin/groups/{id}` | `/admin/groups` | "Группа удалена" |
-| `PATCH /api/admin/users/{id}` | `/admin` | "Пользователь обновлён" |
+| `PATCH /api/admin/users/{id}` | `/admin` | "Пользователь обновлён" (для move — "Пользователь перемещён в другую команду") |
+| `POST /api/admin/users/{id}/groups` | `/admin` | "Пользователь добавлен в команду" |
+| `DELETE /api/admin/users/{id}/groups/{group_id}` | `/admin` | "Членство в команде удалено" |
 | `POST /api/webhooks/me` | `/my/integrations` | "Webhook создан" + one-shot flash `[secret_reveal]` с plaintext |
 | `PATCH /api/webhooks/me` | `/my/integrations` | "Webhook обновлён" |
 | `DELETE /api/webhooks/me` | `/my/integrations` | "Webhook удалён" |
@@ -619,12 +628,13 @@ username=bob&email=bob%40example.com&display_name=Bob+Smith&role=group_member&gr
 
 #### `PATCH /api/admin/users/{id}`
 | Запрос | `{display_name?: str\|null, role?: 'group_leader'\|'group_member', group_id?: int\|null}` (любое подмножество). |
-| Поведение | Изменение полей пользователя через super-admin. <br>— `display_name`: trim → `null` если пусто. <br>— Смена `role` от/к `group_leader`: complex flow. (а) `group_member → group_leader`: backend требует, чтобы текущая группа user'а **не имела другого лидера**; иначе `400 conflict` (нужно сначала переразмерить старого лидера). Чтобы создать **новую группу** для лидера — клиент отдельно вызывает `POST /api/admin/groups` или передаёт `role='group_leader' + group_id=null` (тогда backend auto-create'ит группу как при POST users). (б) `group_leader → group_member`: тоже complex — у группы остаётся без лидера; backend требует, чтобы клиент **сначала** удалил/назначил нового лидера через переход на `PATCH /api/admin/users` с другого user'а (или удалил группу через DELETE). На текущем scope: `400 cannot_demote_lone_leader` если лидер единственный в группе. <br>— Смена `group_id` без смены role: переводит user'а в другую группу (только для `group_member`). <br>— Изменение `role` к `super_admin` или с `super_admin` — **запрещено** (`400 forbidden`); super-admin один и определяется seed'ом. <br>— Все сессии target user'а **revoke'аются** (см. ADR-0019 §10). |
+| Поведение | Изменение полей пользователя через super-admin. <br>— `display_name`: trim → `null` если пусто. <br>— Смена `role` от/к `group_leader`: complex flow. (а) `group_member → group_leader`: backend требует, чтобы текущая группа user'а **не имела другого лидера**; иначе `400 conflict` (нужно сначала переразмерить старого лидера). Чтобы создать **новую группу** для лидера — клиент отдельно вызывает `POST /api/admin/groups` или передаёт `role='group_leader' + group_id=null` (тогда backend auto-create'ит группу как при POST users). (б) `group_leader → group_member`: тоже complex — у группы остаётся без лидера; backend требует, чтобы клиент **сначала** удалил/назначил нового лидера через переход на `PATCH /api/admin/users` с другого user'а (или удалил группу через DELETE). На текущем scope: `400 cannot_demote_lone_leader` если лидер единственный в группе. <br>— Смена `group_id` без смены role — **«Переместить»** (move, ADR-0030): переводит user'а в другую **домашнюю** команду (только для `group_member`). Помимо `users.group_id` backend **синхронизирует `user_groups`** в той же транзакции: удаляет старое домашнее членство, добавляет новое; **дополнительные** членства (ADR-0030) не трогаются; если новая домашняя совпала с уже существующим доп. членством — дедуп (`INSERT ... ON CONFLICT DO NOTHING`). **Перенос для `role='group_leader'` отклоняется** → `409 cannot_move_group_leader` (нарушил бы инвариант лидера; в UI пункт «Переместить» для лидеров скрыт). <br>— Изменение `role` к `super_admin` или с `super_admin` — **запрещено** (`400 forbidden`); super-admin один и определяется seed'ом. <br>— Все сессии target user'а **revoke'аются** (см. ADR-0019 §10) — чтобы `VisibilityScope.group_ids` перечитался из `user_groups`. |
 | Доступ | Только `super_admin`. |
 | 200 | `{id, username, ..., role, group_id, group: {id, name}\|null}`. |
 | 400 | `validation_error` / `group_id_must_be_null_for_new_leader` / `cannot_demote_lone_leader` / `forbidden`. |
 | 404 | `not_found` если user не существует. |
-| Audit | `user_role_change` если role изменился; `user_group_change` если только group_id; обе — если оба. `group_create` дополнительно если auto-create группы для нового лидера. |
+| 409 | `cannot_move_group_leader` (move для `group_leader`, ADR-0030). |
+| Audit | `user_role_change` если role изменился; `user_group_change` если только group_id (move, ADR-0030 — синхронизация `user_groups` входит в ту же операцию); обе — если оба. `group_create` дополнительно если auto-create группы для нового лидера. |
 
 ##### Form-encoded request (no-JS)
 Через method override:
@@ -638,6 +648,65 @@ _method=PATCH&display_name=Alice&role=group_leader&csrf_token=...
 ##### Form-encoded response
 - Success: `303`, `Location: /admin`, flash="Пользователь обновлён".
 - Error: re-render `admin/users.html` с error-context.
+
+#### `POST /api/admin/users/{user_id}/groups` (add membership, ADR-0030)
+
+Добавить пользователю **дополнительное** членство в команде (multi-group). Источник истины — [ADR-0030](./adr/ADR-0030-multi-group-membership.md).
+
+| | |
+| --- | --- |
+| Запрос | `{group_id: int}` |
+| Поведение | INSERT в `user_groups(user_id, group_id)`. **НЕ меняет** `users.group_id` (домашнюю команду) и **НЕ меняет** `users.role`. Идемпотентно через UNIQUE `(user_id, group_id)`: повторное добавление — `409 membership_already_exists` (либо no-op в form-режиме с информирующим flash). Backend проверяет существование `group_id` (`404 group_not_found`). После INSERT — `SessionStore.revoke_all_for_user(user_id)` (чтобы `VisibilityScope.group_ids` перечитался). |
+| Доступ | Только `super_admin`. Лидеры/участники → `403 forbidden`. |
+| Цель | **Не может быть `super_admin`** → `400 cannot_add_super_admin_to_group` (он и так видит всё; членства нарушили бы инвариант `super_admin → group_id IS NULL` и «нет строк в `user_groups`»). Лидер и обычный участник — допустимы (лидер получает доп. членство, не теряя лидерства домашней команды). |
+| CSRF | yes (как у всех admin POST). |
+| 201 | `{user_id, group_id, group: {id, name}, created_at}` — созданное членство. |
+| 400 | `validation_error` / `cannot_add_super_admin_to_group`. |
+| 404 | `not_found` (user не существует) / `group_not_found`. |
+| 409 | `membership_already_exists`. |
+| Audit | `user_group_add` (`actor=super_admin`, `target_user_id=user_id`, `details={group_id}`). |
+
+##### Form-encoded request (no-JS)
+```
+POST /api/admin/users/42/groups HTTP/1.1
+Content-Type: application/x-www-form-urlencoded
+Cookie: mas_session=...; mas_csrf=...
+
+group_id=3&csrf_token=...
+```
+
+##### Form-encoded response
+- Success: `303 See Other`, `Location: /admin`, flash="Пользователь добавлен в команду".
+- `membership_already_exists`: re-render `admin/users.html` с информирующим flash (идемпотентность — повтор безвреден).
+- Validation/other error: re-render `admin/users.html` с error-context.
+
+#### `DELETE /api/admin/users/{user_id}/groups/{group_id}` (remove membership, ADR-0030)
+
+Удалить у пользователя **дополнительное** членство в команде. Источник истины — [ADR-0030](./adr/ADR-0030-multi-group-membership.md).
+
+| | |
+| --- | --- |
+| Поведение | DELETE строки `user_groups(user_id, group_id)`. Нельзя удалить **домашнее** членство (`group_id == users.group_id`) → `400 cannot_remove_home_membership` (для смены домашней команды служит «Переместить», `PATCH /api/admin/users/{id}`). После DELETE — `SessionStore.revoke_all_for_user(user_id)`. |
+| Доступ | Только `super_admin`. Лидеры/участники → `403 forbidden`. |
+| CSRF | yes. |
+| 204 | success. |
+| 400 | `cannot_remove_home_membership`. |
+| 404 | `not_found` (user не существует) / `membership_not_found` (нет такого доп. членства). |
+| Audit | `user_group_remove` (`actor=super_admin`, `target_user_id=user_id`, `details={group_id}`). |
+
+##### Form-encoded request (no-JS)
+Через method override на sibling-роуте:
+```
+POST /api/admin/users/42/groups/3/delete HTTP/1.1
+Content-Type: application/x-www-form-urlencoded
+Cookie: mas_session=...; mas_csrf=...
+
+_method=DELETE&csrf_token=...
+```
+
+##### Form-encoded response
+- Success: `303 See Other`, `Location: /admin`, flash="Членство в команде удалено".
+- `cannot_remove_home_membership`: re-render `admin/users.html` с error-context.
 
 #### `POST /api/admin/users/{id}/reset`
 | Поведение | UPDATE password_hash=NULL, password_reset_required=true, lockout_until=NULL, failed_login_attempts=0; revoke all sessions; audit log: `reset_password`. |
@@ -1346,6 +1415,9 @@ FastAPI автогенерит OpenAPI 3.1. UI:
 | POST | `/api/admin/users/{id}/reset` | super_admin | yes | 50/h | yes | reset password |
 | DELETE | `/api/admin/users/{id}` | super_admin | yes | 50/h | yes | delete user (canonical) |
 | POST | `/api/admin/users/{id}/delete` | super_admin | yes | 50/h | yes | form-fallback delete (`_method=DELETE`) |
+| POST | `/api/admin/users/{id}/groups` | super_admin | yes | 50/h | yes | add membership (ADR-0030); цель ≠ super_admin; идемпотентно через UNIQUE |
+| DELETE | `/api/admin/users/{id}/groups/{group_id}` | super_admin | yes | 50/h | yes | remove additional membership (ADR-0030, canonical); нельзя удалить домашнее |
+| POST | `/api/admin/users/{id}/groups/{group_id}/delete` | super_admin | yes | 50/h | yes | form-fallback delete membership (`_method=DELETE`, ADR-0030) |
 | GET | `/api/admin/groups` | super_admin | — | — | — | list groups (ADR-0019) |
 | POST | `/api/admin/groups` | super_admin | yes | 50/h | yes | create group |
 | GET | `/api/admin/groups/{id}` | super_admin | — | — | — | get group with members |

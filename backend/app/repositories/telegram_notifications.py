@@ -206,7 +206,11 @@ class TelegramNotificationsRepo:
             JOIN   users u
                    ON (
                        u.role = 'super_admin'
-                       OR (ma.group_id IS NOT NULL AND u.group_id = ma.group_id)
+                       OR (ma.group_id IS NOT NULL AND EXISTS (
+                              SELECT 1 FROM user_groups ug
+                              WHERE  ug.user_id = u.id
+                                AND  ug.group_id = ma.group_id
+                          ))
                        OR u.id = ma.user_id
                    )
             JOIN   telegram_links tl
@@ -300,7 +304,11 @@ class TelegramNotificationsRepo:
             JOIN   users u
                    ON (
                        u.role = 'super_admin'
-                       OR (ma.group_id IS NOT NULL AND u.group_id = ma.group_id)
+                       OR (ma.group_id IS NOT NULL AND EXISTS (
+                              SELECT 1 FROM user_groups ug
+                              WHERE  ug.user_id = u.id
+                                AND  ug.group_id = ma.group_id
+                          ))
                        OR u.id = ma.user_id
                    )
             JOIN   telegram_links tl

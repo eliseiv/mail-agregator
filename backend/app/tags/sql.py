@@ -7,16 +7,18 @@ Two queries (both honour the round-10 team-visibility model — see
   ``message_id`` plus its ``mail_account_id`` and resolved subject / body
   / sender, INSERT one row in ``message_tags`` for every matching tag of
   every user who can SEE that message. A user sees a message when either
-  (a) they own its mail account, or (b) the mail account's ``group_id``
-  matches the user's ``group_id``. This is the worker hook called after
-  ``insert_message_idempotent`` in ``worker.app.sync_cycle``.
+  (a) they own its mail account, or (b) they are a member (via
+  ``user_groups`` — home or additional, ADR-0030) of the mail account's
+  team. This is the worker hook called after ``insert_message_idempotent``
+  in ``worker.app.sync_cycle``.
 
 * :data:`APPLY_TAG_TO_EXISTING` — bulk INSERT every existing message
   visible to the tag's owner that matches the given ``tag_id``'s rules.
-  Visibility = personal accounts (``ma.user_id = :user_id``) plus the
-  owner's team accounts (``ma.group_id = :user_group_id``). For a user
-  without a group, pass ``:user_group_id = NULL`` and the second branch
-  short-circuits. round-26: a super-admin (``:is_super_admin = TRUE``)
+  Visibility (ADR-0030) = personal accounts (``ma.user_id = :user_id``)
+  plus accounts of any team the owner is a member of via ``user_groups``
+  (``EXISTS (… ug.user_id = :user_id AND ug.group_id = ma.group_id)``). A
+  user without any membership matches only personal accounts (the EXISTS is
+  FALSE). round-26: a super-admin (``:is_super_admin = TRUE``)
   applies to EVERY message in the system — the flag forces the visibility
   filter to TRUE for all rows, matching the super-admin read scope
   (``MessageService.visible_user_ids`` → None). Called from
@@ -175,8 +177,11 @@ from typing import Final
 #
 # Visibility join: a tag belongs to user ``t.user_id``; that user sees the
 # new message iff either they own the mail account OR (ma.group_id IS NOT
-# NULL AND u.group_id = ma.group_id) OR they are a super_admin (round-28).
-# The first two OR-arms are both needed because team accounts retain their
+# NULL AND the user is a member of ma's team via ``user_groups`` — ADR-0030,
+# home + additional) OR they are a super_admin (round-28).
+# The membership EXISTS replaces the pre-ADR-0030 single-group predicate
+# ``u.group_id = ma.group_id`` so a member of several teams is auto-tagged
+# (and thus notified) on every team's mail. Team accounts retain their
 # original ``group_id`` even when the owner is moved to a different group
 # (round-10 production patch). round-28 (ADR-0017 §5.1) adds ``OR u.role =
 # 'super_admin'`` so a super_admin's personal tags attach to EVERY message
@@ -195,7 +200,11 @@ JOIN users u ON u.id = t.user_id
 JOIN mail_accounts ma ON ma.id = :mail_account_id
 WHERE (
         u.id = ma.user_id
-        OR (ma.group_id IS NOT NULL AND u.group_id = ma.group_id)
+        OR (ma.group_id IS NOT NULL AND EXISTS (
+                SELECT 1 FROM user_groups ug
+                WHERE  ug.user_id = u.id
+                  AND  ug.group_id = ma.group_id
+            ))
         OR u.role = 'super_admin'
     )
   AND (
@@ -239,10 +248,11 @@ ON CONFLICT (message_id, tag_id) DO NOTHING
 """
 
 
-# Visibility filter mirrors ``MailAccountsRepo.list_account_ids_visible``:
-# personal accounts (``ma.user_id = :user_id``) OR the caller's team
-# accounts (``ma.group_id = :user_group_id``, only when the caller has a
-# group). round-26: a super-admin passes ``:is_super_admin = TRUE`` which
+# Visibility filter mirrors ``MailAccountsRepo.list_account_ids_visible``
+# (ADR-0030 multi-group): personal accounts (``ma.user_id = :user_id``) OR
+# accounts of any team the owner is a member of via ``user_groups`` (EXISTS
+# keyed on ``:user_id``). round-26: a super-admin passes ``:is_super_admin =
+# TRUE`` which
 # forces the whole filter to TRUE so the apply reaches EVERY message in the
 # system — matching the super-admin read scope (super-admin sees all
 # messages via ``MessageService.visible_user_ids`` → None). For
@@ -261,16 +271,21 @@ WHERE (
         -- round-26 (super-admin full reach): a super-admin applies the tag to
         -- EVERY message in the system, not just their own/team accounts. The
         -- ``:is_super_admin`` flag short-circuits the visibility filter to TRUE
-        -- for all rows. CAST is required (same reason as ``:user_group_id``
-        -- below): asyncpg cannot infer a prepared-statement type for a bare
-        -- parameter, so we pin it to BOOLEAN to avoid AmbiguousParameterError.
+        -- for all rows. CAST is required: asyncpg cannot infer a
+        -- prepared-statement type for a bare parameter, so we pin it to
+        -- BOOLEAN to avoid AmbiguousParameterError.
         CAST(:is_super_admin AS BOOLEAN)
         OR ma.user_id = :user_id
-        -- CAST is required: ``:user_group_id`` is NULL for super-admin / users
-        -- without a group, and asyncpg cannot infer a prepared-statement type
-        -- for a parameter that only appears in ``IS NOT NULL`` →
-        -- AmbiguousParameterError. Pinning it to BIGINT resolves the type.
-        OR (CAST(:user_group_id AS BIGINT) IS NOT NULL AND ma.group_id = CAST(:user_group_id AS BIGINT))
+        -- ADR-0030 (multi-group): the tag owner sees a team account when they
+        -- are a member of that account's team — via ``user_groups`` (home +
+        -- additional), not only their single home ``users.group_id``. The
+        -- EXISTS naturally handles the no-group case (no membership rows →
+        -- FALSE) and needs no NULL/CAST gymnastics.
+        OR (ma.group_id IS NOT NULL AND EXISTS (
+                SELECT 1 FROM user_groups ug
+                WHERE  ug.user_id = :user_id
+                  AND  ug.group_id = ma.group_id
+            ))
     )
   AND (
         -- match_mode = 'any' (OR, default): at least one rule of the tag matches.

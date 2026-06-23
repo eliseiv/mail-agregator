@@ -25,6 +25,7 @@ from backend.app.groups.schemas import (
     UserBriefDTO,
 )
 from backend.app.repositories.groups import GroupsRepo
+from backend.app.repositories.user_groups import UserGroupsRepo
 from backend.app.repositories.users import UsersRepo
 from backend.app.sessions import SessionStore
 from shared.logging import get_logger
@@ -63,6 +64,7 @@ class GroupsService:
         self._db = session
         self._repo = GroupsRepo(session)
         self._users = UsersRepo(session)
+        self._memberships = UserGroupsRepo(session)
         self._audit = AuditWriter(session)
         self._sessions = SessionStore()
 
@@ -125,7 +127,9 @@ class GroupsService:
             leader = await self._users.get_by_id(group.leader_user_id)
             if leader is None:
                 log.warning("group_without_leader", group_id=group.id)
-        members = await self._users.list_in_group(group.id)
+        # ADR-0030: list members via ``user_groups`` (home + additional)
+        # so the group card reflects everyone who can see the team's mail.
+        members = await self._repo.list_members_in_group(group.id)
         return GroupDetailDTO(
             id=group.id,
             name=group.name,
@@ -156,6 +160,12 @@ class GroupsService:
         Per ADR-0019 §6 the FK on ``users.group_id`` is DEFERRABLE so the
         order is permissive even when the leader was just inserted.
         """
+        # Snapshot the previous home team before the UPDATE so we can drop
+        # its mirrored membership (ADR-0030 — home membership is always
+        # mirrored, and a leader's home is the team they lead).
+        before = await self._users.get_by_id(leader_user_id)
+        old_home_group_id = before.group_id if before is not None else None
+
         try:
             group = await self._repo.insert(name=name, leader_user_id=leader_user_id)
         except IntegrityError as exc:
@@ -169,6 +179,11 @@ class GroupsService:
             role=ROLE_GROUP_LEADER,
             group_id=group.id,
         )
+
+        # ADR-0030: mirror the new home membership; drop the stale one.
+        if old_home_group_id is not None and old_home_group_id != group.id:
+            await self._memberships.remove(user_id=leader_user_id, group_id=old_home_group_id)
+        await self._memberships.add(user_id=leader_user_id, group_id=group.id)
 
         await self._audit.log(
             actor_user_id=actor_user_id,
@@ -339,6 +354,10 @@ class GroupsService:
                 role=ROLE_GROUP_MEMBER,
                 group_id=group.id,
             )
+            # ADR-0030: mirror the new home membership; drop the stale one.
+            if old_group is not None and old_group != group.id:
+                await self._memberships.remove(user_id=member_id, group_id=old_group)
+            await self._memberships.add(user_id=member_id, group_id=group.id)
             await self._sessions.revoke_all_for_user(member_id)
             # Use ``user_role_change`` if the role actually changed; else
             # ``user_group_change``. Both are existing audit actions

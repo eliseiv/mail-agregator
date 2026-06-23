@@ -27,6 +27,7 @@ from backend.app.exceptions import (
     NotAuthenticatedError,
     NotFoundError,
 )
+from backend.app.repositories.user_groups import UserGroupsRepo
 from backend.app.repositories.users import UsersRepo
 from backend.app.sessions import SessionData, SessionStore
 from shared.db import get_session
@@ -119,7 +120,11 @@ class VisibilityScope:
 
     user_id: int
     role: Role
-    group_id: int | None  # None iff role == 'super_admin'
+    group_id: int | None  # "home"/primary team. None iff role == 'super_admin'
+    # ADR-0030: every team the user is a member of (home + additional) from
+    # ``user_groups``. Empty for super_admin (sees everything without
+    # memberships). ``group_id`` always belongs to this set for non-admins.
+    group_ids: frozenset[int]
 
     @property
     def is_super_admin(self) -> bool:
@@ -134,21 +139,43 @@ class VisibilityScope:
         return self.role == ROLE_GROUP_MEMBER
 
 
-def build_scope(user: User) -> VisibilityScope:
+async def build_scope(user: User, db: AsyncSession) -> VisibilityScope:
     """Construct a :class:`VisibilityScope` from a fresh DB row.
 
-    Trusts the DB invariants (CHECK + trigger) — no extra validation.
+    ADR-0030: loads the user's full team set from ``user_groups`` so the
+    scope carries ``group_ids`` (home + additional). ``super_admin`` has no
+    memberships (and sees everything regardless), so its ``group_ids`` is
+    empty. Trusts the DB invariants (CHECK + trigger) — no extra validation.
     """
+    if user.role == ROLE_SUPER_ADMIN:
+        group_ids: frozenset[int] = frozenset()
+    else:
+        members = await UserGroupsRepo(db).list_group_ids_for_user(user.id)
+        group_ids = frozenset(members)
+        # Defence-in-depth: the home membership is always mirrored in
+        # ``user_groups`` (migration backfill + service sync), but if a row
+        # ever drifted we still want the home team visible.
+        if user.group_id is not None:
+            group_ids |= {user.group_id}
     return VisibilityScope(
         user_id=user.id,
         role=user.role,  # type: ignore[arg-type]
         group_id=user.group_id,
+        group_ids=group_ids,
     )
 
 
-def current_scope(user: CurrentUser) -> VisibilityScope:
-    """FastAPI dependency: build a :class:`VisibilityScope` for the request."""
-    return build_scope(user)
+async def current_scope(user: CurrentUser, db: DbSession) -> VisibilityScope:
+    """FastAPI dependency: build a :class:`VisibilityScope` for the request.
+
+    ADR-0030: building a non-admin scope reads ``user_groups``, which
+    autobegins a read transaction on the shared session. We close it here
+    (mirroring :func:`current_user`) so route handlers that later open their
+    own ``async with db.begin():`` don't hit "transaction already begun".
+    """
+    scope = await build_scope(user, db)
+    await db.commit()
+    return scope
 
 
 CurrentScope = Annotated[VisibilityScope, Depends(current_scope)]
