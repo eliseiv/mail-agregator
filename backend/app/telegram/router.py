@@ -183,7 +183,9 @@ async def telegram_push_webhook(bot_name: str, request: Request, db: DbSession) 
 
     Symmetric to :func:`telegram_webhook` but with three narrowings:
 
-    1. Routed by ``bot_name`` (``ivan`` / ``alexandra`` / ``andrei``).
+    1. Routed by ``bot_name`` (any configured push bot — ``ivan`` /
+       ``alexandra`` / ``andrei`` / ``business2`` / … — matched generically
+       against :pyattr:`Settings.push_team_bots`).
     2. The secret lives **only** in the ``X-Telegram-Bot-Api-Secret-Token``
        header (header-only transport — Q-0027-1, the default). FAIL-CLOSED:
        a missing OR mismatched header is rejected as ``not_found`` — unlike

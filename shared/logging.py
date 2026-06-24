@@ -52,11 +52,15 @@ REDACT_KEYS: frozenset[str] = frozenset(
         "BOT_IVAN_TOKEN",
         "BOT_ALEXANDRA_TOKEN",
         "BOT_ANDREI_TOKEN",
+        # ADR-0027 §8 (round-44): fourth push bot ``business2`` token.
+        "BOT_BUSINESS2_TOKEN",
         # ADR-0027 §8 (round-42): per-bot push-webhook secrets — same leak
         # risk as TELEGRAM_WEBHOOK_SECRET (forged push-webhook updates).
         "BOT_IVAN_WEBHOOK_SECRET",
         "BOT_ALEXANDRA_WEBHOOK_SECRET",
         "BOT_ANDREI_WEBHOOK_SECRET",
+        # ADR-0027 §8 (round-44): business2 push-webhook secret.
+        "BOT_BUSINESS2_WEBHOOK_SECRET",
         "TELEGRAM_WEBHOOK_SECRET",
         "X-Telegram-Bot-Api-Secret-Token",
         # OAuth2 Outlook (ADR-0025 §1.11, docs/06-security.md): never log the

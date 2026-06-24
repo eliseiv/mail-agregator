@@ -3,25 +3,27 @@
 | | |
 | --- | --- |
 | Статус | accepted |
-| Дата | 2026-06-09 (round-42: добавлен webhook + callback-кнопка push-ботам) |
+| Дата | 2026-06-09 (round-42: добавлен webhook + callback-кнопка push-ботам; round-44: 4-й push-бот `business2`) |
 | Заменяет / отменён | нет; **расширяет** ADR-0022 §2 (push-уведомления) — добавляет параллельный, упрощённый канал доставки. Не трогает основной бот (`BOT_TOKEN`). |
 
 > **Round-42 update.** Исходная редакция (round-31) слала push-уведомления **без** inline-кнопки «Посмотреть сообщение» (`with_button=False`), потому что у push-ботов не было webhook и callback `msg:{id}` некому было обработать. **Подтверждено** (round-42): webhook на `postapp.store` достижим для Telegram-инфраструктуры (основной бот webhook `…/webhook/{secret}` работает: Telegram резолвит `postapp.store → 132.243.113.117`, `pending=0`, без ошибок; DNS-парковка ломает только браузеры). Поэтому push-боты теперь **получают собственный webhook + callback-кнопку**: §7 пересмотрен (`with_button=True`), добавлен §10 (webhook + callback-маршрут push-ботов) и §11 (авторизация push-callback по `admin_telegram_ids` + group-match). TD-041 (fire-and-forget доставки уведомлений) **не меняется** — webhook касается только inbound-callback, не исходящей доставки.
+
+> **Round-44 update (+`business2`, 4-й push-бот).** Добавлен **четвёртый** push-only бот `business2` — полностью по образцу `ivan`/`alexandra`/`andrei`, той же механикой (отдельная очередь `push_notify_queue` + job `push_notify_dispatch` + callback-webhook). Изменения **только конфигурационные**: новые `.env`-поля `BOT_BUSINESS2_TOKEN` / `BOT_BUSINESS2_GROUP_ID` / `BOT_BUSINESS2_WEBHOOK_SECRET`, перечисление бота в двух местах `shared/config.py` (дубль-инвариант `group_id` в `model_validator` + property `push_team_bots`) и три новых ключа в `REDACT_KEYS` (`shared/logging.py`). **Новых endpoint'ов / worker-job'ов / миграций нет** — роут `/api/telegram/push-webhook/{bot_name}` (`router.py`) и диспатчер `push_notify_dispatch` (`worker/app/push_notify_dispatch.py`) **generic** (матчат бота по `name` / `account.group_id`). Имя-слаг бота — `business2`; webhook URL — `…/api/telegram/push-webhook/business2`. Прод `group_id` для `business2` задаётся **оператором в `.env`** и должен **отличаться** от `1`/`2`/`3` (иначе fail-fast дубля, §2). Везде ниже «3 push-бота» читается теперь как «4 push-бота».
 
 ## Context
 
 Сейчас (ADR-0022 §2, round-31 `TG_NOTIFY_ALL_MESSAGES=true`) **один** основной бот (`BOT_TOKEN`) доставляет push-уведомления обо **всех** новых письмах всем получателям, у которых есть активная `telegram_links`-привязка и право видеть письмо (super_admin/group/owner). Два администратора получают **поток всех писем всех команд в один общий чат** с основным ботом — это неудобно: письма разных команд (`ivan` / `alexandra` / `andrei`) смешаны, нельзя быстро отделить команду от команды.
 
-Пользователь явно запросил: разнести уведомления **по командам** — завести **3 дополнительных push-only бота**, по одному на команду; каждый бот шлёт письма **только своей команды** на тех же 2 администраторов (фиксированные Telegram chat id из `.env`). У администратора появляется **3 раздельных чата** (по одному с каждым ботом) вместо одного смешанного.
+Пользователь явно запросил: разнести уведомления **по командам** — завести **дополнительные push-only боты**, по одному на команду; каждый бот шлёт письма **только своей команды** на тех же 2 администраторов (фиксированные Telegram chat id из `.env`). У администратора появляется **раздельный чат** на каждый бот вместо одного смешанного. Исходно (round-31) заведено **3** бота (`ivan`/`alexandra`/`andrei`); round-44 добавляет **4-й** бот `business2` (итого 4).
 
 Существующий контекст, на который опирается решение:
-- `mail_accounts.group_id` — ключ принадлежности ящика к команде (ADR-0019; аккаунт сохраняет исходную группу при переносе владельца). Прод-маппинг команд: `ivan`=group_id `1`, `alexandra`=group_id `2`, `andrei`=group_id `3`.
+- `mail_accounts.group_id` — ключ принадлежности ящика к команде (ADR-0019; аккаунт сохраняет исходную группу при переносе владельца). Прод-маппинг команд: `ivan`=group_id `1`, `alexandra`=group_id `2`, `andrei`=group_id `3`; `business2`=group_id, задаваемый оператором в `.env` (≠ `1`/`2`/`3`).
 - Основной pipeline доставки (ADR-0022 §2): `sync_cycle` после COMMIT кладёт `message_id` в Redis-list `tg_notify_queue` → APScheduler-job `tg_notify_dispatch` (worker) `LPOP` батч → `TelegramNotifyService.dispatch_one_payload` резолвит получателей (recipient-SQL), формирует текст `format_notification` (round-36) и шлёт `send_notification`. Поверх — `telegram_notifications` (idempotency), `telegram_links` (привязки/dead-mark), per-chat throttle (§2.9), recovery-scan (§2.8).
 - Формат уведомления — `backend/app/telegram/notify_format.py::format_notification` (round-36: `🆔`/`#️⃣`/`Клиент`/`Тема`/превью).
 - Bot-API клиент — `backend/app/telegram/bot.py::send_notification` (использует токен из `settings.BOT_TOKEN` через `_api_url`).
 - Bot-токен маскируется в логах через `REDACT_KEYS` в `shared/logging.py`.
 
-Ключевое отличие новой фичи от ADR-0022: эти 3 бота **не имеют** SSO, `telegram_links`, привязок в БД, ни inbound-команд `/start`/`/help`. Получатели **фиксированы** (2 chat id из `.env`), команда определяется **самим ботом** (явный `group_id` из `.env`), а не правами видимости пользователя. Это позволяет резко упростить доставку.
+Ключевое отличие новой фичи от ADR-0022: эти push-боты **не имеют** SSO, `telegram_links`, привязок в БД, ни inbound-команд `/start`/`/help`. Получатели **фиксированы** (2 chat id из `.env`), команда определяется **самим ботом** (явный `group_id` из `.env`), а не правами видимости пользователя. Это позволяет резко упростить доставку.
 
 **Round-42:** push-боты получают **один** inbound-канал — webhook, который принимает **только `callback_query`** от кнопки «Посмотреть сообщение» (всё остальное — `/start`, `message`, прочие update — игнорируется). Это не возвращает SSO/`telegram_links`/привязки: callback-нажатие авторизуется по `from.id ∈ admin_telegram_ids` (push-админы известны из `.env`, у них может не быть `user`-строки в БД) + защитная проверка принадлежности письма группе этого бота. См. §10–§11.
 
@@ -29,14 +31,14 @@
 
 ## Decision
 
-Завести **3 дополнительных push-only Telegram-бота** (`ivan` / `alexandra` / `andrei`). Каждый бот:
+Завести **дополнительные push-only Telegram-боты** (round-31: `ivan` / `alexandra` / `andrei`; round-44: + `business2` → итого **4**). Каждый бот:
 - шлёт **только** `sendMessage` (никаких webhook / inbound-команд / SSO / БД-привязок);
 - привязан к команде **явным** `group_id` из `.env`;
 - доставляет уведомления о **всех** письмах своей команды (как `notify-all`) на **фиксированный** список из 2 администраторских Telegram chat id (`ADMIN_TELEGRAM_IDS`);
 - использует **тот же** формат текста, что и основной бот (`format_notification`, round-36), **без** метки команды (сам бот = команда);
 - доставляет **fire-and-forget**: без БД-трекинга, idempotency, recovery, без миграций.
 
-Основной бот (`BOT_TOKEN`, ADR-0022 §2) **не меняется** и продолжает работать как прежде. Новые 3 бота — **дополнительный, независимый** канал.
+Основной бот (`BOT_TOKEN`, ADR-0022 §2) **не меняется** и продолжает работать как прежде. Эти push-боты — **дополнительный, независимый** канал.
 
 ### §1. Маппинг бот → команда (group_id)
 
@@ -47,8 +49,11 @@
 | `ivan` | `BOT_IVAN_TOKEN` | `BOT_IVAN_GROUP_ID` | `1` | ivan |
 | `alexandra` | `BOT_ALEXANDRA_TOKEN` | `BOT_ALEXANDRA_GROUP_ID` | `2` | alexandra |
 | `andrei` | `BOT_ANDREI_TOKEN` | `BOT_ANDREI_GROUP_ID` | `3` | andrei |
+| `business2` (round-44) | `BOT_BUSINESS2_TOKEN` | `BOT_BUSINESS2_GROUP_ID` | оператор (`.env`), ≠ `1`/`2`/`3` | business2 |
 
-Получатели — общие для всех трёх ботов:
+> **round-44 — прод `group_id` для `business2`.** В отличие от `ivan`/`alexandra`/`andrei` (зафиксированы `1`/`2`/`3`), конкретный `group_id` команды `business2` **заполняет devops/оператор** в prod `.env` (`BOT_BUSINESS2_GROUP_ID`) и он **обязан отличаться** от `1`/`2`/`3` — иначе сработает fail-fast дубля `group_id` на старте (§2). Значение должно совпадать с реальным `groups.id` команды `business2` в БД (ADR-0019).
+
+Получатели — общие для всех push-ботов:
 
 | Env | Значение | Описание |
 | --- | --- | --- |
@@ -62,16 +67,21 @@
 
 ```
 BOT_IVAN_TOKEN: str = ""
-BOT_IVAN_GROUP_ID: int | None = None
+BOT_IVAN_GROUP_ID: int = Field(default=0, ge=0)
 BOT_IVAN_WEBHOOK_SECRET: str = ""          # round-42
 BOT_ALEXANDRA_TOKEN: str = ""
-BOT_ALEXANDRA_GROUP_ID: int | None = None
+BOT_ALEXANDRA_GROUP_ID: int = Field(default=0, ge=0)
 BOT_ALEXANDRA_WEBHOOK_SECRET: str = ""     # round-42
 BOT_ANDREI_TOKEN: str = ""
-BOT_ANDREI_GROUP_ID: int | None = None
+BOT_ANDREI_GROUP_ID: int = Field(default=0, ge=0)
 BOT_ANDREI_WEBHOOK_SECRET: str = ""        # round-42
+BOT_BUSINESS2_TOKEN: str = ""              # round-44
+BOT_BUSINESS2_GROUP_ID: int = Field(default=0, ge=0)   # round-44
+BOT_BUSINESS2_WEBHOOK_SECRET: str = ""     # round-44
 ADMIN_TELEGRAM_IDS: str = ""   # CSV chat id
 ```
+
+> **Замечание о типе `group_id`.** В реализации `BOT_*_GROUP_ID` — `int = Field(default=0, ge=0)` (не `int | None`): «не задан» кодируется значением `0`, а «настроен» — `group_id > 0`. `business2` следует той же форме. Это влияет на формулировку инварианта и фильтра ниже: бот считается настроенным, когда `token` непустой **И** `group_id > 0`.
 
 **round-42 — `BOT_*_WEBHOOK_SECRET`.** Каждый push-бот, у которого нужна callback-кнопка, получает **явный** per-бот webhook-secret (32 hex, `openssl rand -hex 16`), **симметрично** основному боту (`TELEGRAM_WEBHOOK_SECRET`, ADR-0018). Secret используется и в URL-path push-webhook'а, и в header `X-Telegram-Bot-Api-Secret-Token` (двойная проверка как в основном webhook — `backend/app/telegram/router.py::_secret_matches`).
 
@@ -101,15 +111,15 @@ def push_team_bots_enabled(self) -> bool:
 
 `PushTeamBot` — маленький frozen-dataclass / NamedTuple. **round-42:** добавлено поле `webhook_secret: str` (`name`, `token`, `group_id`, `webhook_secret`). Worker (доставка) поле игнорирует; webhook-роут в `api` (§10) использует его для маршрутизации + secret-валидации.
 
-**round-42 — связь `with_button` и `webhook_secret`.** Push-уведомление получает кнопку «Посмотреть сообщение» **только если у бота задан `webhook_secret`** (иначе callback `msg:{id}` некому обработать — спиннер зависнет). Диспатчер вычисляет `with_button = bool(bot.webhook_secret)` на бот (§7). Production-инвариант: все три push-бота настраиваются с `webhook_secret` (devops), но fallback на `with_button=False` при пустом secret сохраняется — фича деградирует gracefully, а не ломается, если оператор забыл secret.
+**round-42 — связь `with_button` и `webhook_secret`.** Push-уведомление получает кнопку «Посмотреть сообщение» **только если у бота задан `webhook_secret`** (иначе callback `msg:{id}` некому обработать — спиннер зависнет). Диспатчер вычисляет `with_button = bool(bot.webhook_secret)` на бот (§7). Production-инвариант: все push-боты (round-44: все 4 — `ivan`/`alexandra`/`andrei`/`business2`) настраиваются с `webhook_secret` (devops), но fallback на `with_button=False` при пустом secret сохраняется — фича деградирует gracefully, а не ломается, если оператор забыл secret.
 
-**Lookup-инвариант для webhook (round-42):** имя бота в URL push-webhook'а (`/api/telegram/push-webhook/{bot_name}`) — это фиксированный `name` (`ivan`/`alexandra`/`andrei`). `push_team_bots` уже даёт стабильный `name`; webhook-роут резолвит `PushTeamBot` по `name` и сверяет `webhook_secret`. Несуществующее имя / бот без secret → `not_found` (§10).
+**Lookup-инвариант для webhook (round-42):** имя бота в URL push-webhook'а (`/api/telegram/push-webhook/{bot_name}`) — это фиксированный `name` (`ivan`/`alexandra`/`andrei`/`business2`). `push_team_bots` уже даёт стабильный `name`; webhook-роут резолвит `PushTeamBot` по `name` и сверяет `webhook_secret`. Несуществующее имя / бот без secret → `not_found` (§10).
 
-**Инвариант (валидируется в `model_validator`, не допускать):** один `group_id` не должен быть привязан к двум разным ботам. При коллизии `group_id` среди настроенных ботов — **fail-fast** на старте (`ValueError`), потому что иначе письмо одной команды ушло бы дважды (двумя ботами) — это конфигурационная ошибка оператора, а не runtime-edge. Боты с пустым токеном/без `group_id` в проверке не участвуют (они просто не настроены).
+**Инвариант (валидируется в `model_validator`, не допускать):** один `group_id` не должен быть привязан к двум разным ботам. Проверка перечисляет все настроенные боты — round-44: `BOT_IVAN` / `BOT_ALEXANDRA` / `BOT_ANDREI` / `BOT_BUSINESS2`. При коллизии `group_id` среди настроенных ботов — **fail-fast** на старте (`ValueError`), потому что иначе письмо одной команды ушло бы дважды (двумя ботами) — это конфигурационная ошибка оператора, а не runtime-edge. Боты с пустым токеном или `group_id = 0` в проверке не участвуют (они просто не настроены). Текст ошибки перечисляет все 4 поля, например: `Duplicate push-bot group_id: each configured push bot (BOT_IVAN/BOT_ALEXANDRA/BOT_ANDREI/BOT_BUSINESS2) must map to a distinct group_id (ADR-0027 §2)`. **Практическое следствие для `business2`:** `BOT_BUSINESS2_GROUP_ID` обязан отличаться от прод-значений `1`/`2`/`3` (см. §1), иначе старт упадёт.
 
 ### §3. Архитектура доставки (симметрична основному pipeline, минимально-инвазивна)
 
-Отдельная Redis-очередь `push_notify_queue` + отдельный worker-job `push_notify_dispatch`. **Одна** общая очередь на все 3 бота (не по очереди на бота): payload несёт только `message_id`, бот выбирается на стороне диспатчера по `group_id` аккаунта. Это переиспользует существующий `_QueuePayload` и даёт **один** `LPOP` (нет дублей, нет конкуренции нескольких consumer'ов за один message).
+Отдельная Redis-очередь `push_notify_queue` + отдельный worker-job `push_notify_dispatch`. **Одна** общая очередь на все push-боты (round-44: на все 4; не по очереди на бота): payload несёт только `message_id`, бот выбирается на стороне диспатчера по `group_id` аккаунта. Это переиспользует существующий `_QueuePayload` и даёт **один** `LPOP` (нет дублей, нет конкуренции нескольких consumer'ов за один message).
 
 ```mermaid
 flowchart TD
@@ -135,6 +145,8 @@ flowchart TD
       K -- retry_after/transient --> N[log + DROP<br/>fire-and-forget: НЕ re-enqueue]
     end
 ```
+
+> **round-44 — generic-инвариант пути доставки.** Диспатчер `worker/app/push_notify_dispatch.py` и enqueue в `sync_cycle` **не перечисляют** боты по имени: они работают с `settings.push_team_bots` (любой длины) и выбирают бот по `account.group_id`. Поэтому добавление `business2` **не меняет** ни enqueue-блок, ни диспатчер, ни регистрацию job — только `shared/config.py` (новые поля + перечисление в `model_validator`/`push_team_bots`) и `shared/logging.py` (redact). Новой Redis-очереди / job'а не вводится.
 
 **Поток по шагам:**
 
@@ -223,8 +235,8 @@ async def send_notification(*, chat_id: int, text_html: str, message_id: int,
 
 ### §8. Security
 
-- **Токены ботов** (`BOT_IVAN_TOKEN` / `BOT_ALEXANDRA_TOKEN` / `BOT_ANDREI_TOKEN`) — только в `.env` (`chmod 600`), как `BOT_TOKEN`. Передаются в контейнер **worker** (диспатчер живёт в worker'е). В `api` они не нужны.
-- **Redact в логах:** добавить три новых ключа в `REDACT_KEYS` (`shared/logging.py`) рядом с `BOT_TOKEN`: `BOT_IVAN_TOKEN`, `BOT_ALEXANDRA_TOKEN`, `BOT_ANDREI_TOKEN`. **round-42:** добавить ещё три — `BOT_IVAN_WEBHOOK_SECRET`, `BOT_ALEXANDRA_WEBHOOK_SECRET`, `BOT_ANDREI_WEBHOOK_SECRET` (симметрично `TELEGRAM_WEBHOOK_SECRET`, который уже в списке). `_api_url` уже не логирует URL (см. ADR-0022 §2 / docstring `bot.py`) — токен в логи не попадает по построению; redact — defence-in-depth для случайного дампа settings. push-webhook **не** логирует ни secret из URL-path, ни header (как основной webhook, `router.py::telegram_webhook`).
+- **Токены ботов** (`BOT_IVAN_TOKEN` / `BOT_ALEXANDRA_TOKEN` / `BOT_ANDREI_TOKEN` / `BOT_BUSINESS2_TOKEN`) — только в `.env` (`chmod 600`), как `BOT_TOKEN`. Передаются в контейнеры **worker** (диспатчер) и **api** (callback-webhook, см. §10). round-44: `BOT_BUSINESS2_TOKEN` — туда же.
+- **Redact в логах:** добавить новые ключи в `REDACT_KEYS` (`shared/logging.py`) рядом с `BOT_TOKEN`: токены `BOT_IVAN_TOKEN`, `BOT_ALEXANDRA_TOKEN`, `BOT_ANDREI_TOKEN` и (round-44) `BOT_BUSINESS2_TOKEN`. **round-42 + round-44:** добавить per-бот webhook-secret'ы — `BOT_IVAN_WEBHOOK_SECRET`, `BOT_ALEXANDRA_WEBHOOK_SECRET`, `BOT_ANDREI_WEBHOOK_SECRET`, `BOT_BUSINESS2_WEBHOOK_SECRET` (симметрично `TELEGRAM_WEBHOOK_SECRET`, который уже в списке). Итого по push-каналу redact'ятся 8 ключей (4 токена + 4 webhook-secret). `_api_url` уже не логирует URL (см. ADR-0022 §2 / docstring `bot.py`) — токен в логи не попадает по построению; redact — defence-in-depth для случайного дампа settings. push-webhook **не** логирует ни secret из URL-path, ни header (как основной webhook, `router.py::telegram_webhook`).
 - `ADMIN_TELEGRAM_IDS` — не секрет (Telegram chat id), но логировать его в каждом событии не нужно; в structured-логах оставлять только конкретный `chat_id` доставки.
 - Компрометация токена push-бота → атакующий может слать сообщения **от имени бота** двум известным admin'ам (фишинг), но **не** получает доступа к письмам/системе (бот push-only, без БД/SSO). Митигация: ротация токена через BotFather + обновление `.env`.
 - **round-42 — авторизация push-callback** (§11). Тело письма по callback `msg:{id}` отдаётся **только** если нажавший `from.id ∈ admin_telegram_ids` **и** письмо принадлежит группе именно этого бота (`account.group_id == bot.group_id`). Это закрывает два вектора: (а) чужой пользователь, узнавший токен бота и приславший себе кнопку, не получит тело (не админ → deny); (б) админ не сможет вытащить письмо чужой команды, подделав `msg:{id}` от чужой группы (group-mismatch → ignore). Webhook-secret (per-бот) отсекает spoofed-update'ы на уровне маршрута до любой БД-работы (§10).
@@ -262,7 +274,7 @@ async def send_notification(*, chat_id: int, text_html: str, message_id: int,
 POST /api/telegram/push-webhook/{bot_name}
 ```
 
-- `bot_name` ∈ `{ivan, alexandra, andrei}` (стабильный `PushTeamBot.name`).
+- `bot_name` ∈ `{ivan, alexandra, andrei, business2}` (стабильный `PushTeamBot.name`; round-44 добавил `business2`).
 - Authn — **тот же двойной механизм**, что у основного webhook (`router.py::_secret_matches`, `secrets.compare_digest`):
   1. URL-path `{secret}` **не** в пути — secret передаётся **только** в header `X-Telegram-Bot-Api-Secret-Token` (Telegram шлёт его, т.к. `setWebhook` вызывается с `secret_token=…`). **Решение по транспорту secret:** в отличие от основного бота (secret и в path, и в header), у push-webhook secret кладётся **в header**, а в path — только `bot_name`. Причина: один публичный путь `/push-webhook/{bot_name}` проще зарегистрировать и аудировать; перечислимость пути не повышает риск, т.к. без верного header-secret запрос отклоняется до любой работы. Если CI-фикстуры не шлют header — допускается тот же tolerance, что у основного (header отсутствует → принять, header présent но неверный → отклонить); но в проде Telegram **всегда** шлёт header при `setWebhook(secret_token=…)`. **Альтернатива (симметрия):** secret и в path (`/push-webhook/{bot_name}/{secret}`), и в header — оставлено на усмотрение backend-агента (ровно тот же `_secret_matches`); рекомендуется header-only для простоты, но path-вариант приемлем и строго симметричен основному. **Q-0027-1** (non-blocking).
   2. Header `X-Telegram-Bot-Api-Secret-Token` == `bot.webhook_secret` → иначе `NotFoundError` (404-эквивалент, неперечислимо).
@@ -278,7 +290,8 @@ POST /api/telegram/push-webhook/{bot_name}
 source /opt/mail-aggregator/.env
 for pair in "ivan:${BOT_IVAN_TOKEN}:${BOT_IVAN_WEBHOOK_SECRET}" \
             "alexandra:${BOT_ALEXANDRA_TOKEN}:${BOT_ALEXANDRA_WEBHOOK_SECRET}" \
-            "andrei:${BOT_ANDREI_TOKEN}:${BOT_ANDREI_WEBHOOK_SECRET}"; do
+            "andrei:${BOT_ANDREI_TOKEN}:${BOT_ANDREI_WEBHOOK_SECRET}" \
+            "business2:${BOT_BUSINESS2_TOKEN}:${BOT_BUSINESS2_WEBHOOK_SECRET}"; do
   name="${pair%%:*}"; rest="${pair#*:}"; token="${rest%%:*}"; secret="${rest##*:}"
   [ -n "$token" ] && [ -n "$secret" ] && curl -F "url=https://postapp.store/api/telegram/push-webhook/${name}" \
        -F "secret_token=${secret}" \
@@ -310,7 +323,7 @@ done
 ## Consequences
 
 **Плюсы:**
-- Администраторы получают **3 раздельных чата** по командам — чистое разделение потоков без меток/фильтров.
+- Администраторы получают **раздельный чат на каждую команду** (round-44: 4 чата — `ivan`/`alexandra`/`andrei`/`business2`) — чистое разделение потоков без меток/фильтров.
 - Минимально-инвазивно: основной бот, его pipeline, БД-схема, миграции — **не тронуты**. Вся новая логика — один enqueue-блок, один worker-job, токен-параметризация клиента, новые config-поля.
 - Переиспользует формат (round-36) и Bot-клиент → консистентный внешний вид уведомлений, минимум нового кода.
 - Фича полностью управляется `.env`: нет ботов/`ADMIN_TELEGRAM_IDS` → канал выключен, остальное работает как раньше.
@@ -318,11 +331,11 @@ done
 
 **Минусы / принятые компромиссы:**
 - Fire-and-forget → редкая потеря push-уведомления при рестарте worker (TD-041, low). Письма не теряются.
-- Маппинг команд через `.env` (не через UI/БД) → изменение состава команд требует правки `.env` + рестарта worker. На текущем масштабе (3 фиксированные команды) приемлемо.
+- Маппинг команд через `.env` (не через UI/БД) → изменение состава команд / добавление бота (как `business2` в round-44) требует правки `.env` + перечисления бота в `shared/config.py` + рестарта api/worker. На текущем масштабе (4 фиксированные команды) приемлемо; если число команд начнёт расти динамически — отдельный ADR с конфигом ботов в БД/списком.
 - Дублирование доставки между основным ботом и push-ботами (одно письмо команды может прийти и через основной бот по visibility, и через push-бот) — это by design (разные каналы/чаты); если в будущем избыточно — отдельный ADR.
 - Нет per-chat throttle у push-ботов → при всплеске писем одной команды теоретически возможен 429 (тогда уведомление дропается). На текущем потоке (≤2 admin) риск низкий.
 - **round-42:** push-токены и `webhook_secret` теперь нужны **и в api** (не только worker) — для обработки callback. Расширяет поверхность секретов в api-контейнере. Митигация: redact-list + per-бот secret + `chmod 600 .env` + group-match авторизация.
-- **round-42:** ещё три `.env`-ключа (`BOT_*_WEBHOOK_SECRET`) + `setWebhook`-шаги в деплое (по одному на бот). Без secret кнопка деградирует в `with_button=False` (не ломается). Приемлемо при 3 фиксированных ботах.
+- **round-42 / round-44:** per-бот `.env`-ключ `BOT_*_WEBHOOK_SECRET` + `setWebhook`-шаг в деплое на каждый бот (round-44: 4 бота). Без secret кнопка деградирует в `with_button=False` (не ломается). Приемлемо при 4 фиксированных ботах.
 
 ---
 
@@ -357,6 +370,8 @@ done
 ## Open questions
 
 Нет блокирующих. Прод-значения подтверждены пользователем: `ivan`=1, `alexandra`=2, `andrei`=3; получатели — 2 фиксированных admin chat id. Реальные токены ботов и chat id заполняет devops в prod `.env` (не хранятся в репозитории).
+
+**round-44 (`business2`, non-blocking).** Прод `group_id` команды `business2` (`BOT_BUSINESS2_GROUP_ID`) заполняет devops/оператор в prod `.env`; он **обязан отличаться** от `1`/`2`/`3` (иначе fail-fast дубля, §2) и совпадать с реальным `groups.id` команды `business2` (ADR-0019). Токен `BOT_BUSINESS2_TOKEN` и `BOT_BUSINESS2_WEBHOOK_SECRET` (`openssl rand -hex 16`) заполняет devops так же, как у остальных push-ботов (api + worker), и регистрирует webhook шагом деплоя (§10). Конкретное прод-значение `group_id` для `business2` — операционная настройка, не архитектурный блокер: фича включится фактом непустого токена + положительного `group_id` (§2).
 
 **round-42 (non-blocking):**
 

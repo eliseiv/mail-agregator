@@ -206,6 +206,143 @@ class TestPushTeamBotWebhookSecret:
 
 
 # ---------------------------------------------------------------------------
+# round-44 (ADR-0027 §1/§2) — fourth push bot ``business2``
+#
+# Identical mechanics to ivan/alexandra/andrei. Its prod group_id is operator-
+# set in ``.env`` and MUST differ from 1/2/3 (else the duplicate-group_id
+# fail-fast aborts startup, §2). We therefore use group_id >= 4 for the
+# positive cases and a {1,2,3} value for the duplicate case.
+# ---------------------------------------------------------------------------
+
+
+class TestPushTeamBotBusiness2:
+    @pytest.mark.parametrize(
+        ("token", "group_id", "admins", "expected"),
+        [
+            # ADR-0027 §2: configured iff token != "" AND group_id > 0 AND admins.
+            ("B2_TOK", 7, _ADMINS, True),  # task case 1: fully configured -> in
+            ("", 7, _ADMINS, False),  # task case 2: empty token -> out
+            ("B2_TOK", 0, _ADMINS, False),  # task case 3: group_id == 0 -> out
+            ("", 0, _ADMINS, False),  # neither -> out
+            ("B2_TOK", 7, "", False),  # no admins -> whole channel off
+        ],
+    )
+    def test_business2_configured_predicate(
+        self, token: str, group_id: int, admins: str, expected: bool
+    ) -> None:
+        s = _settings(
+            BOT_BUSINESS2_TOKEN=token,
+            BOT_BUSINESS2_GROUP_ID=group_id,
+            ADMIN_TELEGRAM_IDS=admins,
+        )
+        names = [b.name for b in s.push_team_bots]
+        assert ("business2" in names) is expected
+
+    def test_business2_fully_configured_has_expected_fields(self) -> None:
+        # task case 1: business2 with non-empty token AND group_id > 0 (and
+        # admins present) -> materialised with exactly those fields.
+        s = _settings(
+            BOT_BUSINESS2_TOKEN="B2_TOK",
+            BOT_BUSINESS2_GROUP_ID=7,
+            ADMIN_TELEGRAM_IDS=_ADMINS,
+        )
+        assert s.push_team_bots == [
+            PushTeamBot(name="business2", token="B2_TOK", group_id=7, webhook_secret="")
+        ]
+
+    def test_business2_added_alongside_the_other_three(self) -> None:
+        # round-44 "4 push bots": business2 coexists with ivan/alexandra/andrei
+        # on a distinct group_id (4, not 1/2/3). Insertion order is preserved.
+        s = _settings(
+            BOT_IVAN_TOKEN="A",
+            BOT_IVAN_GROUP_ID=1,
+            BOT_ALEXANDRA_TOKEN="B",
+            BOT_ALEXANDRA_GROUP_ID=2,
+            BOT_ANDREI_TOKEN="C",
+            BOT_ANDREI_GROUP_ID=3,
+            BOT_BUSINESS2_TOKEN="D",
+            BOT_BUSINESS2_GROUP_ID=4,
+            ADMIN_TELEGRAM_IDS=_ADMINS,
+        )
+        assert s.push_team_bots == [
+            PushTeamBot(name="ivan", token="A", group_id=1, webhook_secret=""),
+            PushTeamBot(name="alexandra", token="B", group_id=2, webhook_secret=""),
+            PushTeamBot(name="andrei", token="C", group_id=3, webhook_secret=""),
+            PushTeamBot(name="business2", token="D", group_id=4, webhook_secret=""),
+        ]
+
+    def test_business2_only_configured_returns_just_business2(self) -> None:
+        # Only business2 set, the other three unconfigured -> exactly business2.
+        s = _settings(
+            BOT_BUSINESS2_TOKEN="D",
+            BOT_BUSINESS2_GROUP_ID=4,
+            ADMIN_TELEGRAM_IDS=_ADMINS,
+        )
+        assert [b.name for b in s.push_team_bots] == ["business2"]
+
+    def test_business2_no_admins_returns_empty(self) -> None:
+        # task case: even fully-configured business2 is gated off with no admins.
+        s = _settings(
+            BOT_BUSINESS2_TOKEN="D",
+            BOT_BUSINESS2_GROUP_ID=4,
+            ADMIN_TELEGRAM_IDS="",
+        )
+        assert s.push_team_bots == []
+
+
+class TestPushTeamBotBusiness2WebhookSecret:
+    def test_business2_secret_carried_through(self) -> None:
+        # task case 6: business2 with a set webhook_secret -> proxied into the
+        # PushTeamBot record.
+        s = _settings(
+            BOT_BUSINESS2_TOKEN="B2_TOK",
+            BOT_BUSINESS2_GROUP_ID=7,
+            BOT_BUSINESS2_WEBHOOK_SECRET="cafebabecafebabecafebabecafebabe",
+            ADMIN_TELEGRAM_IDS=_ADMINS,
+        )
+        assert s.push_team_bots == [
+            PushTeamBot(
+                name="business2",
+                token="B2_TOK",
+                group_id=7,
+                webhook_secret="cafebabecafebabecafebabecafebabe",
+            )
+        ]
+
+    def test_business2_stays_in_list_with_empty_secret(self) -> None:
+        # task case 5: business2 with an EMPTY webhook_secret is still
+        # materialised (delivery still works), webhook_secret == "" (the
+        # callback button + push-webhook route just deactivate — §2/§7).
+        s = _settings(
+            BOT_BUSINESS2_TOKEN="B2_TOK",
+            BOT_BUSINESS2_GROUP_ID=7,
+            BOT_BUSINESS2_WEBHOOK_SECRET="",
+            ADMIN_TELEGRAM_IDS=_ADMINS,
+        )
+        b2 = next(b for b in s.push_team_bots if b.name == "business2")
+        assert b2.webhook_secret == ""
+
+    def test_business2_with_button_predicate_tracks_secret(self) -> None:
+        # ADR-0027 §7: dispatcher attaches the button iff bool(secret).
+        empty = _settings(
+            BOT_BUSINESS2_TOKEN="B2_TOK",
+            BOT_BUSINESS2_GROUP_ID=7,
+            BOT_BUSINESS2_WEBHOOK_SECRET="",
+            ADMIN_TELEGRAM_IDS=_ADMINS,
+        )
+        filled = _settings(
+            BOT_BUSINESS2_TOKEN="B2_TOK",
+            BOT_BUSINESS2_GROUP_ID=7,
+            BOT_BUSINESS2_WEBHOOK_SECRET="abc123",
+            ADMIN_TELEGRAM_IDS=_ADMINS,
+        )
+        empty_bot = next(b for b in empty.push_team_bots if b.name == "business2")
+        filled_bot = next(b for b in filled.push_team_bots if b.name == "business2")
+        assert bool(empty_bot.webhook_secret) is False
+        assert bool(filled_bot.webhook_secret) is True
+
+
+# ---------------------------------------------------------------------------
 # push_team_bots_enabled (ADR-0027 §2)
 # ---------------------------------------------------------------------------
 
@@ -277,6 +414,64 @@ class TestDuplicateGroupIdFailFast:
             ADMIN_TELEGRAM_IDS=_ADMINS,
         )
         assert len(s.push_team_bots) == 2
+
+    # --- round-44: business2 participates in the same duplicate check -------
+
+    def test_business2_dupe_with_ivan_group_id_raises(self) -> None:
+        # task case 4: business2 configured with the SAME group_id as a real
+        # bot (ivan=1, a value from the {1,2,3} reserved set) -> fail-fast at
+        # startup. The error text must name BOT_BUSINESS2 (it enumerates all
+        # four configured push-bot env prefixes).
+        with pytest.raises(ValidationError) as exc:
+            _settings(
+                BOT_IVAN_TOKEN="A",
+                BOT_IVAN_GROUP_ID=1,
+                BOT_BUSINESS2_TOKEN="D",
+                BOT_BUSINESS2_GROUP_ID=1,  # collides with ivan (reserved 1)
+                ADMIN_TELEGRAM_IDS=_ADMINS,
+            )
+        msg = str(exc.value)
+        assert "Duplicate push-bot group_id" in msg
+        assert "BOT_BUSINESS2" in msg
+
+    def test_business2_dupe_matches_canonical_message(self) -> None:
+        # Same scenario, asserting via pytest.raises match= on the documented
+        # ADR-0027 §2 message (mirrors the existing duplicate test style).
+        with pytest.raises(ValidationError, match="Duplicate push-bot group_id"):
+            _settings(
+                BOT_ANDREI_TOKEN="C",
+                BOT_ANDREI_GROUP_ID=3,
+                BOT_BUSINESS2_TOKEN="D",
+                BOT_BUSINESS2_GROUP_ID=3,  # collides with andrei (reserved 3)
+                ADMIN_TELEGRAM_IDS=_ADMINS,
+            )
+
+    def test_business2_empty_token_on_same_group_id_is_not_an_error(self) -> None:
+        # business2 shares ivan's group_id but has an EMPTY token -> it is NOT
+        # "configured" and does not participate in the duplicate check.
+        s = _settings(
+            BOT_IVAN_TOKEN="A",
+            BOT_IVAN_GROUP_ID=1,
+            BOT_BUSINESS2_TOKEN="",
+            BOT_BUSINESS2_GROUP_ID=1,
+            ADMIN_TELEGRAM_IDS=_ADMINS,
+        )
+        assert [b.name for b in s.push_team_bots] == ["ivan"]
+
+    def test_business2_distinct_group_id_passes_with_others(self) -> None:
+        # business2 on a group_id != 1/2/3 coexists with all three -> no error.
+        s = _settings(
+            BOT_IVAN_TOKEN="A",
+            BOT_IVAN_GROUP_ID=1,
+            BOT_ALEXANDRA_TOKEN="B",
+            BOT_ALEXANDRA_GROUP_ID=2,
+            BOT_ANDREI_TOKEN="C",
+            BOT_ANDREI_GROUP_ID=3,
+            BOT_BUSINESS2_TOKEN="D",
+            BOT_BUSINESS2_GROUP_ID=4,
+            ADMIN_TELEGRAM_IDS=_ADMINS,
+        )
+        assert len(s.push_team_bots) == 4
 
 
 # ---------------------------------------------------------------------------

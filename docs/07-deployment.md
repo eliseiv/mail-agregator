@@ -241,6 +241,9 @@ Healthcheck не настроен — это бесконечный sleep-цик
 | `BOT_ANDREI_TOKEN` | (none) | no | **ADR-0027:** токен push-only бота команды `andrei`. **round-42:** в **worker + api**. Redact. |
 | `BOT_ANDREI_GROUP_ID` | (none) | no | **ADR-0027:** `group_id` команды `andrei`. Прод: `3`. |
 | `BOT_ANDREI_WEBHOOK_SECRET` | (none) | no | **ADR-0027 round-42:** webhook-secret бота `andrei` (см. `BOT_IVAN_WEBHOOK_SECRET`). Redact. |
+| `BOT_BUSINESS2_TOKEN` | (none) | no | **ADR-0027 round-44:** токен push-only бота команды `business2` (BotFather). Нужен **и в worker** (доставка), **и в api** (обработка callback) — как у прочих push-ботов round-42. Маскируется в structlog redact-list. Пустой → бот не настроен (тихо игнорируется). |
+| `BOT_BUSINESS2_GROUP_ID` | (none) | no | **ADR-0027 round-44:** `mail_accounts.group_id` команды `business2`. В отличие от `ivan`/`alexandra`/`andrei` (`1`/`2`/`3`) — задаёт **оператор/devops** в prod `.env`; **обязан отличаться** от `1`/`2`/`3` (иначе fail-fast дубля `group_id` на старте, ADR-0027 §2) и совпадать с реальным `groups.id` команды `business2` (ADR-0019). Без него бот в `push_team_bots` не попадает. |
+| `BOT_BUSINESS2_WEBHOOK_SECRET` | (none) | no | **ADR-0027 round-44 §2/§10:** 32 hex (`openssl rand -hex 16`) — secret push-webhook'а бота `business2` (header `X-Telegram-Bot-Api-Secret-Token`). Нужен **в api** (валидация callback). Пустой → у бота нет callback-кнопки (`with_button=False`, graceful degradation). Redact (рядом с `TELEGRAM_WEBHOOK_SECRET`). |
 | `ADMIN_TELEGRAM_IDS` | (none) | no | **ADR-0027:** CSV Telegram chat id двух администраторов-получателей push-ботов, напр. `11111111,22222222`. Пусто → push-каналы выключены (`push_team_bots_enabled=false`). Не секрет, но в логах оставлять только конкретный `chat_id` доставки. |
 | `PUSH_NOTIFY_DISPATCH_INTERVAL_SECONDS` | `5` | no | **ADR-0027:** интервал APScheduler-job `push_notify_dispatch` (drain `push_notify_queue`). |
 | `PUSH_NOTIFY_BATCH_SIZE` | `30` | no | **ADR-0027:** размер `LPOP`-батча `push_notify_dispatch` за тик. |
@@ -250,7 +253,7 @@ Healthcheck не настроен — это бесконечный sleep-цик
 | `OUTLOOK_TENANT` | `common` | no | **ADR-0025:** tenant для authorize/token endpoints `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/...`. Для личных ящиков — `common` (ранее `consumers`; `consumers` давал IMAP XOAUTH2 "User is authenticated but not connected"). `common` пускает и личные, и рабочие аккаунты. |
 | `OUTLOOK_OAUTH_STATE_TTL_SECONDS` | `600` | no | **ADR-0025:** TTL Redis-ключа `oauth_state:{state}` (CSRF/anti-fixation state + PKCE verifier). |
 
-OAuth включён (`OUTLOOK_OAUTH_ENABLED`, derived), когда заданы `OUTLOOK_CLIENT_ID` + `OUTLOOK_CLIENT_SECRET`; иначе `/api/oauth/outlook/*` отдают `404` (route скрыт). `OUTLOOK_CLIENT_SECRET` передаётся в **api** (authorize/callback/SMTP) и **worker** (refresh перед IMAP). `TELEGRAM_BOT_TOKEN` хранится в `.env` (`chmod 600`). **Изменение от ADR-0018:** `worker` теперь использует Telegram API для доставки push-нотификаций (ADR-0022 §2) — `TELEGRAM_BOT_TOKEN` передаётся **и** в `api`, **и** в `worker` контейнеры. Маскировка в логах гарантируется redact-list'ом structlog (одинаково для обоих контейнеров). **ADR-0027:** токены push-only ботов по командам (`BOT_IVAN_TOKEN` / `BOT_ALEXANDRA_TOKEN` / `BOT_ANDREI_TOKEN`) + их `*_GROUP_ID` + `ADMIN_TELEGRAM_IDS` передаются **только** в `worker` (диспатчер `push_notify_dispatch` живёт там; `api` их не использует). Три новых токена добавлены в structlog redact-list рядом с `TELEGRAM_BOT_TOKEN`.
+OAuth включён (`OUTLOOK_OAUTH_ENABLED`, derived), когда заданы `OUTLOOK_CLIENT_ID` + `OUTLOOK_CLIENT_SECRET`; иначе `/api/oauth/outlook/*` отдают `404` (route скрыт). `OUTLOOK_CLIENT_SECRET` передаётся в **api** (authorize/callback/SMTP) и **worker** (refresh перед IMAP). `TELEGRAM_BOT_TOKEN` хранится в `.env` (`chmod 600`). **Изменение от ADR-0018:** `worker` теперь использует Telegram API для доставки push-нотификаций (ADR-0022 §2) — `TELEGRAM_BOT_TOKEN` передаётся **и** в `api`, **и** в `worker` контейнеры. Маскировка в логах гарантируется redact-list'ом structlog (одинаково для обоих контейнеров). **ADR-0027 (round-44, 4 push-бота):** токены push-only ботов по командам (`BOT_IVAN_TOKEN` / `BOT_ALEXANDRA_TOKEN` / `BOT_ANDREI_TOKEN` / `BOT_BUSINESS2_TOKEN`) + их `*_GROUP_ID` + `*_WEBHOOK_SECRET` + `ADMIN_TELEGRAM_IDS` передаются **и в `worker`** (диспатчер `push_notify_dispatch`), **и в `api`** (callback-webhook `/api/telegram/push-webhook/{name}`, round-42 §10). Все push-боты получают `.env` через `env_file: .env` обоих контейнеров (compose не перечисляет их поимённо в `environment:`) — добавление `business2` в `.env` автоматически прокидывается в api и worker, правка `docker-compose.yml` не требуется. Четыре токена + четыре webhook-secret добавлены в structlog redact-list рядом с `TELEGRAM_BOT_TOKEN`.
 
 ### External pull-API (ADR-0029)
 
@@ -739,13 +742,22 @@ curl "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo"
 
 Для каждого настроенного push-бота с непустым `BOT_*_WEBHOOK_SECRET` регистрируется собственный webhook (callback-кнопка «Посмотреть сообщение»). Это **тот же** Bot-API метод `setWebhook`, отличаются токен, URL (`/push-webhook/{name}`) и `secret_token`. Идемпотентно — безопасно гонять при каждом деплое.
 
-Предусловие: `BOT_*_TOKEN` и `BOT_*_WEBHOOK_SECRET` присутствуют в `.env` **api**-контейнера (callback) и **worker** (доставка); `api` перезапущен после правки `.env`.
+Предусловие: `BOT_*_TOKEN` и `BOT_*_WEBHOOK_SECRET` присутствуют в `.env` **api**-контейнера (callback) и **worker** (доставка). Контейнеры читают `.env` через `env_file`, кэшируют settings в процессе (`lru_cache get_settings`), поэтому после правки `.env` нужно **force-recreate обоих** контейнеров — `business2`-токены (как и прочие push-боты) читают и `api`, и `worker`:
+
+```bash
+# После добавления/изменения BOT_BUSINESS2_* (и любых push-bot env) в .env —
+# пересоздать оба контейнера, чтобы новые переменные подхватились.
+docker compose --profile prod up -d --force-recreate api worker
+```
+
+Затем зарегистрировать push-webhook'и:
 
 ```bash
 source /opt/mail-aggregator/.env
 for pair in "ivan:${BOT_IVAN_TOKEN}:${BOT_IVAN_WEBHOOK_SECRET}" \
             "alexandra:${BOT_ALEXANDRA_TOKEN}:${BOT_ALEXANDRA_WEBHOOK_SECRET}" \
-            "andrei:${BOT_ANDREI_TOKEN}:${BOT_ANDREI_WEBHOOK_SECRET}"; do
+            "andrei:${BOT_ANDREI_TOKEN}:${BOT_ANDREI_WEBHOOK_SECRET}" \
+            "business2:${BOT_BUSINESS2_TOKEN}:${BOT_BUSINESS2_WEBHOOK_SECRET}"; do
   name="${pair%%:*}"; rest="${pair#*:}"; token="${rest%%:*}"; secret="${rest##*:}"
   if [ -n "$token" ] && [ -n "$secret" ]; then
     curl -F "url=https://postapp.store/api/telegram/push-webhook/${name}" \

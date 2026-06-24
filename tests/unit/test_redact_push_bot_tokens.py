@@ -15,7 +15,14 @@ from shared.logging import REDACT_KEYS, _redact_processor
 
 pytestmark = pytest.mark.unit
 
-_PUSH_TOKEN_KEYS = ["BOT_IVAN_TOKEN", "BOT_ALEXANDRA_TOKEN", "BOT_ANDREI_TOKEN"]
+# round-44 (ADR-0027 §8): the fourth push bot ``business2`` token must be
+# redacted exactly like the other three.
+_PUSH_TOKEN_KEYS = [
+    "BOT_IVAN_TOKEN",
+    "BOT_ALEXANDRA_TOKEN",
+    "BOT_ANDREI_TOKEN",
+    "BOT_BUSINESS2_TOKEN",
+]
 
 
 class TestPushBotTokenRedaction:
@@ -30,22 +37,29 @@ class TestPushBotTokenRedaction:
         assert out[key] == "[REDACTED]"
         assert "SUPER_SECRET_BOT_TOKEN" not in str(out)
 
-    def test_full_settings_dump_masks_all_three_tokens(self) -> None:
+    def test_full_settings_dump_masks_all_four_tokens(self) -> None:
         event = {
             "event": "settings_dump",
             "BOT_IVAN_TOKEN": "ivan-secret",
             "BOT_ALEXANDRA_TOKEN": "alexandra-secret",
             "BOT_ANDREI_TOKEN": "andrei-secret",
+            "BOT_BUSINESS2_TOKEN": "business2-secret",  # round-44
             "ADMIN_TELEGRAM_IDS": "111,222",  # not a secret — stays visible
         }
         out = _redact_processor(None, "info", event)
         assert out["BOT_IVAN_TOKEN"] == "[REDACTED]"
         assert out["BOT_ALEXANDRA_TOKEN"] == "[REDACTED]"
         assert out["BOT_ANDREI_TOKEN"] == "[REDACTED]"
+        assert out["BOT_BUSINESS2_TOKEN"] == "[REDACTED]"
         # Chat ids are not secret; left as-is.
         assert out["ADMIN_TELEGRAM_IDS"] == "111,222"
         rendered = str(out)
-        for secret in ("ivan-secret", "alexandra-secret", "andrei-secret"):
+        for secret in (
+            "ivan-secret",
+            "alexandra-secret",
+            "andrei-secret",
+            "business2-secret",
+        ):
             assert secret not in rendered
 
 
@@ -59,6 +73,8 @@ _PUSH_SECRET_KEYS = [
     "BOT_IVAN_WEBHOOK_SECRET",
     "BOT_ALEXANDRA_WEBHOOK_SECRET",
     "BOT_ANDREI_WEBHOOK_SECRET",
+    # round-44 (ADR-0027 §8): business2 push-webhook secret.
+    "BOT_BUSINESS2_WEBHOOK_SECRET",
 ]
 
 
@@ -74,20 +90,22 @@ class TestPushBotWebhookSecretRedaction:
         assert out[key] == "[REDACTED]"
         assert "deadbeef" not in str(out)
 
-    def test_full_settings_dump_masks_all_three_secrets(self) -> None:
+    def test_full_settings_dump_masks_all_four_secrets(self) -> None:
         event = {
             "event": "settings_dump",
             "BOT_IVAN_WEBHOOK_SECRET": "ivanhook",
             "BOT_ALEXANDRA_WEBHOOK_SECRET": "alexhook",
             "BOT_ANDREI_WEBHOOK_SECRET": "andreihook",
+            "BOT_BUSINESS2_WEBHOOK_SECRET": "business2hook",  # round-44
             # The header form (as it might appear on an inbound request log).
-            "X-Telegram-Bot-Api-Secret-Token": "ivanhook",
+            "X-Telegram-Bot-Api-Secret-Token": "business2hook",
         }
         out = _redact_processor(None, "info", event)
         assert out["BOT_IVAN_WEBHOOK_SECRET"] == "[REDACTED]"
         assert out["BOT_ALEXANDRA_WEBHOOK_SECRET"] == "[REDACTED]"
         assert out["BOT_ANDREI_WEBHOOK_SECRET"] == "[REDACTED]"
+        assert out["BOT_BUSINESS2_WEBHOOK_SECRET"] == "[REDACTED]"
         assert out["X-Telegram-Bot-Api-Secret-Token"] == "[REDACTED]"
         rendered = str(out)
-        for secret in ("ivanhook", "alexhook", "andreihook"):
+        for secret in ("ivanhook", "alexhook", "andreihook", "business2hook"):
             assert secret not in rendered

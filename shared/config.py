@@ -28,7 +28,8 @@ AppEnv = Literal["dev", "prod"]
 class PushTeamBot:
     """A single configured push-only per-team Telegram bot (ADR-0027 §1/§2).
 
-    ``name`` is the team label (``ivan`` / ``alexandra`` / ``andrei``),
+    ``name`` is the team label (``ivan`` / ``alexandra`` / ``andrei`` /
+    ``business2``),
     ``token`` the BotFather token used to call the Bot API, ``group_id`` the
     team's ``mail_accounts.group_id`` (ADR-0019) this bot is bound to. Only
     fully-configured bots (non-empty token AND ``group_id > 0``) are
@@ -210,14 +211,14 @@ class Settings(BaseSettings):
     TG_SEND_PER_CHAT_PER_MINUTE: int = Field(default=20, ge=1, le=60)
 
     # --- Push-only per-team Telegram bots (ADR-0027) ----------------------
-    # Three additional push-only bots (ivan / alexandra / andrei); each
-    # delivers notifications about ALL messages of ITS team (bound by an
+    # Four additional push-only bots (ivan / alexandra / andrei / business2);
+    # each delivers notifications about ALL messages of ITS team (bound by an
     # explicit ``group_id``) to the fixed ``ADMIN_TELEGRAM_IDS``. Worker
     # container reads these; the main bot (``BOT_TOKEN``) is unaffected.
     # Tokens are marked redact in ``shared/logging.py`` alongside BOT_TOKEN.
     # A bot is "configured" only when its token is non-empty AND its
     # group_id > 0 (see ``push_team_bots``). Prod mapping (ADR-0027 §1):
-    # ivan=1, alexandra=2, andrei=3.
+    # ivan=1, alexandra=2, andrei=3; business2=operator-set in ``.env`` (≠1/2/3).
     BOT_IVAN_TOKEN: str = ""
     BOT_IVAN_GROUP_ID: int = Field(default=0, ge=0)
     # round-42 (ADR-0027 §2/§10): per-bot webhook secret (32 hex,
@@ -231,6 +232,14 @@ class Settings(BaseSettings):
     BOT_ANDREI_TOKEN: str = ""
     BOT_ANDREI_GROUP_ID: int = Field(default=0, ge=0)
     BOT_ANDREI_WEBHOOK_SECRET: str = ""
+    # round-44 (ADR-0027 §1/§2): fourth push-only bot ``business2``, identical
+    # in mechanics to ivan/alexandra/andrei. Its prod ``group_id`` is operator-
+    # set in ``.env`` and MUST differ from 1/2/3 (else the duplicate-group_id
+    # fail-fast in ``_enforce_required`` aborts startup). Token + webhook secret
+    # marked redact in ``shared/logging.py`` alongside the other push bots.
+    BOT_BUSINESS2_TOKEN: str = ""
+    BOT_BUSINESS2_GROUP_ID: int = Field(default=0, ge=0)
+    BOT_BUSINESS2_WEBHOOK_SECRET: str = ""
     # CSV of the two fixed administrator Telegram chat ids that every
     # push-bot delivers to (e.g. ``11111111,22222222``). Not a secret
     # (chat ids), but parsed defensively — see ``admin_telegram_ids``.
@@ -335,14 +344,15 @@ class Settings(BaseSettings):
             (self.BOT_IVAN_TOKEN, self.BOT_IVAN_GROUP_ID),
             (self.BOT_ALEXANDRA_TOKEN, self.BOT_ALEXANDRA_GROUP_ID),
             (self.BOT_ANDREI_TOKEN, self.BOT_ANDREI_GROUP_ID),
+            (self.BOT_BUSINESS2_TOKEN, self.BOT_BUSINESS2_GROUP_ID),
         ):
             if token and group_id > 0:
                 configured_group_ids.append(group_id)
         if len(configured_group_ids) != len(set(configured_group_ids)):
             raise ValueError(
                 "Duplicate push-bot group_id: each configured push bot "
-                "(BOT_IVAN/BOT_ALEXANDRA/BOT_ANDREI) must map to a distinct "
-                "group_id (ADR-0027 §2)"
+                "(BOT_IVAN/BOT_ALEXANDRA/BOT_ANDREI/BOT_BUSINESS2) must map to "
+                "a distinct group_id (ADR-0027 §2)"
             )
         return self
 
@@ -433,6 +443,12 @@ class Settings(BaseSettings):
                 self.BOT_ANDREI_TOKEN,
                 self.BOT_ANDREI_GROUP_ID,
                 self.BOT_ANDREI_WEBHOOK_SECRET,
+            ),
+            (
+                "business2",
+                self.BOT_BUSINESS2_TOKEN,
+                self.BOT_BUSINESS2_GROUP_ID,
+                self.BOT_BUSINESS2_WEBHOOK_SECRET,
             ),
         ):
             if token and group_id > 0:
