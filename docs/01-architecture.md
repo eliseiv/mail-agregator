@@ -384,23 +384,25 @@ sequenceDiagram
 ```mermaid
 flowchart LR
     subgraph host[Single host / VM]
+        cb[certbot pkg + certbot.timer<br/>host-level TLS renewal]
         subgraph compose[docker compose project]
             api1[api]
             worker1[worker]
             pg[postgres]
             rd[redis]
             mn[minio]
+            rev[nginx :80, :443<br/>prod-only]
         end
-        rev[reverse proxy<br/>nginx + certbot<br/>:80, :443]
     end
 
     Browser((Browser))
     Browser -- HTTPS --> rev --> api1
     api1 --> pg & rd & mn
     worker1 --> pg & rd & mn
+    cb -. /etc/letsencrypt bind-mount RO .- rev
 ```
 
-- TLS terminates на reverse proxy (nginx 1.27 + certbot/Let's Encrypt — см. `07-deployment.md` sec. 6).
+- TLS terminates на reverse proxy — контейнер nginx 1.27; сертификаты Let's Encrypt выпускает/обновляет **host-level** certbot (`certbot.timer`), nginx читает `/etc/letsencrypt` bind-mount'ом с хоста. В docker-compose нет сервиса certbot (см. `07-deployment.md` sec. 6, ADR-0032).
 - Все backend-контейнеры в общей docker-сети, не публикуют порты наружу.
 - Только `:443` (proxy) и опционально `:9001` (MinIO console, ограничен по IP) выставляются.
 

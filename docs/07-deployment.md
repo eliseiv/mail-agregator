@@ -1,6 +1,10 @@
 # 07. Deployment
 
-Целевая среда — single-host Linux (например, Ubuntu 22.04 LTS) с Docker Engine 24+ и docker compose v2. Все компоненты упакованы в docker-compose.
+Целевая среда — single-host Linux (Ubuntu 22.04 LTS или новее) с Docker Engine 24+ и docker compose v2. Все компоненты упакованы в docker-compose.
+
+**Актуальный prod (с 2026-07-01):** выделенный сервер Hetzner `49.12.189.77`, Ubuntu 26.04, домен `postapp.store` (A-запись у reg.ru). Деплой по SSH под `root`, checkout в `/opt/mail-agregator`. До 2026-07-01 прод жил на общем сервере `132.243.113.117`; процедура переезда — секция 15 «Migration to a new server».
+
+> **TLS-модель (важно — читать перед правкой §6).** Сертификаты Let's Encrypt обслуживаются **на хосте**: пакетный `certbot` пишет в host-каталог `/etc/letsencrypt`, а обновление гоняет системный `certbot.timer` (webroot `/var/www/certbot`). В docker-compose **нет** сервиса `certbot` и **нет** volume `mas_certbot_certs`/`mas_certbot_webroot` — контейнер `nginx` (единственный prod-only сервис под `--profile prod`) читает `/etc/letsencrypt` и `/var/www/certbot` через **bind-mount с хоста** (см. `docker-compose.yml`, сервис `nginx`). Это осознанное решение, зафиксировано в ADR-0032.
 
 ---
 
@@ -8,26 +12,29 @@
 
 ```mermaid
 flowchart LR
-    subgraph net[Docker network: mas-net]
-        api[api<br/>:8080 internal]
-        worker[worker<br/>no ports]
-        pg[postgres<br/>:5432 internal]
-        rd[redis<br/>:6379 internal]
-        mn[minio<br/>:9000 internal<br/>:9001 console]
-        ng[nginx<br/>:80, :443]
-        cb[certbot<br/>renewal loop]
+    subgraph host[Host]
+        cb[certbot pkg + certbot.timer<br/>host-level renewal]
+        le[(/etc/letsencrypt<br/>/var/www/certbot)]
+        subgraph net[Docker network: mas-net]
+            api[api<br/>:8080 internal]
+            worker[worker<br/>no ports]
+            pg[postgres<br/>:5432 internal]
+            rd[redis<br/>:6379 internal]
+            mn[minio<br/>:9000 internal<br/>:9001 console]
+            ng[nginx<br/>:80, :443]
+        end
     end
 
     ng --> api
     api --> pg & rd & mn
     worker --> pg & rd & mn
-    cb -. webroot+certs .- ng
+    cb --> le
+    le -. bind-mount RO .- ng
 ```
 
 | Сервис | Image | Restart | Ports (host:container) | Зависит от (depends_on healthy) |
 | --- | --- | --- | --- | --- |
 | `nginx` | `nginx:1.27-alpine` | unless-stopped | `80:80, 443:443` | api |
-| `certbot` | `certbot/certbot:v2.11.0` | unless-stopped | (нет) | — (shares two volumes with nginx) |
 | `api` | local build / GHCR (`deploy/Dockerfile` target `api`) | unless-stopped | (только internal) | postgres, redis, minio, minio-bootstrap, mas-migrations |
 | `worker` | local build / GHCR (`deploy/Dockerfile` target `worker`) | unless-stopped | (нет) | postgres, redis, minio, minio-bootstrap, mas-migrations |
 | `postgres` | `postgres:16-alpine` | unless-stopped | (только internal) | — |
@@ -36,7 +43,7 @@ flowchart LR
 
 Все internal-порты в общей docker network `mas-net` (default bridge). Никаких host-port mapping для api/postgres/redis/minio:9000.
 
-`nginx` и `certbot` запускаются только под `--profile prod` — в dev их нет, api публикуется на `127.0.0.1:8080` через `docker-compose.override.yml`.
+**Нет** контейнера `certbot` — TLS-renewal выполняет host-level `certbot.timer` (см. секцию 6). `nginx` — **единственный** сервис под `--profile prod`; в dev его нет, api публикуется на `127.0.0.1:8080` через `docker-compose.override.yml`. TLS-материал (`/etc/letsencrypt`) и ACME-webroot (`/var/www/certbot`) прокидываются в `nginx` **bind-mount'ом с хоста** (RO), а не через named volumes.
 
 ---
 
@@ -47,10 +54,15 @@ flowchart LR
 | `mas_pg_data` | postgres | `/var/lib/postgresql/data` | **Critical** — основные данные |
 | `mas_minio_data` | minio | `/data` | **Critical** — вложения |
 | `mas_redis_data` | redis | `/data` (если включить AOF) | Low — можно потерять (sessions релогинятся) |
-| `mas_certbot_certs` | certbot (RW), nginx (RO) | `/etc/letsencrypt` (account keys + `live/<domain>/{fullchain,privkey,chain}.pem`) | Medium — рестор Let's Encrypt автоматически, но избегаем rate-limit (5 fails/час, 50 certs/нед на домен) |
-| `mas_certbot_webroot` | certbot (RW), nginx (RO) | `/var/www/certbot` (HTTP-01 challenge files) | Low — пересоздаётся при каждом renewal |
 
-Все volumes — named volumes Docker.
+Все три — named volumes Docker (см. `docker-compose.yml`, секция `volumes:`).
+
+**Host bind-mounts (TLS, не docker volumes).** Сертификаты и ACME-challenge живут на **хосте** и монтируются в `nginx` read-only — named volume для них **нет**:
+
+| Host-путь | Монтируется в | Владелец на хосте | Backup-критичность |
+| --- | --- | --- | --- |
+| `/etc/letsencrypt` | `nginx:/etc/letsencrypt:ro` | host `certbot` (RW), nginx (RO) | Medium — account keys + `live/<domain>/{fullchain,privkey,chain}.pem`. Рестор Let's Encrypt автоматический, но избегаем rate-limit (5 fails/час, 50 certs/нед на домен). При переезде каталог копируется tar'ом (секция 15), чтобы не переполучать cert. |
+| `/var/www/certbot` | `nginx:/var/www/certbot:ro` | host `certbot` (RW), nginx (RO) | Low — HTTP-01 challenge files, пересоздаётся при каждом renewal. |
 
 ---
 
@@ -118,7 +130,7 @@ healthcheck:
 Server-блок отвечает `200 ok\n` на `/_health_nginx` (HTTP, не HTTPS — чтобы не зависеть от наличия cert).
 
 ### `certbot`
-Healthcheck не настроен — это бесконечный sleep-цикл renewal. Достаточно `restart: unless-stopped`. Логи: `docker logs mas-certbot`.
+Контейнера `certbot` **нет** — renewal выполняется host-level `certbot.timer` (systemd), поэтому docker-healthcheck неприменим. Статус: `systemctl status certbot.timer` / `systemctl list-timers certbot.timer`; логи renewal: `journalctl -u certbot` (или `/var/log/letsencrypt/letsencrypt.log`). См. секцию 6.
 
 ---
 
@@ -209,12 +221,14 @@ Healthcheck не настроен — это бесконечный sleep-цик
 | `SETUP_SESSION_TTL_SECONDS` | `900` | no | 15 минут. |
 | `COOKIE_DOMAIN` | (none) | no | Если задан — кладётся в Set-Cookie domain. |
 
-### Reverse proxy + TLS (nginx + certbot)
+### Reverse proxy + TLS (nginx-контейнер + host certbot)
+
+`SERVER_DOMAIN` — единственная env-переменная, которую читает контейнер `nginx`. Host-level `certbot` (пакет + `certbot.timer`) конфигурируется на хосте (домен и e-mail задаются при первом выпуске cert, секция 6), а **не** через `.env` docker-стека.
 
 | Переменная | Default | Required | Описание |
 | --- | --- | --- | --- |
-| `SERVER_DOMAIN` | (none) | yes (prod) | FQDN для TLS (например, `mail.example.com`). nginx envsubst-ит в `default.conf`; certbot использует для запроса cert. |
-| `ACME_EMAIL` | `admin@example.com` | yes (prod) | Контакт для Let's Encrypt — приходят уведомления о истечении сертификата + reset-ссылки для аккаунта LE. |
+| `SERVER_DOMAIN` | (none) | yes (prod) | FQDN для TLS (прод: `postapp.store`). nginx envsubst-ит в `default.conf`. Должен совпадать с доменом host-cert в `/etc/letsencrypt/live/<domain>/`. |
+| `ACME_EMAIL` | `admin@example.com` | no (host-level) | Контакт Let's Encrypt (уведомления об истечении). Используется **host-командой** `certbot certonly` при первом выпуске (секция 6), контейнеры его не читают. Может присутствовать в `.env` как справочная запись. |
 
 ### Telegram bot (ADR-0018 launcher + ADR-0022 SSO/notifications)
 
@@ -285,54 +299,69 @@ OAuth включён (`OUTLOOK_OAUTH_ENABLED`, derived), когда заданы
 
 ---
 
-## 6. Reverse proxy: nginx + certbot
+## 6. Reverse proxy: nginx (контейнер) + certbot (host-level)
 
-TLS терминируется на nginx; cert получаем у Let's Encrypt через certbot. Нужны открытые на firewall'е порты `80` (HTTP-01 challenge + 301 redirect) и `443` (HTTPS).
+TLS терминируется на контейнере `nginx`. Сертификаты Let's Encrypt выпускает и обновляет **host-level** `certbot` (системный пакет + `certbot.timer`), пишущий в host-каталог `/etc/letsencrypt`; nginx читает его **bind-mount'ом с хоста** (RO). В docker-compose нет ни сервиса `certbot`, ни named-volume для сертификатов. Нужны открытые на firewall'е порты `80` (HTTP-01 challenge + 301 redirect) и `443` (HTTPS).
 
 ### Файлы
 
 - `deploy/nginx/nginx.conf` — main config (worker процессы, gzip, log_format, общие SSL defaults).
 - `deploy/nginx/templates/default.conf.template` — server-блок для `${SERVER_DOMAIN}`. nginx alpine-образ автоматически рендерит шаблоны из `/etc/nginx/templates/` через envsubst при старте контейнера.
+- Host: `/etc/letsencrypt/live/${SERVER_DOMAIN}/{fullchain,privkey}.pem` — cert, bind-mount `-> /etc/letsencrypt:ro` в nginx.
+- Host: `/var/www/certbot` — webroot для HTTP-01, bind-mount `-> /var/www/certbot:ro` в nginx.
 
 ### Поведение server-блока
 
-- Listen `80` — HTTP→HTTPS 301 redirect, **кроме** `/.well-known/acme-challenge/*` (раздаётся из webroot для cert challenge) и `/_health_nginx` (healthcheck).
-- Listen `443 ssl http2` — proxy_pass на `http://api:8080`. Cert из `mas_certbot_certs` volume (`/etc/letsencrypt/live/${SERVER_DOMAIN}/`).
+- Listen `80` — HTTP→HTTPS 301 redirect, **кроме** `/.well-known/acme-challenge/*` (раздаётся из host-webroot `/var/www/certbot` для cert challenge) и `/_health_nginx` (healthcheck).
+- Listen `443 ssl http2` — proxy_pass на `http://api:8080`. Cert берётся из bind-mount host-каталога `/etc/letsencrypt/live/${SERVER_DOMAIN}/`.
 - Headers вверх: `Host`, `X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Proto: https`, `X-Forwarded-Host`, `X-Request-ID`. Backend полагается на эти headers для cookie Secure + audit IP + Message-ID URL-build.
 - HSTS: `Strict-Transport-Security: max-age=63072000; includeSubDomains; preload`.
 - gzip on для text/css, application/json, application/javascript, application/xml+rss, atom, image/svg+xml. text/html включается gzip-модулем по умолчанию — добавлять его в `gzip_types` нельзя (warning duplicate MIME type).
 - `client_max_body_size 30m` (под MAX_ATTACHMENT_BYTES=25 MiB + MIME overhead).
 - `proxy_read_timeout 60s` / `proxy_send_timeout 60s` / `proxy_connect_timeout 5s` — выровнено с gunicorn `--timeout=60` в api Dockerfile.
 
-### Первое получение cert (standalone)
-
-В первый запуск nginx падает (нет cert). Bootstrap:
+### Установка certbot на хост (одноразово)
 
 ```bash
-# поднимаем всё КРОМЕ nginx
-docker compose up -d postgres redis minio minio-bootstrap mas-migrations api worker
-
-# certbot standalone — занимает порт 80 на время challenge
-docker compose run --rm -p 80:80 certbot certonly --standalone \
-  -d "$SERVER_DOMAIN" --email "$ACME_EMAIL" --agree-tos --no-eff-email
-
-# теперь поднимаем nginx + renewal-loop
-docker compose --profile prod up -d nginx certbot
+sudo apt-get update && sudo apt-get install -y certbot
+sudo install -d -m 755 /var/www/certbot
 ```
 
-### Renewal
+### Первое получение cert (standalone)
 
-`certbot` контейнер — бесконечный цикл `certbot renew --webroot -w /var/www/certbot --quiet` каждые 12 часов. При успешном renewal:
+В первый запуск nginx падает (нет cert). Cert выпускаем host-командой, пока порт 80 свободен (nginx ещё не поднят):
 
-1. Cert файлы в `mas_certbot_certs` обновляются.
-2. `--deploy-hook` создаёт маркер `/etc/letsencrypt/.reload-needed` (виден в обоих контейнерах через volume).
-3. **Nginx нужно перезагрузить вручную** — certbot не имеет docker socket, и signal-механизмы между контейнерами хрупкие. Способ: внешний host-cron, например еженедельно:
-   ```cron
-   0 4 * * 1 cd /opt/mail-aggregator && docker compose --profile prod exec -T nginx nginx -s reload
-   ```
-   `nginx -s reload` graceful — без потерь активных соединений. Cert меняется раз в 60 дней, так что недельный cron безопасно покрывает rotation window.
+```bash
+# поднимаем всё КРОМЕ nginx (nginx — единственный сервис под --profile prod)
+docker compose up -d postgres redis minio minio-bootstrap mas-migrations api worker
 
-В dev TLS не терминируется на nginx — его просто нет под `--profile prod`. API публикуется на `127.0.0.1:8080` через `docker-compose.override.yml`.
+# host-certbot standalone — сам занимает порт 80 на время challenge
+sudo certbot certonly --standalone \
+  -d "$SERVER_DOMAIN" --email "$ACME_EMAIL" --agree-tos --no-eff-email --non-interactive
+
+# теперь поднимаем nginx (он bind-mount'ит host /etc/letsencrypt и /var/www/certbot)
+docker compose --profile prod up -d nginx
+```
+
+После первого выпуска рекомендуется переключить renewal на **webroot** (nginx уже держит порт 80), чтобы обновление не требовало остановки nginx — см. ниже.
+
+### Renewal (host `certbot.timer`)
+
+Renewal выполняет системный `certbot.timer` (ставится автоматически пакетом `certbot`; проверить — `systemctl list-timers certbot.timer`). Он гоняет `certbot renew` дважды в сутки; renew срабатывает фактически только когда до истечения < 30 дней.
+
+Метод обновления — **webroot** (nginx постоянно слушает `:80` и раздаёт `/.well-known/acme-challenge/` из `/var/www/certbot`), поэтому останавливать nginx не нужно. Renewal-конфиг домена (`/etc/letsencrypt/renewal/<domain>.conf`) должен указывать `authenticator = webroot` и `webroot_path = /var/www/certbot`.
+
+После успешного renewal контейнер nginx нужно перезагрузить, чтобы подхватить новый cert. Хостовый `deploy-hook` делает graceful reload:
+
+```bash
+# /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh  (chmod +x)
+#!/bin/sh
+cd /opt/mail-agregator && docker compose --profile prod exec -T nginx nginx -s reload
+```
+
+`nginx -s reload` graceful — без потерь активных соединений. Хук выполняется только при фактическом обновлении cert. Как страховочный вариант допустим еженедельный host-cron с тем же `nginx -s reload` (недельное окно безопасно покрывает 60-дневный rotation window).
+
+В dev TLS не терминируется — контейнера nginx нет под `--profile prod`. API публикуется на `127.0.0.1:8080` через `docker-compose.override.yml`.
 
 ---
 
@@ -342,7 +371,7 @@ docker compose --profile prod up -d nginx certbot
 
 ```bash
 git clone <repo>
-cd mail-aggregator
+cd mail-agregator
 cp .env.example .env
 # Отредактировать .env: MAIL_ENCRYPTION_KEY, ADMIN_PASSWORD, POSTGRES_PASSWORD,
 #   MINIO_ROOT_USER, MINIO_ROOT_PASSWORD, MINIO_APP_ACCESS_KEY, MINIO_APP_SECRET_KEY,
@@ -360,7 +389,7 @@ docker compose logs -f api worker
    - `Storage.ensure_bucket` — defensive проверка `head_bucket`; bucket уже создан init-контейнером, шаг возвращается мгновенно.
 5. `worker` стартует с теми же зависимостями.
 
-UI доступен на `https://${SERVER_DOMAIN}/login`. Полный operator-runbook по подъёму свежего prod-сервера (DNS, firewall, GH secrets, GHCR auth, бэкапы) — `docs/SERVER-SETUP.md`.
+UI доступен на `https://${SERVER_DOMAIN}/login`. Полный operator-runbook по подъёму свежего prod-сервера (DNS, firewall, GH secrets, host-certbot, бэкапы) — `docs/SERVER-SETUP.md`. Перенос существующего прода на новый сервер — секция 15 ниже.
 
 ### Обновление (deploy)
 
@@ -369,7 +398,7 @@ UI доступен на `https://${SERVER_DOMAIN}/login`. Полный operator
 Порядок деплоя на сервере (тот же, что выполняет `deploy.yml` через SSH — миграции вызываются **явно** перед стартом нового кода):
 
 ```bash
-cd /opt/mail-aggregator
+cd /opt/mail-agregator
 git checkout <sha>
 # правка IMAGE_TAG / IMAGE_REGISTRY в .env под целевой sha
 sed -i "s|^IMAGE_TAG=.*|IMAGE_TAG=<sha>|" .env
@@ -394,7 +423,7 @@ docker compose ps
 - Через workflow_dispatch на `Deploy`: запустить вручную, передать sha из known-good коммита.
 - Вручную на сервере:
   ```bash
-  cd /opt/mail-aggregator
+  cd /opt/mail-agregator
   git checkout <previous-tag-or-sha>
   sed -i "s|^IMAGE_TAG=.*|IMAGE_TAG=<previous-sha>|" .env
   docker compose --profile prod pull api worker
@@ -465,8 +494,12 @@ docker run --rm -v mas_minio_data:/data -v /backups/minio:/out alpine tar czf /o
 - Шаги:
   1. `wait-for-ci` job дожидается зелёного `Build images (api)` и `Build images (worker)` на этой sha (через `lewagon/wait-on-check-action`).
   2. `deploy` job: `appleboy/ssh-action` SSH'ится на `$DEPLOY_HOST` под `$DEPLOY_USER`, на сервере выполняет (в этом порядке): `git checkout <sha>` → перезаписывает `IMAGE_TAG`/`IMAGE_REGISTRY` в `.env` → `docker compose --profile prod pull api worker` → **`docker compose --profile prod run --rm mas-migrations`** (явный шаг миграций перед стартом нового кода) → `docker compose --profile prod up -d --remove-orphans api worker` → `docker compose --profile prod up -d --force-recreate nginx` → healthcheck-гейт: ждёт, пока `mas-api` станет healthy (90s). Явный вызов `mas-migrations` гарантирует, что api/worker не стартуют на старой схеме (у них нет entrypoint-миграций — см. секция 7 «Обновление (deploy)» и `deploy/README.md`).
-- Required GH Secrets: `DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_KEY` (full PEM private key), `DEPLOY_PATH` (обычно `/opt/mail-aggregator`).
-- На сервере должен быть выполнен `docker login ghcr.io` под пользователем `$DEPLOY_USER` (одноразово, см. `docs/SERVER-SETUP.md` Часть A шаг 9).
+- Required GH Secrets (фактические имена/значения, см. `.github/workflows/deploy.yml`):
+  - `DEPLOY_HOST` — прод: `49.12.189.77` (**единственный** Secret, изменённый при переезде 2026-07-01; ранее `132.243.113.117`).
+  - `DEPLOY_USER` — прод: `root`.
+  - `DEPLOY_KEY_B64` — **base64** приватного SSH-ключа (не `DEPLOY_KEY`!). Workflow декодирует его `base64 -d` в `~/.ssh/deploy_key`. base64-кодирование выбрано, потому что однострочное значение без переносов не искажается UI GitHub Secrets. Публичный ключ добавлен в `~root/.ssh/authorized_keys` на сервере; приватный на стороне оператора — `~/.ssh/postapp-deploy`.
+  - `DEPLOY_PATH` — прод: `/opt/mail-agregator` (имя каталога = имя репозитория, одна `g`).
+- **GHCR-образы публичные** — `docker login ghcr.io` на сервере **не требуется** (файла `~/.docker/config.json` нет; `docker compose pull` тянет `ghcr.io/<owner>/<repo>/{api,worker}` анонимно). Если образы когда-либо станут private — вернуть шаг `docker login` (PAT `read:packages`).
 - Concurrency lock `deploy-prod` запрещает параллельные deploy'и разных sha.
 
 ### Quality gates
@@ -720,7 +753,7 @@ docker compose restart api
 Из любого хоста с доступом в Internet (можно с самого сервера):
 
 ```bash
-source /opt/mail-aggregator/.env
+source /opt/mail-agregator/.env
 curl -F "url=https://postapp.store/api/telegram/webhook/${TELEGRAM_WEBHOOK_SECRET}" \
      -F "secret_token=${TELEGRAM_WEBHOOK_SECRET}" \
      "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook"
@@ -753,7 +786,7 @@ docker compose --profile prod up -d --force-recreate api worker
 Затем зарегистрировать push-webhook'и:
 
 ```bash
-source /opt/mail-aggregator/.env
+source /opt/mail-agregator/.env
 for pair in "ivan:${BOT_IVAN_TOKEN}:${BOT_IVAN_WEBHOOK_SECRET}" \
             "alexandra:${BOT_ALEXANDRA_TOKEN}:${BOT_ALEXANDRA_WEBHOOK_SECRET}" \
             "andrei:${BOT_ANDREI_TOKEN}:${BOT_ANDREI_WEBHOOK_SECRET}" \
@@ -800,5 +833,123 @@ TELEGRAM_BOT_ENABLED=false
 ```bash
 curl "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/deleteWebhook"
 ```
+
+---
+
+## 15. Migration to a new server
+
+Runbook переноса всего прода на новый выделенный хост. Референс — фактический переезд 2026-07-01 (`132.243.113.117` → `49.12.189.77`, Hetzner, Ubuntu 26.04, домен `postapp.store`, ADR-0032). Все данные переносятся 1:1; `MAIL_ENCRYPTION_KEY` сохраняется тем же (иначе зашифрованные пароли ящиков и OAuth refresh-токены станут нерасшифровываемыми).
+
+Переиспользует команды бэкапа из секции 8 (`pg_dump` / MinIO `tar`).
+
+### 15.1 Провижининг нового хоста
+
+```bash
+# на НОВОМ сервере (root)
+curl -fsSL https://get.docker.com | sh
+systemctl enable --now docker
+apt-get update && apt-get install -y certbot
+ufw allow 22/tcp && ufw allow 80/tcp && ufw allow 443/tcp && ufw --force enable
+install -d /opt && git clone https://github.com/<owner>/<repo>.git /opt/mail-agregator
+install -d -m 755 /var/www/certbot
+```
+
+Публичный SSH-ключ деплоя (тот же, что в `DEPLOY_KEY_B64`) — в `~root/.ssh/authorized_keys` нового хоста.
+
+### 15.2 Останов записи на СТАРОМ сервере (anti split-brain)
+
+До снятия дампа остановить всё, что пишет в БД/IMAP/шлёт уведомления, иначе новые письма после `pg_dump` потеряются:
+
+```bash
+# на СТАРОМ сервере
+cd /opt/mail-agregator            # (старый путь мог быть /opt/mail-aggregator)
+docker compose --profile prod stop worker api
+```
+
+`postgres`/`minio` оставляем поднятыми — они нужны для дампа. С этого момента начинается короткий downtime.
+
+### 15.3 Снятие дампов на старом сервере
+
+```bash
+# PostgreSQL (custom format — как в секции 8)
+docker exec mas-postgres pg_dump -U mas -d mail_aggregator -F c -f /tmp/dump.bin
+docker cp mas-postgres:/tmp/dump.bin ./pg-dump.bin
+
+# MinIO volume (tar, как в секции 8)
+docker run --rm -v mas_minio_data:/data:ro -v "$PWD":/out alpine \
+  tar czf /out/minio-data.tar.gz -C /data .
+```
+
+### 15.4 Перенос артефактов на новый сервер
+
+Переносятся: `pg-dump.bin`, `minio-data.tar.gz`, `.env` (вербатим, включая тот же `MAIL_ENCRYPTION_KEY`), host-каталог TLS `/etc/letsencrypt`.
+
+```bash
+# со старого хоста (или через промежуточную машину)
+scp pg-dump.bin minio-data.tar.gz root@49.12.189.77:/opt/mail-agregator/
+scp /opt/mail-agregator/.env       root@49.12.189.77:/opt/mail-agregator/.env
+# TLS: сохранить симлинки (live/ ссылается на archive/) — tar с хоста
+tar czf letsencrypt.tar.gz -C /etc letsencrypt
+scp letsencrypt.tar.gz root@49.12.189.77:/tmp/
+```
+
+На новом хосте:
+
+```bash
+cd /opt/mail-agregator
+chmod 600 .env
+tar xzf /tmp/letsencrypt.tar.gz -C /etc        # восстанавливает /etc/letsencrypt (cert postapp.store)
+```
+
+> Перенос `/etc/letsencrypt` целиком нужен, чтобы **не** перевыпускать cert (экономит Let's Encrypt rate-limit) и чтобы renewal продолжил работать. `certbot.timer` на новом хосте подхватит существующий renewal-конфиг после установки пакета `certbot` (шаг 15.1).
+
+### 15.5 Восстановление данных на новом сервере
+
+```bash
+cd /opt/mail-agregator
+# поднять только data-tier (без api/worker/nginx)
+docker compose up -d postgres minio minio-bootstrap
+docker compose run --rm mas-migrations         # создаёт схему в свежем volume
+
+# PostgreSQL restore (как в секции 8)
+docker cp pg-dump.bin mas-postgres:/tmp/dump.bin
+docker exec -i mas-postgres pg_restore -U mas -d mail_aggregator -c /tmp/dump.bin
+
+# MinIO restore: распаковать tar обратно в volume
+docker run --rm -v mas_minio_data:/data -v "$PWD":/in alpine \
+  sh -c "cd /data && tar xzf /in/minio-data.tar.gz"
+```
+
+Затем поднять стек и подтянуть образы:
+
+```bash
+docker compose --profile prod pull api worker      # GHCR публичный — docker login не нужен
+docker compose --profile prod up -d --force-recreate api worker nginx
+docker compose ps
+```
+
+### 15.6 Cutover: переключение трафика и деплоя
+
+Порядок важен, чтобы не осталось split-brain (два живых прода):
+
+1. Убедиться, что новый стек healthy: `docker compose ps`, `curl -ksI https://49.12.189.77/healthz --resolve postapp.store:443:49.12.189.77`.
+2. Обновить **только** GitHub Secret `DEPLOY_HOST` → `49.12.189.77` (`DEPLOY_USER`/`DEPLOY_KEY_B64`/`DEPLOY_PATH` не меняются — user/key/path идентичны).
+3. Перенацелить A-запись `postapp.store` (reg.ru) на `49.12.189.77`. TTL DNS определяет длительность окна, когда часть трафика ещё идёт на старый IP.
+4. Дождаться пропагации DNS: `dig +short postapp.store` → `49.12.189.77`.
+5. Полностью остановить старый прод, чтобы исключить приём почты/уведомлений двумя серверами:
+   ```bash
+   # на СТАРОМ сервере, после подтверждения работы нового
+   docker compose --profile prod down
+   ```
+6. Прогнать post-deploy smoke-test (Part D в `SERVER-SETUP.md`) и, для push-ботов, повторить `setWebhook` не нужно — webhook'и указывают на домен `postapp.store`, а не на IP, поэтому смена IP их не ломает.
+
+### 15.7 Проверка после переезда
+
+- `curl -sSI https://postapp.store/healthz | head -1` → `HTTP/2 200`.
+- `curl -sSI https://postapp.store/healthz | grep -i strict-transport` → HSTS присутствует (TLS-cert валиден, перенесён из `/etc/letsencrypt`).
+- Логин супер-админа → inbox рендерится, письма и вложения на месте (значит pg + MinIO + `MAIL_ENCRYPTION_KEY` перенесены корректно).
+- `docker logs mas-worker --tail 50` → sync-циклы идут без `login failed`/decrypt-ошибок (подтверждает совпадение `MAIL_ENCRYPTION_KEY`).
+- Тестовый push через любого настроенного Telegram-бота доходит (webhook по домену не пострадал).
+- Ручной прогон deploy'а (`workflow_dispatch`) успешно SSH'ится на новый `DEPLOY_HOST`.
 
 ---

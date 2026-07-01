@@ -13,7 +13,10 @@
 #   - minio-bootstrap : one-shot init container (creates bucket, policy,
 #                      service account from MINIO_APP_*). Idempotent.
 #   - nginx     : TLS + reverse proxy (only in prod profile, see profiles)
-#   - certbot   : Let's Encrypt cert renewal loop (only in prod profile)
+#   TLS/certs   : handled at HOST level — host `certbot` + systemd `certbot.timer`
+#                 (webroot /var/www/certbot), certs in host /etc/letsencrypt
+#                 bind-mounted RO into nginx. There is NO certbot service here
+#                 and NO mas_certbot_* volumes (see ADR-0032 / docs/07-deployment.md §6).
 #
 # All services live on a single user-defined bridge network so DNS resolves
 # by service name (postgres / redis / minio / api). No host-port mapping
@@ -351,8 +354,10 @@ services:
   # 127.0.0.1:8080) — nginx is never started.
   #
   # First-run requires a TLS cert: bring up the rest of the stack first,
-  # run certbot in standalone mode (Part B of docs/SERVER-SETUP.md), then
-  # `docker compose --profile prod up -d nginx certbot`.
+  # obtain the cert with the HOST certbot (webroot/standalone, Part B of
+  # docs/SERVER-SETUP.md) into host /etc/letsencrypt, then
+  # `docker compose --profile prod up -d nginx`. Renewal is the host
+  # `certbot.timer`; there is no certbot container (ADR-0032).
   # -------------------------------------------------------------------------
   nginx:
     image: nginx:1.27-alpine

@@ -12,16 +12,16 @@
 #      is up), then assert healthchecks.
 #
 # Required GitHub Secrets (Settings → Secrets and variables → Actions):
-#   DEPLOY_HOST  — public IP / DNS name
-#   DEPLOY_USER  — ssh login user (must be in the docker group on the host)
-#   DEPLOY_KEY   — full PEM of the private SSH key (matching the public key
-#                  added to ~$DEPLOY_USER/.ssh/authorized_keys)
-#   DEPLOY_PATH  — absolute path to the checkout on the server (e.g.
-#                  /opt/mail-aggregator)
+#   DEPLOY_HOST    — public IP / DNS name
+#   DEPLOY_USER    — ssh login user (root in prod; must be in the docker group)
+#   DEPLOY_KEY_B64 — base64 of the private SSH key PEM (decoded with `base64 -d`
+#                    below; matching pubkey in ~$DEPLOY_USER/.ssh/authorized_keys)
+#   DEPLOY_PATH    — absolute path to the checkout on the server
+#                    (prod: /opt/mail-agregator)
 #
 # The host must already be bootstrapped per docs/SERVER-SETUP.md (Docker
-# installed, repo cloned to $DEPLOY_PATH, .env populated, GHCR `docker login`
-# done so `docker compose pull` can read private images).
+# installed, repo cloned to $DEPLOY_PATH, .env populated). GHCR images are
+# PUBLIC — no `docker login` on the host is required for `docker compose pull`.
 # ---------------------------------------------------------------------------
 
 name: Deploy

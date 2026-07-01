@@ -13,7 +13,8 @@
 | [`04-api-contracts.md`](./04-api-contracts.md) | Все REST endpoints (auth / user / admin), схемы request/response, коды ошибок. | actual |
 | [`05-modules.md`](./05-modules.md) | Модули backend + frontend: ответственность, публичный API, зависимости, инварианты. Базис для исполнителей. | actual |
 | [`06-security.md`](./06-security.md) | STRIDE-анализ, шифрование почтовых паролей (AES-256-GCM), хеширование паролей (argon2id), сессии, CSRF, rate-limit, audit log, ротация ключей. | actual |
-| [`07-deployment.md`](./07-deployment.md) | docker-compose, env-переменные, volumes, healthchecks, CI/CD, observability. | actual |
+| [`07-deployment.md`](./07-deployment.md) | docker-compose, env-переменные, volumes, healthchecks, TLS (host-certbot), CI/CD, observability, migration to a new server (sec. 15). | actual |
+| [`SERVER-SETUP.md`](./SERVER-SETUP.md) | Операторский runbook: провижининг хоста, DNS, host-certbot, GitHub Secrets, деплой, бэкапы, ротация секретов. Процедурный компаньон к `07-deployment.md`. | actual |
 | [`08-frontend.md`](./08-frontend.md) | UX-флоу, wireframe-описания страниц, список Jinja2-шаблонов и JS-компонентов. | actual |
 | [`100-known-tech-debt.md`](./100-known-tech-debt.md) | Реестр осознанных компромиссов и отложенных работ (TD-NNN). | actual |
 | [`adr/INDEX.md`](./adr/INDEX.md) | Реестр всех архитектурных решений (ADR). | actual |
