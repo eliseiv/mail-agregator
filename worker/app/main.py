@@ -35,6 +35,7 @@ from shared.logging import configure_logging, get_logger
 from shared.redis_client import close_redis
 from shared.storage import get_storage
 from worker.app.cleanup import retention_cleanup
+from worker.app.mailbox_alert_dispatch import mailbox_alert_dispatch
 from worker.app.push_notify_dispatch import push_notify_dispatch
 from worker.app.sync_cycle import force_sync_dispatch, sync_cycle
 from worker.app.tg_notify_dispatch import tg_notify_dispatch
@@ -123,6 +124,18 @@ async def _safe_push_notify_dispatch() -> None:
     except Exception as exc:
         log.error(
             "push_notify_dispatch_unhandled",
+            detail=str(exc)[:300],
+            exc_info=True,
+        )
+
+
+async def _safe_mailbox_alert_dispatch() -> None:
+    """Wrapper for the mailbox-down Telegram alert dispatcher (ADR-0033 §4)."""
+    try:
+        await mailbox_alert_dispatch()
+    except Exception as exc:
+        log.error(
+            "mailbox_alert_dispatch_unhandled",
             detail=str(exc)[:300],
             exc_info=True,
         )
@@ -235,6 +248,18 @@ async def main() -> None:
             max_instances=1,
             misfire_grace_time=30,
         )
+    # ADR-0033 §4: mailbox-down Telegram alert dispatcher (drains Redis queue).
+    # Registered ONLY when the feature is enabled; no recovery job
+    # (fire-and-forget, TD-042).
+    if settings.MAILBOX_DOWN_ALERT_ENABLED:
+        scheduler.add_job(
+            _safe_mailbox_alert_dispatch,
+            trigger=IntervalTrigger(seconds=settings.MAILBOX_ALERT_DISPATCH_INTERVAL_SECONDS),
+            id="mailbox_alert_dispatch",
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=30,
+        )
     # ADR-0023 §3.3: outbound-webhook dispatcher (drains Redis queue).
     scheduler.add_job(
         _safe_webhook_dispatch,
@@ -267,6 +292,7 @@ async def main() -> None:
         tg_notify_dispatch_seconds=settings.TG_NOTIFY_DISPATCH_INTERVAL_SECONDS,
         tg_notify_recovery_seconds=settings.TG_NOTIFY_RECOVERY_INTERVAL_SECONDS,
         push_team_bots_enabled=settings.push_team_bots_enabled,
+        mailbox_down_alert_enabled=settings.MAILBOX_DOWN_ALERT_ENABLED,
         webhook_dispatch_seconds=settings.WEBHOOK_DISPATCH_INTERVAL_SECONDS,
         webhook_recovery_seconds=settings.WEBHOOK_RECOVERY_INTERVAL_SECONDS,
     )

@@ -88,6 +88,17 @@ class MailAccount(Base):
     consecutive_failures: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=text("0")
     )
+    # ADR-0033: idempotency stamp for the "mailbox auto-disabled" Telegram
+    # alert. NULL = no outstanding alert (normal state of an active mailbox).
+    # Set ``= now()`` guarded (``WHERE disabled_alert_sent_at IS NULL``) in the
+    # same transaction as ``is_active=false`` inside
+    # ``worker.sync_cycle._disable_after_failures`` — one alert per
+    # Active→Disabled transition. Reset to NULL on re-enable
+    # (``MailAccountService.update`` creds-changed branch). Migration
+    # ``20260703_020``.
+    disabled_alert_sent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("now()")
     )

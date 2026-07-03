@@ -311,8 +311,10 @@ POST /api/mail-accounts HTTP/1.1
 Content-Type: application/x-www-form-urlencoded
 Cookie: mas_session=...; mas_csrf=...
 
-email=user%40gmail.com&password=secret&imap_host=imap.gmail.com&imap_port=993&imap_ssl=on&smtp_host=smtp.gmail.com&smtp_port=465&smtp_ssl=on&group_id=3&csrf_token=...
+email=user%40gmail.com&password=secret&imap_host=imap.gmail.com&imap_port=993&imap_ssl=on&smtp_host=smtp.gmail.com&smtp_port=587&smtp_starttls=on&group_id=3&csrf_token=...
 ```
+> Пример использует **587/STARTTLS** (ADR-0032 follow-up: прод-сервер блокирует TCP 465). Провайдер-пресеты (`05-modules.md` §9) авто-подставляют `smtp_port=587`, `smtp_ssl` off, `smtp_starttls` on для password-провайдеров; `smtp_ssl` и `smtp_starttls` взаимоисключаемы (CHECK).
+
 Чекбоксы (`imap_ssl`, `smtp_ssl`, `smtp_starttls`): значение `on`/`true`/`1` → true; отсутствие поля → false. Опциональные поля (`smtp_username`, `smtp_password`) — допускают пустую строку, backend интерпретирует как «не задано». Поле `group_id` (ADR-0031): отсутствие/пустая строка → не передано (домашняя группа владельца); значение → выбранная команда (валидируется по роли). Для `super_admin` пустое значение в селекторе «Без команды» означает `NULL` — backend интерпретирует явный выбор «Без команды» как `group_id=null` (form-маркер — см. `08-frontend.md` §4.7).
 
 ##### Form-encoded response
@@ -581,6 +583,7 @@ csrf_token=...
 #### `PATCH /api/me/settings` (ADR-0022 §2.7)
 | Запрос | `{tg_notifications_enabled?: bool}` — любое подмножество. На текущей итерации поддерживается только `tg_notifications_enabled`; в будущем добавятся другие preferences. |
 | Поведение | Upsert в `users_settings` (`INSERT … ON CONFLICT (user_id) DO UPDATE SET tg_notifications_enabled=EXCLUDED.tg_notifications_enabled, updated_at=now()`). |
+| Область opt-out | `tg_notifications_enabled=false` подавляет **и** push-уведомления о письмах (ADR-0022 §2), **и** алерты о нерабочей почте (ADR-0033) — оба канала используют один и тот же предикат получателей с `COALESCE(us.tg_notifications_enabled, true)=true`. Отдельного тумблера для mailbox-down-алертов нет. |
 | Доступ | user-сессия (любая роль). |
 | CSRF | yes. |
 | 200 | `{tg_notifications_enabled: bool}` — итоговое значение. |

@@ -249,6 +249,19 @@ class Settings(BaseSettings):
     # Per-tick LPOP batch size (cap on push dispatcher throughput / tick).
     PUSH_NOTIFY_BATCH_SIZE: int = Field(default=30, ge=1, le=500)
 
+    # --- Mailbox-down Telegram alert (ADR-0033) ---------------------------
+    # Kill-switch for the "mailbox auto-disabled" Telegram alert. ``false`` →
+    # worker neither enqueues (``_disable_after_failures``) nor registers the
+    # ``mailbox_alert_dispatch`` job. The ``disabled_alert_sent_at`` stamp is
+    # still written in the disable transaction (does not break idempotency if
+    # the feature is enabled later). Delivery uses the MAIN bot (``BOT_TOKEN``)
+    # — no new secret (ADR-0033 §8).
+    MAILBOX_DOWN_ALERT_ENABLED: bool = Field(default=True)
+    # Interval of the ``mailbox_alert_dispatch`` APScheduler job (§14.3).
+    MAILBOX_ALERT_DISPATCH_INTERVAL_SECONDS: int = Field(default=5, ge=1, le=600)
+    # Per-tick ``LPOP count`` from ``mailbox_alert_queue``.
+    MAILBOX_ALERT_BATCH_SIZE: int = Field(default=30, ge=1, le=500)
+
     # --- Outlook OAuth2 (ADR-0025, Sprint B) ------------------------------
     # Azure App (Personal Microsoft accounts only) credentials. When BOTH
     # client id and secret are set, ``outlook_oauth_enabled`` flips on and the

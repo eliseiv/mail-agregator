@@ -669,6 +669,10 @@ class MailAccountService:
             update_fields["is_active"] = True
             update_fields["last_sync_error"] = None
             update_fields["consecutive_failures"] = 0
+            # ADR-0033: re-enabling the mailbox (Disabled → Active) resets the
+            # alert idempotency stamp so a *subsequent* auto-disable generates a
+            # fresh alert (repeat only on an honest re-enable → disable).
+            update_fields["disabled_alert_sent_at"] = None
 
         await self._repo.update_fields(account_id, **update_fields)
         refreshed = await self._repo.get_by_id(account_id)

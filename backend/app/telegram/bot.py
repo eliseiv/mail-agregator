@@ -269,7 +269,7 @@ async def send_notification(  # noqa: PLR0911 - each return is a distinct, docum
     *,
     chat_id: int,
     text_html: str,
-    message_id: int,
+    message_id: int | None = None,
     bot_token: str | None = None,
     with_button: bool = True,
 ) -> SendNotificationResult:
@@ -288,6 +288,10 @@ async def send_notification(  # noqa: PLR0911 - each return is a distinct, docum
     ``with_button`` (ADR-0027 §7): when ``False`` no ``reply_markup`` is
     attached. Push bots have no webhook, so the callback ``msg:{id}`` button
     would lead nowhere (a hung spinner) — they pass ``False``.
+
+    ``message_id`` (ADR-0033): identifies the message for the callback button
+    and is only used when ``with_button=True``. The mailbox-down alert has no
+    message, so it passes ``message_id=None`` with ``with_button=False``.
     """
     settings = get_settings()
     if bot_token is None and not settings.telegram_bot_enabled:

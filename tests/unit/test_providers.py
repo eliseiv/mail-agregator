@@ -26,16 +26,37 @@ class TestKnownDomains:
     """
 
     def test_gmail_returns_imap_gmail_with_ssl(self) -> None:
+        # ADR-0032 follow-up: prod host blocks outbound :465 → SMTP on
+        # :587/STARTTLS for all password providers (IMAP stays :993 SSL).
         hint = suggest_provider_defaults("alice@gmail.com")
         assert hint == ProviderHint(
             imap_host="imap.gmail.com",
             imap_port=993,
             imap_ssl=True,
             smtp_host="smtp.gmail.com",
-            smtp_port=465,
-            smtp_ssl=True,
-            smtp_starttls=False,
+            smtp_port=587,
+            smtp_ssl=False,
+            smtp_starttls=True,
         )
+
+    @pytest.mark.parametrize(
+        "domain,imap_host,smtp_host",
+        [
+            ("aol.com", "imap.aol.com", "smtp.aol.com"),
+            ("yahoo.com", "imap.mail.yahoo.com", "smtp.mail.yahoo.com"),
+        ],
+    )
+    def test_aol_yahoo_presets_use_587_starttls(
+        self, domain: str, imap_host: str, smtp_host: str
+    ) -> None:
+        hint = suggest_provider_defaults(f"user@{domain}")
+        assert hint is not None
+        assert hint.imap_host == imap_host
+        assert hint.imap_ssl is True
+        assert hint.smtp_host == smtp_host
+        assert hint.smtp_port == 587
+        assert hint.smtp_ssl is False
+        assert hint.smtp_starttls is True
 
     def test_googlemail_alias_matches_gmail(self) -> None:
         a = suggest_provider_defaults("a@gmail.com")

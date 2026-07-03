@@ -35,7 +35,16 @@ from shared.logging import get_logger
 
 log = get_logger(__name__)
 
-_SMTP_TIMEOUT = 60
+# ADR-0033 / ADR-0032 follow-up: fail-fast SMTP timeout. A hung or blocked
+# SMTP connect (e.g. provider silently drops outbound :465, or the server
+# never answers the banner) must surface as a domain error long before
+# nginx ``proxy_read_timeout`` (60s) turns it into a 504. Invariant (QA §21):
+# ``_SMTP_TIMEOUT <= 25`` AND ``_SMTP_TIMEOUT + _IMAP_APPEND_TIMEOUT + 5 < 60``
+# (20 + 30 + 5 = 55 < 60). ``aiosmtplib`` applies this single timeout to the
+# whole connect+STARTTLS+AUTH+DATA sequence, so a stuck connect raises
+# ``SMTPConnectError`` / ``SMTPTimeoutError`` (both ``SMTPException``
+# subclasses) within 20s → mapped to ``SMTPSendFailedError`` below.
+_SMTP_TIMEOUT = 20
 _IMAP_APPEND_TIMEOUT = 30
 
 

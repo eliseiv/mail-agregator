@@ -260,6 +260,62 @@ class TelegramNotificationsRepo:
             RecipientTag(id=int(row.id), name=str(row.name), color=str(row.color)) for row in result
         ]
 
+    async def list_recipients_for_mailbox(self, *, mail_account_id: int) -> list[NotifyRecipient]:
+        """Recipients of a mailbox-down alert (ADR-0033 §3).
+
+        Twin of :meth:`list_recipients_for_message` but resolved **by mailbox**
+        instead of by message. Same visibility predicate (super_admin OR
+        membership in the mailbox's team via ``user_groups`` per ADR-0030 OR
+        the owner) + a live ``telegram_links`` row (``dead_at IS NULL``) +
+        opt-out via ``users_settings.tg_notifications_enabled``, but **without**
+        any per-message predicate:
+
+        - **No** ``m.internal_date >= tl.created_at`` (first-link backfill guard)
+          — a mailbox-down alert has no message/time; disabling is a *current*
+          operational event that any *currently* linked recipient must receive,
+          regardless of when they linked Telegram.
+        - **No** tag predicate / ``TG_NOTIFY_ALL_MESSAGES`` toggle — tags relate
+          to messages, not to mailbox state.
+
+        Returns one row per eligible recipient. ``mail_account_id`` is carried
+        into each :class:`NotifyRecipient` from the input (there is no message
+        here) so the caller keeps the shared dataclass. Per-chat dedup by
+        ``telegram_user_id`` happens in the dispatcher (§14.3).
+        """
+        stmt = text(
+            """
+            SELECT DISTINCT
+                   u.id                AS user_id,
+                   tl.telegram_user_id AS telegram_user_id
+            FROM   mail_accounts ma
+            JOIN   users u
+                   ON (
+                       u.role = 'super_admin'
+                       OR (ma.group_id IS NOT NULL AND EXISTS (
+                              SELECT 1 FROM user_groups ug
+                              WHERE  ug.user_id = u.id
+                                AND  ug.group_id = ma.group_id
+                          ))
+                       OR u.id = ma.user_id
+                   )
+            JOIN   telegram_links tl
+                   ON tl.user_id = u.id
+                   AND tl.dead_at IS NULL
+            LEFT JOIN users_settings us ON us.user_id = u.id
+            WHERE  ma.id = :mail_account_id
+              AND  COALESCE(us.tg_notifications_enabled, true) = true
+            """
+        )
+        result = await self._s.execute(stmt, {"mail_account_id": mail_account_id})
+        return [
+            NotifyRecipient(
+                user_id=int(row.user_id),
+                telegram_user_id=int(row.telegram_user_id),
+                mail_account_id=mail_account_id,
+            )
+            for row in result
+        ]
+
     async def list_missing_for_recovery(self, *, window_hours: int, limit: int) -> list[int]:
         """SQL from ADR-0022 §2.8 (round-33 per-recipient; round-35 / ADR-0024
         §7 per-chat).

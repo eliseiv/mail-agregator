@@ -116,7 +116,7 @@ backend/
       audit.py
       tags.py               # TagsRepo, TagRulesRepo, MessageTagsRepo
       telegram_links.py     # ADR-0022 + ADR-0024 — TelegramLinksRepo (get_active_*, list_by_user_id, list_active_by_user_id, upsert, delete_all_by_user_id, delete_one, mark_dead/mark_alive)
-      telegram_notifications.py  # ADR-0022 + ADR-0024 — TelegramNotificationsRepo (try_reserve(message_id,user_id,telegram_user_id), mark_sent, rollback, list_recipients_for_message, list_tags_for_message, list_missing_for_recovery per (message_id,telegram_user_id))
+      telegram_notifications.py  # ADR-0022 + ADR-0024 — TelegramNotificationsRepo (try_reserve(message_id,user_id,telegram_user_id), mark_sent, rollback, list_recipients_for_message, list_tags_for_message, list_missing_for_recovery per (message_id,telegram_user_id), list_recipients_for_mailbox — ADR-0033)
       user_settings.py      # ADR-0022 — UserSettingsRepo (get, upsert)
       webhooks.py           # ADR-0023 — WebhooksRepo (get_by_group_id, reserve_id, insert_with_explicit_id, update_*, set_active, delete, mark_dead/success, bump_failures, touch_last_error, find_active_for_message)
       webhook_deliveries.py # ADR-0023 — WebhookDeliveriesRepo (try_reserve, mark_sent, mark_failed, rollback, list_tags_for_team, list_missing_for_recovery)
@@ -960,9 +960,22 @@ UI везде использует helper `effective_account_label(account) = ac
 - Provider defaults (helper):
 ```python
 def suggest_provider_defaults(email: str) -> ProviderHint | None
-# домен → ProviderHint(imap_host, imap_port=993, imap_ssl=True, smtp_host, smtp_port=465|587, smtp_ssl|smtp_starttls)
+# домен → ProviderHint(imap_host, imap_port=993, imap_ssl=True, smtp_host, smtp_port, smtp_ssl, smtp_starttls)
 ```
-Поддерживаемые домены (на старт): `gmail.com`, `googlemail.com`, `yandex.ru`, `yandex.com`, `mail.ru`, `inbox.ru`, `bk.ru`, `list.ru`, `outlook.com`, `hotmail.com`, `live.com`. Хардкод-таблица в `accounts/providers.py`.
+
+**Провайдер-пресеты (ADR-0032 follow-up: прод-сервер Hetzner блокирует исходящий TCP 465, работает 587/STARTTLS).** Хардкод-таблица `accounts/providers.py` (backend — источник истины) и зеркало в `static/js/account_form.js` (§16 frontend). IMAP у всех — `:993 SSL` (не меняется); SMTP переведён на `587 STARTTLS` для всех password-провайдеров:
+
+| Домены | IMAP | SMTP (после ADR-0032 follow-up) |
+| --- | --- | --- |
+| `gmail.com`, `googlemail.com` | `imap.gmail.com:993 SSL` | `smtp.gmail.com:587` `ssl=false`,`starttls=true` |
+| `yandex.ru` | `imap.yandex.ru:993 SSL` | `smtp.yandex.ru:587` `ssl=false`,`starttls=true` |
+| `yandex.com` | `imap.yandex.com:993 SSL` | `smtp.yandex.com:587` `ssl=false`,`starttls=true` |
+| `mail.ru`, `inbox.ru`, `bk.ru`, `list.ru` | `imap.mail.ru:993 SSL` | `smtp.mail.ru:587` `ssl=false`,`starttls=true` |
+| `aol.com` **(новый пресет)** | `imap.aol.com:993 SSL` | `smtp.aol.com:587` `ssl=false`,`starttls=true` |
+| `yahoo.com` **(новый пресет)** | `imap.mail.yahoo.com:993 SSL` | `smtp.mail.yahoo.com:587` `ssl=false`,`starttls=true` |
+| `outlook.com`, `hotmail.com`, `live.com` | `outlook.office365.com:993 SSL` | `smtp.office365.com:587` `ssl=false`,`starttls=true` (уже было 587) |
+
+Поддерживаемые домены — **13** (было 11): добавлены `aol.com`, `yahoo.com`; ранее `gmail`/`yandex`/`mail.ru`-семейства были на `465 SSL` — переведены на `587 STARTTLS`. `smtp_ssl` и `smtp_starttls` взаимоисключаемы (CHECK). Backend re-валидирует IMAP/SMTP на POST/test, поэтому дрейф между таблицами безвреден; при добавлении/смене пресета обе таблицы правятся синхронно (backend-агент — `providers.py`, frontend-агент — `account_form.js`).
 
 ### Зависимости
 - repositories.mail_accounts, repositories.groups (ADR-0031 — валидация целевой команды через `GroupsRepo`), repositories.audit (ADR-0031 — `mail_account_group_change` при переносе), crypto, imap-tools (для теста), aiosmtplib (для теста), redis (force_sync маркер).
@@ -984,6 +997,14 @@ stateDiagram-v2
 > circuit-breaker не сработал в этом цикле. TRANSIENT-ошибки (DNS/таймаут/сеть/«too many
 > simultaneous connections»/нераспознанное) **никогда** не ведут в `Disabled` и не инкрементят
 > счётчик — аккаунт остаётся `Active` и само-восстанавливается следующим успешным циклом.
+
+> **ADR-0033 (Telegram-алерт об отключении):** переход `Active → Disabled` воркером ставит штамп
+> `disabled_alert_sent_at=now()` (guarded) и enqueue'ит один Telegram-алерт (§14 enqueue, §14.3
+> доставка). Обратный переход `Disabled → Active` (`user PATCH (re-test passes)`) — в
+> `MailAccountService.update` ветка `creds_changed` **дополнительно сбрасывает
+> `disabled_alert_sent_at = NULL`** рядом с `is_active=True`/`last_sync_error=None`/
+> `consecutive_failures=0`, чтобы следующий disable снова сгенерировал алерт (повтор только на честном
+> re-enable → disable). Ручное отключение (`is_active=false`) штамп не ставит и алерт не шлёт.
 
 ### Edge cases
 - IMAP login OK, но INBOX недоступен (?нет таких прав) — `imap_login_failed` с `details.detail="cannot_select_inbox"`.
@@ -1149,6 +1170,7 @@ def build_mime(
 - `in_reply_to_message_id` не принадлежит пользователю -> 404.
 - BCC: backend убирает из MIME (BCC по определению не в headers); SMTP RCPT TO добавляется отдельно.
 - SMTP вернул soft fail (4xx) -> 502 (не сохраняем sent_message).
+- **Заблокированный/зависший SMTP-connect (ADR-0032 follow-up).** Прод-сервер Hetzner блокирует исходящий TCP 465 → connect к `smtp.*:465` зависает до таймаута. Раньше `_SMTP_TIMEOUT=60` совпадал с nginx `proxy_read_timeout 60s` → зависший connect отдавал клиенту **504** (nginx), а не чистую доменную ошибку. Фикс: `_SMTP_TIMEOUT` снижен до **fail-fast 20s** (см. Инварианты) — `aiosmtplib.send(..., timeout=20)` ограничивает и connect, и command-фазу; блокированный/зависший SMTP кидает `SMTPException`/`TimeoutError`/`OSError`, которые уже ловятся и мапятся в `SMTPSendFailedError` → доменный **502 JSON** задолго до nginx-60s. Тот же таймаут — в OAuth-пути `_smtp_send_oauth` (явный `connect()`).
 - IMAP APPEND fail -> sent_message сохранён, `appended_to_sent=false`, `appended_error="..."`. Возвращаем 200 (отправка успешна!).
 - Адреса в TO/CC/BCC: валидация по RFC 5322; <2k chars total в строке заголовка (RFC limit на soft-line — 998, на hard — 78; lib `email.policy.SMTP` нормализует).
 
@@ -1156,6 +1178,7 @@ def build_mime(
 - `smtp_message_id` уникален и соответствует header `Message-ID:`.
 - `INSERT INTO sent_messages` происходит ТОЛЬКО после успешной SMTP-отправки.
 - IMAP APPEND — best-effort, не влияет на успех endpoint'а.
+- **SMTP send timeout < nginx `proxy_read_timeout` (ADR-0032 follow-up).** Инвариант отказоустойчивости: суммарный worst-case времени SMTP-пути на одном запросе `POST /api/messages/send` должен быть **строго меньше** nginx `proxy_read_timeout` (60s, `deploy/nginx/templates/default.conf.template`), чтобы клиент всегда получал доменный 502/JSON, а не сырой **504** от nginx на зависшем upstream. Составная граница: `_SMTP_TIMEOUT` (20s) + best-effort IMAP APPEND (`_IMAP_APPEND_TIMEOUT + 5` = 35s, выполняется **после** успешной отправки) = 55s < 60s (запас ~5s). `_SMTP_TIMEOUT` держать `≤ 25` при неизменном nginx-60s. Значение — константа модуля `send/service.py`, не env.
 
 ### Content negotiation (no-JS fallback)
 
@@ -1499,6 +1522,18 @@ disable** для всех permanent-аккаунтов этого цикла (в
    `_disable_after_failures` (disable + audit `account_auto_disabled`,
    `details.reason="N_consecutive_failures"` или `"auth_failed"`/`"decrypt_fail"`).
 
+**Telegram-алерт об авто-отключении (ADR-0033).** `_disable_after_failures` — **единственная** точка
+авто-disable и потому единственный триггер алерта. В **той же транзакции**, где `is_active=false` +
+audit `account_auto_disabled`, guarded-UPDATE ставит штамп
+`disabled_alert_sent_at = now() WHERE id=:id AND disabled_alert_sent_at IS NULL` (idempotency «ровно
+один алерт на переход», ADR-0033 §2). **После COMMIT**, если штамп реально проставился (переход
+`NULL → now()`) и `MAILBOX_DOWN_ALERT_ENABLED=true`, — `LPUSH mailbox_alert_queue
+{v,mail_account_id,reason}` (тот же `reason`, что в audit). LPUSH в `try/except` с логом — сбой Redis
+**никогда** не роняет цикл (изоляция как у `tg_notify` enqueue). Circuit-breaker-подавление, transient,
+OAuth needs-consent и **ручное** отключение пользователем алерт **не** триггерят (штамп ставится только
+здесь). Доставка — §14.3. Сброс штампа в `NULL` — при re-enable ящика (`MailAccountService.update`,
+ветка `creds_changed`, §9).
+
 **Наблюдаемость подавлённых permanent (ADR-0026 §3):** `last_sync_error` пишется в фазе 1 для **ВСЕХ**
 ошибок, **включая permanent, подавлённые брейкером** — поэтому в UI у каждого реально-протухшего
 ящика виден его конкретный `last_sync_error`, даже когда disable подавлён и аккаунт остался `Active`.
@@ -1587,7 +1622,7 @@ async def tg_notify_recovery_scan() -> None   # APScheduler interval=1h; max_ins
 
 ### Зависимости
 - redis (LPOP с count, LPUSH; per-chat token-bucket `rl:tg_send:<chat_id>`).
-- repositories: `telegram_notifications` (try_reserve, mark_sent, rollback, list_recipients_for_message, list_tags_for_message), `telegram_links` (mark_dead), `mail_accounts`/`messages` (контекст — acc label, from_name|from_addr).
+- repositories: `telegram_notifications` (try_reserve, mark_sent, rollback, list_recipients_for_message, list_tags_for_message; **+ `list_recipients_for_mailbox` — ADR-0033 §3, используется отдельным job `mailbox_alert_dispatch` §14.3, не этим диспатчером**), `telegram_links` (mark_dead), `mail_accounts`/`messages` (контекст — acc label, from_name|from_addr).
 - `backend/app/rate_limit.py:try_consume` (неблокирующий per-chat throttle, round-31).
 - `backend/app/telegram/bot.py:send_notification`.
 - audit (для mark-dead).
@@ -1788,6 +1823,94 @@ async def dispatch_one_payload(message_id: int) -> DispatchOneResult
 - `X-Webhook-Secret` plaintext **не** появляется в логах ни на одном уровне (redact-list по ключам `secret`, `X-Webhook-Secret`, `secret_plaintext`).
 - Recovery_scan не «оживляет» письма, пришедшие до создания webhook'а (фильтр `m.internal_date >= w.created_at`).
 - Receiver-side `response_excerpt` усечён до 500 байт; гарантирует ограниченный размер строки в БД даже при receiver'е, возвращающем большой body.
+
+---
+
+## 14.3. worker — mailbox_alert_dispatch (Telegram-алерт об авто-отключённой почте)
+
+Источник истины — [ADR-0033](./adr/ADR-0033-mailbox-down-telegram-alert.md).
+
+### Назначение
+Доставить **одно** Telegram-уведомление получателям об **авто-отключении** почтового ящика воркером
+(permanent-ошибка → `is_active=false`, ADR-0026 §3). Enqueue — в `_disable_after_failures` (§14).
+Доставка — основным ботом ADR-0022 (`send_notification`), **не** push-ботами ADR-0027.
+
+### Публичный API
+```python
+async def mailbox_alert_dispatch() -> None   # APScheduler interval=MAILBOX_ALERT_DISPATCH_INTERVAL_SECONDS (5s); max_instances=1, coalesce=True
+```
+Регистрируется в `worker/app/main.py` рядом с `tg_notify_dispatch`/`push_notify_dispatch` через
+`_safe_*`-wrapper (unhandled-исключение логируется, scheduler не падает). Job активен только при
+`MAILBOX_DOWN_ALERT_ENABLED=true`.
+
+### Зависимости
+- redis (LPOP с count, LPUSH enqueue со стороны `_disable_after_failures`).
+- `TelegramNotificationsRepo.list_recipients_for_mailbox(mail_account_id)` (новый метод, §18) — получатели
+  по ящику под тем же visibility-предикатом, что уведомления о письмах (ADR-0022 §2.2), **без**
+  per-message-предикатов.
+- `repositories.mail_accounts.get_by_id` — `acc_label = display_name or email` для текста.
+- `backend/app/telegram/bot.py:send_notification` (основной бот; `message_id=None` — кнопки «Посмотреть
+  сообщение» нет).
+- `TelegramSSOService.mark_link_dead` (при 403/400 от Bot API — per-chat, ADR-0024 §2/§7).
+
+### Очередь и payload
+- Ключ Redis: `mailbox_alert_queue` (LIST).
+- Payload: `{"v":1, "mail_account_id": <int>, "reason": <str>}`, где `reason ∈ {auth_failed, decrypt_fail,
+  N_consecutive_failures}` (тот же, что audit `account_auto_disabled.details.reason`).
+
+### Алгоритм
+```text
+1. items = redis.lpop("mailbox_alert_queue", count=MAILBOX_ALERT_BATCH_SIZE)   # default 30
+2. if not items: return
+3. for raw in items:
+     p = parse(raw); if malformed: log + skip                                  # не ре-энквьюим (не станет валидным)
+     account = mail_accounts.get_by_id(p.mail_account_id); if None: log + skip  # ящик удалён между enqueue и dispatch
+     recipients = list_recipients_for_mailbox(p.mail_account_id)               # §18 / ADR-0033 §3
+     if not recipients: continue
+     dedup recipients by telegram_user_id                                       # per-chat dedup в пределах алерта
+     text = format_mailbox_down(acc_label=account.display_name or account.email, reason=p.reason)  # ADR-0033 §5
+     for chat_id in recipients:
+        outcome = send_notification(chat_id, text_html=text, message_id=None)
+        ok            -> log tg_mailbox_alert_sent
+        dead(403/400) -> mark_link_dead(chat_id, user_id, reason); log
+        429/5xx/net   -> log + ДРОП (fire-and-forget, НЕ ре-энквьюим — TD-042)
+4. log event=mailbox_alert_dispatch_finish (sent, dead, dropped)
+```
+
+### Текст (ADR-0033 §5)
+```
+⚠️ Почта <b>{acc_label}</b> не работает: {reason_ru}. Синхронизация приостановлена — проверьте пароль/настройки.
+```
+`{reason_ru}` детерминированно маппится из `reason`: `auth_failed` → «ошибка авторизации (неверный
+пароль или логин)»; `decrypt_fail` → «ошибка расшифровки сохранённых учётных данных»;
+`N_consecutive_failures` → «почтовый сервер недоступен (N неудачных попыток подряд)». Все
+user-controlled значения (`acc_label`) → `html.escape()` (parse_mode=HTML). Сырой `last_sync_error` в
+чат **не** попадает (безопасность — `06-security.md` §1.9).
+
+### Идемпотентность
+- **Кросс-цикловая** — штамп `mail_accounts.disabled_alert_sent_at` (ADR-0033 §2): enqueue возможен
+  только на переход `NULL → now()`, поэтому один алерт на переход; повтор — только после re-enable
+  (сброс в `NULL`) → нового disable. Отдельной таблицы-реестра доставок (как `telegram_notifications`
+  для писем) **нет** — идемпотентность на уровне ящика, а не пары ящик-чат.
+- **Внутри одного алерта** — per-chat dedup по `telegram_user_id` (multi-link ADR-0024 / owner∩super_admin
+  overlap коллапсируются).
+
+### Edge cases
+- Redis недоступен на LPOP — APScheduler следующий тик повторит; штамп уже в БД (повтор enqueue не
+  возникнет), но недоставленный текущий алерт — потерян (fire-and-forget, TD-042).
+- Ящик удалён/переехал между enqueue и dispatch — `get_by_id` None → skip; либо `list_recipients_for_mailbox`
+  вернёт актуальный (после переноса ADR-0031) набор — видимость пересчитывается на каждый dispatch.
+- Получатель заблокировал бота (403) → `mark_link_dead` per-chat; остальные привязки не тронуты.
+- Нет живых привязок / все opt-out → `recipients` пуст → тихо пропускаем (алерт всё равно виден в UI как
+  `is_active=false` + `last_sync_error`).
+
+### Инварианты
+- Ровно один алерт на переход `Active → Disabled` (штамп-guard, ADR-0033 §2).
+- Ручное отключение пользователем и circuit-breaker-подавление алерт **не** генерируют.
+- `sync_cycle` никогда не падает из-за ошибок Bot API/Redis на этом пути (LPUSH в try/except, §14).
+- Bot API token не появляется в логах (redact-list, как §14.1).
+- Получатель видит ровно те ящики, что и в UI (visibility-предикат идентичен `list_recipients_for_message`,
+  минус per-message-предикаты).
 
 ---
 
@@ -2215,6 +2338,20 @@ class TelegramNotificationsRepo:
     async def list_missing_for_recovery(...) -> list[int]                      # ADR-0024 §7 — NOT EXISTS per (message_id, telegram_user_id)
     async def list_tags_for_message(message_id: int) -> list[RecipientTag]      # round-12: ОДИН раз на письмо, не per-recipient
         # SELECT t.id, t.name, t.color FROM message_tags mt JOIN tags t ON t.id=mt.tag_id WHERE mt.message_id=:mid ORDER BY mt.tag_id
+    async def list_recipients_for_mailbox(mail_account_id: int) -> list[NotifyRecipient]   # ADR-0033 §3 — используется job'ом mailbox_alert_dispatch (§14.3)
+        # Близнец list_recipients_for_message, но резолвит получателей ПО ЯЩИКУ (не по письму):
+        # ТОТ ЖЕ visibility-предикат (super_admin OR членство user_groups в ma.group_id (ADR-0030) OR owner)
+        #   + живой telegram_links (dead_at IS NULL) + COALESCE(us.tg_notifications_enabled,true)=true;
+        # НО БЕЗ per-message-предикатов: НЕТ m.internal_date>=tl.created_at и НЕТ тег-предиката.
+        # SELECT DISTINCT u.id, tl.telegram_user_id
+        #   FROM mail_accounts ma
+        #   JOIN users u ON (u.role='super_admin'
+        #                    OR (ma.group_id IS NOT NULL AND EXISTS (SELECT 1 FROM user_groups ug WHERE ug.user_id=u.id AND ug.group_id=ma.group_id))
+        #                    OR u.id=ma.user_id)
+        #   JOIN telegram_links tl ON tl.user_id=u.id AND tl.dead_at IS NULL
+        #   LEFT JOIN users_settings us ON us.user_id=u.id
+        #   WHERE ma.id=:mail_account_id AND COALESCE(us.tg_notifications_enabled,true)=true
+        # (mail_account_id во возвращаемом NotifyRecipient = вход)
 ```
 
 - Repository (`backend/app/repositories/user_settings.py`):
@@ -3010,10 +3147,12 @@ class ExternalMessagesPage(BaseModel):
 - CSRF middleware: missing/invalid token -> 403; valid -> pass; safe methods bypass.
 - rate-limit: 6-я попытка login -> 429.
 - mime builder: text/plain charset=utf-8; In-Reply-To/References корректны; BCC отсутствует в headers.
-- providers.suggest_provider_defaults: правильные дефолты для всех 11 доменов.
+- providers.suggest_provider_defaults: правильные дефолты для всех **13** доменов (ADR-0032 follow-up: +`aol.com`, +`yahoo.com`); все password-провайдеры отдают `smtp_port=587`, `smtp_ssl=false`, `smtp_starttls=true` (никакого `465`); IMAP у всех `993 SSL`. JS-таблица `account_form.js` (`PROVIDERS`) совпадает с backend по этим значениям.
 - tags (ADR-0017): `ensure_builtin_tags` идемпотентен; per-user изоляция (cross-user — нет утечек); DELETE builtin → `CannotDeleteBuiltinTagError`; UNIQUE `(user_id, name)` — race на create возвращает 409.
 - telegram (ADR-0018): `POST /api/telegram/webhook/<wrong>` → 403; правильный secret + `/start` → 200 и Bot API получил `sendMessage` с inline-keyboard и web_app.url; правильный secret + `/help` или произвольный текст или body без `message` → 200 без вызова Bot API; `TELEGRAM_BOT_TOKEN` отсутствует во всех логах (redact-test).
 - webhooks (ADR-0023): `encrypt_webhook_secret`/`decrypt_webhook_secret` round-trip с `webhook_id` AAD; decrypt с другим `webhook_id` → `InvalidTag`; URL validation (https only, lexical localhost reject, SSRF DNS-резолв с приватными CIDR → 400); idempotency `try_reserve` (повторный вызов → None); `find_active_for_message` отсеивает inactive/dead/history-filter; `secret` plaintext отсутствует во всех логах (redact-test); FSM transitions (4xx×10 → dead, 410 → dead, 5xx → rollback, 2xx → success); `POST /test` не пишет `webhook_deliveries`.
+- send SMTP timeout (ADR-0032 follow-up): `_SMTP_TIMEOUT` ≤ 25 и `_SMTP_TIMEOUT + _IMAP_APPEND_TIMEOUT + 5 < 60` (nginx `proxy_read_timeout`); зависший/заблокированный SMTP-connect (mock-сервер не отвечает на 465) → `SMTPSendFailedError` (502/доменная ошибка) в пределах `_SMTP_TIMEOUT`, НЕ зависание до 60s; `TimeoutError`/`OSError`/`SMTPException` на send-пути → 502 JSON, не 500/504.
+- mailbox-down alert (ADR-0033): `list_recipients_for_mailbox` отдаёт тех же получателей, что `list_recipients_for_message` для письма в том же ящике **минус** per-message-фильтры (сравнить наборы; получатель с `internal_date < tl.created_at` попадает в mailbox-алерт, но не в message-нотификацию); opt-out (`tg_notifications_enabled=false`) и dead-link (`dead_at`) исключают получателя; вне scope (не super_admin, не член команды ящика, не владелец) — не в наборе. Идемпотентность: `_disable_after_failures` ставит `disabled_alert_sent_at` guarded (`WHERE ... IS NULL`) → повторный вызов в том же disabled-состоянии не enqueue'ит второй раз; re-enable (`creds_changed`) сбрасывает штамп в NULL → следующий disable снова enqueue'ит. Триггер строго в worker-auto-disable: ручное `is_active=false` и circuit-breaker-подавление алерт НЕ enqueue'ят. Текст: `reason` маппится в RU-фразу; сырой `last_sync_error` в тексте отсутствует; `acc_label` экранируется. Диспатчер: per-chat dedup (один чат — один send в пределах алерта); `send_notification` вызван с `message_id=None`; сбой Bot API 403 → `mark_link_dead`, 429/5xx → дроп без re-enqueue.
 - external pull-API (ADR-0029): auth-флоу — нет ключа → 401; неверный ключ → 401 (`compare_digest`); `EXTERNAL_API_KEY` пуст (фича выключена) → 401 (неотличимо от неверного ключа); `X-API-Key` и `Authorization: Bearer` оба принимаются, `X-API-Key` приоритетнее; rate-limit consume **до** auth (исчерпание → 429 `Retry-After`, ключ не сравнивается); query validation (`since_id<0` → 400, `limit=0`/`limit=201` → 400, defaults `since_id=0`/`limit=50`); ключ/заголовок отсутствуют во всех логах (redact-test); `body_text`/`body_html` отдаются **сырыми** (без `collapse_blank_lines_*` — сравнить с UI-DTO на письме с пустыми строками); **canonical-дедуп** — `ExternalMessagesRepo.list_since_id` вызывается с `mail_account_ids` из `list_canonical_account_ids()` (mock возвращает только canonical id), не-канонические `mail_account_id` отсутствуют в SQL-фильтре; пустой `mail_account_ids` → пустой результат без SQL-запроса.
 
 ### Integration (с реальными Postgres/Redis/MinIO в test-compose)

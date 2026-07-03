@@ -332,7 +332,7 @@ flowchart LR
 │                                                │
 │   ── SMTP ──                                   │
 │   Хост:     [ smtp.gmail.com                 ] │
-│   Порт:     [ 465 ]   ☑ SSL   ☐ STARTTLS       │
+│   Порт:     [ 587 ]   ☐ SSL   ☑ STARTTLS       │
 │                                                │
 │   ▶ Использовать отдельные SMTP-учётные данные │
 │     (раскрывает поля username / password)      │
@@ -340,6 +340,14 @@ flowchart LR
 │   [ Проверить соединение ]   [ Сохранить ]     │
 └────────────────────────────────────────────────┘
 ```
+
+> **SMTP-порт по умолчанию — 587/STARTTLS (ADR-0032 follow-up).** Прод-сервер Hetzner блокирует
+> исходящий TCP 465, поэтому провайдер-пресеты авто-подставляют `587` + `STARTTLS` (не `465`+`SSL`).
+> Зеркальная таблица в `account_form.js` (`PROVIDERS`) содержит те же значения, что backend
+> `accounts/providers.py`: gmail/googlemail/yandex.*/mail.ru-семейство переведены на 587-STARTTLS,
+> добавлены пресеты `aol.com` и `yahoo.com` (IMAP `imap.aol.com`/`imap.mail.yahoo.com:993 SSL`, SMTP
+> `smtp.aol.com`/`smtp.mail.yahoo.com:587 STARTTLS`). Итог — 13 доменов. Полная таблица —
+> `05-modules.md` §9. Frontend-агент правит JS-таблицу синхронно с backend.
 
 - **Поле «Никнейм»** (display_name; ADR-0020): `<input name="display_name" maxlength="100" placeholder="Опционально">`. После trim'а пустое = NULL.
 - При вводе email — JS auto-fills IMAP/SMTP defaults (см. сек. 3).

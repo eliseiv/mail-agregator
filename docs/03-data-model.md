@@ -356,9 +356,9 @@ erDiagram
 | `imap_port` | INT | NOT NULL DEFAULT 993 | |
 | `imap_ssl` | BOOLEAN | NOT NULL DEFAULT true | |
 | `smtp_host` | TEXT | NOT NULL | |
-| `smtp_port` | INT | NOT NULL DEFAULT 465 | |
-| `smtp_ssl` | BOOLEAN | NOT NULL DEFAULT true | true = SSL on connect (порт 465). |
-| `smtp_starttls` | BOOLEAN | NOT NULL DEFAULT false | true для порта 587. Взаимоисключаемо с `smtp_ssl`. |
+| `smtp_port` | INT | NOT NULL DEFAULT 465 | Column-default остаётся `465` (миграция не требуется), но **фактические** значения задаются явно из провайдер-пресетов/формы. **ADR-0032 follow-up:** прод-сервер Hetzner **блокирует исходящий TCP 465** (SMTP over SSL); рабочий путь — **587 (STARTTLS)**. Провайдер-пресеты (`accounts/providers.py`, `05-modules.md` §9) для password-провайдеров переведены на `587`; см. `smtp_ssl`/`smtp_starttls`. |
+| `smtp_ssl` | BOOLEAN | NOT NULL DEFAULT true | true = SSL on connect (implicit TLS, порт 465). **ADR-0032 follow-up:** на прод-сервере порт 465 заблокирован → для password-провайдеров пресеты ставят `smtp_ssl=false` + `smtp_starttls=true` (587). |
+| `smtp_starttls` | BOOLEAN | NOT NULL DEFAULT false | true для порта 587 (STARTTLS). Взаимоисключаемо с `smtp_ssl` (CHECK `NOT (smtp_ssl AND smtp_starttls)`). **ADR-0032 follow-up:** предпочтительный режим отправки на прод-сервере. |
 | `smtp_username` | TEXT | NULL | Если NULL — использовать `email`. |
 | `smtp_encrypted_password` | BYTEA | NULL | Если NULL — использовать `encrypted_password`. |
 | `is_active` | BOOLEAN | NOT NULL DEFAULT true | false → worker пропускает. Может быть выключен пользователем или автоматически (см. ADR-0008/ADR-0026). **ADR-0026:** auto-disable только по PERMANENT-ошибкам (порог `SYNC_MAX_CONSECUTIVE_FAILURES` или явный auth/decrypt) и только если не сработал circuit-breaker; TRANSIENT-ошибки НЕ дисейблят. |
@@ -367,6 +367,7 @@ erDiagram
 | `last_synced_at` | TIMESTAMPTZ | NULL | Время последней синхронизации. **ADR-0026:** обновляется на success и на PERMANENT-ошибку; на TRANSIENT НЕ трогается (сохраняет приоритет `list_active()` ORDER BY `last_synced_at NULLS FIRST`). |
 | `last_sync_error` | TEXT | NULL | Краткое описание последней ошибки (без секретов). **ADR-0026:** пишется и для TRANSIENT, и для PERMANENT; UI-префикс из `error_classify.error_prefix()`. NULL = успех. |
 | `consecutive_failures` | INT | NOT NULL DEFAULT 0 | **ADR-0026:** счётчик подряд идущих **PERMANENT**-ошибок (TRANSIENT не инкрементит). Сброс на 0 при успешном цикле (`mark_sync_success`). `>= SYNC_MAX_CONSECUTIVE_FAILURES` (default 3) → auto-disable при не сработавшем circuit-breaker. |
+| `disabled_alert_sent_at` | TIMESTAMPTZ | NULL | **ADR-0033:** штамп «Telegram-алерт об авто-отключении поставлен в очередь». `NULL` = нет неотработанного алерта (нормальное состояние активного ящика). Ставится `= now()` **guarded** (`WHERE disabled_alert_sent_at IS NULL`) в той же транзакции, что `is_active=false`, в `worker.sync_cycle._disable_after_failures` — enqueue алерта **только** при переходе `NULL → now()` (гарантия «ровно один алерт на переход»). Сбрасывается в `NULL` при re-enable ящика (`MailAccountService.update`, ветка `creds_changed`). Ручное отключение и circuit-breaker/transient/needs-consent штамп **не** ставят. Миграция `20260703_020`. |
 | `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | |
 | `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | |
 
@@ -861,3 +862,8 @@ BUILTIN_TAGS = [
      После backfill каждый пользователь с группой имеет своё домашнее членство; `super_admin` (`group_id IS NULL`) строк не получает.
   5. `users.group_id` **НЕ удаляется** — сохраняется как «домашняя» команда (см. ADR-0030 §1 и колонку `users.group_id`).
   - `down`: `DROP TABLE user_groups` (lossy для дополнительных членств — домашние восстановимы из `users.group_id`, добавленные — нет; задокументировано в ADR-0030).
+- **Миграция `20260703_020_mailbox_disabled_alert`** (ADR-0033) — down_revision `20260623_019`:
+  1. `ALTER TABLE mail_accounts ADD COLUMN disabled_alert_sent_at TIMESTAMPTZ NULL` — штамп идемпотентности Telegram-алерта об авто-отключении ящика (см. колонку выше + ADR-0033 §2/§7).
+  2. Никакой data-миграции: все строки стартуют `NULL` = «нет неотработанного алерта». Уже-отключённые (до фичи) ящики остаются `NULL` и ретроактивного алерта не генерируют (фича проактивна с момента внедрения; повтор — только через re-enable → повторный disable).
+  - `down`: `ALTER TABLE mail_accounts DROP COLUMN disabled_alert_sent_at` (non-lossy — колонка чисто операционная).
+  - ADR-0031 (выбор/смена команды ящика) миграции **не** вводил (`mail_accounts.group_id` уже существовал), поэтому `020` — следующий свободный номер после `019`.

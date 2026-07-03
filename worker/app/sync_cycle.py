@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime as _dt
+import json
 import uuid
 from collections.abc import Awaitable
 from dataclasses import dataclass
@@ -55,6 +56,7 @@ from shared.redis_client import get_redis
 from shared.storage import get_storage
 from worker.app.error_classify import classify, error_prefix, is_explicit_permanent
 from worker.app.imap_fetcher import FetchedBox, fetch_blocking
+from worker.app.mailbox_alert_dispatch import MAILBOX_ALERT_QUEUE_KEY
 from worker.app.push_notify_dispatch import _QUEUE_KEY as _PUSH_NOTIFY_QUEUE_KEY
 
 log = get_logger(__name__)
@@ -618,15 +620,50 @@ async def _record_failure(account_id: int, *, error: str, disable: bool) -> int:
         return await MailAccountsRepo(s).mark_sync_failure(account_id, error=error, disable=disable)
 
 
+async def _enqueue_mailbox_alert(account_id: int, *, reason: str) -> None:
+    """LPUSH one mailbox-down alert onto ``mailbox_alert_queue`` (ADR-0033 §4).
+
+    Called AFTER the disable transaction commits, only on a clean
+    ``NULL → now()`` stamp transition and only when
+    ``MAILBOX_DOWN_ALERT_ENABLED`` is on. Wrapped in ``try/except`` with a log —
+    a Redis outage must NEVER abort the sync cycle (same isolation as the
+    ``tg_notify`` enqueue). The stamp is already committed, so a lost enqueue is
+    not retried (fire-and-forget, TD-042).
+    """
+    try:
+        redis = get_redis()
+        payload = json.dumps(
+            {"v": 1, "mail_account_id": account_id, "reason": reason},
+            separators=(",", ":"),
+        )
+        await cast(Awaitable[int], redis.lpush(MAILBOX_ALERT_QUEUE_KEY, payload))
+        log.info("mailbox_alert_enqueued", mail_account_id=account_id, reason=reason)
+    except Exception as exc:
+        log.warning(
+            "mailbox_alert_enqueue_failed",
+            mail_account_id=account_id,
+            detail=str(exc)[:200],
+        )
+
+
 async def _disable_after_failures(account_id: int, *, user_id: int, reason: str) -> None:
     """Disable the account and write an ``account_auto_disabled`` audit row.
 
     ``reason`` is a stable string for ``details.reason``:
     ``"N_consecutive_failures"`` (threshold) or ``"auth_failed"`` /
     ``"decrypt_fail"`` (explicit permanent, instant disable). ADR-0026 §3.
+
+    ADR-0033: this is the ONLY worker auto-disable point and thus the only
+    mailbox-down alert trigger. In the same transaction as ``is_active=false`` +
+    audit, a guarded UPDATE stamps ``disabled_alert_sent_at=now()`` iff it was
+    ``NULL`` (idempotency "one alert per transition"). After COMMIT, if the
+    stamp really transitioned (``NULL → now()``) AND the feature is enabled, we
+    enqueue exactly one alert. Circuit-breaker suppression / transient / OAuth
+    needs-consent / manual disable never reach this function, so they never
+    alert.
     """
     async with make_session() as s, s.begin():
-        await MailAccountsRepo(s).update_fields(account_id, is_active=False)
+        stamped = await MailAccountsRepo(s).disable_and_stamp_alert(account_id)
         # The audit log requires ``actor_user_id``. For system actions we
         # attribute to the super-admin (the one with role='super_admin').
         # If for whatever reason there is no admin row (e.g. seed didn't
@@ -642,6 +679,12 @@ async def _disable_after_failures(account_id: int, *, user_id: int, reason: str)
                 "reason": reason,
             },
         )
+
+    # After COMMIT: enqueue exactly one alert on the clean NULL → now()
+    # transition. The stamp is written regardless of the flag; only the enqueue
+    # is gated by ``MAILBOX_DOWN_ALERT_ENABLED`` (ADR-0033 §8).
+    if stamped and get_settings().MAILBOX_DOWN_ALERT_ENABLED:
+        await _enqueue_mailbox_alert(account_id, reason=reason)
 
 
 async def _audit_mass_failure_suppressed(

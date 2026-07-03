@@ -245,6 +245,9 @@ Server-блок отвечает `200 ok\n` на `/_health_nginx` (HTTP, не HT
 | `TG_NOTIFY_RECOVERY_WINDOW_HOURS` | `24` | no | Окно (часы) для `tg_notify_recovery_scan` — не пытаемся доставить уведомления о письмах старше этого срока (ADR-0022 §2.8). |
 | `TG_NOTIFY_ALL_MESSAGES` | `true` | no | round-31: `true` — уведомлять по ВСЕМ новым письмам; `false` — только письма с ≥1 тегом (историческое поведение). Откат — смена env + рестарт `worker` (lru-cache `get_settings`), без редеплоя кода (ADR-0022 §2.1/§2.2). |
 | `TG_SEND_PER_CHAT_PER_MINUTE` | `20` | no | round-31: per-chat троттлинг доставки уведомлений (Redis `rl:tg_send:<chat_id>`, окно 60 сек). Диапазон 1..60. Защита от flood/429 при `TG_NOTIFY_ALL_MESSAGES=true` (ADR-0022 §2.9). |
+| `MAILBOX_DOWN_ALERT_ENABLED` | `true` | no | **ADR-0033:** kill-switch Telegram-алерта об авто-отключении почты. `false` → worker не enqueue'ит и не регистрирует job `mailbox_alert_dispatch`. Доставка — **основным** ботом (`TELEGRAM_BOT_TOKEN`), новых секретов нет. |
+| `MAILBOX_ALERT_DISPATCH_INTERVAL_SECONDS` | `5` | no | **ADR-0033:** интервал APScheduler для `mailbox_alert_dispatch` (§14.3). |
+| `MAILBOX_ALERT_BATCH_SIZE` | `30` | no | **ADR-0033:** `LPOP count` из `mailbox_alert_queue` за тик. |
 | `TG_MAX_LINKS_PER_USER` | `10` | no | **ADR-0024 (Спринт A):** мягкий потолок числа активных TG-привязок на один internal user. Проверяется в `link_pending`/`POST /api/telegram/links` (`COUNT(active) < limit`); при достижении — `409 tg_link_limit`, audit `telegram_link_limit_reached`. Не DB-констрейнт. |
 | `BOT_IVAN_TOKEN` | (none) | no | **ADR-0027:** токен push-only бота команды `ivan` (BotFather). **round-42:** нужен **и в worker** (доставка), **и в api** (обработка callback). Маскируется в structlog redact-list. Пустой → бот не настроен (тихо игнорируется). |
 | `BOT_IVAN_GROUP_ID` | (none) | no | **ADR-0027:** `mail_accounts.group_id` команды `ivan`. Прод: `1`. Без него бот в `push_team_bots` не попадает. |

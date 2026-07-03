@@ -435,6 +435,39 @@ class MailAccountsRepo:
             )
         )
 
+    async def disable_and_stamp_alert(self, account_id: int) -> bool:
+        """Auto-disable a mailbox + stamp the alert idempotency marker (ADR-0033 §2).
+
+        Combined guarded UPDATE (matches the ADR §2 SQL): sets
+        ``is_active=false`` AND ``disabled_alert_sent_at=now()`` only when the
+        stamp was still ``NULL``. Returns ``True`` when the stamp transitioned
+        ``NULL → now()`` (a clean Active→Disabled transition — the caller must
+        enqueue exactly one Telegram alert), ``False`` when a row was already
+        stamped (theoretical two-cycle race — no second alert).
+
+        Called exclusively from ``worker.sync_cycle._disable_after_failures``
+        inside the same transaction as the ``account_auto_disabled`` audit row.
+        The stamp is written regardless of ``MAILBOX_DOWN_ALERT_ENABLED`` (the
+        enqueue is gated by that flag, not the stamp) so toggling the feature on
+        later never re-alerts a mailbox disabled while it was off.
+        """
+        now = datetime.now(UTC)
+        stmt = (
+            update(MailAccount)
+            .where(
+                MailAccount.id == account_id,
+                MailAccount.disabled_alert_sent_at.is_(None),
+            )
+            .values(
+                is_active=False,
+                disabled_alert_sent_at=now,
+                updated_at=now,
+            )
+            .returning(MailAccount.id)
+        )
+        row = (await self._s.execute(stmt)).one_or_none()
+        return row is not None
+
     async def mark_transient_error(self, account_id: int, *, error: str) -> None:
         """Record a TRANSIENT sync error (ADR-0026 §2).
 

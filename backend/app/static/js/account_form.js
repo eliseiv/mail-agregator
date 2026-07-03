@@ -39,14 +39,17 @@
   // Mirrors accounts/providers.py (05-modules.md sec 9).
   // Keep in sync if backend updates the table.
   const PROVIDERS = {
-    'gmail.com':       { label: 'Gmail',   imap_host: 'imap.gmail.com',     imap_port: 993, imap_ssl: true,  smtp_host: 'smtp.gmail.com',     smtp_port: 465, smtp_ssl: true,  smtp_starttls: false },
-    'googlemail.com':  { label: 'Gmail',   imap_host: 'imap.gmail.com',     imap_port: 993, imap_ssl: true,  smtp_host: 'smtp.gmail.com',     smtp_port: 465, smtp_ssl: true,  smtp_starttls: false },
-    'yandex.ru':       { label: 'Yandex',  imap_host: 'imap.yandex.ru',     imap_port: 993, imap_ssl: true,  smtp_host: 'smtp.yandex.ru',     smtp_port: 465, smtp_ssl: true,  smtp_starttls: false },
-    'yandex.com':      { label: 'Yandex',  imap_host: 'imap.yandex.com',    imap_port: 993, imap_ssl: true,  smtp_host: 'smtp.yandex.com',    smtp_port: 465, smtp_ssl: true,  smtp_starttls: false },
-    'mail.ru':         { label: 'Mail.ru', imap_host: 'imap.mail.ru',       imap_port: 993, imap_ssl: true,  smtp_host: 'smtp.mail.ru',       smtp_port: 465, smtp_ssl: true,  smtp_starttls: false },
-    'inbox.ru':        { label: 'Mail.ru', imap_host: 'imap.mail.ru',       imap_port: 993, imap_ssl: true,  smtp_host: 'smtp.mail.ru',       smtp_port: 465, smtp_ssl: true,  smtp_starttls: false },
-    'bk.ru':           { label: 'Mail.ru', imap_host: 'imap.mail.ru',       imap_port: 993, imap_ssl: true,  smtp_host: 'smtp.mail.ru',       smtp_port: 465, smtp_ssl: true,  smtp_starttls: false },
-    'list.ru':         { label: 'Mail.ru', imap_host: 'imap.mail.ru',       imap_port: 993, imap_ssl: true,  smtp_host: 'smtp.mail.ru',       smtp_port: 465, smtp_ssl: true,  smtp_starttls: false },
+    // ADR-0032 follow-up: prod host blocks outbound :465 → SMTP on :587/STARTTLS.
+    'gmail.com':       { label: 'Gmail',   imap_host: 'imap.gmail.com',     imap_port: 993, imap_ssl: true,  smtp_host: 'smtp.gmail.com',     smtp_port: 587, smtp_ssl: false, smtp_starttls: true },
+    'googlemail.com':  { label: 'Gmail',   imap_host: 'imap.gmail.com',     imap_port: 993, imap_ssl: true,  smtp_host: 'smtp.gmail.com',     smtp_port: 587, smtp_ssl: false, smtp_starttls: true },
+    'yandex.ru':       { label: 'Yandex',  imap_host: 'imap.yandex.ru',     imap_port: 993, imap_ssl: true,  smtp_host: 'smtp.yandex.ru',     smtp_port: 587, smtp_ssl: false, smtp_starttls: true },
+    'yandex.com':      { label: 'Yandex',  imap_host: 'imap.yandex.com',    imap_port: 993, imap_ssl: true,  smtp_host: 'smtp.yandex.com',    smtp_port: 587, smtp_ssl: false, smtp_starttls: true },
+    'mail.ru':         { label: 'Mail.ru', imap_host: 'imap.mail.ru',       imap_port: 993, imap_ssl: true,  smtp_host: 'smtp.mail.ru',       smtp_port: 587, smtp_ssl: false, smtp_starttls: true },
+    'inbox.ru':        { label: 'Mail.ru', imap_host: 'imap.mail.ru',       imap_port: 993, imap_ssl: true,  smtp_host: 'smtp.mail.ru',       smtp_port: 587, smtp_ssl: false, smtp_starttls: true },
+    'bk.ru':           { label: 'Mail.ru', imap_host: 'imap.mail.ru',       imap_port: 993, imap_ssl: true,  smtp_host: 'smtp.mail.ru',       smtp_port: 587, smtp_ssl: false, smtp_starttls: true },
+    'list.ru':         { label: 'Mail.ru', imap_host: 'imap.mail.ru',       imap_port: 993, imap_ssl: true,  smtp_host: 'smtp.mail.ru',       smtp_port: 587, smtp_ssl: false, smtp_starttls: true },
+    'aol.com':         { label: 'AOL',     imap_host: 'imap.aol.com',       imap_port: 993, imap_ssl: true,  smtp_host: 'smtp.aol.com',       smtp_port: 587, smtp_ssl: false, smtp_starttls: true },
+    'yahoo.com':       { label: 'Yahoo',   imap_host: 'imap.mail.yahoo.com',imap_port: 993, imap_ssl: true,  smtp_host: 'smtp.mail.yahoo.com',smtp_port: 587, smtp_ssl: false, smtp_starttls: true },
     'outlook.com':     { label: 'Outlook', imap_host: 'outlook.office365.com', imap_port: 993, imap_ssl: true, smtp_host: 'smtp.office365.com', smtp_port: 587, smtp_ssl: false, smtp_starttls: true },
     'hotmail.com':     { label: 'Outlook', imap_host: 'outlook.office365.com', imap_port: 993, imap_ssl: true, smtp_host: 'smtp.office365.com', smtp_port: 587, smtp_ssl: false, smtp_starttls: true },
     'live.com':        { label: 'Outlook', imap_host: 'outlook.office365.com', imap_port: 993, imap_ssl: true, smtp_host: 'smtp.office365.com', smtp_port: 587, smtp_ssl: false, smtp_starttls: true },
