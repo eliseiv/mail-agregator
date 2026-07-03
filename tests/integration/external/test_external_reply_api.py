@@ -22,7 +22,7 @@ third-party boundaries (no real e-mail is ever sent).
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from email.message import EmailMessage
 from typing import Any
@@ -74,7 +74,7 @@ def reply_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[..., Any]]:
             monkeypatch.setenv("EXTERNAL_REPLY_RATE_LIMIT_PER_MINUTE", str(rate))
         get_settings.cache_clear()
         s = get_settings()
-        assert s.EXTERNAL_API_KEY == key
+        assert key == s.EXTERNAL_API_KEY
         assert s.EXTERNAL_REPLY_ENABLED is enabled
         return s
 
@@ -363,9 +363,7 @@ class TestCheckOrder:
         # Write DISABLED and key WRONG. Auth (401) runs before the write-gate
         # (403) -> the opaque 401 wins (config/gate state never disclosed).
         reply_env(key=TEST_API_KEY, enabled=False)
-        resp = await client.post(
-            _url(1), headers={"X-API-Key": "wrong"}, json={"body": "hi"}
-        )
+        resp = await client.post(_url(1), headers={"X-API-Key": "wrong"}, json={"body": "hi"})
         assert resp.status_code == 401, resp.text
         assert resp.json()["error"]["code"] == "not_authenticated"
 
@@ -436,22 +434,16 @@ class TestAuthAndGate:
         reply_env: Callable[..., Any],
     ) -> None:
         reply_env(key=TEST_API_KEY, enabled=False)
-        resp = await client.post(
-            _url(1), headers={"X-API-Key": TEST_API_KEY}, json={"body": "hi"}
-        )
+        resp = await client.post(_url(1), headers={"X-API-Key": TEST_API_KEY}, json={"body": "hi"})
         assert resp.status_code == 403
         assert resp.json()["error"]["code"] == "forbidden"
 
-    async def test_no_key_returns_401(
-        self, client: httpx.AsyncClient, reply_on: str
-    ) -> None:
+    async def test_no_key_returns_401(self, client: httpx.AsyncClient, reply_on: str) -> None:
         resp = await client.post(_url(1), json={"body": "hi"})
         assert resp.status_code == 401
         assert resp.json()["error"]["code"] == "not_authenticated"
 
-    async def test_wrong_key_returns_401(
-        self, client: httpx.AsyncClient, reply_on: str
-    ) -> None:
+    async def test_wrong_key_returns_401(self, client: httpx.AsyncClient, reply_on: str) -> None:
         resp = await client.post(_url(1), headers={"X-API-Key": "nope"}, json={"body": "hi"})
         assert resp.status_code == 401
 
@@ -479,9 +471,7 @@ class TestAuthAndGate:
         # EXTERNAL_API_KEY empty => whole external API off; opaque 401 even
         # though EXTERNAL_REPLY_ENABLED would be true.
         reply_env(key="", enabled=True)
-        resp = await client.post(
-            _url(1), headers={"X-API-Key": TEST_API_KEY}, json={"body": "hi"}
-        )
+        resp = await client.post(_url(1), headers={"X-API-Key": TEST_API_KEY}, json={"body": "hi"})
         assert resp.status_code == 401
         assert resp.json()["error"]["code"] == "not_authenticated"
 
@@ -494,9 +484,7 @@ class TestAuthAndGate:
         # csrf_failed — the /api/external/ prefix is exempt (ADR-0035 §2). With
         # the write-gate off we still get the domain 403, never a 403 csrf.
         reply_env(key=TEST_API_KEY, enabled=False)
-        resp = await client.post(
-            _url(1), headers={"X-API-Key": TEST_API_KEY}, json={"body": "hi"}
-        )
+        resp = await client.post(_url(1), headers={"X-API-Key": TEST_API_KEY}, json={"body": "hi"})
         assert resp.json()["error"]["code"] != "csrf_failed"
 
 
@@ -548,9 +536,7 @@ class TestScopeAndNotFound:
         # ``{id}`` is a plain int path param; id=0 is a valid int route match
         # that resolves to "no such message" -> 404 (NOT a pre-auth 400), which
         # keeps the ADR-0035 §3 order intact.
-        resp = await client.post(
-            _url(0), headers={"X-API-Key": reply_on}, json={"body": "hi"}
-        )
+        resp = await client.post(_url(0), headers={"X-API-Key": reply_on}, json={"body": "hi"})
         assert resp.status_code == 404
 
 
