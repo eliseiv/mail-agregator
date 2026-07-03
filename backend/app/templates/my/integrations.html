@@ -285,6 +285,127 @@
   {% endif %}
 
   {# ====================================================================
+     Переадресация писем команды (ADR-0034 / 04-api-contracts.md §4e /
+     08-frontend.md §4.13).
+
+     Текущий конфиг переадресации НЕ передаётся в контекст этой страницы:
+     её рендерит webhooks-router, а forwarding — самостоятельный JSON-модуль
+     (как и Telegram-привязки ниже). Поэтому актуальное состояние (адрес,
+     статус, наличие записи) подтягивает ``forwarding.js`` через
+     GET /api/forwarding/me и заполняет форму.
+
+     Прогрессивное улучшение (ADR-0015): форма «Сохранить» — обычный POST +
+     ``_method=PUT`` и работает без JS (upsert). Удаление без JS — через
+     <noscript>-форму POST /api/forwarding/me/delete + ``_method=DELETE``
+     (оба точных пути в whitelist method-override, см. middlewares.py).
+
+     Эндпоинты (04-api-contracts.md §4e):
+       GET    /api/forwarding/me → {id, group_id, forward_to, is_active, created_at, updated_at} | 404
+       PUT    /api/forwarding/me → upsert (200/201)
+       DELETE /api/forwarding/me → 204 (no-JS: POST /api/forwarding/me/delete + _method=DELETE)
+     ``super_admin`` обязан передавать ``?group_id=<id>``; ``group_leader`` — нет.
+  #}
+  <section class="forwarding" aria-labelledby="forwarding-heading" data-forwarding-section>
+    <header class="forwarding__header">
+      <h2 id="forwarding-heading" class="integrations-card__title">Переадресация писем команды</h2>
+    </header>
+    <p class="integrations-card__hint">
+      Все входящие письма ящиков команды будут пересылаться на этот адрес.
+    </p>
+
+    {% if session and session.role == 'super_admin' and group_id_param is none %}
+      {# super_admin без выбранной команды — симметрично webhook-секции. #}
+      <p class="forwarding__pick-group" role="status">
+        Выберите команду через <code>?group_id=&lt;id&gt;</code>, чтобы настроить переадресацию.
+      </p>
+
+    {% else %}
+      {# JS-only индикатор загрузки текущего конфига (скрыт для no-JS). #}
+      <p class="forwarding__loading" role="status" data-forwarding-loading hidden>
+        Загрузка настроек переадресации&hellip;
+      </p>
+
+      {# Сетевая / загрузочная ошибка (заполняется forwarding.js). #}
+      <p class="forwarding__error" role="alert" data-forwarding-error hidden></p>
+
+      {# ---------- Сохранить (upsert через PUT) ---------- #}
+      <form
+        method="POST"
+        action="/api/forwarding/me{% if group_id_param %}?group_id={{ group_id_param }}{% endif %}"
+        class="form forwarding__form"
+        data-forwarding-form>
+        {{ m.csrf_input() }}
+        <input type="hidden" name="_method" value="PUT">
+        {# ``is_active_present`` даёт backend отличить «не отправлено» от
+           «отправлено без галочки» (unchecked checkbox не сабмитится). #}
+        <input type="hidden" name="is_active_present" value="1">
+
+        <div class="field">
+          <label class="field__label" for="forwarding-email">E-mail для пересылки</label>
+          <input
+            class="field__input"
+            type="email"
+            id="forwarding-email"
+            name="forward_to"
+            required
+            maxlength="254"
+            autocomplete="off"
+            inputmode="email"
+            spellcheck="false"
+            placeholder="lead@example.com"
+            data-forwarding-email>
+          <p class="forwarding__field-error" role="alert" data-forwarding-field-error hidden></p>
+        </div>
+
+        <label class="integrations-toggle__label" for="forwarding-active">
+          <input
+            type="checkbox"
+            class="integrations-toggle__checkbox"
+            id="forwarding-active"
+            name="is_active"
+            value="true"
+            checked
+            data-forwarding-active-checkbox>
+          <span class="integrations-toggle__text">Включена</span>
+        </label>
+
+        <div class="form-actions">
+          <button type="submit" class="btn btn--primary" data-forwarding-save>Сохранить</button>
+        </div>
+      </form>
+
+      {# Строка статуса — заполняется forwarding.js (включена/выключена • дата). #}
+      <p class="forwarding__status" role="status" data-forwarding-status hidden></p>
+
+      {# ---------- Удалить (отдельная форма; JS показывает только при наличии записи) ---------- #}
+      <form
+        method="POST"
+        action="/api/forwarding/me/delete{% if group_id_param %}?group_id={{ group_id_param }}{% endif %}"
+        class="inline-form forwarding__delete"
+        data-forwarding-delete-form
+        data-confirm="Удалить переадресацию? Входящие письма команды перестанут пересылаться."
+        hidden>
+        {{ m.csrf_input() }}
+        <input type="hidden" name="_method" value="DELETE">
+        <button type="submit" class="btn btn--danger" data-forwarding-delete>Удалить</button>
+      </form>
+
+      {# No-JS fallback: без JS нельзя определить, есть ли запись, поэтому даём
+         рабочую форму удаления (backend вернёт flash-ошибку, если удалять нечего). #}
+      <noscript>
+        <form
+          method="POST"
+          action="/api/forwarding/me/delete{% if group_id_param %}?group_id={{ group_id_param }}{% endif %}"
+          class="inline-form forwarding__delete">
+          {{ m.csrf_input() }}
+          <input type="hidden" name="_method" value="DELETE">
+          <button type="submit" class="btn btn--danger">Удалить переадресацию</button>
+        </form>
+      </noscript>
+    {% endif %}
+  </section>
+
+  {# ====================================================================
      Telegram-привязки (ADR-0024 §4 / 04-api-contracts.md §4b).
 
      Список и управление привязками — клиентский рендер: секция вызывает
@@ -406,5 +527,6 @@
 
 {% block extra_js %}
 <script src="/static/js/integrations.js?v={{ static_v }}"></script>
+<script src="/static/js/forwarding.js?v={{ static_v }}"></script>
 <script src="/static/js/telegram_links.js?v={{ static_v }}"></script>
 {% endblock %}

@@ -55,7 +55,7 @@ from shared.models import MailAccount
 from shared.redis_client import get_redis
 from shared.storage import get_storage
 from worker.app.error_classify import classify, error_prefix, is_explicit_permanent
-from worker.app.imap_fetcher import FetchedBox, fetch_blocking
+from worker.app.imap_fetcher import FetchedBox, FetchedMessage, fetch_blocking
 from worker.app.mailbox_alert_dispatch import MAILBOX_ALERT_QUEUE_KEY
 from worker.app.push_notify_dispatch import _QUEUE_KEY as _PUSH_NOTIFY_QUEUE_KEY
 
@@ -65,6 +65,18 @@ log = get_logger(__name__)
 # ``_run_for_accounts`` to apply bump/disable AFTER the circuit-breaker
 # decision (so a mass infra outage cannot disable everything at once).
 AccountSyncOutcome = Literal["ok", "transient", "permanent"]
+
+# ADR-0034 §3.2: our own outbound forwards stamp ``X-Forwarded-By:
+# mail-aggregator``. A newly-fetched message already carrying this stamp is a
+# copy of one we forwarded (it landed back in one of our mailboxes) and must
+# NOT be re-enqueued for forwarding — loop-guard part 1.
+_FORWARD_STAMP = "mail-aggregator"
+
+
+def _carries_own_forward_stamp(fmsg: FetchedMessage) -> bool:
+    """True when the message already carries our ``X-Forwarded-By`` stamp."""
+    value = fmsg.x_forwarded_by
+    return value is not None and _FORWARD_STAMP in value.lower()
 
 
 @dataclass(slots=True)
@@ -228,6 +240,11 @@ async def sync_one_account(
     # commits. Inserting from inside the transaction would risk pushing
     # message_ids whose tags get rolled back on tag-apply failure.
     notified_message_ids: list[int] = []
+    # ADR-0034 §3.2: separate accumulator for forwarding (NOT tag-gated — we
+    # forward ALL new incoming of a team). Only mailboxes bound to a team
+    # (group_id NOT NULL) and only messages that do not already carry our
+    # forward stamp (loop-guard part 1) are collected.
+    forward_ids: list[int] = []
     async with make_session() as s, s.begin():
         repo = MessagesRepo(s)
         tags_service = TagsService(s)
@@ -254,6 +271,10 @@ async def sync_one_account(
                 conflict_count += 1
                 continue
             new_count += 1
+            # ADR-0034 §3.2: collect for forwarding — team mailbox only,
+            # loop-guard part 1 (skip our own already-forwarded copies).
+            if account.group_id is not None and not _carries_own_forward_stamp(fmsg):
+                forward_ids.append(inserted_id)
             for fatt in fmsg.attachments:
                 att_id = await repo.reserve_attachment_id()
                 key = storage.build_key(
@@ -397,6 +418,29 @@ async def sync_one_account(
                     detail=str(exc)[:200],
                     count=len(notified_message_ids),
                 )
+
+    # ADR-0034 §3.2: enqueue forward deliveries. Independent of the TG/webhook
+    # channels — separate accumulator (all new team incoming, minus loop-guarded
+    # ones) and its own try/except so a Redis failure here never aborts the sync
+    # cycle nor the other notification channels. Consumer does the final config /
+    # temporal / loop / dedup checks (worker.forward_dispatch, §14.4).
+    if forward_ids:
+        try:
+            from backend.app.forwarding.dispatch_service import ForwardDispatchService
+
+            async with make_session() as s:
+                pushed = await ForwardDispatchService(s).enqueue_message_ids(forward_ids)
+            cycle_log.info(
+                "forward_enqueued",
+                count=pushed,
+                mail_account_id=account.id,
+            )
+        except Exception as exc:
+            cycle_log.warning(
+                "forward_enqueue_failed",
+                detail=str(exc)[:200],
+                count=len(forward_ids),
+            )
 
     cycle_log.info(
         "sync_account_finish",

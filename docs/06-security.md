@@ -225,6 +225,26 @@
 
 ---
 
+### 1.14 Переадресация писем команды лидеру (ADR-0034)
+
+Лидер команды задаёт **один** `forward_to`-адрес для своей команды (`group_forwarding`, одна запись на команду); worker пересылает **новые** входящие письма всех ящиков команды на этот адрес SMTP-кредами получившего ящика. См. [ADR-0034](./adr/ADR-0034-leader-mail-forwarding.md).
+
+| Угроза | Описание | Митигация |
+| --- | --- | --- |
+| E | Чужой лидер настроил переадресацию на чужую команду | Невозможно: ACL — копия `WebhooksService._resolve_target_group_id`. `scope.group_id` строго фиксируется на сессии (`group_leader`); `super_admin` — только явным `?group_id=`; `group_member` → `403` на всех endpoint'ах. `group_leader` с `?group_id=` → `400`. |
+| I | Лидер пересылает письма команды на **свой** адрес → «утечка» содержимого наружу | **By design** (продукт-требование). Переадресация принадлежит **команде**, лидер видит её письма и в UI (visibility-scope на `mail_accounts.group_id`, ADR-0019/0030). Адрес назначения — на ответственности лидера. Персональные ящики (`group_id NULL`) **не** пересылаются — чужие/личные письма в канал не попадают. |
+| I | Утечка хостовых/инфра-деталей в сообщении об ошибке | `message_forwards.error` усечён до 500 байт; в UI ошибок форварда нет (нет листинга). Пользователю API-CRUD возвращаются только доменные коды (`validation_error`/`forbidden`/`not_found`) — **без** SMTP-хоста/стектрейса. Диспатчер логирует ошибку в structlog (оператор), не в ответ пользователю. |
+| I | Утечка SMTP-кредов/OAuth-токенов через логи форварда | Отправка через общий `smtp_send_message` — те же redact-гарантии, что у `send` (пароли/`oauth_*`-токены в structlog redact-list, ADR-0005/0014/0025). `build_forward_mime`/диспатчер не логируют тело/вложения/креды. |
+| T (loop) | Петля пересылки (форвард попадает в наш ящик → пересылается снова → …) | **Двойной loop-guard:** (1) исходящий форвард несёт `X-Forwarded-By: mail-aggregator`; (2) на enqueue-side (`save_message`) письма, уже несущие этот заголовок, **не** ставятся в очередь; (3) консюмер пропускает `forward_to == account.email` (self). Плюс персональные ящики не пересылаются. Практически исключает бесконечную петлю. |
+| E | SSRF через адрес пересылки | Соединение SMTP идёт **только** к хосту самого ящика (`account.smtp_host`), уже проверенному `assert_public_host` при создании ящика и повторно в `smtp_send_message` (запрет приватных CIDR/localhost — §4). `forward_to` — адрес в конверте (MAIL RCPT), к нему **прямого** соединения нет → отдельной URL-SSRF-проверки (как для webhook URL) не требуется. |
+| D | Флуд форвардами (крупные вложения / большой поток) | Per-account throttle `FORWARD_PER_ACCOUNT_PER_MINUTE` (fail-open + лог); суммарный размер письма ограничен `FORWARD_MAX_TOTAL_BYTES` (~25 МБ), oversized-вложения пропускаются с пометкой; батч `FORWARD_BATCH_SIZE`; kill-switch `FORWARDING_ENABLED`. |
+| R | Скрытие настройки переадресации | Новые actions в `admin_audit`: `forwarding_updated`, `forwarding_deleted` (`details={group_id, forward_to[, is_active]}`). super_admin видит в `/admin/audit`. |
+| T | Подмена адреса пересылки с украденной сессией лидера | Cookie-session + CSRF — те же гарантии, что для прочих state-changing endpoint'ов. Audit `forwarding_updated` фиксирует смену `forward_to`. |
+
+> **Компрометация `MAIL_ENCRYPTION_KEY`** не даёт атакующему ничего нового по этому каналу: `group_forwarding.forward_to` хранится plaintext (это не секрет), а SMTP-креды ящиков — те же зашифрованные blob'ы, что и для `send` (обрабатываются `mas-cli reencrypt` при ротации ключа, ADR-0005 §10).
+
+---
+
 ## 2. Шифрование почтовых паролей (схема)
 
 См. также ADR-0005.

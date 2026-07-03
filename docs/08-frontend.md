@@ -57,6 +57,7 @@ flowchart LR
 | `tags/form.html` | Create / edit tag form | `GET /tags/new`, `GET /tags/{id}/edit` |
 | `admin/groups/list.html` | Groups list page (super_admin only, ADR-0019) | `GET /admin/groups` |
 | `admin/groups/form.html` | Create / edit group form | `GET /admin/groups/new`, `GET /admin/groups/{id}/edit` |
+| `my/integrations.html` | Интеграции: секция «Webhook» (ADR-0023) + секция «Переадресация» (ADR-0034); только `group_leader`/`super_admin` | `GET /my/integrations` |
 | `errors/4xx.html` | Generic 4xx error | error handlers |
 | `errors/5xx.html` | Generic 5xx error | error handlers |
 
@@ -128,6 +129,7 @@ flowchart LR
 | `account_form.js` | Add/edit account: при вводе email — auto-fill IMAP/SMTP defaults для известных доменов (хардкод-таблица в JS, см. ниже; backend-эндпоинта provider-suggest нет, чтобы не плодить лишних round-trip'ов); кнопка "Test connection" — POST `/api/mail-accounts/test`, показывает inline-результат. |
 | `admin_users.js` | Admin: раскрытие/сворачивание списка mail-аккаунтов внутри строки пользователя; confirm-диалоги для reset/delete. |
 | `tags.js` | Tags form (create / edit): динамическое добавление/удаление строк condition (rule_type[] + rule_pattern[]); валидация (тип выбран, pattern непустой) перед submit; color-picker swatches (см. секцию 5.1); confirm-диалог при DELETE тега и DELETE rule. **Важно:** без JS форма всё равно работает — template рендерит фиксированное число пустых rule-row (например, 5); пользователь заполняет столько, сколько нужно; backend пропускает empty pairs. |
+| `forwarding.js` | (ADR-0034) Секция «Переадресация» на `/my/integrations`: submit `forward_to`+`is_active` через `csrfFetch` `PUT /api/forwarding/me`; кнопка «Удалить» с `window.confirm` → `DELETE /api/forwarding/me`; inline-валидация e-mail перед отправкой; обновление статуса без перезагрузки. **Прогрессивное улучшение** — без JS секция полностью работает через form-fallback (`_method=PUT`/`DELETE`). |
 | `tg.js` | Telegram WebApp adaptation (ADR-0018). На DOMContentLoaded: если `window.Telegram?.WebApp` существует — `Telegram.WebApp.ready()`, читает `themeParams` и применяет как CSS-vars (`--tg-bg`, `--tg-text`, `--tg-hint`, `--tg-link`, `--tg-button`, `--tg-button-text`, `--tg-secondary-bg`) на `document.documentElement`; добавляет класс `tg-app` на `<body>`; подписывается на `themeChanged`. Если SDK не загружен (открыто в браузере) — no-op. Подключается на каждой странице (в `base.html`) с `defer`. |
 
 **Provider auto-suggest**: хардкод-таблица в `account_form.js` (короткий объект, дублирующий `accounts/providers.py`). Минимальный набор — `gmail.com`, `yandex.ru`, `mail.ru`, `outlook.com`; backend-агент при необходимости расширяет JS-таблицу до полного списка из `providers.py` (см. `05-modules.md` секция 9). Backend остаётся источником истины — он ре-валидирует всё при POST/test.
@@ -573,6 +575,37 @@ flowchart LR
 - Pagination 50/page.
 - Click on action — раскрывается JSON `details`.
 - Read-only (нет edit/delete).
+
+### 4.13 Интеграции (`my/integrations.html`) — секция «Переадресация» (ADR-0034)
+
+Страница `/my/integrations` доступна `group_leader`/`super_admin` (ADR-0023). К существующей секции «Webhook» добавляется секция **«Переадресация писем команды»**. `super_admin` работает с выбранной командой через `?group_id=` (селектор группы — как для webhook-секции).
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  Интеграции                                                          │
+│  ── Webhook ─────────────────────────────────────────────────────    │
+│     (секция ADR-0023: URL, статус, Сохранить/Ротировать/Тест/Удалить) │
+│                                                                      │
+│  ── Переадресация писем команды ─────────────────────────────────    │
+│  Все входящие письма ящиков команды пересылаются на этот адрес.      │
+│  ┌────────────────────────────────────────────────────────────────┐  │
+│  │ E-mail для пересылки:  [ lead@example.com            ]          │  │
+│  │ ☑ Включена                                                     │  │
+│  │ [ Сохранить ]                          [ Удалить ]             │  │
+│  └────────────────────────────────────────────────────────────────┘  │
+│  Статус: включена • настроена 2026-07-03                            │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+- **Нет записи** (`GET /api/forwarding/me` → 404): показывается пустая форма (поле `forward_to` + чекбокс «Включена», default checked) с кнопкой «Сохранить» (`PUT`). Кнопки «Удалить» нет.
+- **Есть запись**: форма предзаполнена (`forward_to`, `is_active`); кнопка «Сохранить» (`PUT` upsert), кнопка «Удалить» (`DELETE`, с `window.confirm`). Строка статуса: «включена/выключена • настроена {created_at}».
+- **Форма (no-JS fallback, ADR-0015):**
+  - Сохранить: `<form method="POST" action="/api/forwarding/me">` + `{{ csrf_input() }}` + `<input type="hidden" name="_method" value="PUT">` + `forward_to` + `is_active` (checkbox).
+  - Удалить: `<form method="POST" action="/api/forwarding/me/delete">` + `{{ csrf_input() }}` + `<input type="hidden" name="_method" value="DELETE">`.
+  - Для `super_admin` формы включают `<input type="hidden" name="group_id" value="{{ selected_group_id }}">` (или query в action).
+- **Прогрессивное улучшение (`forwarding.js`):** submit/delete через `csrfFetch` без перезагрузки; клиентская проверка e-mail до отправки. Без JS — те же формы работают через `_method`-override.
+- **Ошибки:** `validation_error` (`field=forward_to`) → inline-подсказка «Введите корректный e-mail»; `field=group_id` (super_admin без выбора команды) → «Выберите команду». Маппинг кодов — через `_macros.html → error_text(code)` (ADR-0021, все тексты на русском).
+- **Bottom-nav / topbar:** пункт «Интеграции» (link `/my/integrations`) уже добавлен для `group_leader`/`super_admin` (ADR-0023); отдельного пункта для переадресации не вводится — это секция той же страницы.
 
 ---
 

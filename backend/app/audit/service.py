@@ -56,6 +56,9 @@ ALLOWED_ACTIONS: Final[frozenset[str]] = frozenset(
         "sync_mass_failure_suppressed",
         # ADR-0031 §6 — mailbox team transfer (PATCH group_id).
         "mail_account_group_change",
+        # ADR-0034 §2 — mail-forwarding config upsert/delete.
+        "forwarding_updated",
+        "forwarding_deleted",
     }
 )
 

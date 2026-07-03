@@ -142,6 +142,11 @@ _OVERRIDE_EXACT_PATHS: frozenset[str] = frozenset(
         "/api/admin/users",
         "/api/admin/groups",  # ADR-0019: group create
         "/api/tags",
+        # ADR-0034: mail-forwarding no-JS fallback — PUT (upsert) via
+        # ``POST /api/forwarding/me`` + ``_method=PUT``; DELETE via
+        # ``POST /api/forwarding/me/delete`` + ``_method=DELETE``.
+        "/api/forwarding/me",
+        "/api/forwarding/me/delete",
     }
 )
 _OVERRIDE_REGEX_PATHS: tuple[re.Pattern[str], ...] = (

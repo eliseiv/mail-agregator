@@ -137,5 +137,6 @@ class TestRegexCount:
 
     def test_exact_paths_present(self) -> None:
         # /api/messages/send, /api/mail-accounts, /api/admin/users, /api/tags,
-        # /api/admin/groups (ADR-0019).
-        assert len(_OVERRIDE_EXACT_PATHS) == 5
+        # /api/admin/groups (ADR-0019), /api/forwarding/me +
+        # /api/forwarding/me/delete (ADR-0034). 7 total.
+        assert len(_OVERRIDE_EXACT_PATHS) == 7

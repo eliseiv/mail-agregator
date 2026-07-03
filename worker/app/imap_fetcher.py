@@ -173,6 +173,11 @@ class FetchedMessage:
     body_present: bool
     in_reply_to: str | None
     refs_header: str | None
+    # ADR-0034 §3.2 loop-guard (enqueue-side): the raw ``X-Forwarded-By``
+    # header of the incoming message, if any. A message that already carries
+    # our ``mail-aggregator`` stamp is NOT enqueued for forwarding (breaks a
+    # potential loop). Not persisted — inspected live in ``save_message``.
+    x_forwarded_by: str | None
     attachments: list[FetchedAttachment]
 
 
@@ -287,6 +292,7 @@ def _from_imap_msg(
         body_present=body_present,
         in_reply_to=msg.headers.get("in-reply-to", (None,))[0] if msg.headers else None,
         refs_header=msg.headers.get("references", (None,))[0] if msg.headers else None,
+        x_forwarded_by=msg.headers.get("x-forwarded-by", (None,))[0] if msg.headers else None,
         attachments=atts,
     )
 

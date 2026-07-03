@@ -35,6 +35,7 @@ from shared.logging import configure_logging, get_logger
 from shared.redis_client import close_redis
 from shared.storage import get_storage
 from worker.app.cleanup import retention_cleanup
+from worker.app.forward_dispatch import forward_dispatch
 from worker.app.mailbox_alert_dispatch import mailbox_alert_dispatch
 from worker.app.push_notify_dispatch import push_notify_dispatch
 from worker.app.sync_cycle import force_sync_dispatch, sync_cycle
@@ -165,6 +166,18 @@ async def _safe_webhook_recovery() -> None:
         )
 
 
+async def _safe_forward_dispatch() -> None:
+    """Wrapper for the mail-forwarding dispatcher (ADR-0034 §3.3)."""
+    try:
+        await forward_dispatch()
+    except Exception as exc:
+        log.error(
+            "forward_dispatch_unhandled",
+            detail=str(exc)[:300],
+            exc_info=True,
+        )
+
+
 async def _bootstrap() -> None:
     """One-time async startup: ensure bucket etc."""
     try:
@@ -278,6 +291,18 @@ async def main() -> None:
         max_instances=1,
         misfire_grace_time=600,
     )
+    # ADR-0034 §3.5: mail-forwarding dispatcher (drains Redis queue). Registered
+    # ONLY when the feature is enabled; no recovery job (fire-and-forget,
+    # TD-043).
+    if settings.FORWARDING_ENABLED:
+        scheduler.add_job(
+            _safe_forward_dispatch,
+            trigger=IntervalTrigger(seconds=settings.FORWARD_DISPATCH_INTERVAL_SECONDS),
+            id="forward_dispatch",
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=30,
+        )
 
     # Touch once immediately so the health-check works even before the first
     # 30-second tick.
@@ -295,6 +320,7 @@ async def main() -> None:
         mailbox_down_alert_enabled=settings.MAILBOX_DOWN_ALERT_ENABLED,
         webhook_dispatch_seconds=settings.WEBHOOK_DISPATCH_INTERVAL_SECONDS,
         webhook_recovery_seconds=settings.WEBHOOK_RECOVERY_INTERVAL_SECONDS,
+        forwarding_enabled=settings.FORWARDING_ENABLED,
     )
 
     # Optional: kick off one sync immediately on boot, so we don't wait the

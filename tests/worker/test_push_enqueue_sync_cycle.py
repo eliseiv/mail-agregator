@@ -131,6 +131,7 @@ def _single_message_box(uid: int) -> Any:
                 body_present=True,
                 in_reply_to=None,
                 refs_header=None,
+                x_forwarded_by=None,
                 attachments=[],
             )
         ],

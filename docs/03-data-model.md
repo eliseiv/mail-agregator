@@ -24,11 +24,14 @@ erDiagram
     users ||--o| users_settings : "has (0..1)"
     groups ||--o| webhooks : "has outbound (0..1)"
     webhooks ||--o{ webhook_deliveries : "delivered"
+    groups ||--o| group_forwarding : "has forwarding (0..1, ADR-0034)"
+    groups ||--o{ message_forwards : "forwarded_for (ADR-0034)"
     mail_accounts ||--o{ messages : "stores"
     messages ||--o{ attachments : "has"
     messages ||--o{ message_tags : "tagged_with"
     messages ||--o{ telegram_notifications : "notified_for"
     messages ||--o{ webhook_deliveries : "webhook_pushed"
+    messages ||--o{ message_forwards : "forwarded (ADR-0034)"
     tags ||--o{ tag_rules : "matches_via"
     tags ||--o{ message_tags : "applied_to"
     sent_messages ||--o{ sent_attachments : "has"
@@ -227,6 +230,25 @@ erDiagram
         timestamptz sent_at "nullable; null=claimed-but-not-completed"
         int response_code "nullable"
         text response_excerpt "nullable; <=500 chars"
+        timestamptz created_at
+    }
+
+    group_forwarding {
+        bigint id PK
+        bigint group_id FK "UNIQUE; ON DELETE CASCADE"
+        text forward_to "e-mail лидера; 3..254"
+        boolean is_active "default true"
+        timestamptz created_at
+        timestamptz updated_at
+    }
+
+    message_forwards {
+        bigint id PK
+        bigint message_id FK "ON DELETE CASCADE"
+        bigint group_id FK "ON DELETE CASCADE"
+        text forward_to "снимок адреса на момент отправки"
+        timestamptz sent_at "nullable; null=claimed-but-not-completed"
+        text error "nullable; <=500 chars"
         timestamptz created_at
     }
 ```
@@ -486,7 +508,7 @@ erDiagram
 | --- | --- | --- | --- |
 | `id` | BIGSERIAL | PK | |
 | `actor_user_id` | BIGINT | NOT NULL | id супер-админа. **БЕЗ FK** (запись должна жить даже если случайно удалили админа из БД; см. seed-логику). |
-| `action` | TEXT | NOT NULL | Enum-string: `admin_login`, `admin_logout`, `create_user`, `reset_password`, `delete_user`, `lockout_triggered`, `account_auto_disabled`, **`group_create`**, **`group_delete`**, **`group_rename`**, **`user_role_change`**, **`user_group_change`** (новые из ADR-0019 §9; `user_group_change` с ADR-0030 пишется при «Переместить» — синхронизация `users.group_id` + `user_groups`), **`user_group_add`**, **`user_group_remove`** (новые из ADR-0030 — add/remove дополнительного членства в `user_groups`), **`mail_account_group_change`** (новое из ADR-0031 — перенос ящика между командами; `details={mail_account_id, from_group_id, to_group_id}`; `actor=инициатор`, `target_user_id=владелец ящика`), **`telegram_link_created`**, **`telegram_link_revoked`**, **`telegram_link_dead_marked`** (из ADR-0022), **`telegram_link_rebound`**, **`telegram_link_limit_reached`** (новые из ADR-0024), `telegram_link_collision` (**deprecated** ADR-0024 §3 — больше не пишется, оставлен для исторических записей), **`webhook_created`**, **`webhook_updated`**, **`webhook_deleted`**, **`webhook_secret_rotated`**, **`webhook_dead_marked`** (из ADR-0023), **`oauth_account_linked`**, **`oauth_refresh_invalidated`** (новые из ADR-0025). |
+| `action` | TEXT | NOT NULL | Enum-string: `admin_login`, `admin_logout`, `create_user`, `reset_password`, `delete_user`, `lockout_triggered`, `account_auto_disabled`, **`group_create`**, **`group_delete`**, **`group_rename`**, **`user_role_change`**, **`user_group_change`** (новые из ADR-0019 §9; `user_group_change` с ADR-0030 пишется при «Переместить» — синхронизация `users.group_id` + `user_groups`), **`user_group_add`**, **`user_group_remove`** (новые из ADR-0030 — add/remove дополнительного членства в `user_groups`), **`mail_account_group_change`** (новое из ADR-0031 — перенос ящика между командами; `details={mail_account_id, from_group_id, to_group_id}`; `actor=инициатор`, `target_user_id=владелец ящика`), **`telegram_link_created`**, **`telegram_link_revoked`**, **`telegram_link_dead_marked`** (из ADR-0022), **`telegram_link_rebound`**, **`telegram_link_limit_reached`** (новые из ADR-0024), `telegram_link_collision` (**deprecated** ADR-0024 §3 — больше не пишется, оставлен для исторических записей), **`webhook_created`**, **`webhook_updated`**, **`webhook_deleted`**, **`webhook_secret_rotated`**, **`webhook_dead_marked`** (из ADR-0023), **`oauth_account_linked`**, **`oauth_refresh_invalidated`** (новые из ADR-0025), **`forwarding_updated`**, **`forwarding_deleted`** (новые из ADR-0034 — upsert/delete конфига переадресации команды; `forwarding_updated.details={group_id, forward_to, is_active}`, `forwarding_deleted.details={group_id}`; `actor=инициатор`, `target_user_id=лидер группы или сам super_admin`). |
 | `target_user_id` | BIGINT | NULL | id затронутого пользователя (для user-actions). |
 | `target_username` | TEXT | NULL | snapshot username на случай delete. |
 | `details` | JSONB | NULL | Произвольная структурированная информация (например, для `account_auto_disabled` — `{mail_account_id, reason}`). |
@@ -703,6 +725,55 @@ Many-to-many линки тегов и сообщений. Создаются wor
 
 ---
 
+### `group_forwarding`
+
+Источник истины — [ADR-0034](./adr/ADR-0034-leader-mail-forwarding.md) §1.1. Конфигурация переадресации входящих писем команды на e-mail лидера — **одна запись на команду** (`UNIQUE(group_id)`). Лидер настраивает свой адрес (без участия super_admin'а); super_admin может работать с любым через `?group_id=`. Форк `webhooks` **без** secret'а (переадресация не требует auth к внешнему получателю — отправка идёт SMTP-кредами самого ящика).
+
+| Колонка | Тип | Constraints | Описание |
+| --- | --- | --- | --- |
+| `id` | BIGSERIAL | PRIMARY KEY | |
+| `group_id` | BIGINT | NOT NULL, UNIQUE, FK → `groups(id)` ON DELETE CASCADE | Одна команда — максимум одна запись переадресации. CASCADE → при удалении группы запись + все её `message_forwards` удаляются автоматически. |
+| `forward_to` | TEXT | NOT NULL | E-mail лидера (адрес назначения). **Plaintext** — это не секрет. Валидация формата на backend — ручной паттерн `accounts/schemas.py` (один `@`, домен с точкой, без `..`, длина 3..254). |
+| `is_active` | BOOLEAN | NOT NULL DEFAULT TRUE | Лидер может временно отключить (`PUT {"is_active": false}`). Диспатчер пропускает inactive. |
+| `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | Anchor фильтра «не флудим историей»: пересылаются только письма с `internal_date >= created_at` (см. `05-modules.md` §14.4). |
+| `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | Обновляется триггером `BEFORE UPDATE ON group_forwarding`. |
+
+**Constraints:** UNIQUE `(group_id)`.
+
+**Индексы:** UNIQUE на `group_id` обслуживает lookup при dispatch (`get_by_group_id`).
+
+**Триггер:** `BEFORE UPDATE ON group_forwarding` — `NEW.updated_at = now()`.
+
+**Объём:** ≤ 5 команд × 1 = ≤ 5 строк.
+
+---
+
+### `message_forwards`
+
+Источник истины — [ADR-0034](./adr/ADR-0034-leader-mail-forwarding.md) §1.2. Реестр/claim пересланных писем per `(message_id, group_id)`. Форк `webhook_deliveries`. Создаётся диспатчером **перед** сборкой/отправкой форварда (`INSERT … ON CONFLICT (message_id, group_id) DO NOTHING RETURNING id`); пустой `RETURNING` → письмо для этой команды уже обработано → пересылка пропускается (exactly-once claim).
+
+| Колонка | Тип | Constraints | Описание |
+| --- | --- | --- | --- |
+| `id` | BIGSERIAL | PRIMARY KEY | |
+| `message_id` | BIGINT | NOT NULL, FK → `messages(id)` ON DELETE CASCADE | При retention cleanup `messages` (ADR-0011) — реестр чистится автоматически. Симметрично `webhook_deliveries`. |
+| `group_id` | BIGINT | NOT NULL, FK → `groups(id)` ON DELETE CASCADE | Команда, для которой переслано письмо. При удалении группы — строки уходят. |
+| `forward_to` | TEXT | NOT NULL | Снимок адреса назначения на момент отправки (для audit; `group_forwarding.forward_to` мог позже смениться). |
+| `sent_at` | TIMESTAMPTZ | NULL | `NULL` = claim проставлен, отправка ещё не завершена (или упала до `mark_error`). `mark_sent` ставит `sent_at = now()`. |
+| `error` | TEXT | NULL | При ошибке SMTP — усечённый до 500 байт текст (без хостовых деталей). Строка с `error` **остаётся** и **не** ретраится (нет recovery-scan, at-most-once после claim; см. ADR-0034 §3.6). |
+| `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | |
+
+**Constraints:**
+- UNIQUE `(message_id, group_id)` (constraint `message_forwards_unique`) — дедуп/идемпотентность пересылки. Гарантирует ровно одну пересылку письма для команды даже при дубле в очереди / повторном enqueue / рестарте worker.
+
+**Индексы:**
+- UNIQUE-индекс `(message_id, group_id)` — служит для claim SQL.
+- `message_forwards_message_id_idx` на `(message_id)`.
+- `message_forwards_group_id_idx` на `(group_id)`.
+
+**Объём:** ≤ 5 команд × входящий поток × 30 д retention. С CASCADE от `messages` — авточистка вместе с письмами.
+
+---
+
 ### Заполнение builtin-тегов
 
 Builtin-теги создаются **не через миграцию**, а через **post-login hook** в `auth.AuthService` — при первом успешном login пользователя или завершении set-password flow (см. ADR-0017 §6 и `05-modules.md` модуль `auth`). Реализация — в `backend/app/tags/builtin.py` (статичный список из 4 объектов).
@@ -744,11 +815,12 @@ BUILTIN_TAGS = [
 | Удаление чего | Что каскадно удаляется (Postgres ON DELETE CASCADE) | Что чистится приложением |
 | --- | --- | --- |
 | `users(id)` | `mail_accounts`, `sent_messages`, `sent_attachments`, `messages` (через `mail_accounts → messages → attachments`), `attachments`, `tags`, `tag_rules` (через `tags`), `message_tags` (через `tags` и `messages`), **`telegram_links`** (ADR-0022), **`telegram_notifications`** (ADR-0022), **`users_settings`** (ADR-0022), **`user_groups`** (ADR-0030 — все членства пользователя) | Объекты MinIO по префиксу `{user_id}/`; все session keys (Redis); запись в `admin_audit` (action=delete_user). **Защита от удаления лидера** — `groups.leader_user_id ON DELETE RESTRICT` (см. ADR-0019 §3): нельзя удалить user'а, пока он лидер; super-admin сначала удаляет группу. |
-| `mail_accounts(id)` | `messages`, `attachments`, `sent_messages` (FK from_account_id), `message_tags` (через `messages`), **`telegram_notifications`** (через `messages`), **`webhook_deliveries`** (через `messages`, ADR-0023) | Объекты MinIO по префиксу `{user_id}/{mail_account_id}/` |
-| `messages(id)` (retention) | `attachments`, `message_tags`, **`telegram_notifications`** (ADR-0022), **`webhook_deliveries`** (ADR-0023) | Объекты MinIO по prefix `{user_id}/{mail_account_id}/{uid}/` |
+| `mail_accounts(id)` | `messages`, `attachments`, `sent_messages` (FK from_account_id), `message_tags` (через `messages`), **`telegram_notifications`** (через `messages`), **`webhook_deliveries`** (через `messages`, ADR-0023), **`message_forwards`** (через `messages`, ADR-0034) | Объекты MinIO по префиксу `{user_id}/{mail_account_id}/` |
+| `messages(id)` (retention) | `attachments`, `message_tags`, **`telegram_notifications`** (ADR-0022), **`webhook_deliveries`** (ADR-0023), **`message_forwards`** (ADR-0034) | Объекты MinIO по prefix `{user_id}/{mail_account_id}/{uid}/` |
 | `tags(id)` (user delete tag) | `tag_rules`, `message_tags` | — |
-| `groups(id)` (super-admin delete group) | `users.group_id` → SET NULL (FK ON DELETE SET NULL — см. ADR-0019 §4), **`user_groups`** (FK ON DELETE CASCADE, ADR-0030 — все членства в этой команде, домашние и дополнительные), **`webhooks`** (FK ON DELETE CASCADE, ADR-0023) → каскадно **`webhook_deliveries`** | Backend ОБЯЗАН в той же транзакции: проверить, что в группе нет участников (`SELECT 1 FROM users WHERE group_id = :group_id`) и нет лидера (тот же group). Если есть — `400 group_has_members`. Super-admin сначала переназначает участников / переводит лидера, потом удаляет группу. SET NULL для `users.group_id` остаётся как safety-net для прямого DDL обхода. Webhook каскад намеренно `CASCADE` (а не `RESTRICT`) — webhook привязан к группе, а не к её участникам; удаление группы должно унести и её исходящий канал. |
+| `groups(id)` (super-admin delete group) | `users.group_id` → SET NULL (FK ON DELETE SET NULL — см. ADR-0019 §4), **`user_groups`** (FK ON DELETE CASCADE, ADR-0030 — все членства в этой команде, домашние и дополнительные), **`webhooks`** (FK ON DELETE CASCADE, ADR-0023) → каскадно **`webhook_deliveries`**, **`group_forwarding`** (FK ON DELETE CASCADE, ADR-0034), **`message_forwards`** (FK `group_id` ON DELETE CASCADE, ADR-0034) | Backend ОБЯЗАН в той же транзакции: проверить, что в группе нет участников (`SELECT 1 FROM users WHERE group_id = :group_id`) и нет лидера (тот же group). Если есть — `400 group_has_members`. Super-admin сначала переназначает участников / переводит лидера, потом удаляет группу. SET NULL для `users.group_id` остаётся как safety-net для прямого DDL обхода. Webhook/forwarding-каскады намеренно `CASCADE` (а не `RESTRICT`) — оба канала привязаны к группе, а не к её участникам; удаление группы должно унести и исходящий канал, и переадресацию. |
 | `webhooks(id)` (DELETE /api/webhooks/me) | **`webhook_deliveries`** (FK ON DELETE CASCADE, ADR-0023) | — |
+| `group_forwarding(id)` (DELETE /api/forwarding/me) | — (у `message_forwards` FK на `messages`+`groups`, не на `group_forwarding`; удаление конфига не трогает историю пересылок) | Удаление конфига просто прекращает будущую переадресацию; `message_forwards` живут по retention `messages`. |
 
 Приложение перед каждым DELETE собирает список s3_key заранее (одним SELECT) и удаляет объекты MinIO, потом DELETE из БД. Транзакционности между MinIO и Postgres нет; в случае сбоя возможны "осиротевшие" объекты — это допустимо (cleanup `orphan_scan` в backlog).
 
@@ -867,3 +939,11 @@ BUILTIN_TAGS = [
   2. Никакой data-миграции: все строки стартуют `NULL` = «нет неотработанного алерта». Уже-отключённые (до фичи) ящики остаются `NULL` и ретроактивного алерта не генерируют (фича проактивна с момента внедрения; повтор — только через re-enable → повторный disable).
   - `down`: `ALTER TABLE mail_accounts DROP COLUMN disabled_alert_sent_at` (non-lossy — колонка чисто операционная).
   - ADR-0031 (выбор/смена команды ящика) миграции **не** вводил (`mail_accounts.group_id` уже существовал), поэтому `020` — следующий свободный номер после `019`.
+- **Миграция `20260703_021_mail_forwarding`** (ADR-0034) — down_revision `20260703_020`:
+  1. `CREATE TABLE group_forwarding` (DDL — см. секцию `group_forwarding` выше): `id` BIGSERIAL PK, `group_id` BIGINT NOT NULL UNIQUE FK → `groups(id)` ON DELETE CASCADE, `forward_to` TEXT NOT NULL, `is_active` BOOLEAN NOT NULL DEFAULT TRUE, `created_at`/`updated_at` TIMESTAMPTZ NOT NULL DEFAULT now() + триггер `BEFORE UPDATE`.
+  2. `CREATE TABLE message_forwards` (DDL — см. секцию `message_forwards` выше): `id` BIGSERIAL PK, `message_id` BIGINT NOT NULL FK → `messages(id)` ON DELETE CASCADE, `group_id` BIGINT NOT NULL FK → `groups(id)` ON DELETE CASCADE, `forward_to` TEXT NOT NULL, `sent_at` TIMESTAMPTZ NULL, `error` TEXT NULL, `created_at` TIMESTAMPTZ NOT NULL DEFAULT now() + UNIQUE `(message_id, group_id)` + индексы `message_forwards_message_id_idx` / `message_forwards_group_id_idx`.
+  3. Никакой data-миграции — обе таблицы стартуют пустыми. Первые записи появятся:
+     - `group_forwarding` — после первого `PUT /api/forwarding/me` от лидера команды (или super_admin'а).
+     - `message_forwards` — после первого нового входящего письма в ящик команды с активной переадресацией (claim в `worker.forward_dispatch`, см. `05-modules.md` §14.4).
+  4. Backend-агент дополнительно расширяет `ALLOWED_ACTIONS` в `backend/app/audit/service.py` на 2 новых action'а: `forwarding_updated`, `forwarding_deleted` (см. таблицу `admin_audit` выше).
+  - `down`: `DROP TABLE message_forwards; DROP TABLE group_forwarding` (non-lossy — обе таблицы операционные; конфиг переадресации восстанавливается лидером через UI).

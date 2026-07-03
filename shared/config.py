@@ -301,6 +301,22 @@ class Settings(BaseSettings):
     # POST ``/api/webhooks/me/test`` rate-limit (per webhook, per hour).
     WEBHOOK_TEST_LIMIT: int = Field(default=10, ge=1, le=1000)
 
+    # --- Mail forwarding (ADR-0034 §6) ------------------------------------
+    # Kill-switch. ``false`` → worker neither enqueues forward ids nor
+    # registers the ``forward_dispatch`` job.
+    FORWARDING_ENABLED: bool = Field(default=True)
+    # Interval of the ``forward_dispatch`` APScheduler job (§14.4).
+    FORWARD_DISPATCH_INTERVAL_SECONDS: int = Field(default=5, ge=1, le=600)
+    # Per-tick ``LPOP count`` from ``forward_dispatch_queue``.
+    FORWARD_BATCH_SIZE: int = Field(default=30, ge=1, le=500)
+    # Total attachment budget per forward (bytes, ~25 MiB); attachments that
+    # would push the running total past this are skipped with a body note.
+    FORWARD_MAX_TOTAL_BYTES: int = Field(default=26_214_400, ge=1024, le=1_073_741_824)
+    # Per-account forward throttle (forwards / minute / mail_account). Redis
+    # token-bucket via ``try_consume`` (fail-open + log). Overrides
+    # ``LIMIT_FORWARD_PER_ACCOUNT.capacity`` at consume-time.
+    FORWARD_PER_ACCOUNT_PER_MINUTE: int = Field(default=30, ge=1, le=6000)
+
     @field_validator("MAIL_ENCRYPTION_KEY")
     @classmethod
     def _validate_master_key(cls, v: str) -> str:

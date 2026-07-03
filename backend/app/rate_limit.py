@@ -104,6 +104,16 @@ LIMIT_WEBHOOK_ROTATE = Limit(name="webhook_rotate", capacity=5, window_seconds=6
 # redeploy of the codebase. The static value here is a sensible fallback
 # only if the settings lookup is unavailable for some reason.
 LIMIT_WEBHOOK_TEST = Limit(name="webhook_test", capacity=10, window_seconds=60 * 60)
+# Mail forwarding (ADR-0034 §2). Keyed per ``group_id`` (like webhooks):
+# ``PUT`` (upsert) 30/h, ``DELETE`` 10/h.
+LIMIT_FORWARDING_UPDATE = Limit(name="forwarding_update", capacity=30, window_seconds=60 * 60)
+LIMIT_FORWARDING_DELETE = Limit(name="forwarding_delete", capacity=10, window_seconds=60 * 60)
+# Per-account forward throttle (ADR-0034 §6, docs/06-security.md §1.14 threat D).
+# Consumed via the non-raising :func:`try_consume` in the worker dispatcher;
+# ``capacity`` is overridden at consume-time from
+# ``settings.FORWARD_PER_ACCOUNT_PER_MINUTE`` (same pattern as
+# ``LIMIT_WEBHOOK_TEST``). Key: ``rl:forward_acct:<mail_account_id>``.
+LIMIT_FORWARD_PER_ACCOUNT = Limit(name="forward_acct", capacity=30, window_seconds=60)
 # Telegram per-chat send throttle (ADR-0022 §2.9). ``capacity`` is overridden
 # at consume-time from ``settings.TG_SEND_PER_CHAT_PER_MINUTE`` (same pattern as
 # ``LIMIT_WEBHOOK_TEST``) so operators can tune the cap without a code redeploy.

@@ -2866,6 +2866,64 @@ body.tg-app .footer {
   margin-top: var(--space-3);
 }
 
+/* ---------- 21c. Переадресация писем команды (ADR-0034) ---------- */
+.forwarding {
+  margin-top: var(--space-6);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-5);
+  background: var(--color-bg);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+.forwarding__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+.forwarding__loading {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+  margin: 0;
+}
+.forwarding__error {
+  color: var(--color-danger);
+  background: var(--color-danger-soft);
+  border: 1px solid rgba(220, 38, 38, 0.35);
+  border-radius: var(--radius-md);
+  padding: var(--space-3) var(--space-4);
+  font-size: var(--font-size-sm);
+  margin: 0;
+}
+.forwarding__form { margin: 0; }
+.forwarding__field-error {
+  color: var(--color-danger);
+  font-size: var(--font-size-xs);
+  margin: 0;
+}
+.forwarding__pick-group {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+  margin: 0;
+}
+.forwarding__pick-group code {
+  font-family: var(--font-family-mono);
+  background: var(--color-bg-hover);
+  padding: 1px 5px;
+  border-radius: var(--radius-sm);
+  font-size: 0.92em;
+}
+.forwarding__status {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+  margin: 0;
+}
+.forwarding__status--on { color: var(--color-success); }
+.forwarding__status--off { color: var(--color-text-muted); }
+.forwarding__delete { margin: 0; }
+
 /* ---------- 21a. Mobile (<=640px) tweaks ---------- */
 @media (max-width: 640px) {
   .integrations-card {
@@ -2912,6 +2970,9 @@ body.tg-app .footer {
     flex-direction: column;
   }
   .integrations-secret-reveal__row .btn { width: 100%; }
+  .forwarding { padding: var(--space-4); }
+  .forwarding__form .form-actions .btn,
+  .forwarding__delete .btn { width: 100%; }
 }
 
 /* ---------- 21b. Telegram WebApp variant ---------- */
@@ -2961,6 +3022,9 @@ body.tg-app.page--integrations .integrations-secret-reveal__row {
 body.tg-app.page--integrations .integrations-secret-reveal__row .btn {
   width: 100%;
 }
+body.tg-app.page--integrations .forwarding { padding: var(--space-4); }
+body.tg-app.page--integrations .forwarding__form .form-actions .btn,
+body.tg-app.page--integrations .forwarding__delete .btn { width: 100%; }
 
 /* =============================================================================
    Searchable account combobox (inbox filter — ARIA 1.2 combobox pattern).

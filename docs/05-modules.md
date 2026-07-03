@@ -83,6 +83,13 @@ backend/
       dispatch_service.py  # WebhookDispatchService.enqueue_message_ids, dispatch_one_payload — копируется по паттерну telegram/sso_service+notify_format
       schemas.py           # WebhookCreate, WebhookUpdate, WebhookDTO (no secret), WebhookCreatedDTO (with one-shot secret), TestResultDTO
       payload.py           # build_message_tagged_payload(ctx, team_tags, webhook_id, delivery_id) — формирование dict для json.dumps
+    forwarding/            # ADR-0034 — переадресация писем команды на почту лидера (форк webhooks)
+      __init__.py
+      router.py            # GET/PUT/DELETE /api/forwarding/me (+ form-fallback POST /api/forwarding/me[/delete]) — секция на /my/integrations
+      service.py           # ForwardingService.get_for_scope/upsert_for_scope/delete_for_scope; _resolve_target_group_id — копия WebhooksService
+      schemas.py           # ForwardingUpsert (forward_to, is_active?), ForwardingDTO; e-mail-паттерн из accounts/schemas
+      dispatch_service.py  # ForwardDispatchService.enqueue_message_ids(ids) → LPUSH forward_dispatch_queue (форк webhooks/dispatch_service)
+      mime.py              # build_forward_mime(account, message, attachments, forward_to) — multipart text+html+вложения (может жить в send/mime.py)
     external/              # ADR-0029 — external PULL-API (B2B-партнёр забирает письма инкрементально)
       __init__.py
       router.py            # GET /api/external/messages (csrf-exempt, no session)
@@ -106,6 +113,7 @@ backend/
       telegram_notification.py  # ADR-0022 — TelegramNotification ORM
       user_settings.py      # ADR-0022 — UserSettings ORM
       webhook.py            # ADR-0023 — Webhook + WebhookDelivery ORM
+      group_forwarding.py   # ADR-0034 — GroupForwarding + MessageForward ORM (экспорт в models/__init__.py)
     repositories/
       users.py
       groups.py             # GroupsRepo — ADR-0019 (member_counts/list_in_group считают через user_groups — ADR-0030)
@@ -120,6 +128,8 @@ backend/
       user_settings.py      # ADR-0022 — UserSettingsRepo (get, upsert)
       webhooks.py           # ADR-0023 — WebhooksRepo (get_by_group_id, reserve_id, insert_with_explicit_id, update_*, set_active, delete, mark_dead/success, bump_failures, touch_last_error, find_active_for_message)
       webhook_deliveries.py # ADR-0023 — WebhookDeliveriesRepo (try_reserve, mark_sent, mark_failed, rollback, list_tags_for_team, list_missing_for_recovery)
+      group_forwarding.py   # ADR-0034 — GroupForwardingRepo (get_by_group_id, upsert(group_id, forward_to, is_active), delete) — репо без транзакций, как WebhooksRepo
+      message_forwards.py   # ADR-0034 — MessageForwardsRepo (claim(message_id, group_id, forward_to) → INSERT ON CONFLICT DO NOTHING RETURNING id; mark_sent, mark_error)
     templates/             # Jinja2 — все на русском, см. ADR-0021
       base.html              # включает Log out button (восстановлен после редизайна) + ссылка «Интеграции» для group_leader/super_admin (ADR-0023)
       _macros.html           # csrf_input, flash_messages, error_text(code) — RU mapping (ADR-0021); tag_chip; secret_reveal_block (ADR-0023, one-shot show plaintext)
@@ -136,7 +146,7 @@ backend/
       admin/groups/form.html # ADR-0019 — create/edit группы
       tags/list.html
       tags/form.html
-      my/integrations.html   # ADR-0023 — webhook config UI: URL form, status (last_fired_at/last_error/consecutive_failures/dead), кнопки Save/Rotate/Test/Delete
+      my/integrations.html   # ADR-0023 — webhook config UI + ADR-0034 — секция «Переадресация» (forward_to form, is_active toggle, кнопки Сохранить/Удалить)
     static/
       css/main.css
       js/app.js
@@ -144,6 +154,7 @@ backend/
       js/inbox.js
       js/compose.js
       js/tags.js
+      js/forwarding.js       # ADR-0034 — CRUD секции «Переадресация» через csrfFetch (PUT/DELETE); прогрессивное улучшение над form-fallback
       js/tg.js               # ADR-0018: Telegram WebApp adaptation (theme vars + body.tg-app)
   migrations/              # alembic
     env.py
@@ -156,6 +167,8 @@ backend/
       20260527_017_multi_telegram_links.py   # ADR-0024 (Спринт A) — drop UNIQUE(telegram_links.user_id); telegram_notifications +telegram_user_id, UNIQUE(message_id, telegram_user_id)
       20260527_018_outlook_oauth2.py         # ADR-0025 (Спринт B) — mail_accounts +auth_type/oauth_* columns, encrypted_password DROP NOT NULL, CHECK constraints
       20260623_019_user_groups.py            # ADR-0030 — CREATE TABLE user_groups (M:N) + UNIQUE(user_id,group_id) + INDEX(group_id) + backfill домашних членств; users.group_id НЕ удаляется
+      20260703_020_mailbox_disabled_alert.py # ADR-0033 — mail_accounts +disabled_alert_sent_at
+      20260703_021_mail_forwarding.py        # ADR-0034 — CREATE TABLE group_forwarding, message_forwards (+ UNIQUE(message_id,group_id), индексы, триггер updated_at)
   tests/
     unit/
     integration/
@@ -163,7 +176,7 @@ backend/
 worker/
   app/
     __init__.py
-    main.py                # APScheduler entrypoint (jobs: sync_cycle, force_sync_dispatch, retention_cleanup, tg_notify_dispatch, tg_notify_recovery_scan, webhook_dispatch, webhook_recovery_scan, push_notify_dispatch)
+    main.py                # APScheduler entrypoint (jobs: sync_cycle, force_sync_dispatch, retention_cleanup, tg_notify_dispatch, tg_notify_recovery_scan, webhook_dispatch, webhook_recovery_scan, push_notify_dispatch, mailbox_alert_dispatch, forward_dispatch [ADR-0034, под FORWARDING_ENABLED])
     config.py              # shared with backend (через общий пакет, см. ниже)
     sync_cycle.py
     cleanup.py
@@ -174,6 +187,7 @@ worker/
     webhook_dispatch.py    # ADR-0023 — диспатчер outbound webhooks (каждые 5 сек)
     webhook_recovery.py    # ADR-0023 — recovery_scan для webhooks (каждый час)
     push_notify_dispatch.py # ADR-0027 — push-only боты по командам (LPOP push_notify_queue → bot по group_id → fire-and-forget; каждые 5 сек, recovery НЕТ)
+    forward_dispatch.py    # ADR-0034 — диспатчер переадресации (LPOP forward_dispatch_queue → claim → build_forward_mime → SMTP кредами ящика; каждые 5 сек, recovery НЕТ)
   tests/
 shared/                    # общий пакет, импортируется и api, и worker
   __init__.py
@@ -1160,6 +1174,15 @@ def build_mime(
 ) -> EmailMessage
 ```
 
+- **ADR-0034 — расширение MIME + вынос SMTP-ядра.** Текущий `build_mime` строит только `text/plain` без HTML/вложений. Для переадресации добавляется `build_forward_mime(account, message, attachments, forward_to) -> EmailMessage` (`multipart/mixed`: `Subject: Fwd: …`, `From=account.email`, `To=forward_to`, новый `Message-ID`, заголовок `X-Forwarded-By: mail-aggregator`; `add_alternative(text)` + `add_alternative(html, subtype="html")` c префикс-блоком «пересланное сообщение»; вложения из MinIO кроме `skipped_too_large`, с контролем `FORWARD_MAX_TOTAL_BYTES` — пропущенные списком в теле). Отправка обеих фич (`send` и `forward`) идёт через общий хелпер, выделяемый из `send/service.py`:
+```python
+async def smtp_send_message(account: MailAccount, msg: EmailMessage, recipients: list[str]) -> None
+    # ветки: password (decrypt_mail_password(smtp_encrypted_password|encrypted_password, account.id) + SMTP LOGIN)
+    #        / oauth_outlook (OutlookTokenService.get_valid_access_token + XOAUTH2, _smtp_send_oauth)
+    # + assert_public_host(account.smtp_host), _ssl_context, _SMTP_TIMEOUT=20
+```
+Для форвардов **Sent-append НЕ выполняется** (не засоряем «Отправленные» ящика). SSRF-поверхность форварда узкая: соединение только к SMTP-хосту самого ящика (уже валидирован); `forward_to` — адрес в конверте, к нему прямого коннекта нет.
+
 ### Зависимости
 - repositories.mail_accounts, repositories.messages (для in_reply_to lookup), repositories.sent_messages, crypto, aiosmtplib, imap-tools (для best-effort APPEND).
 - **ADR-0025:** для `from_account` с `auth_type='oauth_outlook'` — SMTP-аутентификация через XOAUTH2 (access-token из `OutlookTokenService.get_valid_access_token`), а не login/пароль; IMAP APPEND аналогично через XOAUTH2. Ветвление по `account.auth_type`.
@@ -1404,6 +1427,7 @@ async def sync_one_account(account: MailAccount) -> AccountSyncResult
 - **Apply tags (ADR-0017):** если INSERT messages вернул `RETURNING id` (т.е. это была новая запись, не дубль), в той же транзакции выполняется `tags_service.apply_tags_to_message(message_id, user_id)` (использует SQL `APPLY_TAGS_TO_MESSAGE` из `app/tags/sql.py`). Все условия — один SQL-запрос, ON CONFLICT DO NOTHING. Падение apply откатывает всю транзакцию (включая INSERT messages) → message будет пере-обработан при следующем sync. `user_id` берётся из `mail_accounts.user_id` (resolve один раз перед циклом save_message). При ON CONFLICT (письмо уже было) apply пропускается — повторно теги не применяются.
 - **Enqueue notification (ADR-0022 §2.1):** ПОСЛЕ COMMIT транзакции save_message (а не внутри неё — чтобы доставка не зависела от транзакционной видимости), если `apply_tags_to_message` вернул `applied_count > 0`, добавить `message_id` в локальный аккумулятор `notify_ids`. После завершения цикла обработки одного account'а (т.е. в `sync_one_account` после `mailbox.logout()`) выполнить **один** `LPUSH tg_notify_queue val1 val2 …` всеми накопленными ID. Padение LPUSH (Redis down) — ловится try/except + log warn `event=tg_notify_enqueue_failed`; **не** прерывает sync_cycle. Recovery_scan (см. 14.1) подберёт упущенные.
 - **Enqueue outbound webhook (ADR-0023 §3.1):** **параллельно и независимо** от TG-блока выше. Тот же `notify_ids` (один источник истины — письма с `applied_count > 0`) передаётся в `WebhookDispatchService(s).enqueue_message_ids(notify_ids)`, который делает pre-filter (отбрасывает ids, у которых владеющая группа не имеет активного webhook'а) и один batched `LPUSH webhook_dispatch_queue val1 val2 …`. Падение этого блока ловится своим try/except + log warn `event=webhook_enqueue_failed`; **не** валит ни sync_cycle, ни TG-доставку. Recovery_scan webhook'ов (см. 14.2) подберёт упущенные с тем же 24-часовым окном.
+- **Enqueue переадресации (ADR-0034 §3.2):** **параллельно и независимо** от TG/webhook-блоков, в **отдельном** `try/except`. Аккумулятор — **отдельный** `forward_ids` (НЕ `notify_ids`): переадресация не зависит от тегов, шлём **все** новые входящие. В `forward_ids` попадают `message_id` **только** ящиков с `group_id IS NOT NULL` (персональные `group_id NULL` не пересылаются) и **только** те, чьи исходные IMAP-заголовки **не** несут `X-Forwarded-By: mail-aggregator` (loop-guard часть 1 — проверяется по live-объекту `imap_tools` в `save_message`, без новой колонки в БД). В конце `sync_one_account` — один `ForwardDispatchService(s).enqueue_message_ids(forward_ids)` (batched `LPUSH forward_dispatch_queue`). Падение ловится своим try/except + log warn `event=forward_enqueue_failed`; **не** валит sync/TG/webhook. Recovery для forward **нет** (см. §14.4; ADR-0034 §3.6).
 
 ### Обработка ошибок (per-account) — ADR-0026
 
@@ -1911,6 +1935,82 @@ user-controlled значения (`acc_label`) → `html.escape()` (parse_mode=H
 - Bot API token не появляется в логах (redact-list, как §14.1).
 - Получатель видит ровно те ящики, что и в UI (visibility-предикат идентичен `list_recipients_for_message`,
   минус per-message-предикаты).
+
+---
+
+## 14.4. worker — forward_dispatch (переадресация писем команды лидеру)
+
+Источник истины — [ADR-0034](./adr/ADR-0034-leader-mail-forwarding.md) §3. Форк `webhook_dispatch` (§14.2) **без** recovery-scan.
+
+### Назначение
+- `forward_dispatch` — каждые `FORWARD_DISPATCH_INTERVAL_SECONDS=5` сек драйнит Redis `forward_dispatch_queue` (LIST), пересылает новое входящее письмо на `group_forwarding.forward_to` SMTP-кредами получившего ящика, обеспечивает exactly-once через `message_forwards`. Job активен **только** при `FORWARDING_ENABLED=true`.
+- **Recovery-scan НЕТ** (fire-and-forget после claim; при ошибке SMTP / рестарте worker форвард по письму теряется — ADR-0034 §3.6, TD-043). Письмо остаётся в системе и видно в UI.
+
+Изоляция полная: падение переадресации не влияет на sync/TG/webhook, и наоборот.
+
+### Публичный API
+```python
+async def forward_dispatch() -> None            # APScheduler interval=5s; max_instances=1, coalesce=True; регистрируется под FORWARDING_ENABLED
+async def dispatch_one(message_id: int) -> ForwardDispatchResult
+```
+
+### Зависимости
+- redis (LPOP с count).
+- repositories: `group_forwarding` (get_by_group_id), `message_forwards` (claim, mark_sent, mark_error), `mail_accounts` (get_by_id), `messages` (get + list_attachments_bulk).
+- `backend/app/forwarding/mime.py:build_forward_mime` (или `send/mime.py`).
+- `backend/app/send/service.py:smtp_send_message` (общий SMTP-хелпер, password/XOAUTH2 — §11).
+- `shared/storage.py:get_object_stream` (стрим вложений из MinIO).
+- `backend/app/rate_limit.py:try_consume` (per-account forward throttle, fail-open).
+
+### Алгоритм forward_dispatch
+```text
+1. items = redis.lpop("forward_dispatch_queue", count=FORWARD_BATCH_SIZE)   # default 30
+2. if not items: return
+3. for raw in items:
+     message_id = json.loads(raw)["message_id"]
+     await dispatch_one(message_id)   # каждый в своём try/except — сбой одного не роняет цикл
+4. log forward_dispatch_finish {sent, skipped_dedup, skipped_no_config, skipped_loop, skipped_history, skipped_personal, errors}
+```
+
+### Алгоритм dispatch_one (ADR-0034 §3.4)
+```text
+1. message = MessagesRepo.get_by_id(mid); account = MailAccountsRepo.get_by_id(message.mail_account_id)
+   attachments = MessagesRepo.list_attachments_bulk([mid])
+   if not message / not account: log warn + skip
+2. if account.group_id IS NULL: skip (персональный ящик — defensive)
+3. gf = GroupForwardingRepo.get_by_group_id(account.group_id)
+   if gf is None or not gf.is_active: skip (нет конфига / выключен)
+4. if message.internal_date < gf.created_at: skip (temporal-guard «не флудим историей» / initial-backfill)
+5. if gf.forward_to == account.email: skip (loop-guard часть 2 — форвард самому себе)
+6. fid = MessageForwardsRepo.claim(mid, account.group_id, gf.forward_to)
+   # INSERT INTO message_forwards (message_id, group_id, forward_to) VALUES (...)
+   # ON CONFLICT (message_id, group_id) DO NOTHING RETURNING id
+   if fid is None: skip (уже переслано — идемпотентность)
+7. per-account forward rate-limit (try_consume, fail-open + лог при превышении)
+8. msg = build_forward_mime(account, message, attachments, gf.forward_to)   # §11: multipart text+html+вложения, X-Forwarded-By
+9. try:
+       await smtp_send_message(account, msg, recipients=[gf.forward_to])   # без Sent-append
+       MessageForwardsRepo.mark_sent(fid)                                  # sent_at = now()
+   except (SMTPException|TimeoutError|OSError|OAuth error) as e:
+       MessageForwardsRepo.mark_error(fid, truncate(str(e), 500))          # НЕ ретраить, лог warn, не ронять цикл
+```
+
+### Edge cases
+- Redis недоступен в момент LPOP — APScheduler следующий тик повторит (через `_safe_forward_dispatch` wrapper).
+- Письмо/ящик удалены после LPUSH — `get_by_id` вернёт None → skip.
+- Ящик сменил команду (ADR-0031) после enqueue — `get_by_group_id(account.group_id)` резолвит **актуальную** команду ящика на момент dispatch (нет cache).
+- Конфиг переадресации удалён/выключен после enqueue — шаг 3 → skip; строки `message_forwards` не создаётся.
+- Вложение `skipped_too_large=true` — не грузится из MinIO; перечисляется в теле как пропущенное. Суммарный лимит `FORWARD_MAX_TOTAL_BYTES` — вложение сверх лимита пропускается с пометкой.
+- OAuth-ящик (`auth_type='oauth_outlook'`) — `smtp_send_message` шлёт через XOAUTH2; `oauth_needs_consent=true` → SMTP-ветка бросит ошибку → `mark_error` (не ретраим; лидер увидит письмо в UI).
+- Повторный dispatch того же `message_id` (дубль в очереди / рестарт) — claim вернёт None → skip.
+
+### Инварианты
+- **Exactly-once после claim**: `message_forwards` UNIQUE(message_id, group_id) гарантирует ровно одну попытку пересылки на письмо для команды.
+- **Loop-guard в двух точках**: enqueue-side (skip входящих с `X-Forwarded-By`, §14) + consumer (skip `forward_to == account.email`, шаг 5) + исходящий штамп `X-Forwarded-By: mail-aggregator`.
+- **Только команда, только новые**: персональные ящики (`group_id NULL`) не пересылаются; `internal_date >= gf.created_at` отсекает историю/backfill.
+- `sync_cycle` и другие каналы не падают из-за ошибок этого пути.
+- Отправитель форварда = **получивший ящик** (его SMTP-креды); Sent-append не делается; SMTP-креды/токены не появляются в логах (redact-list).
+- SMTP-ошибка логируется и **не** ретраится (at-most-once после claim; TD-043).
 
 ---
 
@@ -3019,6 +3119,97 @@ WHITELIST_PATHS = [
 - `GET /api/webhooks/me` — один объект (UNIQUE по group_id).
 - `webhook_deliveries` — без UI-листинга в MVP (super_admin может через psql). Объём ≤ 75 000 строк на пике (см. `03-data-model.md`).
 - Recovery_scan SQL — `LIMIT 5000` (см. модуль 14.2).
+
+---
+
+## 19a. forwarding (модуль) — переадресация писем команды лидеру
+
+Источник истины — [ADR-0034](./adr/ADR-0034-leader-mail-forwarding.md). Форк модуля webhooks (§19) **без** secret'а, **без** external-URL, **без** recovery-scan. Конфиг — одна запись на команду (`group_forwarding.group_id UNIQUE`); пересылка — все новые входящие ящиков команды на `forward_to` SMTP-кредами получившего ящика.
+
+### Назначение
+1. **CRUD-конфигурация** — лидер/super_admin задаёт `forward_to` команды (upsert), включает/выключает, удаляет.
+2. **Producer** — после COMMIT новых писем sync_cycle LPUSH'ит `forward_ids` в очередь (см. модуль 14).
+3. **Consumer** — worker-job `forward_dispatch` (см. модуль 14.4) drainit и пересылает.
+4. **MIME + SMTP** — `build_forward_mime` (§11) + общий `smtp_send_message` (§11).
+
+### Публичный API
+- HTTP routes (см. `04-api-contracts.md` §4e):
+  - `GET /my/integrations` (HTML — общая с webhooks, добавляется секция «Переадресация»).
+  - `GET /api/forwarding/me`
+  - `PUT /api/forwarding/me` (upsert)
+  - `DELETE /api/forwarding/me`
+  - Sibling form-fallback: `POST /api/forwarding/me` + `_method=PUT`, `POST /api/forwarding/me/delete` + `_method=DELETE` (ADR-0015).
+
+- Service (`backend/app/forwarding/service.py`):
+```python
+class ForwardingService:
+    async def get_for_scope(scope: VisibilityScope, group_id: int | None = None) -> ForwardingDTO
+        # 404 если у команды нет записи
+
+    async def upsert_for_scope(scope, *, forward_to: str, is_active: bool | None, group_id: int | None = None) -> ForwardingDTO
+        # 1. resolve target group_id (копия WebhooksService._resolve_target_group_id: member→403, super_admin→?group_id, leader→scope.group_id)
+        # 2. validate forward_to (ручной e-mail-паттерн accounts/schemas.py)
+        # 3. GroupForwardingRepo.upsert(group_id, forward_to, is_active) — INSERT ... ON CONFLICT (group_id) DO UPDATE
+        # 4. AuditWriter.log(action='forwarding_updated', details={group_id, forward_to, is_active})
+
+    async def delete_for_scope(scope, group_id: int | None = None) -> None
+        # 404 если нет записи; AuditWriter.log(action='forwarding_deleted', details={group_id})
+```
+
+- DispatchService (`backend/app/forwarding/dispatch_service.py`):
+```python
+class ForwardDispatchService:
+    async def enqueue_message_ids(message_ids: list[int]) -> int
+        # (опц. pre-filter по наличию активного group_forwarding) → batched LPUSH forward_dispatch_queue.
+        # Финальная проверка конфига/loop/history — в консюмере (§14.4).
+```
+
+- Repositories:
+```python
+class GroupForwardingRepo:                    # backend/app/repositories/group_forwarding.py
+    async def get_by_group_id(group_id: int) -> GroupForwarding | None
+    async def upsert(group_id: int, forward_to: str, is_active: bool) -> GroupForwarding
+    async def delete(group_id: int) -> bool
+
+class MessageForwardsRepo:                     # backend/app/repositories/message_forwards.py
+    async def claim(message_id: int, group_id: int, forward_to: str) -> int | None
+        # INSERT ... ON CONFLICT (message_id, group_id) DO NOTHING RETURNING id
+    async def mark_sent(forward_id: int) -> None    # sent_at = now()
+    async def mark_error(forward_id: int, error: str) -> None  # error = truncate(500)
+```
+
+### Тестируемые инварианты
+- `upsert_for_scope` для `group_leader` → запись у `scope.group_id`; для `super_admin(?group_id=)` → у запрошенной группы; для `group_member` → 403.
+- `get_for_scope` для `super_admin` без `group_id` → 400 validation_error (`field=group_id`); для `group_leader` с `group_id` → 400.
+- Невалидный `forward_to` (нет `@` / домен без точки / `..` / длина вне 3..254) → 400 validation_error (`field=forward_to`).
+- `upsert` идемпотентен по команде: повторный вызов обновляет ту же строку (UNIQUE group_id), `created_at` не меняется.
+- `claim` идемпотентен: повторный `(message_id, group_id)` → None.
+- `dispatch_one`: skip при (a) нет/выключен `group_forwarding` (b) `internal_date < gf.created_at` (c) `forward_to == account.email` (d) `account.group_id IS NULL` (e) уже claim'нуто.
+- Персональный ящик (`group_id NULL`) не enqueue'ится и не пересылается.
+- Loop-guard: входящее письмо с заголовком `X-Forwarded-By: mail-aggregator` не enqueue'ится (§14).
+- Исходящий форвард несёт `X-Forwarded-By: mail-aggregator`, `From=account.email`, `To=forward_to`, `Subject=Fwd: …`, блок «пересланное сообщение», text+html+вложения (oversized пропущены с пометкой, суммарно ≤ `FORWARD_MAX_TOTAL_BYTES`).
+- OAuth-ящик пересылает через XOAUTH2 (`smtp_send_message`); Sent-append НЕ выполняется.
+- SMTP-ошибка → `mark_error`, письмо не ретраится, sync/TG/webhook не падают.
+- `DELETE /api/admin/groups/{id}` → каскадно удалены `group_forwarding` + `message_forwards` этой группы.
+- Логирование: SMTP-креды/OAuth-токены не появляются в structlog (redact-test).
+
+### Content negotiation (no-JS fallback)
+Whitelist endpoints (см. `04-api-contracts.md` §4e + ADR-0015): `PUT /api/forwarding/me` (также `POST /api/forwarding/me` + `_method=PUT`); `DELETE /api/forwarding/me` (также `POST /api/forwarding/me/delete` + `_method=DELETE`). Оба — **exact**-пути → `_OVERRIDE_EXACT_PATHS` в `backend/app/middlewares.py` 5→**7**; тест `test_method_override.py::test_exact_paths_present` 5→7 (регекс-16 не меняется). Парсинг form-полей: `forward_to` — строка (e-mail-паттерн); `is_active` — чекбокс (`on`/`1`/`true` → true; отсутствие при upsert-create → true (default), при update — «не менять»).
+
+### Интеграция с другими модулями
+- **groups** — `group_forwarding.group_id FK → groups(id) ON DELETE CASCADE`; при DELETE группы → каскад `group_forwarding` + `message_forwards` (FK `group_id`).
+- **send** — переиспользует общий `smtp_send_message` + `build_forward_mime` (§11).
+- **storage** — `get_object_stream(att.s3_key)` для вложений (§4 storage).
+- **audit** — расширение `ALLOWED_ACTIONS` на 2 action'а: `forwarding_updated`, `forwarding_deleted`.
+- **redis** — новый ключ `forward_dispatch_queue` (LIST; отдельный от `webhook_dispatch_queue`/`tg_notify_queue`). Очистки нет — fire-and-forget; persisted state (dedup) — `message_forwards`.
+- **БД** — две новые таблицы: `group_forwarding`, `message_forwards` (см. `03-data-model.md`).
+- **middlewares** — все `/api/forwarding/me*` под CSRF; rate-limit slowapi (PUT 30/ч, DELETE 10/ч per group).
+- **worker.sync_cycle** (модуль 14) — enqueue `forward_ids` (все новые входящие ящиков с `group_id`, минус несущие `X-Forwarded-By`) в try/except.
+- **worker.forward_dispatch** (модуль 14.4) — drainit `forward_dispatch_queue` каждые 5 сек, пересылает; без recovery (TD-043).
+
+### Пагинация / объёмы
+- `GET /api/forwarding/me` — один объект (UNIQUE по group_id).
+- `message_forwards` — без UI-листинга; объём чистится retention `messages` (см. `03-data-model.md`).
 
 ---
 

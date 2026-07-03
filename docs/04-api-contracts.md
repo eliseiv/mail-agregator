@@ -84,6 +84,8 @@
 | 401 | `init_data_expired` | `POST /api/telegram/auth`: `auth_date` в `init_data` старше 5 минут. |
 | 400 | `webhook_url_private_ip` | `POST/PATCH /api/webhooks/me`: URL резолвится в приватный CIDR / localhost. SSRF-защита. См. [ADR-0023](./adr/ADR-0023-outbound-webhooks.md) §4.3. |
 | 409 | `webhook_already_exists` | `POST /api/webhooks/me`: у группы уже есть webhook (`UNIQUE(group_id)`). Используется `PATCH` для update или `DELETE` + `POST` для пересоздания. |
+| 400 | `validation_error` (`field=forward_to`) | `PUT /api/forwarding/me`: `forward_to` отсутствует или не проходит e-mail-паттерн (`accounts/schemas.py`: один `@`, домен с точкой, без `..`, длина 3..254). См. [ADR-0034](./adr/ADR-0034-leader-mail-forwarding.md) §2. |
+| 400 | `validation_error` (`field=group_id`) | `GET/PUT/DELETE /api/forwarding/me`: `super_admin` не передал обязательный `?group_id=`, либо `group_leader` передал запрещённый `?group_id=`. Симметрично webhooks (ADR-0023 §2). |
 | 401 | `not_authenticated` (external) | `GET /api/external/messages`: нет/неверный `X-API-Key`/`Bearer`, **или** фича выключена (`EXTERNAL_API_KEY` пуст). Неперечислимо — «выключено» неотличимо от «неверный ключ». См. [ADR-0029](./adr/ADR-0029-external-pull-api.md) §3/§4. |
 
 ---
@@ -123,10 +125,14 @@
 | `DELETE /api/webhooks/me` | `POST /api/webhooks/me/delete` + form-поле `_method=DELETE` |
 | `POST /api/webhooks/me/rotate-secret` | (тот же путь и метод) |
 | `POST /api/webhooks/me/test` | (тот же путь и метод) |
+| `PUT /api/forwarding/me` (upsert, ADR-0034) | `POST /api/forwarding/me` + form-поле `_method=PUT` |
+| `DELETE /api/forwarding/me` (ADR-0034) | `POST /api/forwarding/me/delete` + form-поле `_method=DELETE` |
 
 Любые остальные роуты не принимают `_method` — `POST` с этим полем на не-whitelist-роуте даёт `400 method_override_not_allowed`.
 
 > **ADR-0031.** Перенос команды ящика идёт через **существующий** `PATCH /api/mail-accounts/{id}` (строка выше) — **новый** form-fallback regex-путь не вводится. Поэтому `_OVERRIDE_REGEX_PATHS` в `backend/app/middlewares.py` остаётся **16** записей, а хардкод `_OVERRIDE_REGEX_PATHS = 16` в `tests/unit/test_method_override.py` (`TestRegexCount.test_regex_paths_present`) **менять не нужно**.
+
+> **ADR-0034.** Оба form-fallback-пути переадресации (`/api/forwarding/me` для PUT, `/api/forwarding/me/delete` для DELETE) — **exact** (без `\d+`-параметра), поэтому добавляются в `_OVERRIDE_EXACT_PATHS` в `backend/app/middlewares.py` (было **5** → станет **7**), а регекс-список `_OVERRIDE_REGEX_PATHS` (16) **не меняется**. Backend-агент обновляет хардкод в `tests/unit/test_method_override.py` (`TestRegexCount.test_exact_paths_present`: `assert len(_OVERRIDE_EXACT_PATHS) == 5` → `== 7`). Регекс-счётчик (16) **не трогать**.
 
 ### Метод override
 
@@ -175,6 +181,8 @@ CSRF-проверка для override-запросов **обязательна*
 | `DELETE /api/webhooks/me` | `/my/integrations` | "Webhook удалён" |
 | `POST /api/webhooks/me/rotate-secret` | `/my/integrations` | one-shot flash `[secret_reveal]` с новым plaintext |
 | `POST /api/webhooks/me/test` | `/my/integrations` | "Тест выполнен: HTTP {code}, {duration_ms} мс" |
+| `PUT /api/forwarding/me` (via `POST` + `_method=PUT`) | `/my/integrations` | "Переадресация сохранена" (ADR-0034) |
+| `DELETE /api/forwarding/me` (via `POST /api/forwarding/me/delete` + `_method=DELETE`) | `/my/integrations` | "Переадресация удалена" (ADR-0034) |
 
 ### Multi-value поля (form-encoded)
 
@@ -1345,6 +1353,96 @@ Payload (`event="message_tagged"`):
 
 ---
 
+## 4e. Mail forwarding — переадресация писем команды лидеру (ADR-0034)
+
+Источник истины — [ADR-0034](./adr/ADR-0034-leader-mail-forwarding.md). Конфигурация переадресации входящих писем команды на e-mail лидера — **одна запись на команду** (`group_forwarding.group_id UNIQUE`). Пересылка выполняется worker'ом (см. `05-modules.md` §20 + §14.4): при получении нового письма любым ящиком команды сервис пересылает его целиком (`body_text`+`body_html`+вложения) на `forward_to` **SMTP-кредами получившего ящика** (`From`=ящик, `To`=лидер, блок «пересланное сообщение»). Секрета/URL нет (в отличие от webhooks ADR-0023) — отправка идёт через SMTP самого ящика; отдельной URL-SSRF-проверки не требуется.
+
+### Авторизация всех endpoint'ов
+
+- `group_leader` — управляет переадресацией своей команды (`scope.group_id`). Передача `?group_id=` **запрещена** (иначе `400 validation_error` `field=group_id`).
+- `super_admin` — управляет переадресацией любой команды; **обязан** передать `?group_id=<id>` в каждом запросе.
+- `group_member` — `403 forbidden` на всех endpoint'ах.
+
+ACL — копия `WebhooksService._resolve_target_group_id` (ADR-0023 §2). Все state-changing endpoints — под CSRF (ADR-0010).
+
+### `GET /my/integrations`
+
+Та же HTML-страница, что и для webhooks (ADR-0023 §2.7). При `group_leader`/`super_admin` рендерит секцию «Переадресация» (см. `08-frontend.md`). `group_member` → `302 /`.
+
+### `GET /api/forwarding/me`
+
+| | |
+| --- | --- |
+| Query | `group_id?: int` — обязателен для super_admin; для group_leader запрещён. |
+| 200 | `{id, group_id, forward_to, is_active, created_at, updated_at}` — **без секретов** (их нет). |
+| 404 | `not_found` — у команды переадресация не настроена. |
+| 403 | `forbidden`. |
+
+### `PUT /api/forwarding/me` (upsert)
+
+| | |
+| --- | --- |
+| Запрос | JSON `{forward_to: str, is_active?: bool}`; либо form-encoded (см. ниже). |
+| Query | `group_id?: int` — для super_admin. |
+| Валидация | `forward_to` — ручной e-mail-паттерн (`accounts/schemas.py`: один `@`, домен с точкой, без `..`, длина 3..254). `is_active` default `true` при создании; при обновлении — сохраняет прежнее, если не передан. |
+| Поведение | Upsert: если записи для команды нет — создаётся (`201`); иначе обновляется (`200`). `created_at` при обновлении не меняется (anchor «не флудим историей»). |
+| Rate-limit | 30/час per `group_id`. |
+| 200 / 201 | тело как в `GET`. |
+| 400 | `validation_error` (`field=forward_to` — невалидный/пустой e-mail; `field=group_id` — нарушение ACL-правила query). |
+| 403 | `forbidden`. |
+| Audit | `forwarding_updated` (`details = {group_id, forward_to, is_active}`). |
+
+Sample request (JSON):
+```http
+PUT /api/forwarding/me HTTP/1.1
+Content-Type: application/json
+Cookie: mas_session=...; mas_csrf=...
+X-CSRF-Token: ...
+
+{"forward_to": "lead@example.com", "is_active": true}
+```
+
+Sample response:
+```json
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "id": 3,
+  "group_id": 5,
+  "forward_to": "lead@example.com",
+  "is_active": true,
+  "created_at": "2026-07-03T10:00:00Z",
+  "updated_at": "2026-07-03T10:05:00Z"
+}
+```
+
+##### Form-encoded request (no-JS)
+
+Через method override (whitelist exact-путь `/api/forwarding/me`, см. «Form-encoded fallback»):
+```
+POST /api/forwarding/me
+Content-Type: application/x-www-form-urlencoded
+
+_method=PUT&forward_to=lead@example.com&is_active=on&csrf_token=...
+```
+Success → `303 /my/integrations` + flash «Переадресация сохранена». Validation error → re-render `integrations.html` с `form_errors`.
+
+### `DELETE /api/forwarding/me`
+
+| | |
+| --- | --- |
+| Query | `group_id?: int` — для super_admin. |
+| Поведение | `DELETE FROM group_forwarding WHERE group_id=:gid`. История `message_forwards` **не** трогается (живёт по retention `messages`). Будущая переадресация прекращается. |
+| Rate-limit | 10/час per `group_id`. |
+| 204 | success. |
+| 404 | `not_found`. |
+| 403 | `forbidden`. |
+| Audit | `forwarding_deleted` (`details = {group_id}`). |
+| Form-fallback | `POST /api/forwarding/me/delete` + `_method=DELETE`. Success → `303 /my/integrations` + flash «Переадресация удалена». |
+
+---
+
 ## 5. Health & ops
 
 ### `GET /healthz`
@@ -1469,5 +1567,9 @@ FastAPI автогенерит OpenAPI 3.1. UI:
 | POST | `/api/webhooks/me/delete` | group_leader \| super_admin | yes | 10/h per webhook | yes | form-fallback delete (`_method=DELETE`) |
 | POST | `/api/webhooks/me/rotate-secret` | group_leader \| super_admin | yes | 5/h per webhook | yes | rotate secret + reveal one-shot |
 | POST | `/api/webhooks/me/test` | group_leader \| super_admin | yes | 10/h per webhook | yes | synchronous test POST to receiver |
+| GET | `/api/forwarding/me` | group_leader \| super_admin | — | — | — | **ADR-0034:** get forwarding config |
+| PUT | `/api/forwarding/me` | group_leader \| super_admin | yes | 30/h per group | yes | **ADR-0034:** upsert forward_to / is_active; через override |
+| DELETE | `/api/forwarding/me` | group_leader \| super_admin | yes | 10/h per group | yes | **ADR-0034:** delete (canonical) |
+| POST | `/api/forwarding/me/delete` | group_leader \| super_admin | yes | 10/h per group | yes | **ADR-0034:** form-fallback delete (`_method=DELETE`) |
 | GET | `/healthz` | none | — | — | — | liveness |
 | GET | `/readyz` | none | — | — | — | readiness |

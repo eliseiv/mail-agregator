@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import ssl
+from email.message import EmailMessage
 
 import aiosmtplib
 import imap_tools
@@ -32,6 +33,7 @@ from backend.app.send.mime import build_mime, generate_message_id
 from backend.app.send.schemas import SendMessageRequest, SendMessageResponse
 from shared.crypto import decrypt_mail_password
 from shared.logging import get_logger
+from shared.models import MailAccount
 
 log = get_logger(__name__)
 
@@ -192,6 +194,79 @@ async def _smtp_send_oauth(
             await client.quit()
 
 
+async def smtp_send_message(
+    account: MailAccount,
+    msg: EmailMessage,
+    recipients: list[str],
+    *,
+    session: AsyncSession,
+) -> None:
+    """Shared SMTP send core for ``send`` and ``forward`` (ADR-0034 §5).
+
+    Encapsulates both authentication branches:
+
+    - **password:** decrypt ``smtp_encrypted_password`` (falling back to
+      ``encrypted_password``) and SMTP LOGIN;
+    - **oauth_outlook:** fetch a fresh XOAUTH2 access token
+      (:class:`OutlookTokenService`) and drive ``AUTH XOAUTH2``.
+
+    Plus ``assert_public_host`` (SSRF re-check at send time), the shared TLS
+    context and the fail-fast ``_SMTP_TIMEOUT``. Does **not** append to the
+    "Sent" folder — the caller decides (``send`` does a best-effort append;
+    ``forward`` does not, ADR-0034 §5). Raises :class:`SMTPSendFailedError`
+    on any SMTP/transport failure and :class:`OAuthReconsentRequiredError`
+    when an oauth account needs re-consent.
+    """
+    assert_public_host(account.smtp_host, port=account.smtp_port)
+
+    if account.auth_type == "oauth_outlook":
+        if account.oauth_needs_consent:
+            raise OAuthReconsentRequiredError("Reconnect Outlook to send from this account")
+        access_token = await OutlookTokenService(session).get_valid_access_token(account)
+        await _smtp_send_oauth(
+            host=account.smtp_host,
+            port=account.smtp_port,
+            starttls=account.smtp_starttls,
+            email=account.email,
+            access_token=access_token,
+            msg=msg,
+            recipients=recipients,
+        )
+        return
+
+    # Password path — prefer the dedicated SMTP password, fall back to the
+    # IMAP password (same precedence as the pre-ADR-0034 inline send).
+    if account.smtp_encrypted_password is not None:
+        smtp_pwd = decrypt_mail_password(account.smtp_encrypted_password, account.id)
+    else:
+        assert account.encrypted_password is not None
+        smtp_pwd = decrypt_mail_password(account.encrypted_password, account.id)
+    smtp_user = account.smtp_username or account.email
+    try:
+        await aiosmtplib.send(
+            msg,
+            hostname=account.smtp_host,
+            port=account.smtp_port,
+            username=smtp_user,
+            password=smtp_pwd,
+            use_tls=account.smtp_ssl,
+            start_tls=account.smtp_starttls,
+            tls_context=_ssl_context(),
+            recipients=recipients,
+            timeout=_SMTP_TIMEOUT,
+        )
+    except aiosmtplib.SMTPException as exc:
+        raise SMTPSendFailedError(
+            "SMTP send failed",
+            details={"detail": _safe_error_text(exc)},
+        ) from exc
+    except (TimeoutError, OSError) as exc:
+        raise SMTPSendFailedError(
+            "SMTP send failed",
+            details={"detail": _safe_error_text(exc)},
+        ) from exc
+
+
 class SendService:
     def __init__(self, session: AsyncSession) -> None:
         self._db = session
@@ -239,22 +314,16 @@ class SendService:
                 else:
                     refs_header = original.message_id_header
 
-        # 3. Resolve credentials. ADR-0025: oauth_outlook accounts use a
-        #    fresh XOAUTH2 access token; password accounts decrypt the stored
-        #    SMTP password (falling back to the IMAP password).
+        # 3. Resolve the OAuth access token if needed. It is consumed by the
+        #    SMTP send (inside ``smtp_send_message``) AND the best-effort IMAP
+        #    append below; password accounts decrypt lazily in each path
+        #    (ADR-0025 / ADR-0034 §5).
         is_oauth = acc.auth_type == "oauth_outlook"
-        smtp_user = acc.smtp_username or acc.email
-        smtp_pwd: str | None = None
         access_token: str | None = None
         if is_oauth:
             if acc.oauth_needs_consent:
                 raise OAuthReconsentRequiredError("Reconnect Outlook to send from this account")
             access_token = await OutlookTokenService(self._db).get_valid_access_token(acc)
-        elif acc.smtp_encrypted_password is not None:
-            smtp_pwd = decrypt_mail_password(acc.smtp_encrypted_password, acc.id)
-        else:
-            assert acc.encrypted_password is not None
-            smtp_pwd = decrypt_mail_password(acc.encrypted_password, acc.id)
 
         # 4. Build MIME.
         message_id = generate_message_id()
@@ -276,43 +345,9 @@ class SendService:
         if payload.bcc:
             recipients.extend(payload.bcc)
 
-        # 5. SMTP send (XOAUTH2 for oauth accounts, LOGIN otherwise).
-        assert_public_host(acc.smtp_host, port=acc.smtp_port)
-        if is_oauth:
-            assert access_token is not None
-            await _smtp_send_oauth(
-                host=acc.smtp_host,
-                port=acc.smtp_port,
-                starttls=acc.smtp_starttls,
-                email=acc.email,
-                access_token=access_token,
-                msg=msg,
-                recipients=recipients,
-            )
-        else:
-            try:
-                await aiosmtplib.send(
-                    msg,
-                    hostname=acc.smtp_host,
-                    port=acc.smtp_port,
-                    username=smtp_user,
-                    password=smtp_pwd,
-                    use_tls=acc.smtp_ssl,
-                    start_tls=acc.smtp_starttls,
-                    tls_context=_ssl_context(),
-                    recipients=recipients,
-                    timeout=_SMTP_TIMEOUT,
-                )
-            except aiosmtplib.SMTPException as exc:
-                raise SMTPSendFailedError(
-                    "SMTP send failed",
-                    details={"detail": _safe_error_text(exc)},
-                ) from exc
-            except (TimeoutError, OSError) as exc:
-                raise SMTPSendFailedError(
-                    "SMTP send failed",
-                    details={"detail": _safe_error_text(exc)},
-                ) from exc
+        # 5. SMTP send via the shared helper (XOAUTH2 for oauth accounts,
+        #    LOGIN otherwise). ADR-0034 §5 — reused by the forward dispatcher.
+        await smtp_send_message(acc, msg, recipients, session=self._db)
 
         # 6. Best-effort IMAP APPEND to the Sent folder.
         appended = False

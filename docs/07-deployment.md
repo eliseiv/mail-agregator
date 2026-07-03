@@ -248,6 +248,11 @@ Server-блок отвечает `200 ok\n` на `/_health_nginx` (HTTP, не HT
 | `MAILBOX_DOWN_ALERT_ENABLED` | `true` | no | **ADR-0033:** kill-switch Telegram-алерта об авто-отключении почты. `false` → worker не enqueue'ит и не регистрирует job `mailbox_alert_dispatch`. Доставка — **основным** ботом (`TELEGRAM_BOT_TOKEN`), новых секретов нет. |
 | `MAILBOX_ALERT_DISPATCH_INTERVAL_SECONDS` | `5` | no | **ADR-0033:** интервал APScheduler для `mailbox_alert_dispatch` (§14.3). |
 | `MAILBOX_ALERT_BATCH_SIZE` | `30` | no | **ADR-0033:** `LPOP count` из `mailbox_alert_queue` за тик. |
+| `FORWARDING_ENABLED` | `true` | no | **ADR-0034:** kill-switch переадресации писем команды лидеру. `false` → worker не enqueue'ит `forward_ids` и не регистрирует job `forward_dispatch`. Отправка — SMTP-кредами самих ящиков, новых секретов нет. |
+| `FORWARD_DISPATCH_INTERVAL_SECONDS` | `5` | no | **ADR-0034:** интервал APScheduler для `forward_dispatch` (§14.4). |
+| `FORWARD_BATCH_SIZE` | `30` | no | **ADR-0034:** `LPOP count` из `forward_dispatch_queue` за тик. |
+| `FORWARD_MAX_TOTAL_BYTES` | `26214400` | no | **ADR-0034:** суммарный лимит вложений в одном форварде (~25 МБ); превышающие пропускаются с пометкой в теле. |
+| `FORWARD_PER_ACCOUNT_PER_MINUTE` | `30` | no | **ADR-0034:** per-account throttle пересылок (Redis token-bucket, fail-open + лог при превышении). |
 | `TG_MAX_LINKS_PER_USER` | `10` | no | **ADR-0024 (Спринт A):** мягкий потолок числа активных TG-привязок на один internal user. Проверяется в `link_pending`/`POST /api/telegram/links` (`COUNT(active) < limit`); при достижении — `409 tg_link_limit`, audit `telegram_link_limit_reached`. Не DB-констрейнт. |
 | `BOT_IVAN_TOKEN` | (none) | no | **ADR-0027:** токен push-only бота команды `ivan` (BotFather). **round-42:** нужен **и в worker** (доставка), **и в api** (обработка callback). Маскируется в structlog redact-list. Пустой → бот не настроен (тихо игнорируется). |
 | `BOT_IVAN_GROUP_ID` | (none) | no | **ADR-0027:** `mail_accounts.group_id` команды `ivan`. Прод: `1`. Без него бот в `push_team_bots` не попадает. |

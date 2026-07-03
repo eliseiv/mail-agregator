@@ -38,6 +38,7 @@ from backend.app.exceptions import (
     install_exception_handlers,
 )
 from backend.app.external.router import router as external_router
+from backend.app.forwarding.router import router as forwarding_router
 from backend.app.groups.router import router as groups_router
 from backend.app.health.router import router as health_router
 from backend.app.messages.router import router as messages_router
@@ -168,6 +169,7 @@ def create_app() -> FastAPI:
     app.include_router(groups_router)
     app.include_router(telegram_router)
     app.include_router(webhooks_router)
+    app.include_router(forwarding_router)
     app.include_router(external_router)
     app.include_router(health_router)
 
