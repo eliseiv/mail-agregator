@@ -89,6 +89,35 @@ class ExternalMessagesResponse(BaseModel):
 ExternalMessagesPage = ExternalMessagesResponse
 
 
+class ExternalMessagesResponseDesc(BaseModel):
+    """Backward / newest-first page envelope — ``order=desc`` (ADR-0036 §3).
+
+    Kept as a **separate** model from :class:`ExternalMessagesResponse` (the
+    ``asc`` forward page) so that each mode's cursor field is present ONLY in
+    its own mode (ADR-0036 §3): the ``asc`` response carries ``next_since_id``
+    and NEVER ``next_before_id``; this ``desc`` response carries
+    ``next_before_id`` and NEVER ``next_since_id``. A single model with two
+    optional cursors would emit the other mode's key as ``null`` — the ADR
+    requires it **absent**, hence two models. ``ExternalMessageDTO`` /
+    ``ExternalTagDTO`` are shared and unchanged.
+
+    - ``messages`` — ``ExternalMessageDTO`` ordered ``id DESC`` (newest-first).
+    - ``next_before_id`` — ``min(id)`` of the batch (= the last element's ``id``
+      since the page is DESC); pass it back as ``before_id`` for the next
+      (older) page. ``null`` when the batch is empty (no older messages left).
+    - ``has_more`` — ``len(messages) == limit`` (same heuristic as forward).
+    """
+
+    messages: list[ExternalMessageDTO]
+    next_before_id: int | None
+    has_more: bool
+
+
+# ADR-0036 migration step 5 names the backward page ``ExternalMessagesPageDesc``;
+# alias keeps that ADR name importable next to ``ExternalMessagesPage`` (asc).
+ExternalMessagesPageDesc = ExternalMessagesResponseDesc
+
+
 # --- External reply-endpoint (ADR-0035 §2/§5) ------------------------------
 
 

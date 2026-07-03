@@ -40,6 +40,7 @@ from backend.app.deps import DbSession
 from backend.app.exceptions import ForbiddenError, NotAuthenticatedError
 from backend.app.external.schemas import (
     ExternalMessagesResponse,
+    ExternalMessagesResponseDesc,
     ExternalReplyRequest,
     ExternalReplyResponse,
 )
@@ -114,14 +115,34 @@ def _authenticate(request: Request, *, ip: str, settings: Settings) -> None:
         raise NotAuthenticatedError()
 
 
-@router.get("/messages", response_model=ExternalMessagesResponse)
+# ADR-0036: two co-existing modes on one endpoint, selected by ``order``.
+# ``response_model=None`` because the two modes return DISTINCT envelopes
+# (``ExternalMessagesResponse`` with ``next_since_id`` for ``asc`` /
+# ``ExternalMessagesResponseDesc`` with ``next_before_id`` for ``desc``) — each
+# cursor field must be present ONLY in its own mode (ADR-0036 §3). A shared
+# ``response_model`` would filter/merge the fields; returning the concrete model
+# lets FastAPI serialise exactly the fields of the chosen mode.
+@router.get("/messages", response_model=None)
 async def list_external_messages(
     request: Request,
     db: DbSession,
+    # ``order``/``before_id`` are intentionally NOT bound-validated by FastAPI
+    # ``Query`` (no ``Literal`` on ``order``, no ``ge`` on ``before_id``): the
+    # mode co-existence + bounds are validated in a DETERMINISTIC order inside
+    # the service (``_validate_mode``, ADR-0036 §5) so the returned ``field`` is
+    # predictable when several constraints are violated at once. ``since_id`` /
+    # ``limit`` keep their ADR-0029 FastAPI bounds unchanged.
+    order: str = Query(default="asc"),
     since_id: int = Query(default=0, ge=0),
+    before_id: int | None = Query(default=None),
     limit: int = Query(default=_DEFAULT_LIMIT, ge=1, le=_MAX_LIMIT),
-) -> ExternalMessagesResponse:
-    """Incrementally pull system messages (ADR-0029). See module docstring."""
+) -> ExternalMessagesResponse | ExternalMessagesResponseDesc:
+    """Incrementally pull system messages (ADR-0029 forward / ADR-0036 backward).
+
+    See module docstring. ``order=asc`` (default) is the ADR-0029 forward keyset
+    (BC, byte-for-byte); ``order=desc`` is the ADR-0036 newest-first mode
+    (latest N when ``before_id`` is absent, older page when present).
+    """
     ip = client_ip(request)
     settings = get_settings()
 
@@ -130,6 +151,7 @@ async def list_external_messages(
     #    ``settings.EXTERNAL_API_RATE_LIMIT_PER_MINUTE`` (same override pattern
     #    as ``WEBHOOK_TEST_LIMIT`` / ``TG_SEND_PER_CHAT_PER_MINUTE``); the static
     #    ``LIMIT_EXTERNAL_API`` only supplies the name + fixed 60 s window.
+    #    Both modes share the SAME budget (ADR-0036 §6 — backward is read too).
     runtime_limit = Limit(
         name=LIMIT_EXTERNAL_API.name,
         capacity=settings.EXTERNAL_API_RATE_LIMIT_PER_MINUTE,
@@ -140,14 +162,21 @@ async def list_external_messages(
     # 2-4. Auth: key extract + feature gate + constant-time compare.
     _authenticate(request, ip=ip, settings=settings)
 
-    # 5. Query already validated by FastAPI (since_id>=0, 1<=limit<=200).
-    # 6. Delegate to the data service.
-    result = await ExternalMessagesService(db).list_messages(since_id=since_id, limit=limit)
+    # 5. Mode validation (deterministic, ADR-0036 §5) + 6. delegate — both live
+    #    in the service (after auth), which returns the mode-appropriate envelope.
+    result = await ExternalMessagesService(db).list_messages(
+        order=order,
+        since_id=since_id,
+        before_id=before_id,
+        limit=limit,
+    )
 
     log.info(
         "external_pull",
         client_ip=ip,
+        order=order,
         since_id=since_id,
+        before_id=before_id,
         limit=limit,
         returned=len(result.messages),
     )

@@ -1303,17 +1303,24 @@ Payload (`event="message_tagged"`):
 
 ### `GET /api/external/messages`
 
+Два режима на одном endpoint: **forward** (ADR-0029, oldest→newest) и **backward/latest** (ADR-0036, newest-first для «бесконечной ленты» CRM). Режим выбирается параметром `order`; forward — дефолт и полностью обратно-совместим.
+
 | | |
 | --- | --- |
 | Доступ | `EXTERNAL_API_KEY` (`X-API-Key` / `Bearer`). |
-| Query `since_id` | `int ≥ 0`, default `0`. Семантика `WHERE id > since_id`. |
-| Query `limit` | `int`, `1..200`, default `50` (hard cap 200). |
-| Семантика | `WHERE m.id > :since_id AND m.mail_account_id IN (:canonical_ids) ORDER BY m.id ASC LIMIT :limit` — keyset по `messages.id BIGSERIAL` (монотонный insert-order; без пропусков/дублей курсора) + canonical-дедуп дубль-ящиков. Внешний сервис хранит `last_id` = `next_since_id`. |
-| 200 | `{messages:[ExternalMessageDTO], next_since_id:int, has_more:bool}` (см. ниже). |
-| 200 (пусто) | `{messages:[], next_since_id:<входной since_id>, has_more:false}`. |
+| Query `order` | enum `asc` \| `desc`, default `asc`. `asc` = forward (ADR-0029). `desc` = backward/latest (ADR-0036). [ADR-0036](./adr/ADR-0036-external-backward-pagination.md) |
+| Query `since_id` | `int ≥ 0`, default `0`. Только при `order=asc`. Семантика `WHERE id > since_id`. При `order=desc` — `400`. |
+| Query `before_id` | `int ≥ 1`, optional (нет default). Только при `order=desc`. Присутствует → `WHERE id < before_id`; отсутствует → latest N. При `order=asc` — `400`. |
+| Query `limit` | `int`, `1..200`, default `50` (hard cap 200). Оба режима. |
+| Семантика `asc` | `WHERE m.id > :since_id AND m.mail_account_id IN (:canonical_ids) ORDER BY m.id ASC LIMIT :limit` — keyset по `messages.id BIGSERIAL` (монотонный insert-order; без пропусков/дублей курсора) + canonical-дедуп дубль-ящиков. Внешний сервис хранит `last_id` = `next_since_id`. |
+| Семантика `desc` | latest: `WHERE m.mail_account_id IN (:canonical_ids) ORDER BY m.id DESC LIMIT :limit`; older: `+ AND m.id < :before_id`. Reverse-scan по PK `id` (без новых индексов). Потребитель хранит `next_before_id` и передаёт его в `before_id` для следующей (более старой) страницы. |
+| 200 (`asc`) | `{messages:[ExternalMessageDTO] (id ASC), next_since_id:int, has_more:bool}`. |
+| 200 (`desc`) | `{messages:[ExternalMessageDTO] (id DESC, newest-first), next_before_id:int\|null, has_more:bool}`. |
+| 200 (пусто, `asc`) | `{messages:[], next_since_id:<входной since_id>, has_more:false}`. |
+| 200 (пусто, `desc`) | `{messages:[], next_before_id:null, has_more:false}`. |
 | 401 | `not_authenticated` — нет/неверный ключ **или** фича выключена (неперечислимо). |
 | 429 | `rate_limited` (+`Retry-After`). |
-| 400 | `validation_error` — `since_id<0`/нечисловой, `limit` вне `1..200`. |
+| 400 | `validation_error` — `since_id<0`/нечисловой; `before_id<1`/нечисловой; `limit` вне `1..200`; `order`∉{asc,desc}; `before_id` при `order=asc`; `since_id` при `order=desc`; `since_id`+`before_id` одновременно. |
 
 `ExternalMessageDTO` (отдельный от UI `MessageDetail` — стабильный версионируемый контракт; **сырое stored** `body_text`/`body_html` без `collapse_blank_lines_*`):
 
@@ -1341,11 +1348,25 @@ Payload (`event="message_tagged"`):
 }
 ```
 
-- `next_since_id` = `id` последнего элемента (`max(id)`); пусто → входной `since_id`.
-- `has_more` = `len(messages) == limit`.
+- `next_since_id` = `id` последнего элемента (`max(id)`); пусто → входной `since_id`. Поле **только** в `asc`-ответе.
+- `has_more` = `len(messages) == limit` (оба режима).
 - `to_addrs` — всегда строка (БД `NOT NULL DEFAULT ''`); `cc_addrs`/`from_name`/`subject`/`body_html`/`mail_account.display_name` — nullable.
-- Вложения **не передаются** (Q-0029-1). `tags` — `[]` если нет тегов. `body_present=false` → `body_text=""`, `body_html=null`.
+- Вложения **не передаются** (Q-0029-1). `tags` — `[]` если нет тегов, возвращаются в **обоих** режимах (`ExternalTagDTO` не меняется). `body_present=false` → `body_text=""`, `body_html=null`.
 - Возвращаются **только** поля письма — никаких паролей/токенов/secret'ов/IMAP-UID.
+
+**Backward/latest (`order=desc`, ADR-0036).** `messages[]` тот же `ExternalMessageDTO`, порядок `id DESC` (newest-first); курсорное поле — `next_before_id` (вместо `next_since_id`):
+
+```json
+{
+  "messages": [ { "id": 12100, "...": "…ExternalMessageDTO, id DESC…" } ],
+  "next_before_id": 12001,
+  "has_more": true
+}
+```
+
+- `next_before_id` = `min(id)` батча (= `id` последнего элемента, т.к. DESC) — передать в `before_id` для следующей (более старой) страницы. `null`, если батч пуст (старых больше нет). Поле **только** в `desc`-ответе.
+- Итерация ленты: первый экран `?order=desc&limit=50` → newest 50 + `next_before_id`; скролл вниз `?order=desc&before_id=<next_before_id>&limit=50`; стоп при `has_more=false` (или `messages=[]`/`next_before_id=null`).
+- Курсор — по монотонному `messages.id` (не `internal_date`): поздно-пришедшее письмо имеет максимальный `id` и корректно попадает в latest-страницу — ADR-0036 снимает ограничение ADR-0029 «нет newest-first» без silent-loss. `EXTERNAL_API_KEY`/rate-limit `LIMIT_EXTERNAL_API`/CSRF-exempt/super_admin-visibility/canonical-дедуп — те же, что в forward; новых env/флагов/миграций нет.
 
 > **Версионирование:** текущий путь `/api/external/` (неявная v1), поля добавляются аддитивно. Breaking change → `/api/external/v1/` + новый ADR.
 >
@@ -1619,7 +1640,7 @@ FastAPI автогенерит OpenAPI 3.1. UI:
 | PATCH | `/api/me/settings` | user | yes | — | — | user preferences (tg_notifications_enabled); см. ADR-0022 |
 | GET | `/api/oauth/outlook/authorize` | user | — | 30/h | — | сгенерить Microsoft authorize URL + state (ADR-0025) |
 | GET | `/api/oauth/outlook/callback` | state in Redis | exempt | 30/min per IP | — | OAuth callback: code→токены, create mail_account (ADR-0025) |
-| GET | `/api/external/messages` | `EXTERNAL_API_KEY` (X-API-Key \| Bearer) | exempt | 120/min per IP (`LIMIT_EXTERNAL_API`) | — | **ADR-0029:** external pull-API — инкрементальный keyset по `messages.id` (`since_id`/`limit`), ВСЕ письма системы, сырое полное тело, no attachments |
+| GET | `/api/external/messages` | `EXTERNAL_API_KEY` (X-API-Key \| Bearer) | exempt | 120/min per IP (`LIMIT_EXTERNAL_API`) | — | **ADR-0029:** external pull-API — keyset по `messages.id`, ВСЕ письма системы, сырое полное тело, no attachments. **ADR-0036:** + backward/latest режим `order=asc\|desc` (`desc`+`before_id` → newest-first лента, курсор `next_before_id`); forward BC неизменен, тот же rate-limit/auth |
 | POST | `/api/external/messages/{id}/reply` | `EXTERNAL_API_KEY` (X-API-Key \| Bearer) + `EXTERNAL_REPLY_ENABLED` | exempt | 30/min per IP (`LIMIT_EXTERNAL_REPLY`) | — | **ADR-0035:** external reply — ответ на существующее письмо; `from`=ящик оригинала (не выбирается), threading по `{id}`; write opt-in (`EXTERNAL_REPLY_ENABLED`, default off) |
 | GET | `/my/integrations` | group_leader \| super_admin | — | — | — | webhook config page (ADR-0023) |
 | GET | `/api/webhooks/me` | group_leader \| super_admin | — | — | — | get webhook config (no secret) |

@@ -219,6 +219,48 @@ class MessagesRepo:
         rows = (await self._s.execute(stmt)).all()
         return [(row[0], row[1]) for row in rows]
 
+    async def list_before_id(
+        self,
+        *,
+        mail_account_ids: list[int],
+        before_id: int | None,
+        limit: int,
+    ) -> list[tuple[Message, MailAccount]]:
+        """Backward / newest-first keyset listing for the external API (ADR-0036 §2).
+
+        The mirror of :meth:`list_since_id`: same canonical-scope filter
+        (``mail_account_id IN (:mail_account_ids)`` — the deduped set from
+        :meth:`MailAccountsRepo.list_canonical_account_ids`) and the same
+        monotonic ``messages.id`` keyset, only reversed:
+
+        - ``before_id is None`` → **latest** page: the freshest ``limit`` rows
+          (``ORDER BY id DESC LIMIT limit``), no lower id bound.
+        - ``before_id`` set → **older** page: rows with ``id < before_id``
+          (``ORDER BY id DESC LIMIT limit``).
+
+        Reverse-scan over the ``messages.id`` PK — no new index/migration
+        (ADR-0036 §2/Migration plan). ``mail_account_ids=[]`` (no mailboxes at
+        all) returns ``[]`` WITHOUT issuing a query; the ``IN`` and ``id <``
+        bounds are parameterised.
+        """
+        if not mail_account_ids:
+            return []
+        stmt = select(Message, MailAccount).join(
+            MailAccount, MailAccount.id == Message.mail_account_id
+        )
+        # ``before_id is None`` ⇒ latest page (no lower id bound); otherwise the
+        # older-page keyset ``id < before_id``. canonical-scope IN applies to
+        # both — identical profile to the forward ``list_since_id`` path.
+        if before_id is not None:
+            stmt = stmt.where(Message.id < before_id)
+        stmt = (
+            stmt.where(Message.mail_account_id.in_(mail_account_ids))
+            .order_by(Message.id.desc())
+            .limit(limit)
+        )
+        rows = (await self._s.execute(stmt)).all()
+        return [(row[0], row[1]) for row in rows]
+
     async def count_unread_for_user_ids(self, mail_account_ids: list[int] | None) -> int:
         stmt = select(func.count(Message.id)).where(Message.is_read.is_(False))
         if mail_account_ids is not None:
