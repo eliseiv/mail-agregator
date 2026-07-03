@@ -1350,6 +1350,67 @@ Payload (`event="message_tagged"`):
 > **Версионирование:** текущий путь `/api/external/` (неявная v1), поля добавляются аддитивно. Breaking change → `/api/external/v1/` + новый ADR.
 >
 > **id-gaps:** retention-cleanup (ADR-0011, 30д) удаляет старые письма → безвредные пропуски в `id` (keyset `id > since_id` их игнорирует). Контракт: внешний сервис поллит **чаще** окна ретенции.
+>
+> **Запись (reply):** внешний API read-only (ADR-0029); единственный write-endpoint — ответ на письмо — описан в **§4d-reply** ниже ([ADR-0035](./adr/ADR-0035-external-reply-endpoint.md)).
+
+### 4d-reply. `POST /api/external/messages/{id}/reply` (ADR-0035)
+
+Источник истины — [ADR-0035](./adr/ADR-0035-external-reply-endpoint.md). **Единственный write** во внешнем API: ответ на **существующее** входящее письмо тем же `X-API-Key`. Не рушит read-only-модель ADR-0029 — узкая поверхность: отвечаем только на письмо, которое партнёр мог получить pull-каналом; отправитель **не выбирается** (= `mail_account` этого письма); нет CRUD/произвольной отправки/выбора `from`.
+
+#### Feature-флаги
+
+- `EXTERNAL_API_KEY` (как ADR-0029): пусто ⇒ весь внешний API (read+reply) выключен.
+- `EXTERNAL_REPLY_ENABLED` (`bool`, default `false`): **отдельный** write-гейт. `false` ⇒ reply отвечает `403 forbidden` даже при валидном ключе. Read-only ADR-0029 остаётся дефолтом; запись — явный opt-in.
+
+#### Авторизация
+
+Тот же флоу, что `GET /api/external/messages` (ADR-0029 §4): rate-limit **до** ключа → `X-API-Key`/`Bearer` (constant-time) → `external_api_enabled` → **затем** write-гейт `EXTERNAL_REPLY_ENABLED`. CSRF **exempt**. Rate-limit — **отдельный** `LIMIT_EXTERNAL_REPLY` (env `EXTERNAL_REPLY_RATE_LIMIT_PER_MINUTE`, `int`, default `30`, `ge=1`; запросов в минуту на IP), **не** переиспользует read-лимит `120/min` (write дороже/abuse-опаснее; изоляция бюджетов).
+
+| | |
+| --- | --- |
+| Метод / путь | `POST /api/external/messages/{id}/reply` (`{id}` — `int ≥ 1`, `messages.id` оригинала). |
+| Доступ | `EXTERNAL_API_KEY` (`X-API-Key` / `Bearer`) **и** `EXTERNAL_REPLY_ENABLED=true`. |
+| Content-Type | `application/json` (form-fallback не предоставляется — машинный канал). |
+| Семантика | Резолв оригинала в canonical scope (как pull, ADR-0029 §5); `from = original.mail_account_id`; отправка через `SendService` c `in_reply_to_message_id={id}` (threading по оригиналу: `In-Reply-To`/`References`). MIME/SMTP/IMAP-append переиспользуются, не дублируются. |
+
+**Тело запроса** (`ExternalReplyRequest`):
+
+| Поле | Тип | Обяз. | Валидация / default |
+| --- | --- | --- | --- |
+| `to` | `list[str] \| null` | нет | не передан/`null`/пустой ⇒ `[<оригинал.from_addr>]`. E-mail-паттерн; `max_length=100`. |
+| `cc` | `list[str] \| null` | нет | default `null`. E-mail-паттерн; `max_length=100`. |
+| `subject` | `str \| null` | нет | не передан/`null` ⇒ `"Re: " + (<оригинал.subject> or "")`. `max_length=998`. |
+| `body` | `str` | **да** | непустой (после `strip` длина `≥1`); `max_length=1_048_576` (1 MiB). `text/plain`. |
+
+Нет `from_account_id` (сервер), нет `bcc`, нет `in_reply_to_message_id` (сервер из `{id}`).
+
+**Ответ 200** (`ExternalReplyResponse` — подмножество `SendMessageResponse`):
+```json
+{ "sent_id": 987, "smtp_message_id": "<generated-msgid@postapp.store>" }
+```
+`appended_to_sent` **не** во внешнем контракте (best-effort IMAP-append — внутренняя деталь; `SendService` его делает, external DTO опускает).
+
+**Коды:**
+
+| HTTP | code | Когда |
+| --- | --- | --- |
+| 200 | — | Отправлено (SMTP успех). Тело — `ExternalReplyResponse`. |
+| 400 | `validation_error` | Пустой/whitespace `body`; `body`>1 MiB; невалидный e-mail `to`/`cc`; `subject`>998; `>100` адресов. `details.errors[]`. |
+| 401 | `not_authenticated` | Нет/неверный ключ **или** `EXTERNAL_API_KEY` пуст. Неперечислимо. |
+| 403 | `forbidden` | Ключ валиден, но `EXTERNAL_REPLY_ENABLED=false`. |
+| 404 | `not_found` | Письма `{id}` нет **или** оно вне canonical scope (в т.ч. non-canonical дубль). |
+| 409 | `oauth_reconsent_required` | Ящик оригинала — `oauth_outlook` с истёкшим consent. |
+| 429 | `rate_limited` | Превышен `LIMIT_EXTERNAL_REPLY` (+`Retry-After`). |
+| 502 | `smtp_failed` | SMTP-отправка не удалась. |
+
+Sample request:
+```http
+POST /api/external/messages/12345/reply HTTP/1.1
+X-API-Key: <key>
+Content-Type: application/json
+
+{"body": "Спасибо, приняли в работу.", "cc": ["ops@corp.example"]}
+```
 
 ---
 
@@ -1559,6 +1620,7 @@ FastAPI автогенерит OpenAPI 3.1. UI:
 | GET | `/api/oauth/outlook/authorize` | user | — | 30/h | — | сгенерить Microsoft authorize URL + state (ADR-0025) |
 | GET | `/api/oauth/outlook/callback` | state in Redis | exempt | 30/min per IP | — | OAuth callback: code→токены, create mail_account (ADR-0025) |
 | GET | `/api/external/messages` | `EXTERNAL_API_KEY` (X-API-Key \| Bearer) | exempt | 120/min per IP (`LIMIT_EXTERNAL_API`) | — | **ADR-0029:** external pull-API — инкрементальный keyset по `messages.id` (`since_id`/`limit`), ВСЕ письма системы, сырое полное тело, no attachments |
+| POST | `/api/external/messages/{id}/reply` | `EXTERNAL_API_KEY` (X-API-Key \| Bearer) + `EXTERNAL_REPLY_ENABLED` | exempt | 30/min per IP (`LIMIT_EXTERNAL_REPLY`) | — | **ADR-0035:** external reply — ответ на существующее письмо; `from`=ящик оригинала (не выбирается), threading по `{id}`; write opt-in (`EXTERNAL_REPLY_ENABLED`, default off) |
 | GET | `/my/integrations` | group_leader \| super_admin | — | — | — | webhook config page (ADR-0023) |
 | GET | `/api/webhooks/me` | group_leader \| super_admin | — | — | — | get webhook config (no secret) |
 | POST | `/api/webhooks/me` | group_leader \| super_admin | yes | 10/h per group | yes | create webhook + one-shot secret reveal |

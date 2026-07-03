@@ -165,6 +165,25 @@ class Settings(BaseSettings):
     # be retuned without a code redeploy. Numeric (requests/60s), NOT a
     # ``"120/minute"`` string. Window is fixed at 60 s.
     EXTERNAL_API_RATE_LIMIT_PER_MINUTE: int = Field(default=120, ge=1, le=10000)
+    # --- External reply-endpoint (ADR-0035) -------------------------------
+    # Separate write-gate for ``POST /api/external/messages/{id}/reply``. The
+    # read API (ADR-0029) is gated by ``EXTERNAL_API_KEY`` alone; the reply
+    # (write) endpoint additionally requires ``EXTERNAL_REPLY_ENABLED=true``.
+    # Default ``false`` keeps existing read-only ADR-0029 deployments read-only
+    # after a code upgrade (no implicit trust expansion — a valid key does NOT
+    # silently gain send-capability). When false the reply endpoint returns
+    # ``403 forbidden`` even for a valid key. Passed only to the ``api``
+    # container. See ADR-0035 §1.
+    EXTERNAL_REPLY_ENABLED: bool = False
+    # Operator-tunable rate limit for the reply endpoint (ADR-0035 §4):
+    # requests per minute, per client IP. A SEPARATE, stricter budget than the
+    # read limit (default 30 < 120) — a reply sends a real SMTP message (more
+    # expensive / abuse-sensitive) and must not share the read budget (no
+    # mutual eviction between pull and reply). Overrides the static
+    # ``LIMIT_EXTERNAL_REPLY`` capacity at consume-time (same pattern as
+    # ``EXTERNAL_API_RATE_LIMIT_PER_MINUTE``). Numeric (requests/60s); window is
+    # fixed at 60 s.
+    EXTERNAL_REPLY_RATE_LIMIT_PER_MINUTE: int = Field(default=30, ge=1, le=10000)
 
     # --- Telegram launcher bot (ADR-0018) + persistent SSO / notifications
     #     (ADR-0022) ---

@@ -33,7 +33,7 @@ from backend.app.send.mime import build_mime, generate_message_id
 from backend.app.send.schemas import SendMessageRequest, SendMessageResponse
 from shared.crypto import decrypt_mail_password
 from shared.logging import get_logger
-from shared.models import MailAccount
+from shared.models import MailAccount, Message
 
 log = get_logger(__name__)
 
@@ -285,6 +285,26 @@ class SendService:
             group_ids=scope.group_ids, owner_user_id=scope.user_id
         )
 
+    @staticmethod
+    def _resolve_threading(original: Message) -> tuple[str | None, str | None]:
+        """Build ``In-Reply-To`` / ``References`` headers from ``original``.
+
+        Shared by the session ``send`` (in-reply-to path) and the external
+        reply (ADR-0035): both thread a new outgoing message onto an existing
+        one. Returns ``(in_reply_to_header, references_header)`` — both ``None``
+        when the original carries no ``Message-ID`` header (nothing to thread
+        onto). ``References`` = original ``References`` + original ``Message-ID``
+        per RFC 5322.
+        """
+        if not original.message_id_header:
+            return None, None
+        in_reply_header = original.message_id_header
+        if original.refs_header:
+            refs_header = original.refs_header.strip() + " " + original.message_id_header
+        else:
+            refs_header = original.message_id_header
+        return in_reply_header, refs_header
+
     async def send(
         self, *, scope: VisibilityScope, payload: SendMessageRequest
     ) -> SendMessageResponse:
@@ -296,7 +316,7 @@ class SendService:
         if acc is None:
             raise NotFoundError("Mail account not found")
 
-        # 2. Resolve in-reply-to headers if requested.
+        # 2. Resolve in-reply-to headers if requested (visibility-scoped).
         in_reply_header: str | None = None
         refs_header: str | None = None
         if payload.in_reply_to_message_id is not None:
@@ -306,77 +326,165 @@ class SendService:
             )
             if original is None:
                 raise NotFoundError("Original message not found")
-            if original.message_id_header:
-                in_reply_header = original.message_id_header
-                # References = old refs + original Message-ID, per RFC 5322.
-                if original.refs_header:
-                    refs_header = original.refs_header.strip() + " " + original.message_id_header
-                else:
-                    refs_header = original.message_id_header
+            in_reply_header, refs_header = self._resolve_threading(original)
 
-        # 3. Resolve the OAuth access token if needed. It is consumed by the
-        #    SMTP send (inside ``smtp_send_message``) AND the best-effort IMAP
-        #    append below; password accounts decrypt lazily in each path
-        #    (ADR-0025 / ADR-0034 §5).
-        is_oauth = acc.auth_type == "oauth_outlook"
-        access_token: str | None = None
-        if is_oauth:
-            if acc.oauth_needs_consent:
-                raise OAuthReconsentRequiredError("Reconnect Outlook to send from this account")
-            access_token = await OutlookTokenService(self._db).get_valid_access_token(acc)
-
-        # 4. Build MIME.
-        message_id = generate_message_id()
-        msg = build_mime(
-            from_addr=acc.email,
+        # 3-7. Shared send core (MIME → SMTP → IMAP-append → persist). The
+        #      author is the caller (``scope.user_id``) — distinct from the
+        #      mailbox owner so a leader sending from a member's mailbox is
+        #      correctly attributed (ADR-0019 §7.3).
+        return await self._send_core(
+            account=acc,
             to=payload.to,
             cc=payload.cc,
             bcc=payload.bcc,
             subject=payload.subject,
-            body_text=payload.body,
+            body=payload.body,
+            in_reply_header=in_reply_header,
+            refs_header=refs_header,
+            author_user_id=scope.user_id,
+        )
+
+    async def send_external_reply(
+        self,
+        *,
+        message_id: int,
+        to: list[str] | None,
+        cc: list[str] | None,
+        subject: str | None,
+        body: str,
+    ) -> SendMessageResponse:
+        """Reply to an existing message via the external API (ADR-0035).
+
+        No user session: the message is resolved in the SAME canonical scope
+        the pull API exposes (ADR-0029 §5), so the caller can only reply to a
+        message it could have pulled. The sender is NOT chosen by the caller —
+        it is fixed to the original message's mailbox (``from`` = the mailbox
+        the message arrived at). Threading is derived server-side from the
+        original. Reuses the shared send core (no MIME/SMTP duplication,
+        ADR-0034 §5 / ADR-0035 §Decision).
+
+        Raises :class:`NotFoundError` (404) when the message does not exist or
+        is outside the canonical scope (non-canonical duplicate mailbox
+        included — its existence is not disclosed, ADR-0035 §Edge cases).
+        """
+        # Resolve the original in the canonical-dedup scope (same as pull).
+        canonical_ids = await self._accounts.list_canonical_account_ids()
+        original = await self._messages.get_for_user_ids(
+            message_id=message_id, mail_account_ids=canonical_ids
+        )
+        if original is None:
+            raise NotFoundError("Original message not found")
+
+        # Sender = the mailbox the original arrived at (never caller-chosen).
+        from_account = await self._accounts.get_for_user_ids(
+            canonical_ids, original.mail_account_id
+        )
+        if from_account is None:
+            # Defensive: the account was resolved as canonical above, so this
+            # only trips on a concurrent delete. Same opaque 404 as above.
+            raise NotFoundError("Original message not found")
+
+        # Server-derived defaults (NOT user input — bypass the request
+        # validator, ADR-0035 §2): reply to the sender; "Re: " subject.
+        reply_to = to or [original.from_addr]
+        reply_subject = subject if subject is not None else "Re: " + (original.subject or "")
+        in_reply_header, refs_header = self._resolve_threading(original)
+
+        # Persist author = mailbox owner (external context has no session
+        # author; FK-valid + semantically the owner sent the reply, ADR-0035 §7).
+        return await self._send_core(
+            account=from_account,
+            to=reply_to,
+            cc=cc,
+            bcc=None,
+            subject=reply_subject,
+            body=body,
+            in_reply_header=in_reply_header,
+            refs_header=refs_header,
+            author_user_id=from_account.user_id,
+        )
+
+    async def _send_core(
+        self,
+        *,
+        account: MailAccount,
+        to: list[str],
+        cc: list[str] | None,
+        bcc: list[str] | None,
+        subject: str | None,
+        body: str,
+        in_reply_header: str | None,
+        refs_header: str | None,
+        author_user_id: int,
+    ) -> SendMessageResponse:
+        """Shared post-visibility send pipeline (ADR-0035 §Migration step 6).
+
+        Steps: OAuth token resolve → MIME build → SMTP send → best-effort IMAP
+        "Sent" append → persist ``sent_messages``. Reused verbatim by the
+        session ``send`` and the external reply so MIME/SMTP/append/persist are
+        NEVER duplicated. Callers own visibility + threading resolution and pass
+        the resolved ``account`` / headers / ``author_user_id`` in.
+        """
+        # OAuth access token (consumed by the best-effort IMAP append below;
+        # ``smtp_send_message`` resolves its own token for the SMTP leg).
+        is_oauth = account.auth_type == "oauth_outlook"
+        access_token: str | None = None
+        if is_oauth:
+            if account.oauth_needs_consent:
+                raise OAuthReconsentRequiredError("Reconnect Outlook to send from this account")
+            access_token = await OutlookTokenService(self._db).get_valid_access_token(account)
+
+        message_id = generate_message_id()
+        msg = build_mime(
+            from_addr=account.email,
+            to=to,
+            cc=cc,
+            bcc=bcc,
+            subject=subject,
+            body_text=body,
             in_reply_to_header=in_reply_header,
             references_header=refs_header,
             message_id=message_id,
         )
 
-        recipients = list(payload.to)
-        if payload.cc:
-            recipients.extend(payload.cc)
-        if payload.bcc:
-            recipients.extend(payload.bcc)
+        recipients = list(to)
+        if cc:
+            recipients.extend(cc)
+        if bcc:
+            recipients.extend(bcc)
 
-        # 5. SMTP send via the shared helper (XOAUTH2 for oauth accounts,
-        #    LOGIN otherwise). ADR-0034 §5 — reused by the forward dispatcher.
-        await smtp_send_message(acc, msg, recipients, session=self._db)
+        # SMTP send via the shared helper (XOAUTH2 for oauth accounts, LOGIN
+        # otherwise). ADR-0034 §5 — reused by the forward dispatcher too.
+        await smtp_send_message(account, msg, recipients, session=self._db)
 
-        # 6. Best-effort IMAP APPEND to the Sent folder.
+        # Best-effort IMAP APPEND to the Sent folder.
         appended = False
         appended_error: str | None = None
         try:
-            assert_public_host(acc.imap_host, port=acc.imap_port)
+            assert_public_host(account.imap_host, port=account.imap_port)
             if is_oauth:
                 assert access_token is not None
                 await asyncio.wait_for(
                     asyncio.to_thread(
                         _imap_append_oauth_blocking,
-                        host=acc.imap_host,
-                        port=acc.imap_port,
-                        email=acc.email,
+                        host=account.imap_host,
+                        port=account.imap_port,
+                        email=account.email,
                         access_token=access_token,
                         raw_message_bytes=bytes(msg),
                     ),
                     timeout=_IMAP_APPEND_TIMEOUT + 5,
                 )
             else:
-                assert acc.encrypted_password is not None
+                assert account.encrypted_password is not None
                 await asyncio.wait_for(
                     asyncio.to_thread(
                         _imap_append_blocking,
-                        host=acc.imap_host,
-                        port=acc.imap_port,
-                        ssl_on=acc.imap_ssl,
-                        username=acc.email,
-                        password=decrypt_mail_password(acc.encrypted_password, acc.id),
+                        host=account.imap_host,
+                        port=account.imap_port,
+                        ssl_on=account.imap_ssl,
+                        username=account.email,
+                        password=decrypt_mail_password(account.encrypted_password, account.id),
                         raw_message_bytes=bytes(msg),
                     ),
                     timeout=_IMAP_APPEND_TIMEOUT + 5,
@@ -386,22 +494,18 @@ class SendService:
             appended_error = _safe_error_text(exc)
             log.info(
                 "smtp_send_imap_append_failed",
-                mail_account_id=acc.id,
+                mail_account_id=account.id,
                 detail=appended_error,
             )
 
-        # 7. Persist sent_messages. ``user_id`` records the *author*
-        # (the caller) — distinct from the mailbox owner ``acc.user_id``
-        # so a leader sending from a member's mailbox is correctly
-        # attributed (ADR-0019 §7.3).
         sent = await self._sent.insert(
-            user_id=scope.user_id,
-            from_account_id=acc.id,
-            to_addrs=", ".join(payload.to),
-            cc_addrs=", ".join(payload.cc) if payload.cc else None,
-            bcc_addrs=", ".join(payload.bcc) if payload.bcc else None,
-            subject=payload.subject,
-            body_text=payload.body,
+            user_id=author_user_id,
+            from_account_id=account.id,
+            to_addrs=", ".join(to),
+            cc_addrs=", ".join(cc) if cc else None,
+            bcc_addrs=", ".join(bcc) if bcc else None,
+            subject=subject,
+            body_text=body,
             in_reply_to=in_reply_header,
             refs_header=refs_header,
             smtp_message_id=message_id,

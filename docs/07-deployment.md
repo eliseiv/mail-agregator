@@ -284,6 +284,17 @@ OAuth включён (`OUTLOOK_OAUTH_ENABLED`, derived), когда заданы
 | `EXTERNAL_API_KEY` | `""` (пусто) | no | **ADR-0029:** статический ключ для `GET /api/external/messages` (доверенный B2B-партнёр забирает все письма pull'ом). Генерация: `openssl rand -hex 32` (256 бит). **Опционально**: пусто ⇒ фича выключена (`external_api_enabled=false`) ⇒ endpoint отдаёт `401` неперечислимо. Передаётся **только** в `api` (worker не использует). Маскируется в structlog redact-list (рядом с `MAIL_ENCRYPTION_KEY`/`TELEGRAM_BOT_TOKEN`); `X-API-Key`/`Authorization` тоже в redact. Ротация — см. `06-security.md` §10. |
 | `EXTERNAL_API_RATE_LIMIT_PER_MINUTE` | `120` | no | **ADR-0029:** лимит запросов в минуту на IP к `GET /api/external/messages` (`LIMIT_EXTERNAL_API`). Consume до проверки ключа (anti-flood). Числовой (`int`, `ge=1`; `0` не допускается). Override на consume-time (паттерн `TG_SEND_PER_CHAT_PER_MINUTE`). |
 
+### External reply-API (ADR-0035)
+
+Отдельный write-гейт для `POST /api/external/messages/{id}/reply` (ответ на существующее письмо тем же `EXTERNAL_API_KEY`). Read-контракт ADR-0029 (ключ + лимит выше) остаётся обязательным условием — reply не работает без непустого `EXTERNAL_API_KEY`; `EXTERNAL_REPLY_ENABLED` — **дополнительный** opt-in поверх него.
+
+| Переменная | Default | Required | Описание |
+| --- | --- | --- | --- |
+| `EXTERNAL_REPLY_ENABLED` | `false` | no | **ADR-0035 §1:** отдельный гейт записи для `POST /api/external/messages/{id}/reply`. `false` (default) ⇒ reply отдаёт `403 forbidden` даже при валидном ключе — существующие read-only деплои ADR-0029 не получают write-способность молча при апгрейде кода. Запись — явный opt-in оператора. **На prod `postapp.store` reply активирован: `EXTERNAL_REPLY_ENABLED=true`** (в серверном `.env`, см. ниже). Передаётся **только** в `api` (worker не использует). Bool (`true`/`false`). |
+| `EXTERNAL_REPLY_RATE_LIMIT_PER_MINUTE` | `30` | no | **ADR-0035 §4:** отдельный, более жёсткий лимит запросов в минуту на IP к reply-endpoint (`LIMIT_EXTERNAL_REPLY`), независимый от read-лимита (каждый вызов = один реальный SMTP-send). Consume **первым**, до проверки ключа. Числовой (`int`, `ge=1`; `0` не допускается). Override на consume-time (паттерн `EXTERNAL_API_RATE_LIMIT_PER_MINUTE`). Default `30` < read `120`. |
+
+Обе переменные приходят в `api` через `env_file: .env` (compose **не** перечисляет их поимённо в `environment:` — тот же механизм, что `EXTERNAL_API_KEY` и push-боты). Правка `docker-compose.yml` не требуется: достаточно строк в серверном `.env`. **Активация на `postapp.store`:** в `/opt/mail-agregator/.env` задать `EXTERNAL_REPLY_ENABLED=true` (и, при необходимости тюнинга, `EXTERNAL_REPLY_RATE_LIMIT_PER_MINUTE`), затем `docker compose --profile prod up -d --force-recreate api` (deploy.yml трогает только `IMAGE_TAG`/`IMAGE_REGISTRY`, остальные строки `.env` не переписывает — значение сохраняется между деплоями). `EXTERNAL_REPLY_ENABLED`/`EXTERNAL_REPLY_RATE_LIMIT_PER_MINUTE` — не секреты (флаг + число), в redact-list не добавляются; секрет остаётся только `EXTERNAL_API_KEY`.
+
 ### CI / Build
 
 | Переменная | Default | Required | Описание |

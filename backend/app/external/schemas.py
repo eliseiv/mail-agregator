@@ -18,7 +18,9 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
+
+from backend.app.send.schemas import _validate_addresses
 
 
 class ExternalMailAccountDTO(BaseModel):
@@ -85,3 +87,57 @@ class ExternalMessagesResponse(BaseModel):
 # canonical class here is ``ExternalMessagesResponse`` (used as the router's
 # ``response_model``). This alias keeps the ADR name importable/consistent.
 ExternalMessagesPage = ExternalMessagesResponse
+
+
+# --- External reply-endpoint (ADR-0035 §2/§5) ------------------------------
+
+
+class ExternalReplyRequest(BaseModel):
+    """Body of ``POST /api/external/messages/{id}/reply`` (ADR-0035 §2).
+
+    Deliberately narrow (ADR-0035 §Decision): NO ``from_account_id`` (the
+    sender is the original message's mailbox, server-derived), NO ``bcc``
+    (surface reduction), NO ``in_reply_to_message_id`` (threading is derived
+    server-side from the path ``{id}``).
+
+    Defaults that depend on the original message (``to`` → ``[from_addr]``,
+    ``subject`` → ``"Re: " + subject``) are NOT resolved here — they are
+    server-derived in :meth:`SendService.send_external_reply` (not user input,
+    so they bypass this request validator, ADR-0035 §2).
+    """
+
+    to: list[str] | None = Field(default=None, max_length=100)
+    cc: list[str] | None = Field(default=None, max_length=100)
+    subject: str | None = Field(default=None, max_length=998)  # RFC 5322 line
+    body: str = Field(..., max_length=1_048_576)  # 1 MiB — parity with send
+
+    @field_validator("to", "cc")
+    @classmethod
+    def _check_addresses(cls, v: list[str] | None) -> list[str] | None:
+        # Same e-mail pattern as the session ``send`` endpoint (ADR-0035 §2 —
+        # reuse ``send/schemas.py:_EMAIL_RE`` via ``_validate_addresses``).
+        if v is None:
+            return None
+        return _validate_addresses(v)
+
+    @field_validator("body")
+    @classmethod
+    def _check_body_not_blank(cls, v: str) -> str:
+        # Non-empty after strip (ADR-0035 §2 / Edge cases: whitespace-only body
+        # → 400 validation_error, field=body). The raw (un-stripped) value is
+        # sent so the partner's intended formatting is preserved.
+        if not v.strip():
+            raise ValueError("body must not be empty")
+        return v
+
+
+class ExternalReplyResponse(BaseModel):
+    """200 body of the reply endpoint (ADR-0035 §5).
+
+    A strict subset of the internal ``SendMessageResponse`` — ``appended_to_sent``
+    is intentionally omitted (best-effort IMAP "Sent" append is an internal
+    detail that does not affect the fact of sending; ADR-0035 §5 / Q-0035-2).
+    """
+
+    sent_id: int
+    smtp_message_id: str

@@ -128,6 +128,15 @@ LIMIT_TG_SEND_PER_CHAT = Limit(name="tg_send", capacity=20, window_seconds=60)
 # ``LIMIT_WEBHOOK_TEST`` / ``LIMIT_TG_SEND_PER_CHAT``) so operators can tune the
 # cap without a code redeploy. The static value here is the default fallback.
 LIMIT_EXTERNAL_API = Limit(name="external_api", capacity=120, window_seconds=60)
+# External reply-endpoint (ADR-0035 §4): 30 req / 60 s per client IP — a
+# SEPARATE, stricter budget than ``LIMIT_EXTERNAL_API`` (read, 120/min). A
+# reply sends a real SMTP message (cost + spam/abuse risk), so its write budget
+# is independent (no mutual eviction between pull and reply) and strictly
+# smaller. Consumed FIRST in the router — before any key work — like the read
+# limit. ``capacity`` is overridden at consume-time from
+# ``settings.EXTERNAL_REPLY_RATE_LIMIT_PER_MINUTE`` (same override pattern as
+# ``LIMIT_EXTERNAL_API``); the static value here is the default fallback.
+LIMIT_EXTERNAL_REPLY = Limit(name="external_reply", capacity=30, window_seconds=60)
 
 
 async def consume(limit: Limit, key: str) -> None:

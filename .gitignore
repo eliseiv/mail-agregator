@@ -115,3 +115,7 @@ final*.txt
 smoke_*.txt
 docker-compose.qa-local.yml
 *.jpg
+# Local scratch env/test helpers — may carry localhost dev credentials; never commit.
+scratch_testenv.sh
+scratch_*
+*.local.sh

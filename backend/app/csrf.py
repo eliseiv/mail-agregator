@@ -57,9 +57,13 @@ EXEMPT_PATHS: frozenset[str] = frozenset(
 EXEMPT_PATH_PREFIXES: tuple[str, ...] = (
     "/api/telegram/webhook/",
     "/api/telegram/push-webhook/",
-    # ADR-0029 §1: external PULL-API. No cookie session — auth is a static
-    # ``X-API-Key`` / ``Bearer`` key (constant-time compare); GET-only,
-    # read-only, so CSRF (a cookie-session defence) does not apply.
+    # ADR-0029 §1 + ADR-0035 §2: external API. No cookie session — auth is a
+    # static ``X-API-Key`` / ``Bearer`` key (constant-time compare). This prefix
+    # covers BOTH the pull GET (ADR-0029) and the reply POST
+    # ``/api/external/messages/{id}/reply`` (ADR-0035 — the single write
+    # endpoint): CSRF is a cookie-session defence and does not apply to the
+    # API-key channel. The reply write-gate is ``EXTERNAL_REPLY_ENABLED``, not
+    # CSRF.
     "/api/external/",
 )
 
