@@ -691,8 +691,10 @@ a:hover { color: var(--color-primary-hover); text-decoration: underline; }
 
 .msg-row__link {
   display: grid;
-  /* indicator | account | from | tags | subject | date */
-  grid-template-columns: 12px auto minmax(140px, 1fr) auto minmax(200px, 2fr) auto;
+  /* indicator | account | from | tags | subject(flex) | date.
+     from hugs its content (max-content, shrinkable) and subject takes the
+     leftover (1fr) so there is no large empty gap between sender and subject. */
+  grid-template-columns: 12px auto minmax(0, max-content) auto minmax(0, 1fr) auto;
   /* Row 1 = meta line; row 2 = body preview (collapses to 0 when preview empty). */
   grid-template-rows: auto auto;
   align-items: center;
@@ -731,9 +733,10 @@ a:hover { color: var(--color-primary-hover); text-decoration: underline; }
   font-size: var(--font-size-sm);
 }
 .msg-row__attach { margin-left: var(--space-2); color: var(--color-text-muted); }
-/* Gmail-style body preview: second grid row under from/subject/date. */
+/* Gmail-style body preview: second grid row, left-aligned with the account
+   chip (starts at the account column, spans to the end). */
 .msg-row__preview {
-  grid-column: 3 / -1;
+  grid-column: 2 / -1;
   grid-row: 2;
   align-self: start;
   min-width: 0;
@@ -2447,22 +2450,6 @@ body.tg-app .main {
 /* The footer with brand name is also redundant inside Telegram. */
 body.tg-app .footer {
   display: none;
-}
-
-/* Telegram DESKTOP (wide window): tg.js sets body.tg-app regardless of width,
-   which otherwise pins the fixed bottom-nav and hides the top-nav even on a
-   wide desktop window. On ≥641px restore the top-nav and drop the bottom-nav
-   (mobile Telegram ≤640px keeps the bottom-nav — this override is width-gated). */
-@media (min-width: 641px) {
-  body.tg-app .topnav {
-    display: flex;
-  }
-  body.tg-app .bottom-nav {
-    display: none;
-  }
-  body.tg-app .main {
-    padding-bottom: var(--space-5);
-  }
 }
 
 /* ---------- 21. Integrations (ADR-0023, 04-api-contracts.md §4b) ---------
