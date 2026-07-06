@@ -4,8 +4,9 @@
  * SDK is fetched from https://telegram.org/js/telegram-web-app.js, also defer).
  * `defer` guarantees execution order: SDK first, then this glue.
  *
- * In a regular browser `window.Telegram` is undefined and this script
- * early-returns — no DOM/CSS mutations, no observable side effects.
+ * In a regular browser the Telegram SDK still defines `window.Telegram.WebApp`
+ * but with `platform === "unknown"`; this script detects that and early-returns
+ * — no `tg-app` class, no DOM/CSS mutations, so the desktop top-nav is used.
  *
  * Inside Telegram WebView:
  *   - tg.ready()  -> Telegram hides its loading splash;
@@ -24,8 +25,20 @@
 
   var tg = window.Telegram && window.Telegram.WebApp;
   if (!tg) {
-    // Regular browser: no SDK was loaded (no /js/telegram-web-app.js, or
-    // network blocked it, or we're outside Telegram WebView). No-op.
+    // The SDK object is absent entirely (script blocked). No-op.
+    return;
+  }
+
+  // IMPORTANT: the official telegram-web-app.js SDK creates
+  // `window.Telegram.WebApp` even in a PLAIN BROWSER (with `platform ==
+  // "unknown"` and empty `initData`). So the mere existence of `tg` does NOT
+  // mean we run inside Telegram. Detect the real Telegram WebView via
+  // `platform` — a regular desktop/mobile browser reports "unknown". Outside
+  // Telegram we behave as an ordinary web app: NO `tg-app` class is added, so
+  // the desktop TOP navigation stays (instead of the mobile bottom-nav) and the
+  // default light palette is used.
+  var isTelegram = !!(tg.platform && tg.platform !== "unknown");
+  if (!isTelegram) {
     return;
   }
 
