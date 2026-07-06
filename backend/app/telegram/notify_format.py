@@ -12,10 +12,11 @@ and the subject line is **always** present (empty subject falls back to a
 "no subject" placeholder). Blank-line separators sit between the
 header/sender blocks and before the (still optional) body preview. The
 preview length cap dropped 120 -> 100 (:data:`PREVIEW_LEN`). The two pure
-helpers that produce a clean plain-text preview from a message body live
-in this module too (:func:`html_to_plain` / :func:`normalize_preview`) —
-the dispatcher (``notify_service.dispatch_one_payload``) calls them once
-per message.
+helpers that produce a clean plain-text preview from a message body
+(:func:`html_to_plain` / :func:`normalize_preview`) now live in
+:mod:`shared.preview` and are re-exported here for backward compatibility
+— the dispatcher (``notify_service.dispatch_one_payload``) still calls
+them once per message via the notify_format names.
 """
 
 # Whole-file noqa: the visible strings here are intentional Russian text
@@ -26,15 +27,32 @@ per message.
 from __future__ import annotations
 
 import html
-import re
 from typing import Final
 
-from shared.html_sanitize import sanitize_telegram_html, strip_invisible_padding
+from shared.html_sanitize import strip_invisible_padding
 
-#: Maximum number of characters kept from the body preview line. Module
-#: constant (NOT env): retuning is unnecessary and an extra flag is pure
-#: overhead (ADR-0022 §2.5). Round-36: 120 → 100.
-PREVIEW_LEN: Final[int] = 100
+# Preview helpers were extracted to ``shared.preview`` so non-Telegram
+# callers (the messages inbox listing) can build the same body preview
+# without importing this telegram module. Re-exported here for backward
+# compatibility — existing importers (``worker.app.push_notify_dispatch``,
+# ``backend.app.telegram.notify_service``) keep using the notify_format
+# names. ``_WHITESPACE_RUN_RE`` / ``_ELLIPSIS`` are still consumed below by
+# :func:`format_notification`.
+from shared.preview import (
+    _ELLIPSIS,
+    _WHITESPACE_RUN_RE,
+    PREVIEW_LEN,
+    html_to_plain,
+    normalize_preview,
+)
+
+__all__ = [
+    "PREVIEW_LEN",
+    "SUBJECT_MAX",
+    "format_notification",
+    "html_to_plain",
+    "normalize_preview",
+]
 
 #: Maximum number of characters kept from the subject line before it is
 #: truncated with an ellipsis. Module constant (see ``PREVIEW_LEN``).
@@ -48,68 +66,6 @@ _NO_TAG: Final[str] = "Не сортировано"
 #: (round-36 — the subject line is now always present; matches the
 #: callback placeholder §2.6).
 _NO_SUBJECT: Final[str] = "(без темы)"
-
-#: Horizontal ellipsis appended after a truncation.
-_ELLIPSIS: Final[str] = "…"
-
-# Strip any HTML tag left behind after the Telegram-subset sanitiser. The
-# sanitiser keeps ``<b>``/``<a>``/``<code>`` etc. — for a *plain* preview
-# we want none of that, so we drop every remaining ``<…>`` run.
-_ANY_TAG_RE: Final[re.Pattern[str]] = re.compile(r"<[^>]+>")
-
-# Collapse every run of whitespace (incl. newlines, tabs, the non-breaking
-# space U+00A0) into a single ASCII space. Invisible zero-width padding is
-# removed beforehand via ``strip_invisible_padding`` so it never lingers as
-# part of a "whitespace" run.
-_WHITESPACE_RUN_RE: Final[re.Pattern[str]] = re.compile(r"[\s\xa0]+")
-
-
-def html_to_plain(body_html: str | None) -> str:
-    """Reduce an HTML email body to clean plain text for a push preview.
-
-    ``sanitize_telegram_html`` only narrows the markup to the Telegram
-    subset (it *keeps* ``<b>``/``<a>``/``<code>``…) — that is still HTML,
-    not plain text. For a teaser preview we strip **all** remaining tags
-    and decode HTML entities so the user sees readable text with no markup.
-
-    Empty / ``None`` input returns ``""``.
-    """
-    if not body_html:
-        return ""
-    # Reuse the shared sanitiser first: it drops <style>/<script>/<head>
-    # bodies (CSS/JS leakage) and converts <br>/block closers to newlines,
-    # so we don't carry layout chrome into the preview.
-    sanitised = sanitize_telegram_html(body_html)
-    # Remove every tag the sanitiser legitimately kept (<b>, <a>, …).
-    without_tags = _ANY_TAG_RE.sub(" ", sanitised)
-    # Decode entities (``&amp;`` → ``&``, ``&lt;`` → ``<`` …). The result is
-    # re-escaped by ``format_notification`` before it reaches Telegram.
-    return html.unescape(without_tags)
-
-
-def normalize_preview(text: str) -> str:
-    """Collapse whitespace, trim, and cap ``text`` to :data:`PREVIEW_LEN`.
-
-    - zero-width / invisible padding is removed (reusing
-      :func:`shared.html_sanitize.strip_invisible_padding`);
-    - every whitespace run (newlines, tabs, ``\\xa0``, multiple spaces) is
-      collapsed to a single ASCII space;
-    - leading / trailing whitespace is stripped;
-    - if the cleaned text is longer than :data:`PREVIEW_LEN` it is cut to
-      ``PREVIEW_LEN`` characters (trailing whitespace removed) plus ``…``.
-
-    Returns ``""`` when nothing meaningful remains (the preview line is
-    then omitted by :func:`format_notification`).
-    """
-    if not text:
-        return ""
-    cleaned = strip_invisible_padding(text)
-    cleaned = _WHITESPACE_RUN_RE.sub(" ", cleaned).strip()
-    if not cleaned:
-        return ""
-    if len(cleaned) > PREVIEW_LEN:
-        return cleaned[:PREVIEW_LEN].rstrip() + _ELLIPSIS
-    return cleaned
 
 
 def format_notification(

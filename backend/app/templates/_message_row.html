@@ -1,6 +1,6 @@
 {# Partial. Expects loop variable `msg` with fields:
      id, mail_account_id, mail_account_email, mail_account_display_name (optional),
-     from_addr, from_name, subject,
+     from_addr, from_name, subject, preview (str — one-line body snippet, may be ""),
      internal_date (ISO str), internal_date_human (str|optional),
      is_read (bool), has_attachments (bool),
      tags (list[TagBriefDTO] — id, name, color).  Optional / may be empty.
@@ -39,5 +39,8 @@
     <span class="msg-row__date">
       {{ m.time_tag(msg.internal_date, msg.internal_date_human if msg.internal_date_human is defined else None) }}
     </span>
+
+    {# Gmail-style one-line body preview under the subject (empty → omitted, row collapses). #}
+    {% if msg.preview is defined and msg.preview %}<span class="msg-row__preview">{{ msg.preview | e }}</span>{% endif %}
   </a>
 </li>

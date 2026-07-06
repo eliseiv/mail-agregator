@@ -36,6 +36,7 @@ from backend.app.tags.schemas import TagBriefDTO
 from shared.html_sanitize import collapse_blank_lines_html, collapse_blank_lines_text
 from shared.logging import get_logger
 from shared.models import Attachment, Tag, User
+from shared.preview import html_to_plain, normalize_preview
 from shared.storage import Storage, get_storage
 
 log = get_logger(__name__)
@@ -196,6 +197,13 @@ class MessageService:
                     continue
                 seen_tag_keys.add(key)
                 unique_tags.append(t)
+            # Gmail-style body snippet. ``body_text``/``body_html`` are
+            # already loaded on ``m`` (no ``deferred``) — no extra SQL. Use
+            # ``.strip()`` not truthiness: ``body_text`` is NOT NULL with a
+            # ``''`` server default, so an empty/whitespace text body must
+            # fall through to the HTML body (mirrors the push dispatcher,
+            # ``worker/app/push_notify_dispatch.py``). Empty body → "".
+            raw_preview = m.body_text if m.body_text.strip() else html_to_plain(m.body_html)
             items.append(
                 MessageListItem(
                     id=m.id,
@@ -209,6 +217,7 @@ class MessageService:
                     internal_date=m.internal_date,
                     is_read=m.is_read,
                     has_attachments=att_map.get(m.id, False),
+                    preview=normalize_preview(raw_preview),
                     tags=[_to_tag_brief(t) for t in unique_tags],
                 )
             )

@@ -32,6 +32,9 @@ class MessageListItem(BaseModel):
     internal_date: datetime
     is_read: bool
     has_attachments: bool
+    # Gmail-style single-line body snippet (≤ ``PREVIEW_LEN`` chars,
+    # whitespace collapsed). Empty string when the message has no body.
+    preview: str = ""
     # ADR-0017: list of tags applied to this message (compact form).
     tags: list[TagBriefDTO] = Field(default_factory=list)
 

@@ -693,8 +693,10 @@ a:hover { color: var(--color-primary-hover); text-decoration: underline; }
   display: grid;
   /* indicator | account | from | tags | subject | date */
   grid-template-columns: 12px auto minmax(140px, 1fr) auto minmax(200px, 2fr) auto;
+  /* Row 1 = meta line; row 2 = body preview (collapses to 0 when preview empty). */
+  grid-template-rows: auto auto;
   align-items: center;
-  gap: var(--space-3);
+  gap: 2px var(--space-3);
   padding: var(--space-4) var(--space-5);
   text-decoration: none;
   color: inherit;
@@ -729,6 +731,18 @@ a:hover { color: var(--color-primary-hover); text-decoration: underline; }
   font-size: var(--font-size-sm);
 }
 .msg-row__attach { margin-left: var(--space-2); color: var(--color-text-muted); }
+/* Gmail-style body preview: second grid row under from/subject/date. */
+.msg-row__preview {
+  grid-column: 3 / -1;
+  grid-row: 2;
+  align-self: start;
+  min-width: 0;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .msg-row__date {
   white-space: nowrap;
   font-size: var(--font-size-xs);
@@ -1778,7 +1792,8 @@ body.tg-app .main {
       "ind tag date"
       "from from from"
       "tags tags tags"
-      "subj subj subj";
+      "subj subj subj"
+      "prev prev prev";
     row-gap: var(--space-1);
     padding: var(--space-3) var(--space-4);
   }
@@ -1788,6 +1803,7 @@ body.tg-app .main {
   .msg-row__tags { grid-area: tags; max-width: none; flex-wrap: wrap; }
   .msg-row__subject { grid-area: subj; white-space: normal; }
   .msg-row__date { grid-area: date; justify-self: end; }
+  .msg-row__preview { grid-area: prev; grid-column: auto; grid-row: auto; }
 
   .message__meta-row { grid-template-columns: 80px 1fr; }
 
@@ -2431,6 +2447,22 @@ body.tg-app .main {
 /* The footer with brand name is also redundant inside Telegram. */
 body.tg-app .footer {
   display: none;
+}
+
+/* Telegram DESKTOP (wide window): tg.js sets body.tg-app regardless of width,
+   which otherwise pins the fixed bottom-nav and hides the top-nav even on a
+   wide desktop window. On ≥641px restore the top-nav and drop the bottom-nav
+   (mobile Telegram ≤640px keeps the bottom-nav — this override is width-gated). */
+@media (min-width: 641px) {
+  body.tg-app .topnav {
+    display: flex;
+  }
+  body.tg-app .bottom-nav {
+    display: none;
+  }
+  body.tg-app .main {
+    padding-bottom: var(--space-5);
+  }
 }
 
 /* ---------- 21. Integrations (ADR-0023, 04-api-contracts.md §4b) ---------
