@@ -89,7 +89,7 @@ backend/
       service.py           # ForwardingService.get_for_scope/upsert_for_scope/delete_for_scope; _resolve_target_group_id — копия WebhooksService
       schemas.py           # ForwardingUpsert (forward_to, is_active?), ForwardingDTO; e-mail-паттерн из accounts/schemas
       dispatch_service.py  # ForwardDispatchService.enqueue_message_ids(ids) → LPUSH forward_dispatch_queue (форк webhooks/dispatch_service)
-      mime.py              # build_forward_mime(account, message, attachments, forward_to) — multipart text+html+вложения (может жить в send/mime.py)
+      mime.py              # build_forward_mime(from_addr, forward_to, message, attachment_parts, reply_to=None) — multipart text+html+вложения, CR/LF-санитизация заголовков (может жить в send/mime.py)
     external/              # ADR-0029 — external PULL-API (B2B-партнёр забирает письма инкрементально)
       __init__.py
       router.py            # GET /api/external/messages (csrf-exempt, no session)
@@ -187,7 +187,7 @@ worker/
     webhook_dispatch.py    # ADR-0023 — диспатчер outbound webhooks (каждые 5 сек)
     webhook_recovery.py    # ADR-0023 — recovery_scan для webhooks (каждый час)
     push_notify_dispatch.py # ADR-0027 — push-only боты по командам (LPOP push_notify_queue → bot по group_id → fire-and-forget; каждые 5 сек, recovery НЕТ)
-    forward_dispatch.py    # ADR-0034 — диспатчер переадресации (LPOP forward_dispatch_queue → claim → build_forward_mime → SMTP кредами ящика; каждые 5 сек, recovery НЕТ)
+    forward_dispatch.py    # ADR-0034 — диспатчер переадресации (LPOP forward_dispatch_queue → claim → build_forward_mime → SMTP кредами ящика ИЛИ служебный релей по forward_relay_enabled §5.1; каждые 5 сек, recovery НЕТ)
   tests/
 shared/                    # общий пакет, импортируется и api, и worker
   __init__.py
@@ -1174,14 +1174,21 @@ def build_mime(
 ) -> EmailMessage
 ```
 
-- **ADR-0034 — расширение MIME + вынос SMTP-ядра.** Текущий `build_mime` строит только `text/plain` без HTML/вложений. Для переадресации добавляется `build_forward_mime(account, message, attachments, forward_to) -> EmailMessage` (`multipart/mixed`: `Subject: Fwd: …`, `From=account.email`, `To=forward_to`, новый `Message-ID`, заголовок `X-Forwarded-By: mail-aggregator`; `add_alternative(text)` + `add_alternative(html, subtype="html")` c префикс-блоком «пересланное сообщение»; вложения из MinIO кроме `skipped_too_large`, с контролем `FORWARD_MAX_TOTAL_BYTES` — пропущенные списком в теле). Отправка обеих фич (`send` и `forward`) идёт через общий хелпер, выделяемый из `send/service.py`:
+- **ADR-0034 — расширение MIME + вынос SMTP-ядра.** Текущий `build_mime` строит только `text/plain` без HTML/вложений. Для переадресации добавляется `build_forward_mime(*, from_addr, forward_to, message, attachment_parts, reply_to=None) -> EmailMessage` (`multipart/mixed`: `Subject: Fwd: …`, `From=from_addr`, `To=forward_to`, опц. `Reply-To=reply_to` (ставится только если задан — ветка релея §5.1), новый `Message-ID`, заголовок `X-Forwarded-By: mail-aggregator`; `add_alternative(text)` + `add_alternative(html, subtype="html")` c префикс-блоком «пересланное сообщение»; вложения из MinIO кроме `skipped_too_large`, с контролем `FORWARD_MAX_TOTAL_BYTES` — пропущенные списком в теле). **Санитизация заголовков (CR/LF-фикс):** все значения, попадающие в заголовки (`Subject` из `message.subject`; defensively `from_addr`/`forward_to`/`reply_to`; `filename` вложений), проходят `_sanitize_header()` — CR/LF и управляющие символы → пробел, схлопывание пробелов, обрезка (Subject ~998, filename ~255). Устраняет `ValueError: Header values may not contain linefeed or carriage return characters` для писем с многострочной/битой темой. Отправка обеих фич (`send` и `forward`) идёт через общий хелпер, выделяемый из `send/service.py`:
 ```python
 async def smtp_send_message(account: MailAccount, msg: EmailMessage, recipients: list[str]) -> None
     # ветки: password (decrypt_mail_password(smtp_encrypted_password|encrypted_password, account.id) + SMTP LOGIN)
     #        / oauth_outlook (OutlookTokenService.get_valid_access_token + XOAUTH2, _smtp_send_oauth)
     # + assert_public_host(account.smtp_host), _ssl_context, _SMTP_TIMEOUT=20
+
+# ADR-0034 §5.1 — служебный SMTP-релей (отправка форвардов, когда ящик не может слать сам):
+async def smtp_send_via_relay(msg: EmailMessage, recipients: list[str]) -> None
+    # aiosmtplib.send(hostname=FORWARD_SMTP_HOST, port=FORWARD_SMTP_PORT, username=FORWARD_SMTP_USERNAME,
+    #                 password=FORWARD_SMTP_PASSWORD, use_tls=FORWARD_SMTP_SSL, start_tls=FORWARD_SMTP_STARTTLS,
+    #                 tls_context, recipients, timeout=20)
+    # + assert_public_host(FORWARD_SMTP_HOST); та же матрица ошибок → SMTPSendFailedError (без хост-деталей)
 ```
-Для форвардов **Sent-append НЕ выполняется** (не засоряем «Отправленные» ящика). SSRF-поверхность форварда узкая: соединение только к SMTP-хосту самого ящика (уже валидирован); `forward_to` — адрес в конверте, к нему прямого коннекта нет.
+Для форвардов **Sent-append НЕ выполняется** (не засоряем «Отправленные» ящика). SSRF-поверхность форварда узкая: соединение только к SMTP-хосту ящика **или** релея (оба валидируются `assert_public_host`); `forward_to` — адрес в конверте, к нему прямого коннекта нет.
 
 ### Зависимости
 - repositories.mail_accounts, repositories.messages (для in_reply_to lookup), repositories.sent_messages, crypto, aiosmtplib, imap-tools (для best-effort APPEND).
@@ -1958,7 +1965,7 @@ async def dispatch_one(message_id: int) -> ForwardDispatchResult
 - redis (LPOP с count).
 - repositories: `group_forwarding` (get_by_group_id), `message_forwards` (claim, mark_sent, mark_error), `mail_accounts` (get_by_id), `messages` (get + list_attachments_bulk).
 - `backend/app/forwarding/mime.py:build_forward_mime` (или `send/mime.py`).
-- `backend/app/send/service.py:smtp_send_message` (общий SMTP-хелпер, password/XOAUTH2 — §11).
+- `backend/app/send/service.py:smtp_send_message` (общий SMTP-хелпер ящика, password/XOAUTH2 — §11) **или** `smtp_send_via_relay` (служебный SMTP-релей, ADR-0034 §5.1) — выбор по `settings.forward_relay_enabled`.
 - `shared/storage.py:get_object_stream` (стрим вложений из MinIO).
 - `backend/app/rate_limit.py:try_consume` (per-account forward throttle, fail-open).
 
@@ -1987,13 +1994,19 @@ async def dispatch_one(message_id: int) -> ForwardDispatchResult
    # ON CONFLICT (message_id, group_id) DO NOTHING RETURNING id
    if fid is None: skip (уже переслано — идемпотентность)
 7. per-account forward rate-limit (try_consume, fail-open + лог при превышении)
-8. msg = build_forward_mime(account, message, attachments, gf.forward_to)   # §11: multipart text+html+вложения, X-Forwarded-By
+8. relay = settings.forward_relay_enabled                                  # ADR-0034 §5.1
+   if relay: from_addr = FORWARD_SMTP_FROM; reply_to = message.from_addr
+   else:     from_addr = account.email;     reply_to = None
+   msg = build_forward_mime(from_addr, gf.forward_to, message, attachments, reply_to)   # §11: multipart text+html+вложения, X-Forwarded-By, опц. Reply-To
 9. try:
-       await smtp_send_message(account, msg, recipients=[gf.forward_to])   # без Sent-append
+       if relay: await smtp_send_via_relay(msg, recipients=[gf.forward_to])   # служебный SMTP, без Sent-append
+       else:     await smtp_send_message(account, msg, recipients=[gf.forward_to])   # креды ящика, без Sent-append
        MessageForwardsRepo.mark_sent(fid)                                  # sent_at = now()
    except (SMTPException|TimeoutError|OSError|OAuth error) as e:
        MessageForwardsRepo.mark_error(fid, truncate(str(e), 500))          # НЕ ретраить, лог warn, не ронять цикл
 ```
+
+**Ветка отправителя (ADR-0034 §5.1):** при `forward_relay_enabled` (заданы `FORWARD_SMTP_HOST` + `FORWARD_SMTP_FROM` + `FORWARD_SMTP_USERNAME`) форвард уходит через служебный SMTP-релей (`From = FORWARD_SMTP_FROM`, `Reply-To = <оригинальный отправитель>`) — для случаев, когда мониторинговый ящик не может отправлять сам (Gmail BadCredentials / AOL connection-lost / Outlook OAuth без `SMTP.Send`). Иначе — прежнее поведение: отправка кредами получившего ящика (`From = account.email`, без `Reply-To`).
 
 ### Edge cases
 - Redis недоступен в момент LPOP — APScheduler следующий тик повторит (через `_safe_forward_dispatch` wrapper).

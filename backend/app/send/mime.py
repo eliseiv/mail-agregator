@@ -78,6 +78,32 @@ _FORWARD_SEPARATOR = "---------- Пересланное сообщение -----
 _SKIPPED_ATTACHMENTS_PREFIX = "⚠️ Вложения не пересланы (слишком большие): "
 _FORWARDED_BY_VALUE = "mail-aggregator"
 
+# RFC 5322 §2.1.1 unfolded-line ceiling; a Subject longer than this is clamped.
+_MAX_SUBJECT_LEN = 998
+# Content-Disposition ``filename`` is far shorter in practice; clamp defensively.
+_MAX_FILENAME_LEN = 255
+
+
+def _sanitize_header(value: str, *, max_len: int = _MAX_SUBJECT_LEN) -> str:
+    """Make ``value`` safe to place in a MIME header (ADR-0034 §4, CR/LF fix).
+
+    ``email.message.EmailMessage`` raises ``ValueError`` ("Header values may
+    not contain linefeed or carriage return characters") for a bare CR/LF in a
+    header value — a header-injection guard. Inbound mail can carry a
+    multi-line / malformed ``Subject`` (mis-folded, or crafted), which would
+    otherwise abort the whole forward. Every value bound for a header is
+    sanitised here:
+
+    - any C0/C1 control char (incl. CR, LF, TAB) and DEL becomes a space;
+    - runs of whitespace collapse to a single space and the ends are trimmed;
+    - the result is clamped to ``max_len``.
+    """
+    cleaned = "".join(" " if (ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F) else ch for ch in value)
+    cleaned = " ".join(cleaned.split())
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len].rstrip()
+    return cleaned
+
 
 @dataclass(frozen=True, slots=True)
 class ForwardAttachmentPart:
@@ -110,16 +136,23 @@ def _forward_prefix_rows(message: Message) -> list[tuple[str, str]]:
 
 def build_forward_mime(
     *,
-    account_email: str,
+    from_addr: str,
     forward_to: str,
     message: Message,
     attachment_parts: list[ForwardAttachmentPart],
+    reply_to: str | None = None,
 ) -> EmailMessage:
     """Build the forward :class:`EmailMessage` (ADR-0034 §4).
 
     - ``Subject: Fwd: <original>`` (``Fwd: (без темы)`` when empty);
-      ``From = account_email``; ``To = forward_to``; a fresh ``Message-ID``;
-      ``X-Forwarded-By: mail-aggregator`` (loop-guard stamp).
+      ``From = from_addr``; ``To = forward_to``; a fresh ``Message-ID``;
+      ``X-Forwarded-By: mail-aggregator`` (loop-guard stamp). When ``reply_to``
+      is given a ``Reply-To`` header is added (relay branch, ADR-0034 §5: the
+      forward is sent from the service relay ``from_addr`` while the leader's
+      "Reply" must reach the *original* sender). ``from_addr``/``forward_to``/
+      ``reply_to`` are sanitised defensively; ``Subject`` is sanitised to strip
+      CR/LF from multi-line / malformed inbound subjects (else
+      :class:`EmailMessage` raises ``ValueError`` on assignment).
     - Body: the plain-text part (and, when the source had one, an html
       alternative) is prefixed with the "forwarded message" block built from
       the stored :class:`Message` fields. Every html value is ``html.escape``-d.
@@ -128,10 +161,12 @@ def build_forward_mime(
       enforcement (``FORWARD_MAX_TOTAL_BYTES``) is the caller's job.
     """
     msg = EmailMessage(policy=SMTP)
-    subject = message.subject or ""
+    subject = _sanitize_header(message.subject or "")
     msg["Subject"] = f"Fwd: {subject}" if subject else f"Fwd: {_NO_SUBJECT}"
-    msg["From"] = account_email
-    msg["To"] = forward_to
+    msg["From"] = _sanitize_header(from_addr)
+    msg["To"] = _sanitize_header(forward_to)
+    if reply_to:
+        msg["Reply-To"] = _sanitize_header(reply_to)
     msg["Message-ID"] = generate_message_id()
     msg["X-Forwarded-By"] = _FORWARDED_BY_VALUE
 
@@ -173,7 +208,7 @@ def build_forward_mime(
             part.data,
             maintype=maintype,
             subtype=subtype,
-            filename=part.filename,
+            filename=_sanitize_header(part.filename, max_len=_MAX_FILENAME_LEN),
         )
 
     return msg

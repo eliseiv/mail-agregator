@@ -226,11 +226,25 @@ async def _dispatch_one(  # noqa: PLR0911 — flat early-return guards are clear
         return "skip_rate_limited"
 
     # 8-9. Build the forward MIME (streaming attachments from MinIO) and send
-    #      it with the mailbox's own SMTP credentials. Both the MIME/stream
-    #      build and the send are wrapped so a MinIO failure records an error
-    #      instead of leaving an orphan claim (reviewer note).
+    #      it. When the service SMTP relay is configured (ADR-0034 §5, relay
+    #      branch) the forward leaves through the relay with ``From`` =
+    #      FORWARD_SMTP_FROM and ``Reply-To`` = the original sender — the
+    #      monitoring mailbox itself may be unable to send (Gmail
+    #      BadCredentials / AOL connection-lost / Outlook OAuth without
+    #      SMTP.Send). Otherwise (relay off) the historical behaviour is kept:
+    #      send with the receiving mailbox's own SMTP credentials, no Reply-To.
+    #      Both the MIME/stream build and the send are wrapped so a MinIO
+    #      failure records an error instead of leaving an orphan claim.
     from backend.app.send.mime import build_forward_mime
-    from backend.app.send.service import smtp_send_message
+    from backend.app.send.service import smtp_send_message, smtp_send_via_relay
+
+    relay = settings.forward_relay_enabled
+    if relay:
+        from_addr = settings.FORWARD_SMTP_FROM
+        reply_to: str | None = message.from_addr
+    else:
+        from_addr = account.email
+        reply_to = None
 
     attachments = (await MessagesRepo(session).list_attachments_bulk([message_id])).get(
         message_id, []
@@ -240,13 +254,17 @@ async def _dispatch_one(  # noqa: PLR0911 — flat early-return guards are clear
             storage, attachments, max_total_bytes=settings.FORWARD_MAX_TOTAL_BYTES
         )
         msg = build_forward_mime(
-            account_email=account.email,
+            from_addr=from_addr,
             forward_to=gf.forward_to,
             message=message,
             attachment_parts=parts,
+            reply_to=reply_to,
         )
         # ADR-0034 §5: no Sent-append for forwards.
-        await smtp_send_message(account, msg, [gf.forward_to], session=session)
+        if relay:
+            await smtp_send_via_relay(msg, [gf.forward_to])
+        else:
+            await smtp_send_message(account, msg, [gf.forward_to], session=session)
     except Exception as exc:
         safe = _safe_forward_error(exc)
         await forwards_repo.mark_error(fid, safe)

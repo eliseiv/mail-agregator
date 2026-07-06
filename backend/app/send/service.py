@@ -31,6 +31,7 @@ from backend.app.repositories.users import UsersRepo
 from backend.app.security import assert_public_host
 from backend.app.send.mime import build_mime, generate_message_id
 from backend.app.send.schemas import SendMessageRequest, SendMessageResponse
+from shared.config import get_settings
 from shared.crypto import decrypt_mail_password
 from shared.logging import get_logger
 from shared.models import MailAccount, Message
@@ -251,6 +252,51 @@ async def smtp_send_message(
             password=smtp_pwd,
             use_tls=account.smtp_ssl,
             start_tls=account.smtp_starttls,
+            tls_context=_ssl_context(),
+            recipients=recipients,
+            timeout=_SMTP_TIMEOUT,
+        )
+    except aiosmtplib.SMTPException as exc:
+        raise SMTPSendFailedError(
+            "SMTP send failed",
+            details={"detail": _safe_error_text(exc)},
+        ) from exc
+    except (TimeoutError, OSError) as exc:
+        raise SMTPSendFailedError(
+            "SMTP send failed",
+            details={"detail": _safe_error_text(exc)},
+        ) from exc
+
+
+async def smtp_send_via_relay(msg: EmailMessage, recipients: list[str]) -> None:
+    """Send a built forward MIME through the service SMTP relay (ADR-0034 §5).
+
+    Used by the forward dispatcher when ``settings.forward_relay_enabled`` —
+    the forward leaves through the operator's relay (``FORWARD_SMTP_*``) instead
+    of the receiving mailbox's own credentials, because many monitoring
+    mailboxes cannot send (Gmail app-password revoked → BadCredentials, AOL
+    drops the connection, Outlook OAuth lacks ``SMTP.Send``). The ``From`` is
+    the relay's ``FORWARD_SMTP_FROM`` and ``Reply-To`` carries the original
+    sender — both already set on ``msg`` by :func:`build_forward_mime`.
+
+    Mirrors the password branch of :func:`smtp_send_message`: SSRF re-check
+    (:func:`assert_public_host` on the relay host), shared TLS context,
+    fail-fast ``_SMTP_TIMEOUT``, and the same error matrix
+    (``SMTPException`` / ``TimeoutError`` / ``OSError`` →
+    :class:`SMTPSendFailedError` with host detail stripped). No Sent-append
+    (forwards never append, ADR-0034 §5).
+    """
+    settings = get_settings()
+    assert_public_host(settings.FORWARD_SMTP_HOST, port=settings.FORWARD_SMTP_PORT)
+    try:
+        await aiosmtplib.send(
+            msg,
+            hostname=settings.FORWARD_SMTP_HOST,
+            port=settings.FORWARD_SMTP_PORT,
+            username=settings.FORWARD_SMTP_USERNAME,
+            password=settings.FORWARD_SMTP_PASSWORD,
+            use_tls=settings.FORWARD_SMTP_SSL,
+            start_tls=settings.FORWARD_SMTP_STARTTLS,
             tls_context=_ssl_context(),
             recipients=recipients,
             timeout=_SMTP_TIMEOUT,

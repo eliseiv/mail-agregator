@@ -80,6 +80,10 @@ REDACT_KEYS: frozenset[str] = frozenset(
         "EXTERNAL_API_KEY",
         "X-API-Key",
         "x-api-key",
+        # Forward SMTP relay (ADR-0034 §5, docs/06-security.md §1.14): the
+        # relay account password lets an attacker send mail as the relay.
+        # Same leak class as the mailbox SMTP passwords above.
+        "FORWARD_SMTP_PASSWORD",
     }
 )
 

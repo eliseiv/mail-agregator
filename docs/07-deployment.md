@@ -253,6 +253,13 @@ Server-блок отвечает `200 ok\n` на `/_health_nginx` (HTTP, не HT
 | `FORWARD_BATCH_SIZE` | `30` | no | **ADR-0034:** `LPOP count` из `forward_dispatch_queue` за тик. |
 | `FORWARD_MAX_TOTAL_BYTES` | `26214400` | no | **ADR-0034:** суммарный лимит вложений в одном форварде (~25 МБ); превышающие пропускаются с пометкой в теле. |
 | `FORWARD_PER_ACCOUNT_PER_MINUTE` | `30` | no | **ADR-0034:** per-account throttle пересылок (Redis token-bucket, fail-open + лог при превышении). |
+| `FORWARD_SMTP_HOST` | `""` | no | **ADR-0034 §5.1:** host служебного SMTP-релея для отправки форвардов. Пусто → релей выключен (отправка кредами самого ящика, прежнее поведение). Задан вместе с `FORWARD_SMTP_FROM` + `FORWARD_SMTP_USERNAME` → `forward_relay_enabled=true`, форварды уходят через релей. Передаётся **только** в `worker`. |
+| `FORWARD_SMTP_PORT` | `587` | no | **ADR-0034 §5.1:** порт релея (`1..65535`). 587 = submission/STARTTLS. |
+| `FORWARD_SMTP_USERNAME` | `""` | no | **ADR-0034 §5.1:** логин SMTP-релея. Часть условия `forward_relay_enabled`. |
+| `FORWARD_SMTP_PASSWORD` | `""` | no | **ADR-0034 §5.1:** пароль SMTP-релея (**секрет**). `chmod 600 .env`; маскируется в structlog redact-list рядом с mail-паролями. Единственный новый секрет канала переадресации. |
+| `FORWARD_SMTP_FROM` | `""` | no | **ADR-0034 §5.1:** адрес в `From` форварда в ветке релея (единый служебный отправитель). Часть условия `forward_relay_enabled`. Оригинальный отправитель уходит в `Reply-To`. |
+| `FORWARD_SMTP_STARTTLS` | `true` | no | **ADR-0034 §5.1:** STARTTLS при подключении к релею (submission/587). |
+| `FORWARD_SMTP_SSL` | `false` | no | **ADR-0034 §5.1:** implicit-TLS (SMTPS/465) при подключении к релею. Взаимоисключающе с STARTTLS (как у ящиков). |
 | `TG_MAX_LINKS_PER_USER` | `10` | no | **ADR-0024 (Спринт A):** мягкий потолок числа активных TG-привязок на один internal user. Проверяется в `link_pending`/`POST /api/telegram/links` (`COUNT(active) < limit`); при достижении — `409 tg_link_limit`, audit `telegram_link_limit_reached`. Не DB-констрейнт. |
 | `BOT_IVAN_TOKEN` | (none) | no | **ADR-0027:** токен push-only бота команды `ivan` (BotFather). **round-42:** нужен **и в worker** (доставка), **и в api** (обработка callback). Маскируется в structlog redact-list. Пустой → бот не настроен (тихо игнорируется). |
 | `BOT_IVAN_GROUP_ID` | (none) | no | **ADR-0027:** `mail_accounts.group_id` команды `ivan`. Прод: `1`. Без него бот в `push_team_bots` не попадает. |

@@ -60,7 +60,7 @@ def _text_and_html(msg: EmailMessage) -> tuple[str, str | None]:
 class TestHeaders:
     def test_subject_prefixed_with_fwd(self) -> None:
         msg = build_forward_mime(
-            account_email="box@company.com",
+            from_addr="box@company.com",
             forward_to="leader@company.com",
             message=_msg(subject="Hello"),
             attachment_parts=[],
@@ -69,7 +69,7 @@ class TestHeaders:
 
     def test_empty_subject_uses_placeholder(self) -> None:
         msg = build_forward_mime(
-            account_email="box@company.com",
+            from_addr="box@company.com",
             forward_to="leader@company.com",
             message=_msg(subject=None),
             attachment_parts=[],
@@ -78,7 +78,7 @@ class TestHeaders:
 
     def test_from_is_mailbox_to_is_leader(self) -> None:
         msg = build_forward_mime(
-            account_email="box@company.com",
+            from_addr="box@company.com",
             forward_to="leader@company.com",
             message=_msg(),
             attachment_parts=[],
@@ -88,7 +88,7 @@ class TestHeaders:
 
     def test_has_fresh_message_id_and_loop_guard_stamp(self) -> None:
         msg = build_forward_mime(
-            account_email="box@company.com",
+            from_addr="box@company.com",
             forward_to="leader@company.com",
             message=_msg(),
             attachment_parts=[],
@@ -101,7 +101,7 @@ class TestHeaders:
 class TestBody:
     def test_prefix_block_present_in_text(self) -> None:
         msg = build_forward_mime(
-            account_email="box@company.com",
+            from_addr="box@company.com",
             forward_to="leader@company.com",
             message=_msg(subject="Quarterly report"),
             attachment_parts=[],
@@ -117,7 +117,7 @@ class TestBody:
 
     def test_html_alternative_present_when_source_has_html(self) -> None:
         msg = build_forward_mime(
-            account_email="box@company.com",
+            from_addr="box@company.com",
             forward_to="leader@company.com",
             message=_msg(body_html="<p>Please review.</p>"),
             attachment_parts=[],
@@ -129,7 +129,7 @@ class TestBody:
 
     def test_no_html_alternative_when_source_lacks_html(self) -> None:
         msg = build_forward_mime(
-            account_email="box@company.com",
+            from_addr="box@company.com",
             forward_to="leader@company.com",
             message=_msg(body_html=None),
             attachment_parts=[],
@@ -139,7 +139,7 @@ class TestBody:
 
     def test_hostile_header_values_are_html_escaped(self) -> None:
         msg = build_forward_mime(
-            account_email="box@company.com",
+            from_addr="box@company.com",
             forward_to="leader@company.com",
             message=_msg(
                 subject="<script>alert(1)</script>",
@@ -161,7 +161,7 @@ class TestAttachments:
     def test_included_attachment_is_attached(self) -> None:
         part = ForwardAttachmentPart("report.pdf", "application/pdf", b"%PDF-1.4 data")
         msg = build_forward_mime(
-            account_email="box@company.com",
+            from_addr="box@company.com",
             forward_to="leader@company.com",
             message=_msg(),
             attachment_parts=[part],
@@ -175,7 +175,7 @@ class TestAttachments:
         # data=None marks a skipped (oversized / over-budget) attachment.
         skipped = ForwardAttachmentPart("huge.zip", "application/zip", None)
         msg = build_forward_mime(
-            account_email="box@company.com",
+            from_addr="box@company.com",
             forward_to="leader@company.com",
             message=_msg(body_html="<p>hi</p>"),
             attachment_parts=[skipped],
@@ -194,7 +194,7 @@ class TestAttachments:
             ForwardAttachmentPart("big.bin", "application/octet-stream", None),
         ]
         msg = build_forward_mime(
-            account_email="box@company.com",
+            from_addr="box@company.com",
             forward_to="leader@company.com",
             message=_msg(),
             attachment_parts=parts,
@@ -208,7 +208,7 @@ class TestAttachments:
     def test_malformed_content_type_falls_back_to_octet_stream(self) -> None:
         part = ForwardAttachmentPart("weird", "not-a-mime", b"x")
         msg = build_forward_mime(
-            account_email="box@company.com",
+            from_addr="box@company.com",
             forward_to="leader@company.com",
             message=_msg(),
             attachment_parts=[part],
@@ -216,3 +216,84 @@ class TestAttachments:
         attached = [p for p in msg.walk() if p.get_filename() == "weird"]
         assert len(attached) == 1
         assert attached[0].get_content_type() == "application/octet-stream"
+
+
+class TestSenderModes:
+    """ADR-0034 §5 — relay vs mailbox sender + Reply-To."""
+
+    def test_relay_mode_from_relay_reply_to_original_sender(self) -> None:
+        # Relay branch: From = the service relay address; Reply-To = the
+        # original sender so the leader's "Reply" reaches the real sender.
+        msg = build_forward_mime(
+            from_addr="relay@service.example",
+            forward_to="leader@company.com",
+            message=_msg(from_addr="alice@partner.com"),
+            attachment_parts=[],
+            reply_to="alice@partner.com",
+        )
+        assert msg["From"] == "relay@service.example"
+        assert msg["To"] == "leader@company.com"
+        assert msg["Reply-To"] == "alice@partner.com"
+
+    def test_mailbox_mode_from_mailbox_no_reply_to(self) -> None:
+        # Relay off (reply_to omitted): historical behaviour — From = the
+        # receiving mailbox, and NO Reply-To header is emitted.
+        msg = build_forward_mime(
+            from_addr="box@company.com",
+            forward_to="leader@company.com",
+            message=_msg(),
+            attachment_parts=[],
+        )
+        assert msg["From"] == "box@company.com"
+        assert msg["Reply-To"] is None
+
+
+class TestHeaderSanitization:
+    """ADR-0034 §4 — CR/LF fix (bug: ValueError on multi-line Subject)."""
+
+    def test_crlf_in_subject_does_not_raise_and_is_stripped(self) -> None:
+        # A multi-line / malformed inbound Subject must NOT abort the forward
+        # with ``ValueError: Header values may not contain linefeed ...``.
+        msg = build_forward_mime(
+            from_addr="box@company.com",
+            forward_to="leader@company.com",
+            message=_msg(subject="Line one\r\nInjected: header\nLine three"),
+            attachment_parts=[],
+        )
+        subject = msg["Subject"]
+        assert "\r" not in subject
+        assert "\n" not in subject
+        assert subject.startswith("Fwd: ")
+        # Collapsed to single spaces, injected content stays inside the value.
+        assert subject == "Fwd: Line one Injected: header Line three"
+
+    def test_control_chars_in_subject_collapsed(self) -> None:
+        msg = build_forward_mime(
+            from_addr="box@company.com",
+            forward_to="leader@company.com",
+            message=_msg(subject="a\tb\x00c"),
+            attachment_parts=[],
+        )
+        assert msg["Subject"] == "Fwd: a b c"
+
+    def test_overlong_subject_is_clamped(self) -> None:
+        msg = build_forward_mime(
+            from_addr="box@company.com",
+            forward_to="leader@company.com",
+            message=_msg(subject="x" * 5000),
+            attachment_parts=[],
+        )
+        # Sanitised subject clamped to <= 998; "Fwd: " prefix adds 5.
+        assert len(msg["Subject"]) <= 998 + len("Fwd: ")
+
+    def test_crlf_in_attachment_filename_is_stripped(self) -> None:
+        part = ForwardAttachmentPart("evil\r\nname.pdf", "application/pdf", b"data")
+        msg = build_forward_mime(
+            from_addr="box@company.com",
+            forward_to="leader@company.com",
+            message=_msg(),
+            attachment_parts=[part],
+        )
+        names = [p.get_filename() for p in msg.walk() if p.get_filename()]
+        assert names == ["evil name.pdf"]
+        assert all("\r" not in n and "\n" not in n for n in names)

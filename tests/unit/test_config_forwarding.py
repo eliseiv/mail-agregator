@@ -59,3 +59,47 @@ class TestForwardingBounds:
 
     def test_kill_switch_can_be_disabled(self) -> None:
         assert _settings(FORWARDING_ENABLED="false").FORWARDING_ENABLED is False
+
+
+class TestForwardRelayDefaults:
+    """ADR-0034 §5 — service SMTP relay settings + ``forward_relay_enabled``."""
+
+    def test_relay_defaults(self) -> None:
+        s = _settings()
+        assert s.FORWARD_SMTP_HOST == ""
+        assert s.FORWARD_SMTP_PORT == 587
+        assert s.FORWARD_SMTP_USERNAME == ""
+        assert s.FORWARD_SMTP_PASSWORD == ""
+        assert s.FORWARD_SMTP_FROM == ""
+        assert s.FORWARD_SMTP_STARTTLS is True
+        assert s.FORWARD_SMTP_SSL is False
+
+    def test_relay_disabled_by_default(self) -> None:
+        assert _settings().forward_relay_enabled is False
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"FORWARD_SMTP_HOST": "relay.example"},  # from + username missing
+            {"FORWARD_SMTP_HOST": "relay.example", "FORWARD_SMTP_FROM": "r@x"},  # username missing
+            {"FORWARD_SMTP_HOST": "relay.example", "FORWARD_SMTP_USERNAME": "u"},  # from missing
+            {"FORWARD_SMTP_FROM": "r@x", "FORWARD_SMTP_USERNAME": "u"},  # host missing
+        ],
+    )
+    def test_relay_stays_off_when_any_required_field_missing(
+        self, overrides: dict[str, str]
+    ) -> None:
+        assert _settings(**overrides).forward_relay_enabled is False
+
+    def test_relay_enabled_when_host_from_username_set(self) -> None:
+        s = _settings(
+            FORWARD_SMTP_HOST="relay.example",
+            FORWARD_SMTP_FROM="relay@service.example",
+            FORWARD_SMTP_USERNAME="relay-user",
+        )
+        assert s.forward_relay_enabled is True
+
+    @pytest.mark.parametrize("value", ["0", "65536"])
+    def test_relay_port_out_of_range_rejected(self, value: str) -> None:
+        with pytest.raises(ValidationError):
+            _settings(FORWARD_SMTP_PORT=value)

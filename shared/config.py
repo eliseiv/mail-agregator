@@ -336,6 +336,25 @@ class Settings(BaseSettings):
     # ``LIMIT_FORWARD_PER_ACCOUNT.capacity`` at consume-time.
     FORWARD_PER_ACCOUNT_PER_MINUTE: int = Field(default=30, ge=1, le=6000)
 
+    # --- Forward SMTP relay (ADR-0034 §5, relay branch) -------------------
+    # Optional service SMTP relay used to SEND forwards. When configured
+    # (``forward_relay_enabled``) the forward leaves through THIS relay instead
+    # of the monitored mailbox's own SMTP credentials — many monitoring
+    # mailboxes cannot send (Gmail app-password revoked → BadCredentials, AOL
+    # drops the connection, Outlook OAuth lacks the ``SMTP.Send`` scope). The
+    # ``From`` becomes ``FORWARD_SMTP_FROM`` and the original sender is carried
+    # in ``Reply-To`` so the leader's "Reply" reaches the real sender. When any
+    # of host/from/username is empty the relay stays OFF and the historical
+    # behaviour (send with the receiving mailbox's own creds) is preserved.
+    # ``FORWARD_SMTP_PASSWORD`` is a secret — redacted in ``shared/logging.py``.
+    FORWARD_SMTP_HOST: str = ""
+    FORWARD_SMTP_PORT: int = Field(default=587, ge=1, le=65535)
+    FORWARD_SMTP_USERNAME: str = ""
+    FORWARD_SMTP_PASSWORD: str = ""  # secret
+    FORWARD_SMTP_FROM: str = ""  # address placed in the forward's From header
+    FORWARD_SMTP_STARTTLS: bool = True
+    FORWARD_SMTP_SSL: bool = False
+
     @field_validator("MAIL_ENCRYPTION_KEY")
     @classmethod
     def _validate_master_key(cls, v: str) -> str:
@@ -515,6 +534,22 @@ class Settings(BaseSettings):
         """True when at least one push-only per-team bot is configured AND
         there is at least one admin recipient (ADR-0027 §2)."""
         return bool(self.push_team_bots)
+
+    @property
+    def forward_relay_enabled(self) -> bool:
+        """True when the forward SMTP relay is fully configured (ADR-0034 §5).
+
+        Requires ``FORWARD_SMTP_HOST`` + ``FORWARD_SMTP_FROM`` +
+        ``FORWARD_SMTP_USERNAME`` all non-empty. When true the forward
+        dispatcher sends every forward through the relay (``From`` =
+        ``FORWARD_SMTP_FROM``, ``Reply-To`` = original sender); when false the
+        forward is sent with the receiving mailbox's own SMTP credentials
+        (historical behaviour). Derived flag — symmetric with
+        :pyattr:`outlook_oauth_enabled` / :pyattr:`external_api_enabled`.
+        """
+        return bool(
+            self.FORWARD_SMTP_HOST and self.FORWARD_SMTP_FROM and self.FORWARD_SMTP_USERNAME
+        )
 
     @property
     def outlook_authorize_endpoint(self) -> str:
