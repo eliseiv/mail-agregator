@@ -8,6 +8,8 @@ super-admin sees all.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -124,7 +126,12 @@ class MailAccountService:
 
     # --- Reads -------------------------------------------------------------
 
-    async def list_for_scope(self, scope: VisibilityScope) -> list[MailAccountDTO]:
+    async def list_for_scope(
+        self,
+        scope: VisibilityScope,
+        *,
+        status: Literal["all", "active", "inactive"] = "all",
+    ) -> list[MailAccountDTO]:
         # FE-FIX round-10: visibility now keys off ``mail_accounts.group_id``
         # (set on insert from the owner's then-current group, never moved
         # automatically when the owner changes group). Personal accounts
@@ -150,7 +157,15 @@ class MailAccountService:
             )
         owner_ids = sorted({a.user_id for a in rows})
         owner_map = await self._users.get_many_by_ids(owner_ids)
-        return [_to_dto(a, owner_map[a.user_id]) for a in rows if a.user_id in owner_map]
+        dtos = [_to_dto(a, owner_map[a.user_id]) for a in rows if a.user_id in owner_map]
+        # Status filter applied in Python (the visible set is small and
+        # unpaginated). ``all`` → no filter. This mirrors the ``is_active``
+        # indicator already rendered per row.
+        if status == "active":
+            return [d for d in dtos if d.is_active]
+        if status == "inactive":
+            return [d for d in dtos if not d.is_active]
+        return dtos
 
     async def get_for_scope(self, scope: VisibilityScope, account_id: int) -> MailAccountDTO:
         if scope.is_super_admin:

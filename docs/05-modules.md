@@ -169,6 +169,7 @@ backend/
       20260623_019_user_groups.py            # ADR-0030 — CREATE TABLE user_groups (M:N) + UNIQUE(user_id,group_id) + INDEX(group_id) + backfill домашних членств; users.group_id НЕ удаляется
       20260703_020_mailbox_disabled_alert.py # ADR-0033 — mail_accounts +disabled_alert_sent_at
       20260703_021_mail_forwarding.py        # ADR-0034 — CREATE TABLE group_forwarding, message_forwards (+ UNIQUE(message_id,group_id), индексы, триггер updated_at)
+      20260706_022_user_password_encrypted.py # ADR-0038 — users +password_encrypted BYTEA NULL (обратимая копия пароля входа; ADD COLUMN nullable, forward-only, без backfill; down_revision=20260703_021)
   tests/
     unit/
     integration/
@@ -366,7 +367,12 @@ class Storage:
 ```python
 def encrypt_mail_password(plain: str, mail_account_id: int) -> bytes
 def decrypt_mail_password(blob: bytes, mail_account_id: int) -> str
+# ADR-0038 — обратимая копия пароля входа оператора (тот же примитив/ключ, AAD-домен user_pw:)
+def encrypt_user_password(plain: str, user_id: int) -> bytes
+def decrypt_user_password(blob: bytes, user_id: int) -> str
 ```
+
+**ADR-0038:** `encrypt_user_password`/`decrypt_user_password` — тот же AES-256-GCM и `MAIL_ENCRYPTION_KEY`, AAD = `b"user_pw:" + str(user_id).encode("ascii")` (domain-separation от `mail_account_password|`/`webhook_secret|`; биндинг к `user_id`). Предсказание id не требуется (`user_id` известен на момент шифрования). `mas-cli/worker reencrypt` обрабатывает `users.password_encrypted` наравне с прочими blob-колонками (backend-агент добавляет `users` в список таблиц reencrypt). См. `06-security.md` §2.3.
 
 ### Зависимости
 - `cryptography`.
@@ -553,13 +559,21 @@ class AdminService:
         role: Literal['group_leader','group_member'],
         group_id: int|None,
         actor_id: int, ip: str, ua: str,
+        password: str|None = None,                  # ADR-0038 §3: задан → argon2-хеш + password_encrypted, password_reset_required=False, audit user_password_set; пуст → self-set-флоу (password_encrypted=NULL)
+        additional_group_ids: list[int]|None = None,  # ADR-0038 §5 / ADR-0030: доп. команды сверх домашней group_id; ТОЛЬКО для role='group_member'; вставка user_groups в той же транзакции, дедуп (ON CONFLICT DO NOTHING), валидация существования (400 group_not_found), audit user_group_add на каждое доп. членство; для leader/super_admin игнорируется
     ) -> UserDTO
     async def update_user(
         target_id: int,
         display_name: str|None|UNSET, role: str|UNSET, group_id: int|None|UNSET,
         actor_id: int, ip: str, ua: str,
     ) -> UserDTO  # ADR-0019; UNSET = не менять
-    async def reset_password(target_id: int, actor_id: int, ip, ua) -> None
+    async def reset_password(
+        target_id: int, actor_id: int, ip, ua,
+        password: str|None = None,  # ADR-0038 §3: задан (12..128, буква+цифра) → argon2-хеш + password_encrypted, password_reset_required=False, audit reset_password + user_password_set; пуст/None → текущий force-self-set (password_hash=NULL, password_encrypted=NULL → колонка «—»). В обоих случаях revoke all sessions + delete telegram_links.
+    ) -> None
+    async def reveal_login_password(
+        target_id: int, actor_id: int, ip: str, ua: str,
+    ) -> str  # ADR-0038 §4 — под GET /api/admin/users/{id}/password (super_admin). decrypt_user_password(password_encrypted, target_id); password_encrypted IS NULL → 404 password_not_set; per-actor rate-limit LIMIT_ADMIN_PASSWORD_REVEAL (default 30/min per actor_id); audit user_password_revealed на каждый успешный показ (details={} — без значения); значение НЕ логировать (structlog/audit/access-log).
     async def delete_user(target_id: int, actor_id: int, ip, ua) -> DeletionStats
     async def list_audit(filters, page, limit) -> tuple[list[AuditDTO], total]
     # ADR-0030 — multi-group membership
@@ -849,7 +863,7 @@ CRUD mail-аккаунтов пользователя, тестирование 
 - Service (ADR-0019: все методы принимают `scope: VisibilityScope` вместо `user_id`):
 ```python
 class MailAccountService:
-    async def list_for_scope(scope: VisibilityScope, group_id_filter: int | None = None, user_id_filter: int | None = None) -> list[MailAccountDTO]
+    async def list_for_scope(scope: VisibilityScope, group_id_filter: int | None = None, user_id_filter: int | None = None, status: Literal['all','active','inactive'] = 'all') -> list[MailAccountDTO]  # ADR-0038-сопутствующее (Часть 1, /accounts): status фильтрует по is_active ПОСЛЕ visibility (active→is_active=true, inactive→false, all→без фильтра); модель/DTO не меняются; некорректное значение → трактуется как 'all'
     async def get_in_scope(scope: VisibilityScope, account_id: int) -> MailAccountDTO  # 404 если вне scope
     async def test(scope: VisibilityScope, payload: MailAccountTestRequest) -> TestResult
     async def create(scope: VisibilityScope, payload: MailAccountCreateRequest) -> MailAccountDTO  # учитывает target_user_id + group_id (ADR-0031)

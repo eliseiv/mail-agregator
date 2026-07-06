@@ -246,6 +246,24 @@
 
 ---
 
+### 1.15 Обратимое хранение пароля входа оператора (ADR-0038)
+
+**Осознанный security-компромисс для внутреннего инструмента.** Пароль входа оператора хранится **дополнительно** к argon2-хешу (ADR-0006, источник истины входа) в обратимо-зашифрованном виде `users.password_encrypted` (AES-256-GCM тем же `MAIL_ENCRYPTION_KEY`, AAD-домен `user_pw:{user_id}`, см. §2.3) — **исключительно** для показа super_admin'ом в колонке «Пароль» на `/admin`. Показ — через `GET /api/admin/users/{id}/password`. См. [ADR-0038](./adr/ADR-0038-reversible-login-password-storage.md).
+
+| Угроза | Описание | Митигация |
+| --- | --- | --- |
+| I (accepted) | Доступ к БД **+** `MAIL_ENCRYPTION_KEY` раскрывает пароли входа операторов в открытом виде (чего argon2-only не позволял) | **Accepted risk** (явное продукт-требование внутреннего инструмента). Меры: (1) endpoint/колонка — **только `super_admin`** (`require_super_admin`); (2) **каждый** показ → `admin_audit` `user_password_revealed`; (3) значение **никогда** не логируется (§8, redact); (4) `MAIL_ENCRYPTION_KEY` env-only, `chmod 600`, не в git/логах (ADR-0005 §1.3); (5) per-actor rate-limit против массовой выкачки; (6) пароль грузится в UI on-demand, не встраивается в разметку списка. Граница риска **не расширяется** относительно уже принятого — тем же ключом уже обратимо шифруются почтовые пароли (ADR-0005) и OAuth-токены (ADR-0025). |
+| S | Не-super_admin получает пароль входа | `GET /api/admin/users/{id}/password` под `require_super_admin` → `403 forbidden` для leader/member/user. Cookie-session + `role` из БД (не из cookie), как все admin-роуты (§1.7). |
+| T | Перестановка blob между пользователями (показать пароль A как B) | AAD `user_pw:{user_id}` биндит blob к конкретному `user_id`: расшифровка чужого blob под другим `user_id` → `InvalidTag` → ошибка (не тихий mis-reveal). Domain-префикс `user_pw:` ≠ `mail_account_password\|`/`webhook_secret\|` — blob из других таблиц тоже не подставить. |
+| R | Скрытие факта показа/задания пароля | `admin_audit`: `user_password_revealed` на **каждый** показ; `user_password_set` при задании пароля админом (create/reset). Оба `details={}` — **без значения**. super_admin видит в `/admin/audit`. |
+| I | Утечка пароля через логи | Значение пароля **не логируется**: не в structlog (response `GET /password` исключён из request/response-логирования — только статус-код), не в `admin_audit.details`, не в access-log (GET-путь без query-секрета). `password` (form/JSON поле create/reset) — в structlog redact-list рядом с `MAIL_ENCRYPTION_KEY`/mail-паролями (ADR-0014). `password_encrypted` — bytes, не логируется. |
+| D | Массовая выкачка всех паролей скриптом + флуд audit | Per-actor rate-limit `LIMIT_ADMIN_PASSWORD_REVEAL` (default `30/min` per super_admin `user_id`). |
+| E | Обратимая копия влияет на проверку входа | Невозможно: аутентификация использует **только** `password_hash` (argon2 verify, §3). `password_encrypted` — отдельная колонка, в login-путь не входит. |
+
+> **Старые пароли** (предшествующие ADR-0038 и не менявшиеся) → `password_encrypted IS NULL` → колонка «—», endpoint отдаёт `404 password_not_set`. Backfill на логине **не** делается (ADR-0038 §3 / Alternative 5).
+
+---
+
 ## 2. Шифрование почтовых паролей (схема)
 
 См. также ADR-0005.
@@ -318,6 +336,30 @@ blob = b"\x01" || iv (12B) || ciphertext_with_tag (variable)
 - **access-token** — кэш (~1ч), шифруется; при потере перевыпускается по refresh (не критичен).
 - **Не логировать**: см. §1.11 redact-list.
 - `INSERT` с предсказанным id (`nextval('mail_accounts_id_seq')`) — тот же паттерн, что для password-аккаунтов (см. §2 / модуль `crypto`).
+
+### 2.3 Обратимая копия пароля входа (ADR-0038)
+
+`users.password_encrypted` использует **тот же примитив** AES-256-GCM (`shared/crypto.py`, тот же `MAIL_ENCRYPTION_KEY`) с **отдельным AAD-доменом** для domain-separation. Новые helper'ы `encrypt_user_password(plaintext, user_id)` / `decrypt_user_password(blob, user_id)`:
+
+```
+plaintext (UTF-8 пароль входа, 12..128 chars)
+   │
+   ├── key  = base64decode(env.MAIL_ENCRYPTION_KEY)      # тот же 32-byte ключ
+   ├── iv   = os.urandom(12)                              # 96 бит, per-record
+   ├── aad  = b"user_pw:" + str(user_id).encode("ascii")  # домен + биндинг к user_id
+   ▼
+ciphertext + tag = AESGCM(key).encrypt(iv, plaintext.encode("utf-8"), aad)
+   │
+   ▼
+blob = b"\x01" || iv (12B) || ciphertext_with_tag         # version_byte как §2 (rotation)
+```
+
+**Domain separation через AAD:** префикс `b"user_pw:"` отличается от `b"mail_account_password|"` (§2) и `b"webhook_secret|"` (§2.1) → blob из `mail_accounts.encrypted_password`/`webhooks.secret_encrypted` **не** подставляется в `users.password_encrypted` (расшифровка → `InvalidTag`). Биндинг к `user_id` блокирует перестановку между пользователями.
+
+- **Предсказание id не требуется** (в отличие от `mail_accounts`/`webhooks`): `user_id` уже известен на момент шифрования — при create пароль пишется после INSERT users (id получен); при reset/self-set пользователь существует.
+- **Пишется вместе с `password_hash`** во всех точках, где известен plaintext (ADR-0038 §3): `admin.create_user`/`admin.reset_password` (опц. поле `password`), `auth.complete_set_password` (self-set).
+- **Не логировать**: см. §1.15 / §8 redact.
+- **Ротация `MAIL_ENCRYPTION_KEY`** (§10): `mas-cli/worker reencrypt` обрабатывает `users.password_encrypted` наравне с `mail_accounts.encrypted_password` / `webhooks.secret_encrypted` / OAuth-токенами — общий `version_byte` (0x00 = старый ключ, 0x01 = новый). Backend-агент добавляет `users` в список таблиц reencrypt.
 
 ---
 
@@ -452,6 +494,9 @@ CSP запрещает inline JS — все скрипты только из `/s
 **Дополнительно (ADR-0029):**
 - `GET /api/external/messages` — `LIMIT_EXTERNAL_API` (env `EXTERNAL_API_RATE_LIMIT_PER_MINUTE`, `int`, default `120`, `ge=1`; лимит запросов в минуту на IP). Consume **до** проверки `EXTERNAL_API_KEY` (anti-flood / anti-brute-force). 429 → `Retry-After`.
 
+**Дополнительно (ADR-0038):**
+- `GET /api/admin/users/{id}/password` — `LIMIT_ADMIN_PASSWORD_REVEAL` (env `ADMIN_PASSWORD_REVEAL_RATE_LIMIT_PER_MINUTE`, `int`, default `30`, `ge=1`) — **per-actor** (по `super_admin` `user_id`, не per IP): анти-bulk-exfiltration паролей входа + защита от заспамливания audit `user_password_revealed`. 429 → `Retry-After`.
+
 ---
 
 ## 8. Audit log
@@ -459,6 +504,7 @@ CSP запрещает inline JS — все скрипты только из `/s
 - Хранится в `admin_audit` (таблица в `03-data-model.md`).
 - Все super-admin actions:
   - User-management: `create_user`, `reset_password`, `delete_user`.
+  - **Reversible login-password (ADR-0038):** `user_password_set` (super_admin задал пароль оператору при create/reset; `actor=super_admin`, `target_user_id={id}`, `details={}` — **без значения пароля**), `user_password_revealed` (super_admin показал пароль через `GET /api/admin/users/{id}/password`; пишется на **каждый** показ; `details={}` — **без значения**). Пароль входа никогда не попадает в `admin_audit.details`, structlog или access-log.
   - Auth: `admin_login`, `admin_logout`.
   - Groups (ADR-0019 §9): `group_create`, `group_delete`, `group_rename`, `user_role_change`, `user_group_change`.
   - Multi-group membership (ADR-0030): `user_group_add`, `user_group_remove` (add/remove дополнительного членства в `user_groups`; `user_group_change` покрывает «Переместить»).
@@ -510,7 +556,8 @@ CSP запрещает inline JS — все скрипты только из `/s
 | `GET /api/admin/users` | ✅ | ❌ 403 | ❌ 403 |
 | `POST /api/admin/users` (create user) | ✅ | ❌ 403 | ❌ 403 |
 | `PATCH /api/admin/users/{id}` (role/group/display_name) | ✅ | ❌ 403 | ❌ 403 |
-| `POST /api/admin/users/{id}/reset` | ✅ | ❌ 403 | ❌ 403 |
+| `POST /api/admin/users/{id}/reset` (+ опц. admin-set `password`, ADR-0038) | ✅ | ❌ 403 | ❌ 403 |
+| `GET /api/admin/users/{id}/password` (показать пароль входа, ADR-0038) | ✅ (audit + rate-limit) | ❌ 403 | ❌ 403 |
 | `DELETE /api/admin/users/{id}` | ✅ (кроме self и leader'ов с непустой группой) | ❌ 403 | ❌ 403 |
 | `GET /api/admin/groups` | ✅ | ❌ 403 | ❌ 403 |
 | `POST/PATCH/DELETE /api/admin/groups/*` | ✅ | ❌ 403 | ❌ 403 |
@@ -531,7 +578,7 @@ CSP запрещает inline JS — все скрипты только из `/s
 
 | Ключ | Частота | Процедура |
 | --- | --- | --- |
-| `MAIL_ENCRYPTION_KEY` | Раз в 12 месяцев или при компрометации | См. ADR-0005 (`mas-cli reencrypt`) |
+| `MAIL_ENCRYPTION_KEY` | Раз в 12 месяцев или при компрометации | См. ADR-0005 (`mas-cli reencrypt`). Reencrypt покрывает все blob-колонки: `mail_accounts.encrypted_password`/`smtp_encrypted_password`, `mail_accounts.oauth_*_token_encrypted` (ADR-0025), `webhooks.secret_encrypted` (ADR-0023) и **`users.password_encrypted`** (ADR-0038). |
 | `ADMIN_PASSWORD` | По требованию | Обновить `.env` → `docker compose restart api worker`. `seed_super_admin` идемпотентно перезапишет `users.password_hash` (см. `07-deployment.md` sec. 11.1). UI смены пароля для супер-админа сознательно не предусмотрен. |
 | Session cookie name / domain | По требованию | Через env, разовая настройка |
 | `EXTERNAL_API_KEY` (ADR-0029) | По требованию / при компрометации | Сгенерировать `openssl rand -hex 32` → заменить в `.env` → `docker compose up -d --force-recreate api`. Партнёр обновляет ключ синхронно. Старый ключ немедленно недействителен (нет grace-периода). Пустое значение = фича выключена. |

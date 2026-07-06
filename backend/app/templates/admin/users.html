@@ -55,6 +55,8 @@
         <thead>
           <tr>
             <th scope="col">Имя</th>
+            {# ADR-0038: колонка «Пароль» видна только super_admin. #}
+            {% if is_super_admin %}<th scope="col">Пароль</th>{% endif %}
             <th scope="col">Роль</th>
             <th scope="col">Команда</th>
             <th scope="col">Создан</th>
@@ -76,7 +78,8 @@
              border styling. Inside one group the rows stay flush. #}
           {% if not loop.first %}
             <tbody class="user-group__spacer" aria-hidden="true">
-              <tr><td colspan="6"></td></tr>
+              {# colspan учитывает колонку «Пароль» (ADR-0038), видимую только super_admin. #}
+              <tr><td colspan="{{ 7 if is_super_admin else 6 }}"></td></tr>
             </tbody>
           {% endif %}
           <tbody class="user-group {{ _band_class }}" data-group-id="{{ _gid }}">
@@ -109,6 +112,33 @@
                     {% endif %}
                   </div>
                 </td>
+                {# ADR-0038: колонка «Пароль» — только super_admin. Пароль НЕ
+                   встраивается заранее; маска + «глаз» грузят его on-demand
+                   (GET /api/admin/users/{id}/password) — см. admin_users.js. #}
+                {% if is_super_admin %}
+                <td class="admin-users-table__password">
+                  {% if u.has_password %}
+                    <span class="pw-cell" data-pw-cell>
+                      <span class="pw-cell__value" data-pw-value aria-live="polite">••••••••</span>
+                      <button
+                        type="button"
+                        class="pw-cell__toggle"
+                        data-pw-reveal
+                        data-user-id="{{ u.id }}"
+                        aria-pressed="false"
+                        title="Показать пароль"
+                        aria-label="Показать пароль пользователя {{ u.username | e }}">
+                        <svg class="pw-icon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false">
+                          <path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/>
+                          <circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="2"/>
+                        </svg>
+                      </button>
+                    </span>
+                  {% else %}
+                    <span class="admin-users-table__muted" title="Пароль задаёт пользователь сам">&mdash;</span>
+                  {% endif %}
+                </td>
+                {% endif %}
                 <td class="admin-users-table__role">
                   {% if u.role %}
                     <span class="admin-user__badge admin-user__badge--{{ u.role | e }}">{{ m.role_label(u.role) }}</span>
@@ -177,6 +207,7 @@
                        the type-the-username dialog already in this page). #}
                     <form method="POST" action="/api/admin/users/{{ u.id }}/reset"
                           class="inline-form" data-admin-reset-form
+                          data-username="{{ u.username | e }}"
                           data-confirm="Сбросить пароль пользователю @{{ u.username | e }}? При следующем входе он должен будет задать новый пароль.">
                       {{ m.csrf_input() }}
                       <button type="submit" class="btn btn--secondary btn--small">Сброс</button>
@@ -215,6 +246,7 @@
       class="form"
       data-admin-create-user-form>
       {{ m.csrf_input() }}
+      <p class="form-error" role="alert" data-admin-create-error hidden></p>
       <div class="field">
         <label class="field__label" for="new-user-username">Логин</label>
         <input
@@ -293,6 +325,64 @@
           </p>
           <p class="field__hint" data-admin-group-hint-member>Обязательное поле для участника команды.</p>
         {% endif %}
+      </div>
+
+      {# ADR-0038 §5 / ADR-0030: мультивыбор ДОПОЛНИТЕЛЬНЫХ команд.
+         Только для role='group_member' — JS показывает/очищает блок по роли.
+         Отправляются как повторяющиеся поля additional_group_ids=<id>.
+         Основная команда (group_id) исключается из выбора (JS disable). #}
+      {% if groups %}
+        {# Visible by default (default role = участник); JS hides it when the
+           «Лидер» radio is chosen. no-JS: participants can still pick extra
+           teams; backend ignores the field for leaders. #}
+        <fieldset class="form-section field" data-admin-additional-groups-field>
+          <legend class="form-section__legend">Дополнительные команды <span class="field__optional">(необязательно)</span></legend>
+          <ul class="checkbox-list" data-admin-additional-groups-list>
+            {% for grp in groups %}
+              <li>
+                <label class="checkbox">
+                  <input
+                    type="checkbox"
+                    name="additional_group_ids"
+                    value="{{ grp.id }}"
+                    data-admin-additional-group
+                    data-group-id="{{ grp.id }}">
+                  <span>{{ grp.name | e }}</span>
+                </label>
+              </li>
+            {% endfor %}
+          </ul>
+          <p class="field__hint">Участник дополнительно видит письма выбранных команд. Основная команда исключается автоматически.</p>
+        </fieldset>
+      {% endif %}
+
+      {# ADR-0038 §3: опциональный пароль. Пусто → self-set-флоу (колонка «—»);
+         задан (≥12, буква+цифра) → admin-set, значение сразу видно в колонке «Пароль». #}
+      <div class="field">
+        <label class="field__label" for="new-user-password">Пароль <span class="field__optional">(необязательно)</span></label>
+        <div class="pw-input">
+          <input
+            class="field__input"
+            type="password"
+            id="new-user-password"
+            name="password"
+            minlength="12"
+            maxlength="128"
+            autocomplete="new-password">
+          <button
+            type="button"
+            class="pw-input__toggle"
+            data-pw-input-toggle
+            aria-pressed="false"
+            title="Показать пароль"
+            aria-label="Показать пароль">
+            <svg class="pw-icon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false">
+              <path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/>
+              <circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="2"/>
+            </svg>
+          </button>
+        </div>
+        <p class="field__hint">≥12 символов, минимум одна буква и одна цифра. Оставьте пустым — пользователь задаст пароль сам при первом входе.</p>
       </div>
 
       <div class="form-actions">
@@ -454,6 +544,52 @@
       <div class="form-actions">
         <button type="button" class="btn btn--secondary" data-admin-add-cancel>Отмена</button>
         <button type="submit" class="btn btn--primary" data-admin-add-go>Добавить</button>
+      </div>
+    </form>
+  </dialog>
+
+  {# Reset-password dialog (ADR-0038 §3). Опциональное поле «Новый пароль»:
+     пусто → force self-set (колонка станет «—»); задан → admin-set (значение
+     сразу видно в колонке «Пароль»). Шлёт POST /api/admin/users/{id}/reset
+     с полем password (JSON). Открывается из data-admin-reset-form (JS). #}
+  <dialog class="dialog" id="dialog-reset-user" data-admin-reset-dialog>
+    <form method="dialog" class="dialog__form-cancel">
+      <button type="submit" class="btn btn--link" aria-label="Закрыть">&times;</button>
+    </form>
+    <h2 class="dialog__title">Сбросить пароль</h2>
+    <p>Пользователь <strong data-admin-reset-username></strong>. Все его активные сессии будут завершены.</p>
+    <p class="form-error" role="alert" data-admin-reset-error hidden></p>
+    <form class="form" data-admin-reset-confirm-form>
+      <div class="field">
+        <label class="field__label" for="reset-user-password">Новый пароль <span class="field__optional">(необязательно)</span></label>
+        <div class="pw-input">
+          <input
+            class="field__input"
+            type="password"
+            id="reset-user-password"
+            name="password"
+            minlength="12"
+            maxlength="128"
+            autocomplete="new-password"
+            data-admin-reset-password>
+          <button
+            type="button"
+            class="pw-input__toggle"
+            data-pw-input-toggle
+            aria-pressed="false"
+            title="Показать пароль"
+            aria-label="Показать пароль">
+            <svg class="pw-icon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false">
+              <path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/>
+              <circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="2"/>
+            </svg>
+          </button>
+        </div>
+        <p class="field__hint">≥12 символов, минимум одна буква и одна цифра. Оставьте пустым — пользователь задаст пароль сам при следующем входе.</p>
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn btn--secondary" data-admin-reset-cancel>Отмена</button>
+        <button type="submit" class="btn btn--primary" data-admin-reset-go>Сбросить</button>
       </div>
     </form>
   </dialog>

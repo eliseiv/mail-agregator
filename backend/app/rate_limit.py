@@ -77,6 +77,13 @@ LIMIT_ACCOUNT_WRITE = Limit(name="acc_write", capacity=50, window_seconds=60 * 6
 LIMIT_ACCOUNT_SYNC = Limit(name="acc_sync", capacity=5, window_seconds=60 * 60)
 LIMIT_MESSAGE_SEND = Limit(name="msg_send", capacity=30, window_seconds=60 * 60)
 LIMIT_ADMIN_WRITE = Limit(name="admin_write", capacity=50, window_seconds=60 * 60)
+# Admin login-password reveal (ADR-0038 §4). Keyed PER super_admin actor
+# (``user_id``), not per IP — anti-bulk-exfiltration of login passwords +
+# protection against flooding the ``user_password_revealed`` audit. ``capacity``
+# is overridden at consume-time from
+# ``settings.ADMIN_PASSWORD_REVEAL_RATE_LIMIT_PER_MINUTE`` (same pattern as
+# ``LIMIT_EXTERNAL_API``); the static value here is the default fallback.
+LIMIT_ADMIN_PASSWORD_REVEAL = Limit(name="admin_pw_reveal", capacity=30, window_seconds=60)
 # Tags (ADR-0017): writes (create/edit/delete tag, add/remove rule) — 30/h.
 # ``apply_to_existing`` is a heavier path and gets its own 50/h limit per user.
 # Raised 5/h -> 50/h: bulk onboarding and repeated re-applies (debug / re-tagging)

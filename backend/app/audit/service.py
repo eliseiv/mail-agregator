@@ -59,6 +59,9 @@ ALLOWED_ACTIONS: Final[frozenset[str]] = frozenset(
         # ADR-0034 §2 — mail-forwarding config upsert/delete.
         "forwarding_updated",
         "forwarding_deleted",
+        # ADR-0038 §3/§4 — reversible login-password lifecycle.
+        "user_password_set",
+        "user_password_revealed",
     }
 )
 

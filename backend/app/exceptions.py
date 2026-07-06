@@ -239,6 +239,18 @@ class GroupNotFoundError(DomainError):
     code = "group_not_found"
 
 
+class PasswordNotSetError(DomainError):
+    """``GET /api/admin/users/{id}/password``: the user has no reversible
+    login-password copy (``users.password_encrypted IS NULL``) — ADR-0038 §4.
+
+    The password predates the feature and was not changed, or create/reset
+    ran in the self-set flow. The admin UI column shows "—".
+    """
+
+    status_code = 404
+    code = "password_not_set"
+
+
 class WebhookUrlPrivateIpError(DomainError):
     """Outbound webhook URL would target a private/loopback/link-local
     address — ADR-0023 §4.3 SSRF protection.

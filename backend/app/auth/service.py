@@ -27,6 +27,7 @@ from backend.app.repositories.users import UsersRepo
 from backend.app.sessions import SessionStore, SetupSessionStore
 from backend.app.tags.service import TagsService
 from shared.config import get_settings
+from shared.crypto import encrypt_user_password
 from shared.logging import get_logger
 
 log = get_logger(__name__)
@@ -249,8 +250,16 @@ class AuthService:
         if user is None:
             raise NotAuthenticatedError("User no longer exists")
 
+        # ADR-0038 §3: the user is choosing their own password here, so we
+        # also store the reversible copy (AES-GCM, AAD bound to this user_id)
+        # alongside the argon2 hash. This keeps the admin "Password" column
+        # correct after a self-set — no de-sync between hash and shown value.
+        # The plaintext is never logged.
         new_hash = self._ph.hash(password)
-        await self._users.set_password_hash(user.id, new_hash)
+        password_encrypted = encrypt_user_password(password, user.id)
+        await self._users.set_password_hash(
+            user.id, new_hash, password_encrypted=password_encrypted
+        )
         await self._setup.revoke(setup_token)
 
         # Round-17: set-password is the first successful auth for this user.

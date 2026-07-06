@@ -14,7 +14,9 @@ Visibility (ADR-0019 §7.1) is enforced via :class:`VisibilityScope`:
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Path, Request, Response, status
+from typing import Annotated, Literal
+
+from fastapi import APIRouter, Path, Query, Request, Response, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import ValidationError as PydanticValidationError
 
@@ -422,8 +424,13 @@ async def _team_selector_context(db: DbSession, scope: CurrentScope) -> dict[str
 
 
 @html.get("/accounts", response_class=HTMLResponse)
-async def accounts_page(request: Request, db: DbSession, scope: CurrentScope) -> Response:
-    accounts = await MailAccountService(db).list_for_scope(scope)
+async def accounts_page(
+    request: Request,
+    db: DbSession,
+    scope: CurrentScope,
+    status: Annotated[Literal["all", "active", "inactive"], Query()] = "all",
+) -> Response:
+    accounts = await MailAccountService(db).list_for_scope(scope, status=status)
     sess = request.state.session
     team_ctx = await _team_selector_context(db, scope)
     # The list/PATCH JSON DTO intentionally omits ``group_id`` (04-api-contracts
@@ -446,6 +453,7 @@ async def accounts_page(request: Request, db: DbSession, scope: CurrentScope) ->
             "accounts": accounts,
             "account_group": account_group,
             "scope": scope,
+            "status_filter": status,
             "csrf_token": sess.csrf_token,
             "session": sess,
             **team_ctx,

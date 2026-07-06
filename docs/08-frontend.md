@@ -127,7 +127,7 @@ flowchart LR
 | `inbox.js` | Inbox: live-toggle "mark as read"; periodic polling списка (опционально); UX-обработка клика по строке; **searchable account-combobox** (фильтр «по почте»): читает список почт из data-island `<script type="application/json">`, клиентская фильтрация по email+display_name (case-insensitive), ARIA 1.2 combobox-навигация, проставляет hidden `account_id` и сабмитит GET-форму; `×`/«Все почты» сбрасывают. Прогрессивное улучшение — без JS остаётся `<select>`-fallback. |
 | `compose.js` | Compose: подсветка некорректных email-адресов; счётчик символов subject; клиентская проверка длины body. |
 | `account_form.js` | Add/edit account: при вводе email — auto-fill IMAP/SMTP defaults для известных доменов (хардкод-таблица в JS, см. ниже; backend-эндпоинта provider-suggest нет, чтобы не плодить лишних round-trip'ов); кнопка "Test connection" — POST `/api/mail-accounts/test`, показывает inline-результат. |
-| `admin_users.js` | Admin: раскрытие/сворачивание списка mail-аккаунтов внутри строки пользователя; confirm-диалоги для reset/delete. |
+| `admin_users.js` | Admin: раскрытие/сворачивание списка mail-аккаунтов внутри строки пользователя; confirm-диалоги для reset/delete; **reveal-toggle пароля (ADR-0038)** — по клику `fetch GET /api/admin/users/{id}/password`, подстановка `response.password` в ячейку колонки «Пароль», повторный клик скрывает (значение не хранится в DOM заранее); мультивыбор доп. команд в диалоге создания (`additional_group_ids`). |
 | `tags.js` | Tags form (create / edit): динамическое добавление/удаление строк condition (rule_type[] + rule_pattern[]); валидация (тип выбран, pattern непустой) перед submit; color-picker swatches (см. секцию 5.1); confirm-диалог при DELETE тега и DELETE rule. **Важно:** без JS форма всё равно работает — template рендерит фиксированное число пустых rule-row (например, 5); пользователь заполняет столько, сколько нужно; backend пропускает empty pairs. |
 | `forwarding.js` | (ADR-0034) Секция «Переадресация» на `/my/integrations`: submit `forward_to`+`is_active` через `csrfFetch` `PUT /api/forwarding/me`; кнопка «Удалить» с `window.confirm` → `DELETE /api/forwarding/me`; inline-валидация e-mail перед отправкой; обновление статуса без перезагрузки. **Прогрессивное улучшение** — без JS секция полностью работает через form-fallback (`_method=PUT`/`DELETE`). |
 | `tg.js` | Telegram WebApp adaptation (ADR-0018). На DOMContentLoaded: если `window.Telegram?.WebApp` существует — `Telegram.WebApp.ready()`, читает `themeParams` и применяет как CSS-vars (`--tg-bg`, `--tg-text`, `--tg-hint`, `--tg-link`, `--tg-button`, `--tg-button-text`, `--tg-secondary-bg`) на `document.documentElement`; добавляет класс `tg-app` на `<body>`; подписывается на `themeChanged`. Если SDK не загружен (открыто в браузере) — no-op. Подключается на каждой странице (в `base.html`) с `defer`. |
@@ -303,6 +303,7 @@ flowchart LR
 └──────────────────────────────────────────────────────────────────┘
 ```
 
+- **Фильтр статуса (тулбар, ADR-0038-сопутствующее / фикс):** сегментированный контрол-ссылки **«Все / Активные / Неактивные»** над списком (`?status=all|active|inactive`, default `all`). Реализация — **GET-навигация без JS** (обычные `<a href="?status=…">`), паттерн как admin-поиск (`admin/users.html`); текущий сегмент подсвечен по контекстной переменной `status_filter`. Сервер фильтрует по `MailAccountDTO.is_active` **после** `VisibilityScope` (см. `04-api-contracts.md` `GET /accounts`); модель/DTO не меняются. Доступен всем ролям (super_admin/leader/member) — фильтрует их видимый набор. `active`→только «●», `inactive`→только «✗», `all`→все.
 - Главный текст строки — `effective_account_label(account)` (display_name → email; ADR-0020).
 - В квадратных скобках после ярлыка — owner: `effective_user_name(owner)` (ADR-0019). Показывается только в group-видимости (когда видимых владельцев больше одного); для личного режима (всё своё) скрывается.
 - Ниже мелким шрифтом — full email (если `display_name` задан, чтобы пользователь всегда видел реальный адрес).
@@ -415,6 +416,11 @@ flowchart LR
 ```
 
 - Колонки строки: `username (display_name)` + chip с `role_label(role)` + chip «Группа `{group.name}`» (если есть).
+- **Колонка «Пароль» (ADR-0038, только `super_admin`)** — между «Имя» и «Роль»:
+  - Если `user.has_password` (= `password_encrypted IS NOT NULL`, приходит из `GET /api/admin/users`) → маска `••••••` + кнопка-«глаз» (reveal-toggle). Иначе — **«—»** (обратимой копии нет).
+  - Клик по «глазу» → `admin_users.js` делает **`fetch GET /api/admin/users/{id}/password`** (on-demand), подставляет `response.password` в ячейку; повторный клик — снова маска. **Пароль НЕ встраивается в DOM заранее** (грузится по требованию — минимальная экспозиция + audit `user_password_revealed` на каждый показ).
+  - Обработка ответов: `404 password_not_set` → показать «—» (рассинхрон `has_password`); `429` → флеш/подсказка «Слишком часто, попробуйте позже»; `403` не встречается (колонка рендерится только для super_admin).
+  - Колонка **не рендерится** для leader/member (страница `/admin` им и так недоступна — 403; условие оставлено на случай переиспользования шаблона).
 - ▶/▼ — раскрытие списка mail-аккаунтов пользователя (JS, без перезагрузки).
 - «Изменить» — открывает edit-форму (страница / модалка) c полями `display_name`, `role` (radio: «Лидер группы» / «Участник группы»; super-admin не доступен), `group_id` (select — отображается только для `role='group_member'`).
   - При смене role на `'group_leader'`: super-admin указывает либо «создать новую группу» (auto-create по `display_name`), либо текущую группу пользователя — но только если в ней нет другого лидера.
@@ -422,8 +428,10 @@ flowchart LR
 - «Создать пользователя» — модалка / отдельная страница: поля `username` (обяз.), `email` (опц.), `display_name` (опц.; ADR-0019 §2), `role` (radio: «Лидер группы» / «Участник группы»; default = «Участник»), `group_id` (select):
   - Если `role = «Участник»`: select обязателен (existing groups; пустой список → super-admin сначала идёт на `/admin/groups/new`).
   - Если `role = «Лидер»`: select **скрыт** (auto-create); подсказка «Группа будет создана автоматически с именем «Группа `{display_name | username}`»». Имя группы можно отредактировать на `/admin/groups/{id}/edit` после создания.
-  - После create — flash «Пользователь создан. Сообщите ему username; потребуется установить пароль.»
-- «Сбросить пароль» — confirm-диалог.
+  - **Поле «Пароль» (опц., ADR-0038):** `<input type="password" name="password" minlength="12" maxlength="128">` + подсказка «≥12 символов, буква и цифра. Оставьте пустым — пользователь задаст сам». Задан → пароль сразу показывается в колонке «Пароль» (обратимая копия); пусто → self-set-флоу, колонка «—».
+  - **Мультивыбор доп. команд (ADR-0038 §5 / ADR-0030), только для `role = «Участник»`:** под основным select'ом команды — набор **чекбоксов** (или multi-select) `additional_group_ids` из списка `groups` контекста (те же команды). Отправляются как повторяющиеся form-поля `additional_group_ids=<id>`. Для `role = «Лидер»` блок **скрыт** (лидер привязан к своей команде). Дедуп с основной `group_id` — на бэкенде (`ON CONFLICT DO NOTHING`); в UI основную команду в списке доп. можно disable/исключить для ясности.
+  - После create — flash «Пользователь создан» (+ «Сообщите ему username; потребуется установить пароль», если пароль не задан).
+- «Сбросить пароль» — confirm-диалог с **опциональным полем «Новый пароль»** (ADR-0038): пусто → текущее поведение (force self-set, колонка станет «—»); задан (≥12, буква+цифра) → admin-set, значение сразу видно в колонке «Пароль». Шлёт `POST /api/admin/users/{id}/reset` с полем `password` (JSON или form).
 - «Удалить» — confirm-диалог с явным «Введите username для подтверждения». Если user — лидер группы, кнопка выводит alert «Сначала удалите или переназначьте группу» (backend всё равно вернёт 409 с подробностями).
 - Super-admin строка — без actions.
 

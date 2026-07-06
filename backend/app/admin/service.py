@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from argon2 import PasswordHasher
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -45,6 +46,7 @@ from backend.app.exceptions import (
     MembershipAlreadyExistsError,
     MembershipNotFoundError,
     NotFoundError,
+    PasswordNotSetError,
     ValidationError,
 )
 from backend.app.groups.service import GroupsService, _auto_group_name
@@ -56,6 +58,7 @@ from backend.app.repositories.user_groups import UserGroupsRepo
 from backend.app.repositories.users import UsersRepo
 from backend.app.sessions import SessionStore
 from backend.app.telegram.sso_service import TelegramSSOService
+from shared.crypto import InvalidTag, decrypt_user_password, encrypt_user_password
 from shared.logging import get_logger
 from shared.models import (
     ROLE_GROUP_LEADER,
@@ -67,6 +70,10 @@ from shared.models import (
 from shared.storage import get_storage
 
 log = get_logger(__name__)
+
+# ADR-0038 §3: hash admin-set login passwords with the same argon2 defaults
+# as the auth module. Module-level so params are computed once per process.
+_PH = PasswordHasher()
 
 
 def _group_brief(group: Group | None) -> GroupBriefDTO | None:
@@ -154,6 +161,7 @@ class AdminService:
                     if (brief := _group_brief(group_by_id.get(gid))) is not None
                 ],
                 password_reset_required=u.password_reset_required,
+                has_password=u.password_encrypted is not None,
                 lockout_until=u.lockout_until,
                 last_login_at=u.last_login_at,
                 created_at=u.created_at,
@@ -245,6 +253,13 @@ class AdminService:
             else (group_id if role == ROLE_GROUP_MEMBER else None)
         )
 
+        # ADR-0038 §3: optional admin-set password. When present we insert the
+        # argon2 hash immediately (no user_id needed) and clear the reset flag;
+        # the reversible copy needs the freshly assigned ``user.id`` for its
+        # AAD, so it is written right after the INSERT below (same transaction).
+        admin_set_password = payload.password is not None
+        password_hash = _PH.hash(payload.password) if payload.password is not None else None
+
         try:
             # ``email`` is no longer accepted in the request payload (the
             # field was removed from the public API). New users are created
@@ -257,11 +272,27 @@ class AdminService:
                 role=role,
                 group_id=insert_group_id,
                 display_name=payload.display_name,
-                password_hash=None,
-                password_reset_required=True,
+                password_hash=password_hash,
+                password_reset_required=not admin_set_password,
             )
         except IntegrityError as exc:
             raise ConflictError("Username already exists", field="username") from exc
+
+        # ADR-0038 §3: store the reversible copy now that ``user.id`` exists.
+        # The plaintext is never logged; audit records the fact only (no value).
+        if admin_set_password:
+            assert payload.password is not None  # mypy: guarded by admin_set_password
+            blob = encrypt_user_password(payload.password, user.id)
+            await self._users.update_fields(user.id, password_encrypted=blob)
+            await self._audit.log(
+                actor_user_id=actor.user_id,
+                action="user_password_set",
+                target_user_id=user.id,
+                target_username=user.username,
+                details={},
+                ip=ip,
+                user_agent=user_agent,
+            )
 
         # Audit base event.
         await self._audit.log(
@@ -279,6 +310,19 @@ class AdminService:
         # the orphan-group branch.)
         if role == ROLE_GROUP_MEMBER and insert_group_id is not None:
             await self._memberships.add(user_id=user.id, group_id=insert_group_id)
+            # ADR-0038 §5 / ADR-0030: additional teams beyond the home team.
+            # Only honoured for group_member (leaders are bound to their own
+            # team; super_admin is not creatable via the API). Same
+            # transaction; dedup against the home team and among themselves;
+            # a non-existent team aborts the whole create with 400.
+            await self._add_additional_memberships(
+                user=user,
+                home_group_id=insert_group_id,
+                additional_group_ids=payload.additional_group_ids,
+                actor=actor,
+                ip=ip,
+                user_agent=user_agent,
+            )
 
         # Auto-create / assign-to-orphan group flow for new leader.
         group: Group | None = None
@@ -341,7 +385,58 @@ class AdminService:
             role=user.role,
             group_id=user.group_id,
             group=_group_brief(group),
+            has_password=admin_set_password,
         )
+
+    async def _add_additional_memberships(
+        self,
+        *,
+        user: User,
+        home_group_id: int,
+        additional_group_ids: list[int] | None,
+        actor: VisibilityScope,
+        ip: str,
+        user_agent: str | None,
+    ) -> None:
+        """Insert extra ``user_groups`` rows for a freshly created member
+        (ADR-0038 §5 / ADR-0030).
+
+        Dedup against the home team and among themselves; validate that each
+        team exists (a missing one raises ``400 group_not_found`` and, because
+        the caller wraps the create in a single transaction, rolls the whole
+        operation back). Writes one ``user_group_add`` audit row per team that
+        was actually added (idempotent — a duplicate is a no-op, no audit).
+        """
+        if not additional_group_ids:
+            return
+        seen: set[int] = {home_group_id}
+        for gid in additional_group_ids:
+            if gid in seen:
+                continue
+            seen.add(gid)
+            group = await self._groups.get_by_id(gid)
+            if group is None:
+                # ADR-0038 §5 / 04-api-contracts: POST /api/admin/users
+                # contract requires 400 group_not_found for a bad additional
+                # team (distinct from the standalone POST .../groups endpoint,
+                # ADR-0030, which returns 404). The single-transaction rollback
+                # is unchanged — only the status/error class differs.
+                raise ValidationError(
+                    "group_not_found",
+                    field="additional_group_ids",
+                    details={"group_id": gid},
+                )
+            created = await self._memberships.add(user_id=user.id, group_id=gid)
+            if created:
+                await self._audit.log(
+                    actor_user_id=actor.user_id,
+                    action="user_group_add",
+                    target_user_id=user.id,
+                    target_username=user.username,
+                    details={"group_id": gid},
+                    ip=ip,
+                    user_agent=user_agent,
+                )
 
     # --- Update -----------------------------------------------------------
 
@@ -568,6 +663,7 @@ class AdminService:
                 if (brief := _group_brief(membership_by_id.get(gid))) is not None
             ],
             password_reset_required=refreshed.password_reset_required,
+            has_password=refreshed.password_encrypted is not None,
             lockout_until=refreshed.lockout_until,
             last_login_at=refreshed.last_login_at,
             created_at=refreshed.created_at,
@@ -717,6 +813,7 @@ class AdminService:
         target_id: int,
         ip: str,
         user_agent: str | None,
+        password: str | None = None,
     ) -> None:
         target = await self._users.get_by_id(target_id)
         if target is None:
@@ -725,7 +822,17 @@ class AdminService:
             raise CannotResetAdminError("Cannot reset super-admin password")
         await self._assert_can_act_on(actor, target)
 
-        await self._users.reset_password(target_id)
+        if password is not None:
+            # ADR-0038 §3: admin-set reset — write the argon2 hash AND the
+            # reversible copy (AAD bound to this user_id), clear the reset
+            # flag. The plaintext is never logged.
+            new_hash = _PH.hash(password)
+            blob = encrypt_user_password(password, target_id)
+            await self._users.set_password_hash(target_id, new_hash, password_encrypted=blob)
+        else:
+            # Force self-set: clears both hash and reversible copy → the
+            # "Password" column reverts to "—".
+            await self._users.reset_password(target_id)
         await self._sessions.revoke_all_for_user(target_id)
 
         await self._audit.log(
@@ -736,6 +843,16 @@ class AdminService:
             ip=ip,
             user_agent=user_agent,
         )
+        if password is not None:
+            await self._audit.log(
+                actor_user_id=actor.user_id,
+                action="user_password_set",
+                target_user_id=target.id,
+                target_username=target.username,
+                details={},
+                ip=ip,
+                user_agent=user_agent,
+            )
         # ADR-0022 §1.5: a password reset invalidates the Telegram link
         # (new owner / new device assumed).
         await TelegramSSOService(self._db).revoke_for_user(
@@ -744,6 +861,49 @@ class AdminService:
             ip=ip,
             user_agent=user_agent,
         )
+
+    async def reveal_login_password(
+        self,
+        *,
+        actor: VisibilityScope,
+        target_id: int,
+        ip: str,
+        user_agent: str | None,
+    ) -> str:
+        """Return the decrypted login password of ``target_id`` (ADR-0038 §4).
+
+        super_admin only (enforced by the ``SuperAdminScope`` dependency at
+        the route). Raises ``404 not_found`` for a missing user and
+        ``404 password_not_set`` when there is no reversible copy
+        (``password_encrypted IS NULL`` → the UI column shows "—"). Every
+        successful reveal writes a ``user_password_revealed`` audit row
+        (``details={}`` — the value is NEVER logged or stored in audit).
+        """
+        target = await self._users.get_by_id(target_id)
+        if target is None:
+            raise NotFoundError()
+        if target.password_encrypted is None:
+            raise PasswordNotSetError()
+
+        try:
+            plaintext = decrypt_user_password(target.password_encrypted, target.id)
+        except InvalidTag:
+            # Corrupt blob or wrong/rotated key. Never log the ciphertext or
+            # any secret; surface as a generic internal error (500) via the
+            # unhandled handler rather than masking it as "not set".
+            log.error("user_password_decrypt_failed", user_id=target.id)
+            raise
+
+        await self._audit.log(
+            actor_user_id=actor.user_id,
+            action="user_password_revealed",
+            target_user_id=target.id,
+            target_username=target.username,
+            details={},
+            ip=ip,
+            user_agent=user_agent,
+        )
+        return plaintext
 
     async def _dissolve_leader_group(
         self,

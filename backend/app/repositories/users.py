@@ -16,6 +16,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.models import ROLE_GROUP_LEADER, ROLE_GROUP_MEMBER, ROLE_SUPER_ADMIN, User
 
+# Sentinel distinguishing "leave ``password_encrypted`` untouched" (e.g. the
+# argon2 re-hash path on login) from "explicitly set it" (including to NULL).
+_UNSET: object = object()
+
 
 class UsersRepo:
     def __init__(self, session: AsyncSession) -> None:
@@ -133,6 +137,7 @@ class UsersRepo:
         display_name: str | None = None,
         password_hash: str | None = None,
         password_reset_required: bool = True,
+        password_encrypted: bytes | None = None,
     ) -> User:
         """Insert a new user. Raises :class:`IntegrityError` on username clash.
 
@@ -153,6 +158,7 @@ class UsersRepo:
             group_id=group_id,
             password_hash=password_hash,
             password_reset_required=password_reset_required,
+            password_encrypted=password_encrypted,
         )
         self._s.add(user)
         try:
@@ -198,19 +204,31 @@ class UsersRepo:
         await self._s.flush()
         return existing, "updated"
 
-    async def set_password_hash(self, user_id: int, password_hash: str) -> None:
-        stmt = (
-            update(User)
-            .where(User.id == user_id)
-            .values(
-                password_hash=password_hash,
-                password_reset_required=False,
-                failed_login_attempts=0,
-                lockout_until=None,
-                updated_at=datetime.now(UTC),
-            )
-        )
-        await self._s.execute(stmt)
+    async def set_password_hash(
+        self,
+        user_id: int,
+        password_hash: str,
+        *,
+        password_encrypted: bytes | None | object = _UNSET,
+    ) -> None:
+        """Persist a new argon2 hash and clear lockout / reset flags.
+
+        ``password_encrypted`` (ADR-0038): when ``_UNSET`` the reversible
+        copy column is left untouched (used by the login argon2 re-hash path,
+        which has no plaintext to re-encrypt). When a ``bytes`` value is
+        passed (admin-set / self-set flows, where the plaintext is known) the
+        reversible copy is written alongside the hash.
+        """
+        values: dict[str, object] = {
+            "password_hash": password_hash,
+            "password_reset_required": False,
+            "failed_login_attempts": 0,
+            "lockout_until": None,
+            "updated_at": datetime.now(UTC),
+        }
+        if password_encrypted is not _UNSET:
+            values["password_encrypted"] = password_encrypted
+        await self._s.execute(update(User).where(User.id == user_id).values(**values))
 
     async def reset_password(self, user_id: int) -> None:
         stmt = (
@@ -218,6 +236,10 @@ class UsersRepo:
             .where(User.id == user_id)
             .values(
                 password_hash=None,
+                # ADR-0038: a self-set reset drops the reversible copy too, so
+                # the "Password" column reverts to "—" until a password is set
+                # again (by the user or an admin-set reset with ``password``).
+                password_encrypted=None,
                 password_reset_required=True,
                 failed_login_attempts=0,
                 lockout_until=None,

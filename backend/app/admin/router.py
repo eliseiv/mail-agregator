@@ -13,6 +13,7 @@ and the actor is a :class:`VisibilityScope` (not a raw User), so a future
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import Annotated
 
@@ -27,6 +28,7 @@ from backend.app.admin.schemas import (
     CreateUserResponse,
     DeleteUserResponse,
     MembershipDTO,
+    ResetPasswordRequest,
     UpdateUserRequest,
     UserDTO,
     UsersListResponse,
@@ -46,9 +48,16 @@ from backend.app.exceptions import (
 from backend.app.flash import flash
 from backend.app.groups.schemas import EligibleUsersResponse
 from backend.app.groups.service import GroupsService
-from backend.app.rate_limit import LIMIT_ADMIN_WRITE, client_ip, consume
+from backend.app.rate_limit import (
+    LIMIT_ADMIN_PASSWORD_REVEAL,
+    LIMIT_ADMIN_WRITE,
+    Limit,
+    client_ip,
+    consume,
+)
 from backend.app.repositories.groups import GroupsRepo
 from backend.app.templates import render
+from shared.config import get_settings
 
 api = APIRouter(prefix="/api/admin", tags=["admin"])
 html = APIRouter(prefix="/admin", tags=["admin-html"])
@@ -77,16 +86,43 @@ def _form_int_or_none(form: object, name: str) -> int | None:
         raise ValidationError(f"{name} must be an integer", field=name) from exc
 
 
+def _form_int_list(form: object, name: str) -> list[int]:
+    """Parse repeated form fields (``name=1&name=2``) into a list of ints.
+
+    Empty values are skipped. A non-integer value raises ``400``. Used for
+    ``additional_group_ids`` on the create-user form (ADR-0038 §5).
+    """
+    if not hasattr(form, "getlist"):
+        return []
+    out: list[int] = []
+    for raw in form.getlist(name):
+        if not isinstance(raw, str):
+            continue
+        s = raw.strip()
+        if not s:
+            continue
+        try:
+            out.append(int(s))
+        except ValueError as exc:
+            raise ValidationError(f"{name} must contain integers", field=name) from exc
+    return out
+
+
 async def _parse_create_user_form(request: Request) -> CreateUserRequest:
     form = await request.form()
     # ``email`` is intentionally NOT parsed: the field was removed from the
     # public API. Form-encoded clients that still submit ``email=...`` will
     # have it silently ignored (forward-compat for old HTML caches).
+    # ADR-0038: ``password`` (blank → None → self-set flow) and repeated
+    # ``additional_group_ids`` fields are parsed for the no-JS path.
+    additional = _form_int_list(form, "additional_group_ids")
     payload: dict[str, object] = {
         "username": _form_str(form, "username"),
         "display_name": _form_str(form, "display_name").strip() or None,
         "role": _form_str(form, "role").strip() or "group_member",
         "group_id": _form_int_or_none(form, "group_id"),
+        "password": _form_str(form, "password") or None,
+        "additional_group_ids": additional or None,
     }
     try:
         return CreateUserRequest.model_validate(payload)
@@ -344,6 +380,31 @@ async def patch_user_sibling(
     return await _patch_user_impl(request, db, actor, user_id)
 
 
+async def _parse_reset_password(request: Request, *, is_form: bool) -> ResetPasswordRequest:
+    """Parse the optional ``password`` from a reset request (ADR-0038 §3).
+
+    JSON body is optional (legacy clients send none → empty body → no
+    password → force self-set flow). Form ``password`` blank → None.
+    """
+    if is_form:
+        form = await request.form()
+        raw: dict[str, object] = {"password": _form_str(form, "password") or None}
+    else:
+        body_bytes = await request.body()
+        raw = {}
+        if body_bytes:
+            try:
+                parsed = json.loads(body_bytes)
+            except (json.JSONDecodeError, ValueError) as exc:
+                raise ValidationError("Invalid JSON payload") from exc
+            if isinstance(parsed, dict):
+                raw = parsed
+    try:
+        return ResetPasswordRequest.model_validate(raw)
+    except PydanticValidationError as exc:
+        raise ValidationError("Invalid payload") from exc
+
+
 @api.post("/users/{user_id}/reset", response_model=None)
 async def reset_password(
     request: Request,
@@ -355,6 +416,7 @@ async def reset_password(
     ip = client_ip(request)
     ua = request.headers.get("user-agent", "")
     is_form = is_form_request(request)
+    reset_req = await _parse_reset_password(request, is_form=is_form)
     try:
         async with db.begin():
             await AdminService(db).reset_password(
@@ -362,6 +424,7 @@ async def reset_password(
                 target_id=user_id,
                 ip=ip,
                 user_agent=ua,
+                password=reset_req.password,
             )
     except DomainError as exc:
         if is_form:
@@ -373,6 +436,44 @@ async def reset_password(
         await flash(request, "success", "Пароль сброшен")
         return RedirectResponse(url="/admin", status_code=status.HTTP_303_SEE_OTHER)
     return JSONResponse(content={"ok": True})
+
+
+@api.get("/users/{user_id}/password", response_model=None)
+async def reveal_user_password(
+    request: Request,
+    db: DbSession,
+    actor: SuperAdminScope,
+    user_id: int = Path(..., ge=1),
+) -> Response:
+    """Reveal a user's login password to a super_admin (ADR-0038 §4).
+
+    Read-only (GET, no method-override). Per-actor rate-limited against bulk
+    exfiltration; each successful reveal writes a ``user_password_revealed``
+    audit row. The returned value is never logged.
+    """
+    settings = get_settings()
+    # Per-actor limit (by super_admin user_id). Capacity is operator-tunable at
+    # consume-time; the static ``LIMIT_ADMIN_PASSWORD_REVEAL`` supplies only the
+    # name + fixed 60 s window (same override pattern as the external API).
+    runtime_limit = Limit(
+        name=LIMIT_ADMIN_PASSWORD_REVEAL.name,
+        capacity=settings.ADMIN_PASSWORD_REVEAL_RATE_LIMIT_PER_MINUTE,
+        window_seconds=LIMIT_ADMIN_PASSWORD_REVEAL.window_seconds,
+    )
+    await consume(runtime_limit, str(actor.user_id))
+    ip = client_ip(request)
+    ua = request.headers.get("user-agent", "")
+    async with db.begin():
+        password = await AdminService(db).reveal_login_password(
+            actor=actor,
+            target_id=user_id,
+            ip=ip,
+            user_agent=ua,
+        )
+    # Response body carries the plaintext for the UI reveal; it is not logged
+    # anywhere (no request/response body logging middleware; domain handler
+    # logs only code/status/path).
+    return JSONResponse(content={"password": password})
 
 
 async def _delete_user_impl(
@@ -695,6 +796,8 @@ async def admin_audit_page(
                 "user_group_change",
                 "user_group_add",
                 "user_group_remove",
+                "user_password_set",
+                "user_password_revealed",
             ],
             "query_qs": query_qs,
             "csrf_token": sess.csrf_token,

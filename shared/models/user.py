@@ -16,6 +16,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     text,
@@ -43,6 +44,14 @@ class User(Base):
     email: Mapped[str | None] = mapped_column(Text, nullable=True)
     display_name: Mapped[str | None] = mapped_column(Text, nullable=True)
     password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # ADR-0038: reversible AES-256-GCM copy of the login password, kept ONLY
+    # so a super_admin can reveal it in the /admin "Password" column. NULL =
+    # no reversible copy (pre-ADR-0038 password unchanged, or reset in the
+    # self-set flow) → the UI column shows "—". Never participates in login
+    # verification (``password_hash`` remains the source of truth, ADR-0006);
+    # never logged. Blob format: version_byte || iv(12B) || ct+tag
+    # (``shared.crypto.encrypt_user_password``, AAD ``user_pw:{id}``).
+    password_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     role: Mapped[str] = mapped_column(
         Text,
         nullable=False,

@@ -51,6 +51,50 @@
   const createBtn    = document.querySelector('[data-admin-create-user]');
   const createDialog = document.querySelector('[data-admin-create-dialog]');
   const createForm   = document.querySelector('[data-admin-create-user-form]');
+  const createError  = document.querySelector('[data-admin-create-error]');
+
+  // ADR-0038 §5: additional-teams multiselect (checkboxes) — visible only for
+  // role=group_member; the home team (group_id) is excluded from the choices.
+  const additionalGroupsField  = document.querySelector('[data-admin-additional-groups-field]');
+  const additionalGroupInputs  = document.querySelectorAll('[data-admin-additional-group]');
+
+  function showCreateError(text) {
+    if (!createError) return;
+    createError.textContent = text || '';
+    createError.hidden = !text;
+  }
+
+  // Client-side mirror of the ADR-0038 §3 password policy (backend re-validates
+  // authoritatively): 12..128 chars, at least one letter and one digit. Returns
+  // an error string, or null when acceptable.
+  function validatePassword(pw) {
+    if (pw.length < 12 || pw.length > 128) {
+      return 'Пароль должен быть от 12 до 128 символов.';
+    }
+    if (!/[A-Za-z]/.test(pw)) {
+      return 'Пароль должен содержать хотя бы одну букву.';
+    }
+    if (!/[0-9]/.test(pw)) {
+      return 'Пароль должен содержать хотя бы одну цифру.';
+    }
+    return null;
+  }
+
+  // Keep the "additional teams" checkboxes consistent with the chosen home
+  // team: the home team can't also be an additional one (backend dedupes via
+  // ON CONFLICT, but the UI hides it for clarity).
+  function syncAdditionalGroupWithHome() {
+    if (!groupSelect) return;
+    const home = (groupSelect.value || '').toString();
+    additionalGroupInputs.forEach(function (cb) {
+      const gid = cb.getAttribute('data-group-id');
+      const isHome = !!home && gid === home;
+      cb.disabled = isHome;
+      if (isHome) cb.checked = false;
+      const label = cb.closest('.checkbox');
+      if (label) label.classList.toggle('is-disabled', isHome);
+    });
+  }
 
   // Toggle the group select visibility according to the selected role.
   // - role=group_leader  → group select VISIBLE but optional (bug-fix #2):
@@ -125,11 +169,26 @@
         opts[i].disabled = false;
       }
     }
+
+    // ADR-0038 §5: additional teams only make sense for a group_member.
+    // Switching to group_leader hides the block and clears any selection.
+    if (additionalGroupsField) {
+      if (role === 'group_member') {
+        additionalGroupsField.hidden = false;
+      } else {
+        additionalGroupsField.hidden = true;
+        additionalGroupInputs.forEach(function (cb) { cb.checked = false; });
+      }
+    }
+    syncAdditionalGroupWithHome();
   }
 
   roleInputs.forEach(function (r) {
     r.addEventListener('change', applyRoleVisibility);
   });
+  if (groupSelect) {
+    groupSelect.addEventListener('change', syncAdditionalGroupWithHome);
+  }
   // Initial state on load.
   applyRoleVisibility();
 
@@ -139,6 +198,12 @@
       roleInputs.forEach(function (r) {
         r.checked = (r.getAttribute('data-role-value') === 'group_member');
       });
+      // Reset optional fields so a re-open never keeps a stale password /
+      // additional-team selection / error banner (ADR-0038).
+      showCreateError('');
+      const pwInput = createForm ? createForm.querySelector('#new-user-password') : null;
+      if (pwInput) { pwInput.value = ''; pwInput.type = 'password'; }
+      additionalGroupInputs.forEach(function (cb) { cb.checked = false; });
       applyRoleVisibility();
       if (typeof createDialog.showModal === 'function') {
         createDialog.showModal();
@@ -173,6 +238,33 @@
         }
       }
 
+      showCreateError('');
+
+      // ADR-0038 §3: optional password. Empty → self-set flow (backend leaves
+      // password_encrypted NULL → column «—»); set → admin-set reversible copy.
+      const pw = (fd.get('password') || '').toString();
+      if (pw) {
+        const pwErr = validatePassword(pw);
+        if (pwErr) { showCreateError(pwErr); return; }
+        payload.password = pw;
+      }
+
+      // ADR-0038 §5: additional teams — only for group_member; deduped against
+      // the home team and each other. Sent as an int array.
+      if (payload.role === 'group_member') {
+        const seen = {};
+        const additional = [];
+        fd.getAll('additional_group_ids').forEach(function (raw) {
+          const n = parseInt((raw || '').toString(), 10);
+          if (!Number.isFinite(n) || n < 1) return;
+          if (payload.group_id && n === payload.group_id) return;
+          if (seen[n]) return;
+          seen[n] = true;
+          additional.push(n);
+        });
+        if (additional.length) payload.additional_group_ids = additional;
+      }
+
       const submitBtn = createForm.querySelector('button[type="submit"]');
       if (submitBtn) submitBtn.disabled = true;
       try {
@@ -182,17 +274,22 @@
         });
         if (resp.ok) {
           window.MAS.flash(
-            'Пользователь создан. Сообщите ему логин — при первом входе нужно будет задать пароль.',
+            payload.password
+              ? 'Пользователь создан. Пароль задан — сообщите его пользователю.'
+              : 'Пользователь создан. Сообщите ему логин — при первом входе нужно будет задать пароль.',
             'success'
           );
           if (createDialog && typeof createDialog.close === 'function') createDialog.close();
           window.location.reload();
           return;
         }
+        // Inline error (keeps the dialog open so the admin can correct input).
+        // 400 group_not_found (field=additional_group_ids) / validation_error
+        // (weak password) / conflict (username) all surface here.
         const err = await window.MAS.readJsonError(resp);
-        window.MAS.flash(err.message || 'Не удалось создать пользователя.', 'error');
+        showCreateError(err.message || 'Не удалось создать пользователя.');
       } catch (_e) {
-        window.MAS.flash('Сетевая ошибка. Попробуйте ещё раз.', 'error');
+        showCreateError('Сетевая ошибка. Попробуйте ещё раз.');
       } finally {
         if (submitBtn) submitBtn.disabled = false;
       }
@@ -400,34 +497,96 @@
     });
   }
 
-  // ---- Reset password ------------------------------------------------------
+  // ---- Reset password (ADR-0038: optional admin-set password) --------------
+  //
+  // Instead of a bare confirm(), the reset action opens a dialog with an
+  // OPTIONAL «Новый пароль» field: empty → force self-set (column «—»); set →
+  // admin-set reversible copy (value shown in the «Пароль» column).
+
+  const resetDialog        = document.querySelector('[data-admin-reset-dialog]');
+  const resetUsernameLabel = document.querySelector('[data-admin-reset-username]');
+  const resetConfirmForm   = document.querySelector('[data-admin-reset-confirm-form]');
+  const resetPasswordInput = document.querySelector('[data-admin-reset-password]');
+  const resetGoBtn         = document.querySelector('[data-admin-reset-go]');
+  const resetCancelBtn     = document.querySelector('[data-admin-reset-cancel]');
+  const resetError         = document.querySelector('[data-admin-reset-error]');
+
+  let pendingResetAction = '';
+
+  function showResetError(text) {
+    if (!resetError) return;
+    resetError.textContent = text || '';
+    resetError.hidden = !text;
+  }
 
   document.querySelectorAll('[data-admin-reset-form]').forEach(function (f) {
-    f.addEventListener('submit', async function (event) {
+    f.addEventListener('submit', function (event) {
       event.preventDefault();
-      const msg = f.getAttribute('data-confirm') ||
-                  'Сбросить пароль? Пользователь должен будет задать новый при следующем входе.';
-      if (!window.confirm(msg)) return;
-      const action = f.getAttribute('action');
-      if (!action) return;
-      const btn = f.querySelector('button[type="submit"]');
-      if (btn) btn.disabled = true;
+      pendingResetAction = f.getAttribute('action') || '';
+      if (!pendingResetAction) return;
+      const username = f.getAttribute('data-username') || '';
+      if (resetUsernameLabel) resetUsernameLabel.textContent = '@' + username;
+      if (resetPasswordInput) { resetPasswordInput.value = ''; resetPasswordInput.type = 'password'; }
+      showResetError('');
+
+      if (!resetDialog) {
+        // Defensive no-dialog fallback: plain self-set reset.
+        window.MAS.csrfFetch(pendingResetAction, { method: 'POST' }).then(function () {
+          window.location.reload();
+        });
+        return;
+      }
+      if (typeof resetDialog.showModal === 'function') {
+        resetDialog.showModal();
+      } else {
+        resetDialog.setAttribute('open', 'open');
+      }
+      if (resetPasswordInput) resetPasswordInput.focus();
+    });
+  });
+
+  if (resetCancelBtn && resetDialog) {
+    resetCancelBtn.addEventListener('click', function () {
+      if (typeof resetDialog.close === 'function') resetDialog.close();
+      else resetDialog.removeAttribute('open');
+    });
+  }
+
+  if (resetConfirmForm) {
+    resetConfirmForm.addEventListener('submit', async function (event) {
+      event.preventDefault();
+      if (!pendingResetAction) return;
+      showResetError('');
+      const pw = resetPasswordInput ? resetPasswordInput.value : '';
+      let options = { method: 'POST' };
+      if (pw) {
+        const pwErr = validatePassword(pw);
+        if (pwErr) { showResetError(pwErr); return; }
+        options = { method: 'POST', body: { password: pw } };
+      }
+      if (resetGoBtn) resetGoBtn.disabled = true;
       try {
-        const resp = await window.MAS.csrfFetch(action, { method: 'POST' });
+        const resp = await window.MAS.csrfFetch(pendingResetAction, options);
         if (resp.ok) {
-          window.MAS.flash('Пароль сброшен. Все сессии завершены.', 'success');
+          window.MAS.flash(
+            pw
+              ? 'Пароль изменён. Все сессии пользователя завершены.'
+              : 'Пароль сброшен — пользователь задаст новый при входе. Все сессии завершены.',
+            'success'
+          );
+          if (resetDialog && typeof resetDialog.close === 'function') resetDialog.close();
           window.location.reload();
           return;
         }
         const err = await window.MAS.readJsonError(resp);
-        window.MAS.flash(err.message || 'Не удалось сбросить пароль.', 'error');
+        showResetError(err.message || 'Не удалось сбросить пароль.');
       } catch (_e) {
-        window.MAS.flash('Сетевая ошибка. Попробуйте ещё раз.', 'error');
+        showResetError('Сетевая ошибка. Попробуйте ещё раз.');
       } finally {
-        if (btn) btn.disabled = false;
+        if (resetGoBtn) resetGoBtn.disabled = false;
       }
     });
-  });
+  }
 
   // ---- Delete user (type-username confirmation) ----------------------------
 
@@ -797,6 +956,87 @@
       } finally {
         if (btn) btn.disabled = false;
       }
+    });
+  });
+
+  // ---- Password reveal in the users table (ADR-0038) -----------------------
+  //
+  // The plaintext is NEVER embedded in the markup. Each reveal fetches it
+  // on-demand (GET /api/admin/users/{id}/password) — minimal exposure plus a
+  // `user_password_revealed` audit entry per reveal. A second click re-masks
+  // it and drops the plaintext from the DOM.
+
+  const PW_MASK = '••••••••';
+
+  document.querySelectorAll('[data-pw-reveal]').forEach(function (btn) {
+    const cell = btn.closest('[data-pw-cell]');
+    const valueEl = cell ? cell.querySelector('[data-pw-value]') : null;
+    const userId = btn.getAttribute('data-user-id');
+    let revealed = false;
+    let busy = false;
+
+    btn.addEventListener('click', async function () {
+      if (busy) return;
+      if (revealed) {
+        // Re-mask: remove the plaintext from the DOM.
+        if (valueEl) valueEl.textContent = PW_MASK;
+        revealed = false;
+        btn.setAttribute('aria-pressed', 'false');
+        btn.setAttribute('title', 'Показать пароль');
+        if (cell) cell.classList.remove('is-revealed');
+        return;
+      }
+      if (!userId) return;
+      busy = true;
+      btn.disabled = true;
+      try {
+        const resp = await window.MAS.csrfFetch(
+          '/api/admin/users/' + encodeURIComponent(userId) + '/password',
+          { method: 'GET' }
+        );
+        if (resp.ok) {
+          const data = await resp.json();
+          const pw = (data && typeof data.password === 'string') ? data.password : '';
+          // textContent (never innerHTML) — server value is rendered as text,
+          // never parsed as HTML.
+          if (valueEl) valueEl.textContent = pw;
+          revealed = true;
+          btn.setAttribute('aria-pressed', 'true');
+          btn.setAttribute('title', 'Скрыть пароль');
+          if (cell) cell.classList.add('is-revealed');
+        } else if (resp.status === 404) {
+          // password_not_set (has_password desync): show «—», drop the toggle.
+          if (valueEl) valueEl.textContent = '—';
+          btn.hidden = true;
+        } else if (resp.status === 429) {
+          window.MAS.flash('Слишком часто. Попробуйте позже.', 'error');
+        } else if (resp.status === 403) {
+          window.MAS.flash('Недостаточно прав для просмотра пароля.', 'error');
+        } else {
+          const err = await window.MAS.readJsonError(resp);
+          window.MAS.flash(err.message || 'Не удалось показать пароль.', 'error');
+        }
+      } catch (_e) {
+        window.MAS.flash('Сетевая ошибка. Попробуйте ещё раз.', 'error');
+      } finally {
+        busy = false;
+        btn.disabled = false;
+      }
+    });
+  });
+
+  // ---- Show/hide toggle for password <input>s (create / reset dialogs) -----
+
+  document.querySelectorAll('[data-pw-input-toggle]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      const wrap = btn.closest('.pw-input');
+      const input = wrap ? wrap.querySelector('input') : null;
+      if (!input) return;
+      const willShow = input.type === 'password';
+      input.type = willShow ? 'text' : 'password';
+      btn.setAttribute('aria-pressed', willShow ? 'true' : 'false');
+      btn.setAttribute('title', willShow ? 'Скрыть пароль' : 'Показать пароль');
+      btn.setAttribute('aria-label', willShow ? 'Скрыть пароль' : 'Показать пароль');
     });
   });
 })();

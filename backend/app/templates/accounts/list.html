@@ -21,10 +21,33 @@
     <a class="btn btn--primary" href="/accounts/new">+ Добавить аккаунт</a>
   </header>
 
+  {# Фильтр статуса (ADR-0038-сопутствующее). Сегментированный контрол-ссылки:
+     чистая GET-навигация без JS (?status=all|active|inactive). Текущий сегмент
+     подсвечивается по контекст-переменной status_filter, которую передаёт роут
+     (accounts_page). Сервер фильтрует видимый набор по MailAccountDTO.is_active
+     ПОСЛЕ VisibilityScope; модель/DTO не меняются (04-api-contracts.md GET /accounts). #}
+  {% set _status = status_filter if status_filter is defined else 'all' %}
+  <nav class="seg-filter" aria-label="Фильтр аккаунтов по статусу">
+    <a class="seg-filter__item {% if _status == 'all' %}is-active{% endif %}"
+       href="/accounts?status=all"
+       {% if _status == 'all' %}aria-current="page"{% endif %}>Все</a>
+    <a class="seg-filter__item {% if _status == 'active' %}is-active{% endif %}"
+       href="/accounts?status=active"
+       {% if _status == 'active' %}aria-current="page"{% endif %}>Активные</a>
+    <a class="seg-filter__item {% if _status == 'inactive' %}is-active{% endif %}"
+       href="/accounts?status=inactive"
+       {% if _status == 'inactive' %}aria-current="page"{% endif %}>Неактивные</a>
+  </nav>
+
   {% if not accounts %}
     <div class="accounts__empty" role="status">
-      <p>Email-аккаунтов пока нет. Добавьте первый, чтобы начать получать почту.</p>
-      <a href="/accounts/new" class="btn btn--primary">Добавить аккаунт</a>
+      {% if _status != 'all' %}
+        <p>Нет аккаунтов с выбранным статусом.
+           <a href="/accounts?status=all">Показать все</a>.</p>
+      {% else %}
+        <p>Email-аккаунтов пока нет. Добавьте первый, чтобы начать получать почту.</p>
+        <a href="/accounts/new" class="btn btn--primary">Добавить аккаунт</a>
+      {% endif %}
     </div>
   {% else %}
     <ul class="account-list">

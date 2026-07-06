@@ -184,6 +184,15 @@ class Settings(BaseSettings):
     # ``EXTERNAL_API_RATE_LIMIT_PER_MINUTE``). Numeric (requests/60s); window is
     # fixed at 60 s.
     EXTERNAL_REPLY_RATE_LIMIT_PER_MINUTE: int = Field(default=30, ge=1, le=10000)
+    # --- Admin login-password reveal (ADR-0038 §4) ------------------------
+    # Operator-tunable rate limit for ``GET /api/admin/users/{id}/password``:
+    # requests per minute, PER super_admin actor (not per IP). Anti-bulk-
+    # exfiltration of login passwords + protection against flooding the
+    # ``user_password_revealed`` audit log. Overrides the static
+    # ``LIMIT_ADMIN_PASSWORD_REVEAL`` capacity at consume-time (same pattern as
+    # ``EXTERNAL_API_RATE_LIMIT_PER_MINUTE``). Numeric (requests/60s); window is
+    # fixed at 60 s.
+    ADMIN_PASSWORD_REVEAL_RATE_LIMIT_PER_MINUTE: int = Field(default=30, ge=1, le=10000)
 
     # --- Telegram launcher bot (ADR-0018) + persistent SSO / notifications
     #     (ADR-0022) ---
