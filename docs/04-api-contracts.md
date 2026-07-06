@@ -1312,6 +1312,9 @@ Payload (`event="message_tagged"`):
 | Query `since_id` | `int ≥ 0`, default `0`. Только при `order=asc`. Семантика `WHERE id > since_id`. При `order=desc` — `400`. |
 | Query `before_id` | `int ≥ 1`, optional (нет default). Только при `order=desc`. Присутствует → `WHERE id < before_id`; отсутствует → latest N. При `order=asc` — `400`. |
 | Query `limit` | `int`, `1..200`, default `50` (hard cap 200). Оба режима. |
+| Query `mail_account_id` | `int ≥ 1`, optional (нет default). Только письма этого ящика. Эффективный набор = `{mail_account_id} ∩ canonical_ids`. Работает в **обоих** режимах `order`. Несуществующий/чужой/non-canonical id → **пустая страница** (не 404). [ADR-0037](./adr/ADR-0037-external-teams-mailboxes-message-filters.md) |
+| Query `group_id` | `int ≥ 1`, optional (нет default). Только письма ящиков этой команды. Эффективный набор = `list_account_ids_in_group(group_id) ∩ canonical_ids`. Оба режима. Несуществующая/пустая команда → **пустая страница** (не 404). ADR-0037 |
+| Взаимоисключение фильтров | `mail_account_id` **и** `group_id` заданы одновременно → `400 validation_error`, `field="filter"` (message «mail_account_id и group_id взаимоисключающи»). Прецедент ADR-0036 §5 (явный отказ, не молчаливый приоритет). ADR-0037 |
 | Семантика `asc` | `WHERE m.id > :since_id AND m.mail_account_id IN (:canonical_ids) ORDER BY m.id ASC LIMIT :limit` — keyset по `messages.id BIGSERIAL` (монотонный insert-order; без пропусков/дублей курсора) + canonical-дедуп дубль-ящиков. Внешний сервис хранит `last_id` = `next_since_id`. |
 | Семантика `desc` | latest: `WHERE m.mail_account_id IN (:canonical_ids) ORDER BY m.id DESC LIMIT :limit`; older: `+ AND m.id < :before_id`. Reverse-scan по PK `id` (без новых индексов). Потребитель хранит `next_before_id` и передаёт его в `before_id` для следующей (более старой) страницы. |
 | 200 (`asc`) | `{messages:[ExternalMessageDTO] (id ASC), next_since_id:int, has_more:bool}`. |
@@ -1320,7 +1323,7 @@ Payload (`event="message_tagged"`):
 | 200 (пусто, `desc`) | `{messages:[], next_before_id:null, has_more:false}`. |
 | 401 | `not_authenticated` — нет/неверный ключ **или** фича выключена (неперечислимо). |
 | 429 | `rate_limited` (+`Retry-After`). |
-| 400 | `validation_error` — `since_id<0`/нечисловой; `before_id<1`/нечисловой; `limit` вне `1..200`; `order`∉{asc,desc}; `before_id` при `order=asc`; `since_id` при `order=desc`; `since_id`+`before_id` одновременно. |
+| 400 | `validation_error` — `since_id<0`/нечисловой; `before_id<1`/нечисловой; `limit` вне `1..200`; `order`∉{asc,desc}; `before_id` при `order=asc`; `since_id` при `order=desc`; `since_id`+`before_id` одновременно; `mail_account_id<1`/нечисловой (`field=mail_account_id`); `group_id<1`/нечисловой (`field=group_id`); `mail_account_id`+`group_id` одновременно (`field=filter`, ADR-0037). |
 
 `ExternalMessageDTO` (отдельный от UI `MessageDetail` — стабильный версионируемый контракт; **сырое stored** `body_text`/`body_html` без `collapse_blank_lines_*`):
 
@@ -1373,6 +1376,44 @@ Payload (`event="message_tagged"`):
 > **id-gaps:** retention-cleanup (ADR-0011, 30д) удаляет старые письма → безвредные пропуски в `id` (keyset `id > since_id` их игнорирует). Контракт: внешний сервис поллит **чаще** окна ретенции.
 >
 > **Запись (reply):** внешний API read-only (ADR-0029); единственный write-endpoint — ответ на письмо — описан в **§4d-reply** ниже ([ADR-0035](./adr/ADR-0035-external-reply-endpoint.md)).
+
+### 4d-teams. `GET /api/external/teams` (ADR-0037)
+
+Источник истины — [ADR-0037](./adr/ADR-0037-external-teams-mailboxes-message-filters.md). Read-only список **команд** системы для внутреннего CRM-потребителя (фильтр «по команде», подписи). Команда = `groups`; **команда ≠ тег** (теги — в `ExternalMessageDTO.tags`, ADR-0017). Тот же `X-API-Key`-флоу, что `GET /api/external/messages` (ADR-0029 §4).
+
+| | |
+| --- | --- |
+| Метод / путь | `GET /api/external/teams` (query-параметров нет). |
+| Доступ | `EXTERNAL_API_KEY` (`X-API-Key` / `Bearer`). CSRF exempt. |
+| Rate-limit | `LIMIT_EXTERNAL_API` (тот же read-бюджет 120/min per IP; нового лимита нет). |
+| Visibility | super_admin — **все** команды. Источник `GroupsRepo.list_all_groups()` (`ORDER BY id`). |
+| 200 | `{"teams": [{"id": int, "name": str}]}`. Пусто → `{"teams": []}`. |
+| 401 | `not_authenticated` — нет/неверный ключ **или** фича выключена (неперечислимо). |
+| 429 | `rate_limited` (+`Retry-After`). |
+
+DTO `ExternalTeamDTO{id:int, name:str}` (обёртка `ExternalTeamsResponse{teams:[...]}`). **Только** `id`/`name` — без `leader_user_id`/`created_at`/`members_count` (в отличие от admin-`GET /api/admin/groups`).
+
+### 4d-mailboxes. `GET /api/external/mailboxes` (ADR-0037)
+
+Источник истины — ADR-0037. Read-only список **ящиков** со статусом для дропдауна почт CRM, счётчиков «активные/неактивные» и маппинга ящик→команда. Тот же auth/флоу.
+
+| | |
+| --- | --- |
+| Метод / путь | `GET /api/external/mailboxes` (query-параметров нет). |
+| Доступ | `EXTERNAL_API_KEY` (`X-API-Key` / `Bearer`). CSRF exempt. |
+| Rate-limit | `LIMIT_EXTERNAL_API` (тот же read-бюджет). |
+| Visibility | super_admin + **canonical-дедуп** (ADR-0029 §5): `MailAccountsRepo.list_by_ids(list_canonical_account_ids())` — один канонический (`MIN(id)`) ящик на `LOWER(email)`. Множество совпадает с ящиками, чьи письма отдаёт `GET /api/external/messages`. |
+| 200 | `{"mailboxes": [{"id": int, "email": str, "display_name": str\|null, "group_id": int\|null, "is_active": bool}]}`. Пусто → `{"mailboxes": []}`. |
+| 401 / 429 | как выше. |
+
+DTO `ExternalMailboxDTO{id:int, email:str, display_name:str|null, group_id:int|null, is_active:bool}` (обёртка `ExternalMailboxesResponse{mailboxes:[...]}`). Поля:
+- `id` = `mail_accounts.id` = `ExternalMessageDTO.mail_account.id` → CRM джойнит письма с ящиками по этому ключу.
+- `display_name` — nullable (БД); хелпер `display_name || email`.
+- `group_id` — маппинг ящик→команда (`mail_accounts.group_id`, nullable; `null` = персональный). `group_id` = `teams[].id`. **Раскрыт осознанно** для CRM (ADR-0037 §Security).
+- `is_active` — статус (`false` = авто-отключён воркером, ADR-0033). Счётчики активные/неактивные CRM считает **клиентски** (server-side агрегатов нет).
+- **Никаких** credentials/`user_id`/owner-структур/`oauth_*`/`smtp_*`/`imap_*`.
+
+> **Консистентность:** `teams[].id` = `groups.id` = `mailboxes[].group_id`; `mailboxes[].id` = `messages[].mail_account.id`. Трёхуровневый джойн письмо → ящик → команда замыкается на стороне CRM. `ExternalMessageDTO`/`ExternalMailAccountDTO` **не меняются** — `group_id`/`is_active` доступны **только** через `mailboxes`, не в письме (стабильность контракта ADR-0029 §6).
 
 ### 4d-reply. `POST /api/external/messages/{id}/reply` (ADR-0035)
 
@@ -1640,7 +1681,9 @@ FastAPI автогенерит OpenAPI 3.1. UI:
 | PATCH | `/api/me/settings` | user | yes | — | — | user preferences (tg_notifications_enabled); см. ADR-0022 |
 | GET | `/api/oauth/outlook/authorize` | user | — | 30/h | — | сгенерить Microsoft authorize URL + state (ADR-0025) |
 | GET | `/api/oauth/outlook/callback` | state in Redis | exempt | 30/min per IP | — | OAuth callback: code→токены, create mail_account (ADR-0025) |
-| GET | `/api/external/messages` | `EXTERNAL_API_KEY` (X-API-Key \| Bearer) | exempt | 120/min per IP (`LIMIT_EXTERNAL_API`) | — | **ADR-0029:** external pull-API — keyset по `messages.id`, ВСЕ письма системы, сырое полное тело, no attachments. **ADR-0036:** + backward/latest режим `order=asc\|desc` (`desc`+`before_id` → newest-first лента, курсор `next_before_id`); forward BC неизменен, тот же rate-limit/auth |
+| GET | `/api/external/messages` | `EXTERNAL_API_KEY` (X-API-Key \| Bearer) | exempt | 120/min per IP (`LIMIT_EXTERNAL_API`) | — | **ADR-0029:** external pull-API — keyset по `messages.id`, ВСЕ письма системы, сырое полное тело, no attachments. **ADR-0036:** + backward/latest режим `order=asc\|desc` (`desc`+`before_id` → newest-first лента, курсор `next_before_id`); forward BC неизменен, тот же rate-limit/auth. **ADR-0037:** + опц. фильтры `mail_account_id`/`group_id` (`ge=1`, оба режима, сужают набор ∩ canonical; вместе → `400 field=filter`; несовпадающий id → пустая страница, не 404) |
+| GET | `/api/external/teams` | `EXTERNAL_API_KEY` (X-API-Key \| Bearer) | exempt | 120/min per IP (`LIMIT_EXTERNAL_API`) | — | **ADR-0037:** список команд `{teams:[{id,name}]}` (`GroupsRepo.list_all_groups()`), super_admin-visibility, минимальная проекция |
+| GET | `/api/external/mailboxes` | `EXTERNAL_API_KEY` (X-API-Key \| Bearer) | exempt | 120/min per IP (`LIMIT_EXTERNAL_API`) | — | **ADR-0037:** список ящиков `{mailboxes:[{id,email,display_name,group_id,is_active}]}` (canonical-дедуп), для дропдауна/счётчиков/маппинга ящик→команда CRM |
 | POST | `/api/external/messages/{id}/reply` | `EXTERNAL_API_KEY` (X-API-Key \| Bearer) + `EXTERNAL_REPLY_ENABLED` | exempt | 30/min per IP (`LIMIT_EXTERNAL_REPLY`) | — | **ADR-0035:** external reply — ответ на существующее письмо; `from`=ящик оригинала (не выбирается), threading по `{id}`; write opt-in (`EXTERNAL_REPLY_ENABLED`, default off) |
 | GET | `/my/integrations` | group_leader \| super_admin | — | — | — | webhook config page (ADR-0023) |
 | GET | `/api/webhooks/me` | group_leader \| super_admin | — | — | — | get webhook config (no secret) |

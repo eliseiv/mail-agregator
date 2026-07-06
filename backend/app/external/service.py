@@ -26,11 +26,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.exceptions import ValidationError
 from backend.app.external.schemas import (
     ExternalMailAccountDTO,
+    ExternalMailboxDTO,
+    ExternalMailboxesResponse,
     ExternalMessageDTO,
     ExternalMessagesResponse,
     ExternalMessagesResponseDesc,
     ExternalTagDTO,
+    ExternalTeamDTO,
+    ExternalTeamsResponse,
 )
+from backend.app.repositories.groups import GroupsRepo
 from backend.app.repositories.mail_accounts import MailAccountsRepo
 from backend.app.repositories.messages import MessagesRepo
 from backend.app.repositories.tags import MessageTagsRepo
@@ -43,6 +48,42 @@ class ExternalMessagesService:
     def __init__(self, db: AsyncSession) -> None:
         self._db = db
 
+    async def list_teams(self) -> ExternalTeamsResponse:
+        """All system teams for the CRM (ADR-0037 §1).
+
+        super_admin-visibility (the trusted key sees everything): the flat,
+        unpaginated ``GroupsRepo.list_all_groups()`` (``ORDER BY id``). Minimal
+        projection — ``id``/``name`` only (no leader/counts/timestamps). Empty
+        system → ``{"teams": []}``.
+        """
+        groups = await GroupsRepo(self._db).list_all_groups()
+        return ExternalTeamsResponse(teams=[ExternalTeamDTO(id=g.id, name=g.name) for g in groups])
+
+    async def list_mailboxes(self) -> ExternalMailboxesResponse:
+        """All canonical mailboxes with status for the CRM (ADR-0037 §2).
+
+        Canonical-dedup (ADR-0029 §5): ``list_by_ids(list_canonical_account_ids())``
+        — one ``MIN(id)`` mailbox per ``LOWER(email)``, so the set matches the
+        mailboxes whose messages ``GET /api/external/messages`` returns. Exposes
+        ``group_id`` (mailbox→team) and ``is_active`` (worker auto-disable);
+        never any credentials/owner structures. No mailboxes → ``{"mailboxes": []}``.
+        """
+        repo = MailAccountsRepo(self._db)
+        canonical_ids = await repo.list_canonical_account_ids()
+        accounts = await repo.list_by_ids(canonical_ids)
+        return ExternalMailboxesResponse(
+            mailboxes=[
+                ExternalMailboxDTO(
+                    id=a.id,
+                    email=a.email,
+                    display_name=a.display_name,
+                    group_id=a.group_id,
+                    is_active=a.is_active,
+                )
+                for a in accounts
+            ]
+        )
+
     async def list_messages(
         self,
         *,
@@ -50,18 +91,75 @@ class ExternalMessagesService:
         since_id: int,
         before_id: int | None,
         limit: int,
+        mail_account_id: int | None = None,
+        group_id: int | None = None,
     ) -> ExternalMessagesResponse | ExternalMessagesResponseDesc:
-        """Return one page in the requested direction (ADR-0029 / ADR-0036).
+        """Return one page in the requested direction (ADR-0029 / ADR-0036 / ADR-0037).
 
-        Validates the mode co-existence (deterministic order below) then
+        Validates the mode co-existence AND the ``mail_account_id`` vs
+        ``group_id`` mutual-exclusion (deterministic order below) — BOTH before any DB call
+        (ADR-0037 §3 + reviewer minor: do not compute ``base`` before the filter
+        check) — then resolves the effective (canonical-narrowed) mailbox set and
         dispatches to the forward (``asc``) or backward (``desc``) builder. The
         two builders return DISTINCT envelopes so each mode's cursor field is
-        present only in its own mode (ADR-0036 §3).
+        present only in its own mode (ADR-0036 §3). The filter only NARROWS the
+        set; cursor semantics are unchanged (ADR-0037 §3).
         """
         self._validate_mode(order=order, since_id=since_id, before_id=before_id)
+        self._validate_filters(mail_account_id=mail_account_id, group_id=group_id)
+        mail_account_ids = await self._resolve_account_ids(
+            mail_account_id=mail_account_id, group_id=group_id
+        )
         if order == "asc":
-            return await self._list_forward(since_id=since_id, limit=limit)
-        return await self._list_backward(before_id=before_id, limit=limit)
+            return await self._list_forward(
+                mail_account_ids=mail_account_ids, since_id=since_id, limit=limit
+            )
+        return await self._list_backward(
+            mail_account_ids=mail_account_ids, before_id=before_id, limit=limit
+        )
+
+    @staticmethod
+    def _validate_filters(*, mail_account_id: int | None, group_id: int | None) -> None:
+        """Mutual-exclusion of the message filters (ADR-0037 §3).
+
+        ``mail_account_id`` and ``group_id`` together ⇒ ``400 validation_error``,
+        ``field="filter"`` (explicit refusal, not a silent priority — precedent
+        ADR-0036 §5). Runs on the query-validation step (after auth), BEFORE any
+        DB call / canonical resolve (reviewer minor). The per-field lower bound
+        (``ge=1``) is enforced upstream by FastAPI ``Query`` and never reaches
+        here; a missing/non-canonical/foreign id resolves to an EMPTY page (not
+        404, ADR-0037 §3 / ADR-0029 §3) inside :meth:`_resolve_account_ids`.
+        """
+        if mail_account_id is not None and group_id is not None:
+            raise ValidationError("mail_account_id и group_id взаимоисключающи", field="filter")
+
+    async def _resolve_account_ids(
+        self, *, mail_account_id: int | None, group_id: int | None
+    ) -> list[int]:
+        """Effective mailbox set = filter ∩ canonical (ADR-0037 §3).
+
+        ``base`` = ``list_canonical_account_ids()`` (canonical-dedup, ADR-0029 §5).
+        Caller has already rejected the ``mail_account_id`` vs ``group_id`` combo
+        (:meth:`_validate_filters`), so at most one filter is set:
+
+        - ``mail_account_id`` set → ``[mail_account_id]`` iff it is canonical,
+          else ``[]`` (missing/foreign/non-canonical → empty page, NOT 404).
+        - ``group_id`` set → ``list_account_ids_in_group(group_id) ∩ base``
+          (missing/empty team / all non-canonical → ``[]`` → empty page).
+        - neither → ``base`` (prior behaviour — all messages).
+
+        The keyset builders return ``[]`` on an empty list without a query, so an
+        empty effective set yields an empty page with an unmoved cursor.
+        """
+        repo = MailAccountsRepo(self._db)
+        base = await repo.list_canonical_account_ids()
+        if mail_account_id is not None:
+            return [mail_account_id] if mail_account_id in base else []
+        if group_id is not None:
+            base_set = set(base)
+            in_group = await repo.list_account_ids_in_group(group_id)
+            return [a for a in in_group if a in base_set]
+        return base
 
     @staticmethod
     def _validate_mode(*, order: str, since_id: int, before_id: int | None) -> None:
@@ -104,15 +202,18 @@ class ExternalMessagesService:
         if before_id is not None and before_id < 1:
             raise ValidationError("before_id must be >= 1", field="before_id")
 
-    async def _list_forward(self, *, since_id: int, limit: int) -> ExternalMessagesResponse:
+    async def _list_forward(
+        self, *, mail_account_ids: list[int], since_id: int, limit: int
+    ) -> ExternalMessagesResponse:
         """Forward page (ADR-0029 §1): ``id > since_id ORDER BY id ASC``.
 
-        ``next_since_id`` = last row id (or the incoming ``since_id`` on an
-        empty page — cursor does not move); ``has_more`` = page was full.
+        ``mail_account_ids`` is the already-resolved effective set (canonical set,
+        optionally narrowed by the ADR-0037 filter). ``next_since_id`` = last row
+        id (or the incoming ``since_id`` on an empty page — cursor does not move);
+        ``has_more`` = page was full.
         """
-        canonical_ids = await MailAccountsRepo(self._db).list_canonical_account_ids()
         rows = await MessagesRepo(self._db).list_since_id(
-            mail_account_ids=canonical_ids,
+            mail_account_ids=mail_account_ids,
             since_id=since_id,
             limit=limit,
         )
@@ -125,18 +226,19 @@ class ExternalMessagesService:
         )
 
     async def _list_backward(
-        self, *, before_id: int | None, limit: int
+        self, *, mail_account_ids: list[int], before_id: int | None, limit: int
     ) -> ExternalMessagesResponseDesc:
         """Backward / latest page (ADR-0036 §2): ``ORDER BY id DESC`` (newest-first).
 
-        ``before_id is None`` ⇒ latest N; ``before_id`` set ⇒ ``id < before_id``.
-        ``next_before_id`` = last row id (= ``min(id)`` of the DESC batch), or
-        ``None`` on an empty page (no older messages left); ``has_more`` = page
-        was full. Reuses the same canonical-scope + tag-dedup as forward.
+        ``mail_account_ids`` is the already-resolved effective set (canonical set,
+        optionally narrowed by the ADR-0037 filter). ``before_id is None`` ⇒
+        latest N; ``before_id`` set ⇒ ``id < before_id``. ``next_before_id`` =
+        last row id (= ``min(id)`` of the DESC batch), or ``None`` on an empty
+        page (no older messages left); ``has_more`` = page was full. Reuses the
+        same tag-dedup as forward.
         """
-        canonical_ids = await MailAccountsRepo(self._db).list_canonical_account_ids()
         rows = await MessagesRepo(self._db).list_before_id(
-            mail_account_ids=canonical_ids,
+            mail_account_ids=mail_account_ids,
             before_id=before_id,
             limit=limit,
         )

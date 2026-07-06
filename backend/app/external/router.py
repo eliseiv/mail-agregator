@@ -39,10 +39,12 @@ from pydantic import ValidationError as PydanticValidationError
 from backend.app.deps import DbSession
 from backend.app.exceptions import ForbiddenError, NotAuthenticatedError
 from backend.app.external.schemas import (
+    ExternalMailboxesResponse,
     ExternalMessagesResponse,
     ExternalMessagesResponseDesc,
     ExternalReplyRequest,
     ExternalReplyResponse,
+    ExternalTeamsResponse,
 )
 from backend.app.external.service import ExternalMessagesService
 from backend.app.rate_limit import (
@@ -136,6 +138,13 @@ async def list_external_messages(
     since_id: int = Query(default=0, ge=0),
     before_id: int | None = Query(default=None),
     limit: int = Query(default=_DEFAULT_LIMIT, ge=1, le=_MAX_LIMIT),
+    # ADR-0037: optional server-side filters (narrow the canonical set). Bounds
+    # (``ge=1``) are FastAPI-validated → ``400 field=mail_account_id``/``group_id``
+    # for ``<1``/non-numeric. The mutual-exclusion (``field=filter``) and the
+    # "missing/foreign id → empty page (not 404)" semantics live in the service
+    # (after auth, before any DB call).
+    mail_account_id: int | None = Query(default=None, ge=1),
+    group_id: int | None = Query(default=None, ge=1),
 ) -> ExternalMessagesResponse | ExternalMessagesResponseDesc:
     """Incrementally pull system messages (ADR-0029 forward / ADR-0036 backward).
 
@@ -169,6 +178,8 @@ async def list_external_messages(
         since_id=since_id,
         before_id=before_id,
         limit=limit,
+        mail_account_id=mail_account_id,
+        group_id=group_id,
     )
 
     log.info(
@@ -178,8 +189,73 @@ async def list_external_messages(
         since_id=since_id,
         before_id=before_id,
         limit=limit,
+        mail_account_id=mail_account_id,
+        group_id=group_id,
         returned=len(result.messages),
     )
+    return result
+
+
+@router.get("/teams", response_model=ExternalTeamsResponse)
+async def list_external_teams(
+    request: Request,
+    db: DbSession,
+) -> ExternalTeamsResponse:
+    """List all system teams for the CRM (ADR-0037 §1).
+
+    Same auth flow as the pull GET (ADR-0029 §4): rate-limit FIRST (shared
+    ``LIMIT_EXTERNAL_API`` budget), then key extract + feature gate +
+    constant-time compare. Read-only, super_admin-visibility, minimal
+    ``id``/``name`` projection. CSRF-exempt via the ``/api/external/`` prefix.
+    """
+    ip = client_ip(request)
+    settings = get_settings()
+
+    # 1. Rate-limit FIRST — before any key work (same budget as the pull GET).
+    runtime_limit = Limit(
+        name=LIMIT_EXTERNAL_API.name,
+        capacity=settings.EXTERNAL_API_RATE_LIMIT_PER_MINUTE,
+        window_seconds=LIMIT_EXTERNAL_API.window_seconds,
+    )
+    await consume(runtime_limit, f"ip:{ip}")
+
+    # 2-4. Auth: key extract + feature gate + constant-time compare (401 opaque).
+    _authenticate(request, ip=ip, settings=settings)
+
+    result = await ExternalMessagesService(db).list_teams()
+    log.info("external_teams", client_ip=ip, returned=len(result.teams))
+    return result
+
+
+@router.get("/mailboxes", response_model=ExternalMailboxesResponse)
+async def list_external_mailboxes(
+    request: Request,
+    db: DbSession,
+) -> ExternalMailboxesResponse:
+    """List all canonical mailboxes with status for the CRM (ADR-0037 §2).
+
+    Same auth flow as the pull GET (ADR-0029 §4): rate-limit FIRST (shared
+    ``LIMIT_EXTERNAL_API`` budget), then key extract + feature gate +
+    constant-time compare. Canonical-dedup (ADR-0029 §5) so the set matches the
+    mailboxes whose messages ``GET /messages`` returns. CSRF-exempt via the
+    ``/api/external/`` prefix.
+    """
+    ip = client_ip(request)
+    settings = get_settings()
+
+    # 1. Rate-limit FIRST — before any key work (same budget as the pull GET).
+    runtime_limit = Limit(
+        name=LIMIT_EXTERNAL_API.name,
+        capacity=settings.EXTERNAL_API_RATE_LIMIT_PER_MINUTE,
+        window_seconds=LIMIT_EXTERNAL_API.window_seconds,
+    )
+    await consume(runtime_limit, f"ip:{ip}")
+
+    # 2-4. Auth: key extract + feature gate + constant-time compare (401 opaque).
+    _authenticate(request, ip=ip, settings=settings)
+
+    result = await ExternalMessagesService(db).list_mailboxes()
+    log.info("external_mailboxes", client_ip=ip, returned=len(result.mailboxes))
     return result
 
 

@@ -43,6 +43,58 @@ class ExternalTagDTO(BaseModel):
     color: str
 
 
+class ExternalTeamDTO(BaseModel):
+    """One team in ``GET /api/external/teams`` (ADR-0037 §1).
+
+    A team == a ``groups`` row. Deliberately minimal: ``id``/``name`` ONLY —
+    NO ``leader_user_id`` / ``created_at`` / ``members_count`` (unlike the heavy
+    admin ``GET /api/admin/groups``). Team != tag (tags live in
+    ``ExternalMessageDTO.tags``, ADR-0017 — untouched here).
+    """
+
+    id: int
+    name: str
+
+
+class ExternalTeamsResponse(BaseModel):
+    """Envelope for ``GET /api/external/teams`` (ADR-0037 §1).
+
+    ``teams`` is the flat, unpaginated list of all system teams
+    (``GroupsRepo.list_all_groups()``, ``ORDER BY id``); empty system → ``[]``.
+    """
+
+    teams: list[ExternalTeamDTO]
+
+
+class ExternalMailboxDTO(BaseModel):
+    """One mailbox in ``GET /api/external/mailboxes`` (ADR-0037 §2).
+
+    ``id`` == ``mail_accounts.id`` == ``ExternalMessageDTO.mail_account.id`` (the
+    CRM join key). ``group_id`` (mailbox→team mapping, ``null`` = personal) and
+    ``is_active`` (``false`` = worker auto-disabled, ADR-0033) are exposed
+    DELIBERATELY for the CRM (ADR-0037 §Security). NEVER any
+    ``encrypted_password`` / ``oauth_*`` / ``smtp_*`` / ``imap_*`` / ``user_id`` /
+    owner structures.
+    """
+
+    id: int
+    email: str
+    display_name: str | None
+    group_id: int | None
+    is_active: bool
+
+
+class ExternalMailboxesResponse(BaseModel):
+    """Envelope for ``GET /api/external/mailboxes`` (ADR-0037 §2).
+
+    ``mailboxes`` is the canonical-deduped set (one ``MIN(id)`` mailbox per
+    ``LOWER(email)`` — ADR-0029 §5), identical to the set whose messages
+    ``GET /api/external/messages`` returns; no mailboxes → ``[]``.
+    """
+
+    mailboxes: list[ExternalMailboxDTO]
+
+
 class ExternalMessageDTO(BaseModel):
     """One message in the external pull response (ADR-0029 §2).
 
