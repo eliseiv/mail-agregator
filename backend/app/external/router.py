@@ -31,25 +31,45 @@ prefix) and need no cookie session. The key is NEVER logged (redacted:
 from __future__ import annotations
 
 import secrets
+from typing import TypeVar
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Query, Request, Response, status
 from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel
 from pydantic import ValidationError as PydanticValidationError
 
 from backend.app.deps import DbSession
 from backend.app.exceptions import ForbiddenError, NotAuthenticatedError
 from backend.app.external.schemas import (
+    ExternalMailboxCreateRequest,
+    ExternalMailboxDTO,
     ExternalMailboxesResponse,
+    ExternalMailboxSyncResponse,
+    ExternalMailboxTestRequest,
+    ExternalMailboxTestResponse,
+    ExternalMailboxUpdateRequest,
     ExternalMessagesResponse,
     ExternalMessagesResponseDesc,
     ExternalReplyRequest,
     ExternalReplyResponse,
+    ExternalTagApplyResponse,
+    ExternalTagCreateRequest,
+    ExternalTagFullDTO,
+    ExternalTagRuleCreateRequest,
+    ExternalTagRuleDTO,
+    ExternalTagsResponse,
+    ExternalTagUpdateRequest,
     ExternalTeamsResponse,
 )
 from backend.app.external.service import ExternalMessagesService
+from backend.app.external.write_service import (
+    ExternalMailboxService,
+    ExternalTagsService,
+)
 from backend.app.rate_limit import (
     LIMIT_EXTERNAL_API,
     LIMIT_EXTERNAL_REPLY,
+    LIMIT_EXTERNAL_WRITE,
     Limit,
     client_ip,
     consume,
@@ -57,6 +77,9 @@ from backend.app.rate_limit import (
 from backend.app.send.service import SendService
 from shared.config import Settings, get_settings
 from shared.logging import get_logger
+
+# Body-model typevar bound for the generic manual parser.
+_BodyT = TypeVar("_BodyT", bound=BaseModel)
 
 log = get_logger(__name__)
 router = APIRouter(prefix="/api/external")
@@ -138,13 +161,15 @@ async def list_external_messages(
     since_id: int = Query(default=0, ge=0),
     before_id: int | None = Query(default=None),
     limit: int = Query(default=_DEFAULT_LIMIT, ge=1, le=_MAX_LIMIT),
-    # ADR-0037: optional server-side filters (narrow the canonical set). Bounds
-    # (``ge=1``) are FastAPI-validated → ``400 field=mail_account_id``/``group_id``
-    # for ``<1``/non-numeric. The mutual-exclusion (``field=filter``) and the
-    # "missing/foreign id → empty page (not 404)" semantics live in the service
-    # (after auth, before any DB call).
-    mail_account_id: int | None = Query(default=None, ge=1),
-    group_id: int | None = Query(default=None, ge=1),
+    # ADR-0039 §3: optional server-side filters, now REPEATABLE and
+    # AND-combinable (the ADR-0037 mutual-exclusion is superseded). FastAPI
+    # parses ``?group_id=1&group_id=2`` into a list; a single value stays BC.
+    # No per-element ``ge`` bound — a missing/foreign/non-canonical id simply
+    # does not appear in the intersection (empty page, not 404 / not 400). The
+    # intersection semantics live in the service (after auth, before any DB
+    # call beyond the canonical resolve).
+    mail_account_id: list[int] | None = Query(default=None),
+    group_id: list[int] | None = Query(default=None),
 ) -> ExternalMessagesResponse | ExternalMessagesResponseDesc:
     """Incrementally pull system messages (ADR-0029 forward / ADR-0036 backward).
 
@@ -178,8 +203,8 @@ async def list_external_messages(
         since_id=since_id,
         before_id=before_id,
         limit=limit,
-        mail_account_id=mail_account_id,
-        group_id=group_id,
+        mail_account_ids=mail_account_id,
+        group_ids=group_id,
     )
 
     log.info(
@@ -231,14 +256,19 @@ async def list_external_teams(
 async def list_external_mailboxes(
     request: Request,
     db: DbSession,
+    # ADR-0039 §4: optional filters over the canonical set. ``is_active`` (None =
+    # all) and a REPEATABLE ``group_id`` (union). No per-element ``ge`` — a
+    # foreign id simply narrows to nothing for that team.
+    is_active: bool | None = Query(default=None),
+    group_id: list[int] | None = Query(default=None),
 ) -> ExternalMailboxesResponse:
-    """List all canonical mailboxes with status for the CRM (ADR-0037 §2).
+    """List canonical mailboxes with status for the CRM (ADR-0037 §2 / ADR-0039 §4).
 
     Same auth flow as the pull GET (ADR-0029 §4): rate-limit FIRST (shared
-    ``LIMIT_EXTERNAL_API`` budget), then key extract + feature gate +
-    constant-time compare. Canonical-dedup (ADR-0029 §5) so the set matches the
-    mailboxes whose messages ``GET /messages`` returns. CSRF-exempt via the
-    ``/api/external/`` prefix.
+    ``LIMIT_EXTERNAL_API`` read budget), then key extract + feature gate +
+    constant-time compare. Read — no write-gate. Canonical-dedup (ADR-0029 §5)
+    so the set matches the mailboxes whose messages ``GET /messages`` returns.
+    CSRF-exempt via the ``/api/external/`` prefix.
     """
     ip = client_ip(request)
     settings = get_settings()
@@ -254,8 +284,16 @@ async def list_external_mailboxes(
     # 2-4. Auth: key extract + feature gate + constant-time compare (401 opaque).
     _authenticate(request, ip=ip, settings=settings)
 
-    result = await ExternalMessagesService(db).list_mailboxes()
-    log.info("external_mailboxes", client_ip=ip, returned=len(result.mailboxes))
+    result = await ExternalMessagesService(db).list_mailboxes(
+        is_active=is_active, group_ids=group_id
+    )
+    log.info(
+        "external_mailboxes",
+        client_ip=ip,
+        is_active=is_active,
+        group_id=group_id,
+        returned=len(result.mailboxes),
+    )
     return result
 
 
@@ -351,3 +389,230 @@ async def reply_external_message(
         sent_id=result.sent_id,
         smtp_message_id=result.smtp_message_id,
     )
+
+
+# ---------------------------------------------------------------------------
+# External WRITE section — mailboxes + global tags CRUD (ADR-0039 / ADR-0040).
+#
+# Auth-flow (strict order, ADR-0029 §4 / ADR-0035 §3):
+#   1. consume(LIMIT_EXTERNAL_WRITE, ip) FIRST — a SEPARATE budget from read /
+#      reply so a write flood can't evict them (and a failed-auth flood is
+#      throttled too).
+#   2-4. shared key auth (X-API-Key / Bearer, feature gate, constant-time).
+#   5. write-gate: EXTERNAL_WRITE_ENABLED false → 403 forbidden (even with a
+#      valid key). Read (GET /tags, /mailboxes, /messages) has NO write-gate.
+#   6. body parsed MANUALLY (``_parse_json_body``) AFTER 1-5 so a malformed /
+#      invalid body cannot pre-empt 401/403/429.
+# Path ids are plain ``int`` (no ``ge``) so an id < 1 resolves to 404 in the
+# service, not a pre-auth 400 (same precedent as the reply endpoint).
+# All routes CSRF-exempt via the ``/api/external/`` prefix.
+# ---------------------------------------------------------------------------
+
+
+async def _authorize_write(request: Request, *, ip: str, settings: Settings) -> None:
+    """Rate-limit → key/gate/compare → write-gate (steps 1-5 above)."""
+    runtime_limit = Limit(
+        name=LIMIT_EXTERNAL_WRITE.name,
+        capacity=settings.EXTERNAL_WRITE_RATE_LIMIT_PER_MINUTE,
+        window_seconds=LIMIT_EXTERNAL_WRITE.window_seconds,
+    )
+    await consume(runtime_limit, f"ip:{ip}")
+    _authenticate(request, ip=ip, settings=settings)
+    if not settings.EXTERNAL_WRITE_ENABLED:
+        log.info("external_write_forbidden", client_ip=ip, path=request.url.path)
+        raise ForbiddenError("External write is disabled")
+
+
+async def _parse_json_body(request: Request, model: type[_BodyT]) -> _BodyT:
+    """Parse + validate a JSON body AFTER auth/gate (mirrors ``_parse_reply_body``).
+
+    A malformed JSON body and a schema violation both surface as
+    ``400 validation_error`` via the app's :class:`RequestValidationError`
+    handler — identical envelope to auto-validated routes.
+    """
+    raw = await request.body()
+    try:
+        return model.model_validate_json(raw)
+    except PydanticValidationError as exc:
+        raise RequestValidationError(exc.errors()) from exc
+
+
+# --- Tags: read (under EXTERNAL_API_KEY, no write-gate) ---------------------
+
+
+@router.get("/tags", response_model=ExternalTagsResponse)
+async def list_external_tags(request: Request, db: DbSession) -> ExternalTagsResponse:
+    """List the global tag catalogue (ADR-0040 §4). Read — no write-gate."""
+    ip = client_ip(request)
+    settings = get_settings()
+    runtime_limit = Limit(
+        name=LIMIT_EXTERNAL_API.name,
+        capacity=settings.EXTERNAL_API_RATE_LIMIT_PER_MINUTE,
+        window_seconds=LIMIT_EXTERNAL_API.window_seconds,
+    )
+    await consume(runtime_limit, f"ip:{ip}")
+    _authenticate(request, ip=ip, settings=settings)
+    result = await ExternalTagsService(db).list()
+    log.info("external_tags_list", client_ip=ip, returned=len(result.tags))
+    return result
+
+
+# --- Mailboxes: write ------------------------------------------------------
+
+
+@router.post("/mailboxes/test", response_model=ExternalMailboxTestResponse)
+async def external_mailbox_test(request: Request, db: DbSession) -> ExternalMailboxTestResponse:
+    """Probe IMAP/SMTP connectivity without persistence (ADR-0039 §2)."""
+    ip = client_ip(request)
+    settings = get_settings()
+    await _authorize_write(request, ip=ip, settings=settings)
+    payload = await _parse_json_body(request, ExternalMailboxTestRequest)
+    result = await ExternalMailboxService(db).test(payload)
+    log.info("external_mailbox_test", client_ip=ip, imap_ok=result.imap_ok, smtp_ok=result.smtp_ok)
+    return result
+
+
+@router.post("/mailboxes", response_model=ExternalMailboxDTO, status_code=status.HTTP_201_CREATED)
+async def external_mailbox_create(request: Request, db: DbSession) -> ExternalMailboxDTO:
+    """Create a mailbox owned by ``crm-service`` (ADR-0039 §2)."""
+    ip = client_ip(request)
+    settings = get_settings()
+    await _authorize_write(request, ip=ip, settings=settings)
+    payload = await _parse_json_body(request, ExternalMailboxCreateRequest)
+    async with db.begin():
+        dto = await ExternalMailboxService(db).create(payload)
+    log.info("external_mailbox_created", client_ip=ip, mailbox_id=dto.id)
+    return dto
+
+
+@router.patch("/mailboxes/{account_id}", response_model=ExternalMailboxDTO)
+async def external_mailbox_update(
+    request: Request, db: DbSession, account_id: int
+) -> ExternalMailboxDTO:
+    """Update a mailbox: creds / hosts / display_name / group / is_active (ADR-0039 §2)."""
+    ip = client_ip(request)
+    settings = get_settings()
+    await _authorize_write(request, ip=ip, settings=settings)
+    payload = await _parse_json_body(request, ExternalMailboxUpdateRequest)
+    async with db.begin():
+        dto = await ExternalMailboxService(db).update(account_id, payload)
+    log.info("external_mailbox_updated", client_ip=ip, mailbox_id=account_id)
+    return dto
+
+
+@router.delete("/mailboxes/{account_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def external_mailbox_delete(request: Request, db: DbSession, account_id: int) -> Response:
+    """Delete a mailbox (+attachment/MinIO cascade) (ADR-0039 §2)."""
+    ip = client_ip(request)
+    settings = get_settings()
+    await _authorize_write(request, ip=ip, settings=settings)
+    async with db.begin():
+        await ExternalMailboxService(db).delete(account_id)
+    log.info("external_mailbox_deleted", client_ip=ip, mailbox_id=account_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post(
+    "/mailboxes/{account_id}/sync",
+    response_model=ExternalMailboxSyncResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def external_mailbox_sync(
+    request: Request, db: DbSession, account_id: int
+) -> ExternalMailboxSyncResponse:
+    """Force-sync a mailbox via the Redis ``force_sync:{id}`` marker (ADR-0039 §2)."""
+    ip = client_ip(request)
+    settings = get_settings()
+    await _authorize_write(request, ip=ip, settings=settings)
+    await ExternalMailboxService(db).sync(account_id)
+    log.info("external_mailbox_sync_queued", client_ip=ip, mailbox_id=account_id)
+    return ExternalMailboxSyncResponse(queued=True)
+
+
+# --- Tags: write (global catalogue) ----------------------------------------
+
+
+@router.post("/tags", response_model=ExternalTagFullDTO, status_code=status.HTTP_201_CREATED)
+async def external_tag_create(request: Request, db: DbSession) -> ExternalTagFullDTO:
+    """Create a global tag (ADR-0040 §4). ``409`` on name clash."""
+    ip = client_ip(request)
+    settings = get_settings()
+    await _authorize_write(request, ip=ip, settings=settings)
+    payload = await _parse_json_body(request, ExternalTagCreateRequest)
+    async with db.begin():
+        dto = await ExternalTagsService(db).create(payload)
+    log.info("external_tag_created", client_ip=ip, tag_id=dto.id)
+    return dto
+
+
+@router.patch("/tags/{tag_id}", response_model=ExternalTagFullDTO)
+async def external_tag_update(request: Request, db: DbSession, tag_id: int) -> ExternalTagFullDTO:
+    """Update a global tag's name / color / match_mode (ADR-0040 §4)."""
+    ip = client_ip(request)
+    settings = get_settings()
+    await _authorize_write(request, ip=ip, settings=settings)
+    payload = await _parse_json_body(request, ExternalTagUpdateRequest)
+    async with db.begin():
+        dto = await ExternalTagsService(db).update(tag_id, payload)
+    log.info("external_tag_updated", client_ip=ip, tag_id=tag_id)
+    return dto
+
+
+@router.delete("/tags/{tag_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def external_tag_delete(request: Request, db: DbSession, tag_id: int) -> Response:
+    """Delete a global tag (ADR-0040 §4). Builtin → ``409 conflict``."""
+    ip = client_ip(request)
+    settings = get_settings()
+    await _authorize_write(request, ip=ip, settings=settings)
+    async with db.begin():
+        await ExternalTagsService(db).delete(tag_id)
+    log.info("external_tag_deleted", client_ip=ip, tag_id=tag_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post(
+    "/tags/{tag_id}/rules",
+    response_model=ExternalTagRuleDTO,
+    status_code=status.HTTP_201_CREATED,
+)
+async def external_tag_add_rule(request: Request, db: DbSession, tag_id: int) -> ExternalTagRuleDTO:
+    """Add a rule to a global tag (ADR-0040 §4)."""
+    ip = client_ip(request)
+    settings = get_settings()
+    await _authorize_write(request, ip=ip, settings=settings)
+    payload = await _parse_json_body(request, ExternalTagRuleCreateRequest)
+    async with db.begin():
+        dto = await ExternalTagsService(db).add_rule(tag_id, payload)
+    log.info("external_tag_rule_added", client_ip=ip, tag_id=tag_id, rule_id=dto.id)
+    return dto
+
+
+@router.delete("/tags/{tag_id}/rules/{rule_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def external_tag_delete_rule(
+    request: Request, db: DbSession, tag_id: int, rule_id: int
+) -> Response:
+    """Delete a rule of a global tag (ADR-0040 §4)."""
+    ip = client_ip(request)
+    settings = get_settings()
+    await _authorize_write(request, ip=ip, settings=settings)
+    async with db.begin():
+        await ExternalTagsService(db).delete_rule(tag_id, rule_id)
+    log.info("external_tag_rule_deleted", client_ip=ip, tag_id=tag_id, rule_id=rule_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/tags/{tag_id}/apply-to-existing", response_model=ExternalTagApplyResponse)
+async def external_tag_apply_to_existing(
+    request: Request, db: DbSession, tag_id: int
+) -> ExternalTagApplyResponse:
+    """Apply a global tag's rules to all existing messages (ADR-0040 §4).
+
+    ``422 tag_apply_too_many`` when the corpus exceeds ``APPLY_TO_EXISTING_LIMIT``.
+    """
+    ip = client_ip(request)
+    settings = get_settings()
+    await _authorize_write(request, ip=ip, settings=settings)
+    async with db.begin():
+        result = await ExternalTagsService(db).apply_to_existing(tag_id)
+    log.info("external_tag_applied", client_ip=ip, tag_id=tag_id, applied=result.applied_count)
+    return result

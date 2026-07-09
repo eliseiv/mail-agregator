@@ -32,10 +32,15 @@ class Tag(Base):
     __tablename__ = "tags"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(
+    # ADR-0040: nullable. ``NULL`` = global tag (single admin catalogue applied
+    # to EVERY message of the system, headless-CRM). Non-NULL = personal tag
+    # (backward compatibility). Global names are unique via the partial-unique
+    # index ``uq_tags_global_name`` below (the composite ``uq_tags_user_name``
+    # does not constrain ``NULL`` rows — ``NULL`` != ``NULL`` in Postgres).
+    user_id: Mapped[int | None] = mapped_column(
         BigInteger,
         ForeignKey("users.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
     )
     name: Mapped[str] = mapped_column(Text, nullable=False)
     color: Mapped[str] = mapped_column(Text, nullable=False)
@@ -54,6 +59,14 @@ class Tag(Base):
 
     __table_args__ = (
         UniqueConstraint("user_id", "name", name="uq_tags_user_name"),
+        # ADR-0040: global tag names are unique (partial-unique on the NULL
+        # owner). Kept in sync with migration 20260709_023.
+        Index(
+            "uq_tags_global_name",
+            "name",
+            unique=True,
+            postgresql_where=text("user_id IS NULL"),
+        ),
         CheckConstraint(
             "char_length(name) BETWEEN 1 AND 64",
             name="ck_tags_name_length",

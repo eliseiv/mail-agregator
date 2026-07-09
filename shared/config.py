@@ -184,6 +184,25 @@ class Settings(BaseSettings):
     # ``EXTERNAL_API_RATE_LIMIT_PER_MINUTE``). Numeric (requests/60s); window is
     # fixed at 60 s.
     EXTERNAL_REPLY_RATE_LIMIT_PER_MINUTE: int = Field(default=30, ge=1, le=10000)
+    # --- External write API — mailboxes + tags CRUD (ADR-0039 / ADR-0040) --
+    # Separate write-gate for the headless-CRM write section
+    # (``POST/PATCH/DELETE /api/external/mailboxes*`` + ``/api/external/tags*``).
+    # The read API (ADR-0029) is gated by ``EXTERNAL_API_KEY`` alone; every
+    # mailboxes/tags write additionally requires ``EXTERNAL_WRITE_ENABLED=true``
+    # (by the pattern of ``EXTERNAL_REPLY_ENABLED``). Default ``false`` keeps a
+    # read-only ADR-0029 deployment read-only after a code upgrade — a valid key
+    # does NOT silently gain write capability. When false the write endpoints
+    # return ``403 forbidden`` even for a valid key. Passed only to the ``api``
+    # container. See ADR-0039 §1.
+    EXTERNAL_WRITE_ENABLED: bool = False
+    # Operator-tunable rate limit for the external write section (ADR-0039 §1):
+    # requests per minute, per client IP. A SEPARATE budget from read (120) and
+    # reply (30) — write is more expensive / abuse-sensitive, so it must not
+    # share (no mutual eviction between pull / reply / write). Overrides the
+    # static ``LIMIT_EXTERNAL_WRITE`` capacity at consume-time (same pattern as
+    # ``EXTERNAL_API_RATE_LIMIT_PER_MINUTE``). Numeric (requests/60s); window is
+    # fixed at 60 s.
+    EXTERNAL_WRITE_RATE_LIMIT_PER_MINUTE: int = Field(default=60, ge=1, le=10000)
     # --- Admin login-password reveal (ADR-0038 §4) ------------------------
     # Operator-tunable rate limit for ``GET /api/admin/users/{id}/password``:
     # requests per minute, PER super_admin actor (not per IP). Anti-bulk-

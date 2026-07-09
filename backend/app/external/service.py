@@ -42,6 +42,26 @@ from backend.app.repositories.tags import MessageTagsRepo
 from shared.models import MailAccount, Message, Tag
 
 
+def to_external_mailbox_dto(acc: MailAccount) -> ExternalMailboxDTO:
+    """Project a ``mail_accounts`` row onto the public external mailbox DTO.
+
+    ADR-0037 §2 + ADR-0039 §4: id/email/display_name/group_id/is_active plus the
+    sync-status triplet (``last_synced_at`` / ``last_sync_error`` /
+    ``consecutive_failures``). NEVER any credentials / owner / oauth / smtp / imap
+    internals. Shared by the read list and the write create/update responses.
+    """
+    return ExternalMailboxDTO(
+        id=acc.id,
+        email=acc.email,
+        display_name=acc.display_name,
+        group_id=acc.group_id,
+        is_active=acc.is_active,
+        last_synced_at=acc.last_synced_at,
+        last_sync_error=acc.last_sync_error,
+        consecutive_failures=acc.consecutive_failures,
+    )
+
+
 class ExternalMessagesService:
     """Assemble a keyset page of external messages (forward or backward)."""
 
@@ -59,30 +79,40 @@ class ExternalMessagesService:
         groups = await GroupsRepo(self._db).list_all_groups()
         return ExternalTeamsResponse(teams=[ExternalTeamDTO(id=g.id, name=g.name) for g in groups])
 
-    async def list_mailboxes(self) -> ExternalMailboxesResponse:
-        """All canonical mailboxes with status for the CRM (ADR-0037 §2).
+    async def list_mailboxes(
+        self,
+        *,
+        is_active: bool | None = None,
+        group_ids: list[int] | None = None,
+    ) -> ExternalMailboxesResponse:
+        """Canonical mailboxes with status for the CRM (ADR-0037 §2 / ADR-0039 §4).
 
         Canonical-dedup (ADR-0029 §5): ``list_by_ids(list_canonical_account_ids())``
         — one ``MIN(id)`` mailbox per ``LOWER(email)``, so the set matches the
         mailboxes whose messages ``GET /api/external/messages`` returns. Exposes
-        ``group_id`` (mailbox→team) and ``is_active`` (worker auto-disable);
-        never any credentials/owner structures. No mailboxes → ``{"mailboxes": []}``.
+        ``group_id`` (mailbox→team), ``is_active`` (worker auto-disable) and the
+        sync-status triplet; never any credentials/owner structures.
+
+        ADR-0039 §4 filters (both optional, applied over the canonical set):
+
+        - ``group_id`` (repeatable → ``group_ids``): union of the given teams'
+          accounts; empty/None = no team filter.
+        - ``is_active``: ``None`` = all; ``True``/``False`` filter on the flag.
+
+        No mailboxes → ``{"mailboxes": []}``.
         """
         repo = MailAccountsRepo(self._db)
         canonical_ids = await repo.list_canonical_account_ids()
-        accounts = await repo.list_by_ids(canonical_ids)
-        return ExternalMailboxesResponse(
-            mailboxes=[
-                ExternalMailboxDTO(
-                    id=a.id,
-                    email=a.email,
-                    display_name=a.display_name,
-                    group_id=a.group_id,
-                    is_active=a.is_active,
-                )
-                for a in accounts
-            ]
-        )
+        effective: set[int] = set(canonical_ids)
+        if group_ids:
+            in_groups: set[int] = set()
+            for gid in set(group_ids):
+                in_groups.update(await repo.list_account_ids_in_group(gid))
+            effective &= in_groups
+        accounts = await repo.list_by_ids(list(effective))
+        if is_active is not None:
+            accounts = [a for a in accounts if a.is_active == is_active]
+        return ExternalMailboxesResponse(mailboxes=[to_external_mailbox_dto(a) for a in accounts])
 
     async def list_messages(
         self,
@@ -91,75 +121,62 @@ class ExternalMessagesService:
         since_id: int,
         before_id: int | None,
         limit: int,
-        mail_account_id: int | None = None,
-        group_id: int | None = None,
+        mail_account_ids: list[int] | None = None,
+        group_ids: list[int] | None = None,
     ) -> ExternalMessagesResponse | ExternalMessagesResponseDesc:
-        """Return one page in the requested direction (ADR-0029 / ADR-0036 / ADR-0037).
+        """Return one page in the requested direction (ADR-0029 / ADR-0036 / ADR-0039 §3).
 
-        Validates the mode co-existence AND the ``mail_account_id`` vs
-        ``group_id`` mutual-exclusion (deterministic order below) — BOTH before any DB call
-        (ADR-0037 §3 + reviewer minor: do not compute ``base`` before the filter
-        check) — then resolves the effective (canonical-narrowed) mailbox set and
-        dispatches to the forward (``asc``) or backward (``desc``) builder. The
-        two builders return DISTINCT envelopes so each mode's cursor field is
-        present only in its own mode (ADR-0036 §3). The filter only NARROWS the
-        set; cursor semantics are unchanged (ADR-0037 §3).
+        Validates the mode co-existence (deterministic order in
+        :meth:`_validate_mode`) BEFORE any DB call, then resolves the effective
+        (canonical-narrowed) mailbox set and dispatches to the forward (``asc``)
+        or backward (``desc``) builder. The two builders return DISTINCT
+        envelopes so each mode's cursor field is present only in its own mode
+        (ADR-0036 §3).
+
+        ADR-0039 §3: ``mail_account_id`` and ``group_id`` are repeatable AND
+        **AND-combinable** (the ADR-0037 mutual-exclusion is superseded). The
+        effective set is the intersection ``canonical ∩ groups ∩ mailboxes``
+        (see :meth:`_resolve_account_ids`); an empty intersection yields an empty
+        page (not 404). BC: a single value of either filter behaves as before.
         """
         self._validate_mode(order=order, since_id=since_id, before_id=before_id)
-        self._validate_filters(mail_account_id=mail_account_id, group_id=group_id)
-        mail_account_ids = await self._resolve_account_ids(
-            mail_account_id=mail_account_id, group_id=group_id
+        account_ids = await self._resolve_account_ids(
+            mail_account_ids=mail_account_ids, group_ids=group_ids
         )
         if order == "asc":
             return await self._list_forward(
-                mail_account_ids=mail_account_ids, since_id=since_id, limit=limit
+                mail_account_ids=account_ids, since_id=since_id, limit=limit
             )
         return await self._list_backward(
-            mail_account_ids=mail_account_ids, before_id=before_id, limit=limit
+            mail_account_ids=account_ids, before_id=before_id, limit=limit
         )
 
-    @staticmethod
-    def _validate_filters(*, mail_account_id: int | None, group_id: int | None) -> None:
-        """Mutual-exclusion of the message filters (ADR-0037 §3).
-
-        ``mail_account_id`` and ``group_id`` together ⇒ ``400 validation_error``,
-        ``field="filter"`` (explicit refusal, not a silent priority — precedent
-        ADR-0036 §5). Runs on the query-validation step (after auth), BEFORE any
-        DB call / canonical resolve (reviewer minor). The per-field lower bound
-        (``ge=1``) is enforced upstream by FastAPI ``Query`` and never reaches
-        here; a missing/non-canonical/foreign id resolves to an EMPTY page (not
-        404, ADR-0037 §3 / ADR-0029 §3) inside :meth:`_resolve_account_ids`.
-        """
-        if mail_account_id is not None and group_id is not None:
-            raise ValidationError("mail_account_id и group_id взаимоисключающи", field="filter")
-
     async def _resolve_account_ids(
-        self, *, mail_account_id: int | None, group_id: int | None
+        self, *, mail_account_ids: list[int] | None, group_ids: list[int] | None
     ) -> list[int]:
-        """Effective mailbox set = filter ∩ canonical (ADR-0037 §3).
+        """Effective mailbox set = canonical ∩ groups ∩ mailboxes (ADR-0039 §3).
 
-        ``base`` = ``list_canonical_account_ids()`` (canonical-dedup, ADR-0029 §5).
-        Caller has already rejected the ``mail_account_id`` vs ``group_id`` combo
-        (:meth:`_validate_filters`), so at most one filter is set:
+        - ``base`` = ``list_canonical_account_ids()`` (canonical-dedup, ADR-0029 §5).
+        - ``group_ids`` (if non-empty) → intersect with the UNION of each team's
+          accounts. An empty / ``None`` list imposes no team constraint.
+        - ``mail_account_ids`` (if non-empty) → intersect with that id set. An
+          empty / ``None`` list imposes no mailbox constraint.
 
-        - ``mail_account_id`` set → ``[mail_account_id]`` iff it is canonical,
-          else ``[]`` (missing/foreign/non-canonical → empty page, NOT 404).
-        - ``group_id`` set → ``list_account_ids_in_group(group_id) ∩ base``
-          (missing/empty team / all non-canonical → ``[]`` → empty page).
-        - neither → ``base`` (prior behaviour — all messages).
-
-        The keyset builders return ``[]`` on an empty list without a query, so an
-        empty effective set yields an empty page with an unmoved cursor.
+        A missing / foreign / non-canonical id simply does not appear in the
+        intersection (empty page, NOT 404 — ADR-0029 §3). An empty intersection
+        yields an empty page; the keyset builders return ``[]`` on an empty list
+        without a query, so the cursor does not move.
         """
         repo = MailAccountsRepo(self._db)
-        base = await repo.list_canonical_account_ids()
-        if mail_account_id is not None:
-            return [mail_account_id] if mail_account_id in base else []
-        if group_id is not None:
-            base_set = set(base)
-            in_group = await repo.list_account_ids_in_group(group_id)
-            return [a for a in in_group if a in base_set]
-        return base
+        effective: set[int] = set(await repo.list_canonical_account_ids())
+        if group_ids:
+            in_groups: set[int] = set()
+            for gid in set(group_ids):
+                in_groups.update(await repo.list_account_ids_in_group(gid))
+            effective &= in_groups
+        if mail_account_ids:
+            effective &= set(mail_account_ids)
+        return list(effective)
 
     @staticmethod
     def _validate_mode(*, order: str, since_id: int, before_id: int | None) -> None:

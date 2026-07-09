@@ -32,6 +32,7 @@ from backend.app.deps import VisibilityScope
 from backend.app.exceptions import (
     ConflictError,
     ForbiddenError,
+    GroupNotFoundError,
     NotFoundError,
     OAuthReconsentRequiredError,
     ValidationError,
@@ -374,7 +375,8 @@ class MailAccountService:
 
         - ``ForbiddenError("user_not_in_group_scope")`` — the role may not put
           a box in this team (or may not detach it to ``NULL``).
-        - ``NotFoundError("group_not_found")`` — ``group_id`` does not exist.
+        - ``GroupNotFoundError`` (``code="group_not_found"``) — ``group_id``
+          does not exist.
         """
         # NULL target — personal box. Only super_admin may have one.
         if group_id is None:
@@ -385,7 +387,7 @@ class MailAccountService:
         # The team must exist before any role-specific authorisation.
         group = await self._groups.get_by_id(group_id)
         if group is None:
-            raise NotFoundError("group_not_found")
+            raise GroupNotFoundError()
 
         if scope.is_super_admin:
             return group_id
@@ -689,6 +691,36 @@ class MailAccountService:
             # fresh alert (repeat only on an honest re-enable → disable).
             update_fields["disabled_alert_sent_at"] = None
 
+        await self._repo.update_fields(account_id, **update_fields)
+        refreshed = await self._repo.get_by_id(account_id)
+        assert refreshed is not None
+        owner = await self._users.get_by_id(refreshed.user_id)
+        assert owner is not None
+        return _to_dto(refreshed, owner)
+
+    # --- Activate / deactivate --------------------------------------------
+
+    async def set_active(
+        self, *, scope: VisibilityScope, account_id: int, is_active: bool
+    ) -> MailAccountDTO:
+        """Toggle ``is_active`` on a visible mailbox (ADR-0039 §2 external PATCH).
+
+        Distinct from :meth:`update` (which flips ``is_active=True`` only as a
+        side effect of a credential change). On **activate** we mirror the
+        credential re-enable branch (ADR-0033): reset ``last_sync_error`` /
+        ``consecutive_failures`` and clear the alert idempotency stamp so a
+        subsequent honest auto-disable re-alerts. On **deactivate** we only set
+        the flag (a manual disable never stamps an alert).
+        """
+        visible = await self._visible_user_ids(scope)
+        acc = await self._repo.get_for_user_ids(visible, account_id)
+        if acc is None:
+            raise NotFoundError()
+        update_fields: dict[str, object] = {"is_active": is_active}
+        if is_active:
+            update_fields["last_sync_error"] = None
+            update_fields["consecutive_failures"] = 0
+            update_fields["disabled_alert_sent_at"] = None
         await self._repo.update_fields(account_id, **update_fields)
         refreshed = await self._repo.get_by_id(account_id)
         assert refreshed is not None

@@ -223,6 +223,19 @@
 
 > Ротация ключа: смена `EXTERNAL_API_KEY` в `.env` → `docker compose up -d --force-recreate api`; партнёр обновляет ключ синхронно. Старый ключ немедленно недействителен (нет grace-периода). См. §10 (таблица ротации).
 
+#### External **write** API (ADR-0039 / ADR-0040)
+
+Headless-CRM управляет почтами и глобальными тегами через write-раздел (`POST/PATCH/DELETE /api/external/mailboxes*`, `/api/external/tags*`). Тот же `EXTERNAL_API_KEY`, тот же auth-flow, **плюс** отдельный write-гейт.
+
+| Угроза | Описание | Митигация |
+| --- | --- | --- |
+| E | Валидный read-ключ молча получает write-права при апгрейде | **`EXTERNAL_WRITE_ENABLED`** (`bool`, default `false`) — отдельный opt-in write-гейт (по образцу `EXTERNAL_REPLY_ENABLED`). Пока `false` — все mailboxes/tags CRUD → `403 forbidden` даже с валидным ключом. Read-only деплои write не получают. |
+| D | Write-flood вытесняет read | Отдельный бюджет **`LIMIT_EXTERNAL_WRITE`** (`60/min` per IP, env `EXTERNAL_WRITE_RATE_LIMIT_PER_MINUTE`), consume **ДО** ключа; не делит с read `120`/reply `30`. |
+| S/T | SSRF через IMAP/SMTP-хосты создаваемого ящика | `assert_public_host` (`backend/app/security.py`) на create/test — как в UI-CRUD. |
+| I | Утечка кредов ящика через логи/ответы | `password`/`smtp_password` — только в запросе, redact в structlog; `ExternalMailboxDTO` их не возвращает (whitelist без `encrypted_password`/`oauth_*`/`smtp_*`/`imap_*`/`user_id`). |
+| S | Кто владелец ящика при безличном ключе | Техпользователь `crm-service` (super_admin, `group_id NULL`, без `telegram_links`) — [ADR-0039](./adr/ADR-0039-external-write-api.md) §Q-0039-1. Аудит подтвердил: доставка (TG/webhooks/forwarding) резолвится по `mail_accounts.group_id`, не по `user_id` → безвредно. |
+| I | Глобальные теги меняют доставку/утечку | Теги не гейтят доставку (TG-enqueue по `TG_NOTIFY_ALL_MESSAGES`, webhooks изолированы ADR-0023 §3.2, forwarding по группе); теги влияют лишь на чипы — [ADR-0040](./adr/ADR-0040-global-tags.md) §5. |
+
 ---
 
 ### 1.14 Переадресация писем команды лидеру (ADR-0034)

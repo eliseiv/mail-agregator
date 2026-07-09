@@ -18,9 +18,14 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from backend.app.send.schemas import _validate_addresses
+from backend.app.tags.schemas import (
+    MatchMode,
+    RuleType,
+    _normalise_color,
+)
 
 
 class ExternalMailAccountDTO(BaseModel):
@@ -67,7 +72,7 @@ class ExternalTeamsResponse(BaseModel):
 
 
 class ExternalMailboxDTO(BaseModel):
-    """One mailbox in ``GET /api/external/mailboxes`` (ADR-0037 §2).
+    """One mailbox in ``GET /api/external/mailboxes`` (ADR-0037 §2 / ADR-0039 §4).
 
     ``id`` == ``mail_accounts.id`` == ``ExternalMessageDTO.mail_account.id`` (the
     CRM join key). ``group_id`` (mailbox→team mapping, ``null`` = personal) and
@@ -75,6 +80,10 @@ class ExternalMailboxDTO(BaseModel):
     DELIBERATELY for the CRM (ADR-0037 §Security). NEVER any
     ``encrypted_password`` / ``oauth_*`` / ``smtp_*`` / ``imap_*`` / ``user_id`` /
     owner structures.
+
+    ADR-0039 §4: additionally carries the sync-status triplet
+    (``last_synced_at`` / ``last_sync_error`` / ``consecutive_failures``) for the
+    CRM status dot / diagnostics. Additive — no secrets exposed.
     """
 
     id: int
@@ -82,6 +91,9 @@ class ExternalMailboxDTO(BaseModel):
     display_name: str | None
     group_id: int | None
     is_active: bool
+    last_synced_at: datetime | None
+    last_sync_error: str | None
+    consecutive_failures: int
 
 
 class ExternalMailboxesResponse(BaseModel):
@@ -222,3 +234,237 @@ class ExternalReplyResponse(BaseModel):
 
     sent_id: int
     smtp_message_id: str
+
+
+# --- External write API: mailboxes (ADR-0039 §2, 04-api-contracts §4f) ------
+
+
+class ExternalMailboxTestRequest(BaseModel):
+    """Body of ``POST /api/external/mailboxes/test`` (ADR-0039 §2).
+
+    A full IMAP/SMTP credential set for a connectivity probe (no persistence).
+    ``password`` / ``smtp_password`` are request-only (never echoed, redacted in
+    logs). Mutual-exclusion of ``smtp_ssl`` / ``smtp_starttls`` + a basic e-mail
+    shape are validated here so a bad payload surfaces as ``400`` at parse time
+    (after auth/gate — ADR-0035 §3 order preserved by manual body parsing).
+    """
+
+    email: str = Field(min_length=3, max_length=254)
+    imap_host: str = Field(min_length=1, max_length=253)
+    imap_port: int = Field(ge=1, le=65535)
+    imap_ssl: bool
+    smtp_host: str = Field(min_length=1, max_length=253)
+    smtp_port: int = Field(ge=1, le=65535)
+    smtp_ssl: bool
+    smtp_starttls: bool
+    smtp_username: str | None = Field(default=None, max_length=254)
+    password: str = Field(min_length=1, max_length=256)
+    smtp_password: str | None = Field(default=None, max_length=256)
+
+    @model_validator(mode="after")
+    def _validate(self) -> ExternalMailboxTestRequest:
+        if self.smtp_ssl and self.smtp_starttls:
+            raise ValueError("smtp_ssl and smtp_starttls are mutually exclusive")
+        if "@" not in self.email or "." not in self.email.split("@", 1)[1]:
+            raise ValueError("email is not a valid address")
+        local, _, domain = self.email.partition("@")
+        if not local or domain.startswith(".") or domain.endswith(".") or ".." in domain:
+            raise ValueError("email is not a valid address")
+        return self
+
+
+class ExternalMailboxCreateRequest(ExternalMailboxTestRequest):
+    """Body of ``POST /api/external/mailboxes`` (ADR-0039 §2).
+
+    Test fields + an optional ``display_name`` and ``group_id`` (validated to
+    exist by the service, else ``404 group_not_found``; ``null`` = a box without
+    a team). Owner is the ``crm-service`` technical user (server-derived).
+    """
+
+    display_name: str | None = Field(default=None, max_length=100)
+    group_id: int | None = Field(default=None, ge=1)
+
+
+class ExternalMailboxUpdateRequest(BaseModel):
+    """Body of ``PATCH /api/external/mailboxes/{id}`` (ADR-0039 §2).
+
+    All fields optional. ``group_id`` uses presence-semantics via
+    ``set_group_id`` (the mere presence of the JSON key — even ``null`` — means
+    "change the team", mirroring the internal ``MailAccountUpdateRequest``);
+    ``is_active`` likewise via ``set_is_active`` (activate/deactivate).
+    """
+
+    email: str | None = Field(default=None, max_length=254)
+    password: str | None = Field(default=None, max_length=256)
+    display_name: str | None = Field(default=None, max_length=100)
+    imap_host: str | None = Field(default=None, max_length=253)
+    imap_port: int | None = Field(default=None, ge=1, le=65535)
+    imap_ssl: bool | None = None
+    smtp_host: str | None = Field(default=None, max_length=253)
+    smtp_port: int | None = Field(default=None, ge=1, le=65535)
+    smtp_ssl: bool | None = None
+    smtp_starttls: bool | None = None
+    smtp_username: str | None = Field(default=None, max_length=254)
+    smtp_password: str | None = Field(default=None, max_length=256)
+    group_id: int | None = Field(default=None, ge=1)
+    set_group_id: bool = False
+    is_active: bool | None = None
+    set_is_active: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _presence(cls, data: object) -> object:
+        """Infer ``set_group_id`` / ``set_is_active`` from JSON key presence."""
+        if isinstance(data, dict):
+            d = dict(data)
+            if "group_id" in d and "set_group_id" not in d:
+                d["set_group_id"] = True
+            if "is_active" in d and "set_is_active" not in d:
+                d["set_is_active"] = True
+            return d
+        return data
+
+    @property
+    def has_account_fields(self) -> bool:
+        """True when any credential / host / display_name / group change is set.
+
+        Drives whether the PATCH delegates to ``MailAccountService.update`` (the
+        credential/host/transfer path). A pure ``is_active`` toggle skips it and
+        goes straight to ``set_active`` to avoid a needless credential rewrite.
+        """
+        return (
+            self.email is not None
+            or self.password is not None
+            or self.display_name is not None
+            or self.imap_host is not None
+            or self.imap_port is not None
+            or self.imap_ssl is not None
+            or self.smtp_host is not None
+            or self.smtp_port is not None
+            or self.smtp_ssl is not None
+            or self.smtp_starttls is not None
+            or self.smtp_username is not None
+            or self.smtp_password is not None
+            or self.set_group_id
+        )
+
+
+class ExternalMailboxTestResponse(BaseModel):
+    """``200`` body of ``POST /api/external/mailboxes/test`` — both legs OK."""
+
+    imap_ok: bool
+    smtp_ok: bool
+
+
+class ExternalMailboxSyncResponse(BaseModel):
+    """``202`` body of ``POST /api/external/mailboxes/{id}/sync``."""
+
+    queued: bool
+
+
+# --- External write API: tags (ADR-0040 §4, 04-api-contracts §4f-tags) ------
+
+
+class ExternalTagRuleDTO(BaseModel):
+    """A persisted rule of a global tag (response side)."""
+
+    id: int
+    type: str
+    pattern: str
+    created_at: datetime
+
+
+class ExternalTagFullDTO(BaseModel):
+    """A global tag with its rules (ADR-0040 §4).
+
+    Shape mirrors the internal ``TagDTO`` but is a deliberately separate wire
+    type (ADR-0029 §6 stable-contract convention). Built from the service DTO.
+    """
+
+    id: int
+    name: str
+    color: str
+    match_mode: str
+    is_builtin: bool
+    rules: list[ExternalTagRuleDTO]
+    created_at: datetime
+    updated_at: datetime
+
+
+class ExternalTagsResponse(BaseModel):
+    """Envelope for ``GET /api/external/tags``. Empty catalogue → ``[]``."""
+
+    tags: list[ExternalTagFullDTO]
+
+
+class ExternalTagCreateRequest(BaseModel):
+    """Body of ``POST /api/external/tags`` (ADR-0040 §4).
+
+    ``color`` is validated against the fixed palette (``^#[0-9A-Fa-f]{6}$`` +
+    whitelist); ``match_mode`` defaults to ``any``.
+    """
+
+    name: str = Field(min_length=1, max_length=64)
+    color: str
+    # ``any`` (OR) by default — mirrors ``DEFAULT_MATCH_MODE`` / the internal
+    # tag create request (a literal so the ``MatchMode`` type is preserved).
+    match_mode: MatchMode = "any"
+
+    @field_validator("name")
+    @classmethod
+    def _normalise_name(cls, v: str) -> str:
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError("name cannot be empty after stripping")
+        return stripped
+
+    @field_validator("color")
+    @classmethod
+    def _check_color(cls, v: str) -> str:
+        return _normalise_color(v)
+
+
+class ExternalTagUpdateRequest(BaseModel):
+    """Body of ``PATCH /api/external/tags/{id}`` — partial."""
+
+    name: str | None = Field(default=None, min_length=1, max_length=64)
+    color: str | None = None
+    match_mode: MatchMode | None = None
+
+    @field_validator("name")
+    @classmethod
+    def _normalise_name(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError("name cannot be empty after stripping")
+        return stripped
+
+    @field_validator("color")
+    @classmethod
+    def _check_color(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return _normalise_color(v)
+
+
+class ExternalTagRuleCreateRequest(BaseModel):
+    """Body of ``POST /api/external/tags/{id}/rules`` (ADR-0040 §4)."""
+
+    type: RuleType
+    pattern: str = Field(min_length=1, max_length=256)
+
+    @field_validator("pattern")
+    @classmethod
+    def _strip_pattern(cls, v: str) -> str:
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError("pattern cannot be empty after stripping")
+        return stripped
+
+
+class ExternalTagApplyResponse(BaseModel):
+    """``200`` body of ``POST /api/external/tags/{id}/apply-to-existing``."""
+
+    applied_count: int

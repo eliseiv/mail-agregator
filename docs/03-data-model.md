@@ -531,27 +531,31 @@ erDiagram
 
 ### `tags`
 
-Источник истины — [ADR-0017](./adr/ADR-0017-tags.md). Per-user классификационные метки, прикладываемые к `messages` через rule-based матчинг.
+Источник истины — [ADR-0017](./adr/ADR-0017-tags.md) + [ADR-0040](./adr/ADR-0040-global-tags.md) (глобальные теги). Классификационные метки, прикладываемые к `messages` через rule-based матчинг. **С ADR-0040 тег может быть глобальным** (`user_id IS NULL`) — единый админский каталог, применяется ко ВСЕМ письмам системы.
 
 | Колонка | Тип | Constraints | Описание |
 | --- | --- | --- | --- |
 | `id` | BIGSERIAL | PK | |
-| `user_id` | BIGINT | NOT NULL, FK → `users(id)` ON DELETE CASCADE | Владелец тега. Tag всегда per-user. |
+| `user_id` | BIGINT | **NULL** (было NOT NULL — ADR-0040), FK → `users(id)` ON DELETE CASCADE | Владелец тега. **`NULL` = глобальный тег** (применяется ко всем письмам, headless-каталог CRM). Не-NULL — персональный (обратная совместимость). |
 | `name` | TEXT | NOT NULL | Видимое имя тега (1..64 символа; UI-валидация). Произвольная строка, в т.ч. кириллица. |
 | `color` | TEXT | NOT NULL | Hex `#RRGGBB`. Backend валидирует: (а) regex `^#[0-9A-Fa-f]{6}$`; (б) значение принадлежит whitelist из 8 цветов палитры (см. `08-frontend.md` сек. 5.1). UI выбирает radio-кнопкой из палитры. |
-| `is_builtin` | BOOLEAN | NOT NULL DEFAULT false | true для 4 системных тегов (`DPLA.PLA`, `Диспут`, `Отменить подписку`, `Продление аккаунта`). Запрет на DELETE; rules/name/color редактируемы. |
+| `is_builtin` | BOOLEAN | NOT NULL DEFAULT false | true для системных тегов (`backend/app/tags/builtin.py`). С ADR-0040 builtin **глобальны** (`user_id IS NULL`), сидируются в lifespan. Запрет на DELETE; rules/name/color редактируемы. |
 | `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | |
 | `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | Обновляется триггером `BEFORE UPDATE ON tags`. |
 
 **Constraints:**
-- UNIQUE `(user_id, name)` — у одного пользователя не может быть двух тегов с одним именем.
+- UNIQUE `(user_id, name)` — у одного пользователя не может быть двух тегов с одним именем (для персональных; NULL-`user_id` в составном UNIQUE не даёт коллизий → см. partial-unique ниже).
+- **Partial-unique `uq_tags_global_name (name) WHERE user_id IS NULL`** (ADR-0040) — глобальные имена уникальны. Новая alembic-ревизия (down_revision `20260706_022`): `ALTER COLUMN user_id DROP NOT NULL` + `CREATE UNIQUE INDEX uq_tags_global_name ON tags(name) WHERE user_id IS NULL`.
 - CHECK `char_length(name) BETWEEN 1 AND 64`.
 - CHECK `color ~ '^#[0-9A-Fa-f]{6}$'`.
 
 **Индексы:**
-- `INDEX (user_id)` — list-tags-for-user (часто, при каждом рендере inbox для filter dropdown).
+- `INDEX (user_id)` — list-tags-for-user.
+- `uq_tags_global_name` (partial-unique, см. выше).
 
 **Триггер:** `BEFORE UPDATE ON tags` — `NEW.updated_at = now()`.
+
+**Применение (ADR-0040 §2):** `backend/app/tags/sql.py::APPLY_TAGS_TO_MESSAGE` использует `LEFT JOIN users` + ветку видимости `t.user_id IS NULL` (глобальный тег → все письма), иначе INNER JOIN выронил бы глобальные теги. Семантика матчинга ADR-0017 (whole-word/case-sensitive/escape) и идемпотентность `ON CONFLICT (message_id,tag_id) DO NOTHING` — не меняются. Builtin создаются в lifespan (`seed_builtin_tags`, образец `seed_super_admin`) вместо ленивого per-login.
 
 **Объём:** ≤ 5 пользователей × ~20 тегов = ≤ 100 строк.
 
@@ -780,7 +784,7 @@ Many-to-many линки тегов и сообщений. Создаются wor
 
 ### Заполнение builtin-тегов
 
-Builtin-теги создаются **не через миграцию**, а через **post-login hook** в `auth.AuthService` — при первом успешном login пользователя или завершении set-password flow (см. ADR-0017 §6 и `05-modules.md` модуль `auth`). Реализация — в `backend/app/tags/builtin.py` (статичный список из 4 объектов).
+Builtin-теги создаются **не через миграцию**, а **идемпотентным сидированием на старте приложения** — **глобальными** (`user_id IS NULL`, единый каталог), по [ADR-0040](./adr/ADR-0040-global-tags.md): функция `seed_builtin_tags(session)` в lifespan `backend/app/main.py::create_app` (по образцу `seed_super_admin`). Прежний ленивый **post-login hook** `TagsService.ensure_builtin_tags(user_id)` (персональные builtin, ADR-0017 §6) **отменён ADR-0040** и поведенчески мёртв (UI-логина в агрегаторе не будет — ADR-0041). Реализация списка — в `backend/app/tags/builtin.py` (статичный список из 4 объектов).
 
 Псевдокод (для исполнителя — это всё в коде, не в DDL):
 
@@ -806,11 +810,11 @@ BUILTIN_TAGS = [
 ]
 ```
 
-`TagsService.ensure_builtin_tags(user_id)`:
-1. `SELECT 1 FROM tags WHERE user_id=:uid AND is_builtin=true LIMIT 1` — если есть, return.
-2. Иначе — в одной транзакции INSERT всех 4 tags + tag_rules.
+`seed_builtin_tags(session)` (lifespan, [ADR-0040](./adr/ADR-0040-global-tags.md)):
+1. Для каждого из 4 builtin-тегов — `INSERT … ON CONFLICT (name) WHERE user_id IS NULL DO NOTHING` (идемпотентность по partial-unique `uq_tags_global_name`), с `user_id = NULL`, `is_builtin = true`.
+2. Правила (`tag_rules`) создаются в той же транзакции.
 
-Идемпотентен: повторный вызов NoOp.
+Идемпотентен: повторный старт приложения — NoOp. Прежний `TagsService.ensure_builtin_tags(user_id)` (per-login, персональные builtin) — мёртвый код после ADR-0040 (см. ADR-0040 §4).
 
 ---
 
@@ -845,7 +849,7 @@ BUILTIN_TAGS = [
 - Используем Alembic (см. `02-tech-stack.md`). Каждая миграция — отдельный файл в `backend/migrations/versions/`.
 - **Первая миграция (V001_initial)** создаёт всю схему выше + триггеры `updated_at` (за исключением tags-таблиц — см. ниже).
 - Seed супер-админа — отдельная init-фаза приложения (не миграция; см. `05-modules.md → admin module → seed flow`).
-- **Миграция `002_add_tags`** (ADR-0017) создаёт `tags`, `tag_rules`, `message_tags` + триггер `updated_at` на `tags`. Builtin-теги в эту миграцию **не попадают** — они создаются post-login hook'ом (см. ADR-0017 §6).
+- **Миграция `002_add_tags`** (ADR-0017) создаёт `tags`, `tag_rules`, `message_tags` + триггер `updated_at` на `tags`. Builtin-теги в эту миграцию **не попадают** — они сидируются в lifespan (`seed_builtin_tags`, глобальные `user_id IS NULL`, [ADR-0040](./adr/ADR-0040-global-tags.md); ранее — per-login hook ADR-0017 §6, отменён).
 - **Миграция `003_groups_and_roles`** (ADR-0019 + ADR-0020) — последовательность:
   1. `CREATE TABLE groups (...)` (см. секцию `groups` выше).
   2. `ALTER TABLE users ADD COLUMN role TEXT NULL` (nullable временно).

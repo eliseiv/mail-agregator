@@ -41,17 +41,34 @@ class TagsRepo:
         stmt = select(exists().where(Tag.user_id == user_id, Tag.is_builtin.is_(True)))
         return bool((await self._s.execute(stmt)).scalar_one())
 
+    # --- Global tags (ADR-0040) -------------------------------------------
+
+    async def list_global(self) -> list[Tag]:
+        """All global tags (``user_id IS NULL``) — the headless-CRM catalogue."""
+        stmt = select(Tag).where(Tag.user_id.is_(None)).order_by(Tag.is_builtin.desc(), Tag.name)
+        return list((await self._s.execute(stmt)).scalars().all())
+
+    async def get_global(self, tag_id: int) -> Tag | None:
+        """Return the tag iff it is global (``user_id IS NULL``) — 404-on-mismatch."""
+        stmt = select(Tag).where(Tag.id == tag_id, Tag.user_id.is_(None))
+        return (await self._s.execute(stmt)).scalar_one_or_none()
+
+    async def find_global_by_name(self, name: str) -> Tag | None:
+        stmt = select(Tag).where(Tag.user_id.is_(None), Tag.name == name)
+        return (await self._s.execute(stmt)).scalar_one_or_none()
+
     # --- Writes ------------------------------------------------------------
 
     async def create(
         self,
         *,
-        user_id: int,
+        user_id: int | None,
         name: str,
         color: str,
         is_builtin: bool,
         match_mode: str = "any",
     ) -> Tag:
+        # ADR-0040: ``user_id=None`` creates a GLOBAL tag (headless catalogue).
         tag = Tag(
             user_id=user_id,
             name=name,

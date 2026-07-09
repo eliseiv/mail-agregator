@@ -256,7 +256,17 @@ class TestMailboxesContent:
         make_secondary_team_mailbox: Callable[..., Any],
     ) -> None:
         """A mailbox exposes EXACTLY {id, email, display_name, group_id,
-        is_active} with the DB values — and no secret/owner columns."""
+        is_active} + the ADR-0039 §4 sync-status triplet (last_synced_at /
+        last_sync_error / consecutive_failures) with the DB values — and no
+        secret/owner columns.
+
+        round-S4-A: ADR-0039 §4 (approved) WIDENED ``ExternalMailboxDTO`` with the
+        sync-status triplet for the CRM status dot (``docs/04-api-contracts.md``
+        §4d-mailboxes DTO line + ``backend/app/external/schemas.py``
+        ``ExternalMailboxDTO``). The pre-ADR-0039 5-field ``==`` shape was
+        orphaned by that widening; the expected set is realigned to the 8-field
+        contract. A freshly-created mailbox has never synced → the triplet is
+        ``(None, None, 0)``."""
         acc = await make_secondary_team_mailbox(
             username="mb_owner",
             group_name="Sales",
@@ -270,6 +280,9 @@ class TestMailboxesContent:
             "display_name": "Sales Box",
             "group_id": acc.group_id,
             "is_active": True,
+            "last_synced_at": None,
+            "last_sync_error": None,
+            "consecutive_failures": 0,
         }
         forbidden = {
             "encrypted_password",

@@ -144,6 +144,14 @@ LIMIT_EXTERNAL_API = Limit(name="external_api", capacity=120, window_seconds=60)
 # ``settings.EXTERNAL_REPLY_RATE_LIMIT_PER_MINUTE`` (same override pattern as
 # ``LIMIT_EXTERNAL_API``); the static value here is the default fallback.
 LIMIT_EXTERNAL_REPLY = Limit(name="external_reply", capacity=30, window_seconds=60)
+# External write API — mailboxes + tags CRUD (ADR-0039 §1): 60 req / 60 s per
+# client IP — a SEPARATE budget from read (``LIMIT_EXTERNAL_API`` 120/min) and
+# reply (``LIMIT_EXTERNAL_REPLY`` 30/min) so a write flood cannot evict read /
+# reply and vice-versa. Consumed FIRST in the router — before any key work —
+# like the read/reply limits. ``capacity`` is overridden at consume-time from
+# ``settings.EXTERNAL_WRITE_RATE_LIMIT_PER_MINUTE`` (same override pattern as
+# ``LIMIT_EXTERNAL_API``); the static value here is the default fallback.
+LIMIT_EXTERNAL_WRITE = Limit(name="external_write", capacity=60, window_seconds=60)
 
 
 async def consume(limit: Limit, key: str) -> None:

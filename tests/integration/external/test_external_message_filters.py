@@ -1,17 +1,25 @@
-"""Integration tests for the external message filters (ADR-0037 §3).
+"""Integration tests for the external message filters (ADR-0037 §3 → ADR-0039 §3).
 
-``GET /api/external/messages`` gains two OPTIONAL query filters —
+``GET /api/external/messages`` carries two OPTIONAL query filters —
 ``mail_account_id`` and ``group_id`` — that NARROW the canonical mailbox set in
 BOTH pagination modes (``order=asc`` forward / ``order=desc`` backward) without
-changing the cursor semantics. The two are mutually exclusive (``400
-validation_error``, ``field="filter"``); a missing/foreign/non-canonical id
-resolves to an EMPTY page (never 404 — ADR-0029 §3 invariant); an out-of-bounds
-value (``<1``) is a FastAPI query ``400 validation_error`` (``field`` in
-``details.errors[].loc``). Omitting both is byte-for-byte ADR-0029/0036 (BC).
+changing the cursor semantics. ADR-0039 §3 **supersedes** the ADR-0037
+mutual-exclusion: both filters are now REPEATABLE (``list[int]``) and
+**AND-combinable**. The effective mailbox set is the intersection
+``canonical ∩ (union of group_id) ∩ set(mail_account_id)``; an empty intersection
+yields an EMPTY page (never 404, never 400); a missing/foreign/non-canonical id
+simply does not appear in the intersection; a single value of either filter is
+byte-for-byte backward compatible. ``field="filter"`` is NEVER returned any more
+(the mutual-exclusion 400 was removed). An out-of-bounds ``<1`` value is no
+longer a FastAPI 400 either — the router dropped the per-element ``ge`` bound —
+so a ``mail_account_id=0`` just narrows to nothing (empty page). Omitting both
+is byte-for-byte ADR-0029/0036 (BC).
 
-Source of truth: ``docs/adr/ADR-0037-external-teams-mailboxes-message-filters.md``
-+ ``docs/04-api-contracts.md`` §4d (filters table) +
-``backend/app/external/{router,service}.py``.
+Source of truth: ``docs/adr/ADR-0039-external-write-api.md`` §3 +
+``docs/04-api-contracts.md`` §4d (filters table) +
+``backend/app/external/{router,service}.py`` (``_resolve_account_ids`` = the
+intersection; the router binds ``mail_account_id`` / ``group_id`` as
+``list[int] | None`` with no ``ge``).
 
 Only the HTTP boundary is exercised through the network — DB state is seeded
 directly against real Postgres so the canonical-dedup ∩ filter resolution and
@@ -184,12 +192,53 @@ class TestGroupFilter:
 
 
 # ===========================================================================
-# 3. Mutual exclusion — 400 validation_error, field=filter (ADR-0037 §3)
+# 3. AND-combination — canonical ∩ (union group_id) ∩ set(mail_account_id) (ADR-0039 §3)
+#    (the ADR-0037 mutual-exclusion is SUPERSEDED — both filters coexist)
 # ===========================================================================
 
 
-class TestMutualExclusion:
-    async def test_both_filters_return_400_field_filter(
+class TestAndCombination:
+    @pytest.mark.parametrize("order", ["asc", "desc"])
+    async def test_group_and_mail_account_intersect(
+        self,
+        client: httpx.AsyncClient,
+        api_key_on: str,
+        make_message: Callable[..., Any],
+        make_mail_account: Callable[..., Any],
+        make_secondary_team_mailbox: Callable[..., Any],
+        order: str,
+    ) -> None:
+        """Both filters set → the INTERSECTION, not a 400. A mailbox that is in
+        the requested team AND is the requested mail_account survives; a sibling
+        mailbox of the SAME team is excluded by the mail_account filter, and a
+        mailbox of ANOTHER team is excluded by the group filter."""
+        acc_a1 = await make_secondary_team_mailbox(
+            username="ac_a1", group_name="AC-A", email="ac-a1@example.com"
+        )
+        # Second mailbox of the SAME team A (same owner + group) — the group
+        # filter would include it, but the mail_account filter must exclude it.
+        acc_a2 = await make_mail_account(
+            acc_a1.user_id, "ac-a2@example.com", group_id=acc_a1.group_id
+        )
+        acc_b = await make_secondary_team_mailbox(
+            username="ac_b", group_name="AC-B", email="ac-b@example.com"
+        )
+        m_a1 = await make_message(acc_a1.id, uid=1)
+        await make_message(acc_a2.id, uid=1)  # same team, excluded by mail_account
+        await make_message(acc_b.id, uid=1)  # other team, excluded by group
+
+        body = await _get(
+            client,
+            api_key_on,
+            order=order,
+            group_id=acc_a1.group_id,
+            mail_account_id=acc_a1.id,
+            limit=200,
+        )
+        got = {m["id"] for m in body["messages"]}
+        assert got == {m_a1.id}, "only the mailbox in BOTH the team AND the id set survives"
+
+    async def test_repeated_mail_account_ids_are_unioned_then_intersected(
         self,
         client: httpx.AsyncClient,
         api_key_on: str,
@@ -197,33 +246,128 @@ class TestMutualExclusion:
         make_mail_account: Callable[..., Any],
         make_message: Callable[..., Any],
     ) -> None:
-        acc = await make_mail_account(super_admin.id, "mx@example.com")
+        """``?mail_account_id=A&mail_account_id=B`` returns messages of BOTH A and
+        B (the id set is a union); a third mailbox C is excluded."""
+        acc_a = await make_mail_account(super_admin.id, "ra@example.com")
+        acc_b = await make_mail_account(super_admin.id, "rb@example.com")
+        acc_c = await make_mail_account(super_admin.id, "rc@example.com")
+        a1 = await make_message(acc_a.id, uid=1)
+        b1 = await make_message(acc_b.id, uid=1)
+        await make_message(acc_c.id, uid=1)
+
+        resp = await client.get(
+            _URL,
+            headers={"X-API-Key": api_key_on},
+            params=[("mail_account_id", acc_a.id), ("mail_account_id", acc_b.id), ("limit", 200)],
+        )
+        assert resp.status_code == 200, resp.text
+        got = {m["id"] for m in resp.json()["messages"]}
+        assert got == {a1.id, b1.id}
+
+    async def test_repeated_group_ids_are_unioned(
+        self,
+        client: httpx.AsyncClient,
+        api_key_on: str,
+        make_message: Callable[..., Any],
+        make_secondary_team_mailbox: Callable[..., Any],
+    ) -> None:
+        """``?group_id=G1&group_id=G2`` returns messages of BOTH teams (union)."""
+        acc_a = await make_secondary_team_mailbox(
+            username="rg_a", group_name="RG-A", email="rg-a@example.com"
+        )
+        acc_b = await make_secondary_team_mailbox(
+            username="rg_b", group_name="RG-B", email="rg-b@example.com"
+        )
+        a1 = await make_message(acc_a.id, uid=1)
+        b1 = await make_message(acc_b.id, uid=1)
+
+        resp = await client.get(
+            _URL,
+            headers={"X-API-Key": api_key_on},
+            params=[("group_id", acc_a.group_id), ("group_id", acc_b.group_id), ("limit", 200)],
+        )
+        assert resp.status_code == 200, resp.text
+        got = {m["id"] for m in resp.json()["messages"]}
+        assert got == {a1.id, b1.id}
+
+    async def test_disjoint_group_and_mail_account_yield_empty_page_not_400(
+        self,
+        client: httpx.AsyncClient,
+        api_key_on: str,
+        make_message: Callable[..., Any],
+        make_secondary_team_mailbox: Callable[..., Any],
+    ) -> None:
+        """A mail_account of team A intersected with group_id of team B → the
+        intersection is empty → an empty 200 page, NOT a 400 and NOT a 404
+        (ADR-0039 §3 — the mutual-exclusion is gone)."""
+        acc_a = await make_secondary_team_mailbox(
+            username="dj_a", group_name="DJ-A", email="dj-a@example.com"
+        )
+        acc_b = await make_secondary_team_mailbox(
+            username="dj_b", group_name="DJ-B", email="dj-b@example.com"
+        )
+        await make_message(acc_a.id, uid=1)
+        await make_message(acc_b.id, uid=1)
+
+        body = await _get(
+            client,
+            api_key_on,
+            group_id=acc_b.group_id,
+            mail_account_id=acc_a.id,
+            limit=50,
+        )
+        assert body["messages"] == []
+        assert body["has_more"] is False
+
+
+class TestFieldFilterNeverReturned:
+    async def test_both_filters_return_200_never_field_filter(
+        self,
+        client: httpx.AsyncClient,
+        api_key_on: str,
+        super_admin: Any,
+        make_mail_account: Callable[..., Any],
+        make_message: Callable[..., Any],
+    ) -> None:
+        """Both filters set → 200 (intersection), NOT the old 400 ``field=filter``.
+        Regression guard: ``field="filter"`` must never appear in any response."""
+        acc = await make_mail_account(super_admin.id, "nf@example.com")
         await make_message(acc.id, uid=1)
         resp = await client.get(
             _URL,
             headers={"X-API-Key": api_key_on},
             params={"mail_account_id": acc.id, "group_id": 1},
         )
-        assert resp.status_code == 400
-        err = resp.json()["error"]
-        assert err["code"] == "validation_error"
-        assert err["field"] == "filter"
+        assert resp.status_code == 200, resp.text
+        assert "field" not in str(resp.json()), "field=filter must never be returned any more"
 
-    async def test_mutual_exclusion_checked_before_db_even_on_empty_system(
+    async def test_both_filters_on_empty_system_is_empty_200_not_400(
         self, client: httpx.AsyncClient, api_key_on: str
     ) -> None:
-        """Both filters set → 400 ``field=filter`` even when NO mailboxes/groups
-        exist. The mutual-exclusion is validated BEFORE any DB resolve, so the
-        empty system must NOT short-circuit to an empty 200 page (ADR-0037 §3)."""
+        """Both filters set on an empty system → an empty 200 page, not a 400.
+        The old ADR-0037 pre-DB mutual-exclusion 400 is removed (ADR-0039 §3)."""
         resp = await client.get(
             _URL,
             headers={"X-API-Key": api_key_on},
             params={"mail_account_id": 999_999, "group_id": 888_888},
         )
-        assert resp.status_code == 400, resp.text
-        err = resp.json()["error"]
-        assert err["code"] == "validation_error"
-        assert err["field"] == "filter"
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["messages"] == []
+        assert body["has_more"] is False
+
+    @pytest.mark.parametrize("bad", [0, -1])
+    async def test_below_one_ids_no_longer_400_just_empty(
+        self, client: httpx.AsyncClient, api_key_on: str, bad: int
+    ) -> None:
+        """The ADR-0037 per-element ``ge=1`` bound was dropped (ADR-0039 §3): a
+        ``mail_account_id=0`` is no longer a FastAPI 400 — it simply never
+        appears in the canonical intersection → an empty 200 page."""
+        resp = await client.get(
+            _URL, headers={"X-API-Key": api_key_on}, params={"mail_account_id": bad}
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["messages"] == []
 
 
 # ===========================================================================
@@ -341,39 +485,6 @@ class TestEmptyPageNotFound:
         body = await _get(client, api_key_on, group_id=dup.group_id, limit=50)
         assert body["messages"] == [], "all-non-canonical team → empty page"
         assert body["has_more"] is False
-
-
-# ===========================================================================
-# 5. Border validation — <1 → 400 with the per-field loc (ADR-0037 §3)
-# ===========================================================================
-
-
-class TestBorders:
-    def _loc_str(self, body: dict[str, Any]) -> str:
-        errors = body["error"]["details"]["errors"]
-        return " ".join(e["loc"] for e in errors)
-
-    @pytest.mark.parametrize("bad", [0, -1])
-    async def test_mail_account_id_below_one_returns_400_field(
-        self, client: httpx.AsyncClient, api_key_on: str, bad: int
-    ) -> None:
-        resp = await client.get(
-            _URL, headers={"X-API-Key": api_key_on}, params={"mail_account_id": bad}
-        )
-        assert resp.status_code == 400, resp.text
-        body = resp.json()
-        assert body["error"]["code"] == "validation_error"
-        assert "mail_account_id" in self._loc_str(body)
-
-    @pytest.mark.parametrize("bad", [0, -1])
-    async def test_group_id_below_one_returns_400_field(
-        self, client: httpx.AsyncClient, api_key_on: str, bad: int
-    ) -> None:
-        resp = await client.get(_URL, headers={"X-API-Key": api_key_on}, params={"group_id": bad})
-        assert resp.status_code == 400, resp.text
-        body = resp.json()
-        assert body["error"]["code"] == "validation_error"
-        assert "group_id" in self._loc_str(body)
 
 
 # ===========================================================================

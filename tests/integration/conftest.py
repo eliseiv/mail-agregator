@@ -24,6 +24,15 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from tests.conftest import _pg_available, _redis_available, _s3_available
 
 # Order matters for TRUNCATE: child tables first (or use CASCADE).
+#
+# ``tags`` is truncated explicitly (ADR-0040): global tags (``user_id IS NULL``)
+# are NOT removed by the ``users`` CASCADE — they have no owner row to cascade
+# from — so without this line the global builtin catalogue seeded by an
+# app-lifespan test (``seed_builtin_tags``) survives every subsequent
+# ``_db_truncate_all`` and leaks into later tests, auto-tagging their messages
+# (breaks ``TG_NOTIFY_ALL_MESSAGES=false`` recipient resolution and the external
+# tag catalogue assertions). CASCADE from ``tags`` clears ``tag_rules`` /
+# ``message_tags`` too.
 _TABLES_TRUNCATE_ORDER = [
     "sent_attachments",
     "sent_messages",
@@ -31,6 +40,7 @@ _TABLES_TRUNCATE_ORDER = [
     "messages",
     "mail_accounts",
     "admin_audit",
+    "tags",
     "users",
 ]
 

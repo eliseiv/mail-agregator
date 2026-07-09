@@ -30,7 +30,7 @@ from fastapi.staticfiles import StaticFiles
 from backend.app.accounts.router import router as accounts_router
 from backend.app.admin.router import router as admin_router
 from backend.app.auth.router import router as auth_router
-from backend.app.auth.service import seed_super_admin
+from backend.app.auth.service import seed_crm_service_user, seed_super_admin
 from backend.app.csrf import CSRFMiddleware
 from backend.app.exceptions import (
     NotAuthenticatedError,
@@ -52,6 +52,7 @@ from backend.app.oauth.router import router as oauth_router
 from backend.app.rate_limit import install_rate_limiter
 from backend.app.send.router import router as send_router
 from backend.app.tags.router import router as tags_router
+from backend.app.tags.service import seed_builtin_tags
 from backend.app.telegram.router import router as telegram_router
 from backend.app.webhooks.router import router as webhooks_router
 from shared.config import get_settings
@@ -72,10 +73,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[dict[str, Any]]:
     # DB engine.
     init_engine(role="api")
 
-    # Seed super-admin (idempotent).
+    # Seed super-admin + crm-service tech user (ADR-0039) + global builtin tags
+    # (ADR-0040) — all idempotent, one transaction.
     try:
         async with make_session() as s, s.begin():
             await seed_super_admin(s)
+            await seed_crm_service_user(s)
+            await seed_builtin_tags(s)
     except Exception as exc:  # — log + crash the boot loud
         log.error("admin_seed_failed", detail=str(exc)[:300])
         raise

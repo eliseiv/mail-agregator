@@ -16,6 +16,7 @@ from typing import Literal
 
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerifyMismatchError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.audit import AuditWriter
@@ -25,10 +26,10 @@ from backend.app.exceptions import (
 )
 from backend.app.repositories.users import UsersRepo
 from backend.app.sessions import SessionStore, SetupSessionStore
-from backend.app.tags.service import TagsService
 from shared.config import get_settings
 from shared.crypto import encrypt_user_password
 from shared.logging import get_logger
+from shared.models import ROLE_SUPER_ADMIN
 
 log = get_logger(__name__)
 
@@ -204,9 +205,10 @@ class AuthService:
 
         await self._users.record_login_success(user.id)
 
-        # Builtin tags post-login hook (ADR-0017 §6). Idempotent — no-op
-        # for users who already have any builtin row.
-        await TagsService(self._db).ensure_builtin_tags(user_id=user.id)
+        # ADR-0040: builtin tags are now GLOBAL and seeded once at startup
+        # (``seed_builtin_tags`` in the API lifespan) — the previous per-login
+        # ``ensure_builtin_tags`` hook is removed (headless CRM has no UI login;
+        # global catalogue is login-independent).
 
         is_super = user.role == "super_admin"
         token, csrf = await self._sessions.create(user.id, user.role, user.group_id, ip, user_agent)
@@ -267,10 +269,8 @@ class AuthService:
         # for users that joined the system via the set-password flow.
         await self._users.record_login_success(user.id)
 
-        # Builtin tags post-login hook (ADR-0017 §6) — fired here too so
-        # that the user-after-set-password-flow lands on /tags with the
-        # four builtin rows already present. Idempotent.
-        await TagsService(self._db).ensure_builtin_tags(user_id=user.id)
+        # ADR-0040: builtin tags are global + seeded at startup — no per-login
+        # ``ensure_builtin_tags`` hook (see the login path above).
 
         is_super = user.role == "super_admin"
         session_token, csrf = await self._sessions.create(
@@ -385,6 +385,74 @@ async def seed_super_admin(session: AsyncSession) -> str:
     else:
         log.info("admin_seed_password_updated", username=settings.ADMIN_LOGIN)
     return status
+
+
+# --- crm-service technical user seed (ADR-0039 §Q-0039-1) -------------------
+
+# Username of the headless-CRM technical owner of externally-created mailboxes.
+# Role ``super_admin``, ``group_id NULL``, no login password, no telegram_links
+# (so it never becomes a notification recipient — the recipient SQL INNER-JOINs
+# ``telegram_links``). Lowercase to satisfy ``ck_users_username_lower``.
+CRM_SERVICE_USERNAME = "crm-service"
+
+
+async def seed_crm_service_user(session: AsyncSession) -> str:
+    """Idempotent seed of the ``crm-service`` technical user (ADR-0039 §Q-0039-1).
+
+    Owner of all mailboxes created through the external write API. Seeded on
+    startup by the pattern of :func:`seed_super_admin`. Returns
+    ``"created"`` | ``"updated"`` | ``"unchanged"``.
+
+    No login password (``password_hash=NULL``): interactive login is not
+    provided for this account. It is a second ``super_admin`` but is harmless
+    for delivery/tagging — it has no ``telegram_links`` (no notifications) and
+    no personal tags (ADR-0039 audit).
+    """
+    repo = UsersRepo(session)
+    existing = await repo.get_by_username(CRM_SERVICE_USERNAME)
+    if existing is not None:
+        # Defensive: keep the invariants (super_admin ⇒ group_id IS NULL) even
+        # if the row was tampered with. Never sets a login password.
+        changed = False
+        if existing.role != ROLE_SUPER_ADMIN:
+            existing.role = ROLE_SUPER_ADMIN
+            changed = True
+        if existing.group_id is not None:
+            existing.group_id = None
+            changed = True
+        if changed:
+            existing.updated_at = datetime.now(UTC)
+            await session.flush()
+            log.info("crm_service_seed_updated")
+            return "updated"
+        log.info("crm_service_seed_unchanged")
+        return "unchanged"
+
+    # Race-safety (by the pattern of ``seed_super_admin`` / ``seed_builtin_tags``):
+    # two workers starting together both see ``existing=None`` (neither has
+    # committed), both INSERT, and the loser hits the ``username`` UNIQUE. Run
+    # the INSERT in a SAVEPOINT so an ``IntegrityError`` rolls back ONLY the
+    # nested block (not the shared lifespan transaction that also carries
+    # ``seed_super_admin`` / ``seed_builtin_tags``); on conflict re-fetch the
+    # row the winner created and report it as already present.
+    try:
+        async with session.begin_nested():
+            await repo.create(
+                username=CRM_SERVICE_USERNAME,
+                email=None,
+                role=ROLE_SUPER_ADMIN,
+                group_id=None,
+                display_name=None,
+                password_hash=None,
+                password_reset_required=False,
+                password_encrypted=None,
+            )
+    except IntegrityError:
+        # Another process won the race — the row now exists.
+        log.info("crm_service_seed_race_skipped")
+        return "unchanged"
+    log.info("crm_service_seed_created")
+    return "created"
 
 
 # --- Helper to surface AccountLockedError uniformly -----------------------

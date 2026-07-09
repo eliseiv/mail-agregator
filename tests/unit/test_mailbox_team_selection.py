@@ -32,7 +32,7 @@ from backend.app.accounts.schemas import (
 )
 from backend.app.accounts.service import MailAccountService
 from backend.app.deps import VisibilityScope
-from backend.app.exceptions import ForbiddenError, NotFoundError
+from backend.app.exceptions import ForbiddenError, GroupNotFoundError, NotFoundError
 from backend.app.groups.service import GroupsService
 from shared.models import (
     Group,
@@ -321,10 +321,10 @@ class TestCreateGroupSelection:
         await db_session.commit()
 
         svc = MailAccountService(db_session)
-        with pytest.raises(NotFoundError) as ei:
+        with pytest.raises(GroupNotFoundError) as ei:
             async with db_session.begin():
                 await svc.create(scope=_scope(member), payload=_create_payload(group_id=999_999))
-        assert ei.value.message == "group_not_found"
+        assert ei.value.code == "group_not_found"
         assert ei.value.status_code == 404
 
     async def test_leader_create_self_into_own_membership(
@@ -398,10 +398,11 @@ class TestCreateGroupSelection:
         sa = await seed.super_admin()
         await db_session.commit()
         svc = MailAccountService(db_session)
-        with pytest.raises(NotFoundError) as ei:
+        with pytest.raises(GroupNotFoundError) as ei:
             async with db_session.begin():
                 await svc.create(scope=_scope(sa), payload=_create_payload(group_id=424242))
-        assert ei.value.message == "group_not_found"
+        assert ei.value.code == "group_not_found"
+        assert ei.value.status_code == 404
 
     async def test_resolve_target_user_id_not_weakened_member_on_other(
         self, db_session: AsyncSession, seed: Seeder
@@ -576,14 +577,15 @@ class TestTransfer:
         acc = await seed.mail_account(user_id=leader.id, group_id=g1.id, email="b@x.com")
         await db_session.commit()
         svc = MailAccountService(db_session)
-        with pytest.raises(NotFoundError) as ei:
+        with pytest.raises(GroupNotFoundError) as ei:
             async with db_session.begin():
                 await svc.update(
                     scope=_scope(leader, frozenset({g1.id})),
                     account_id=acc.id,
                     payload=MailAccountUpdateRequest(group_id=999_001),
                 )
-        assert ei.value.message == "group_not_found"
+        assert ei.value.code == "group_not_found"
+        assert ei.value.status_code == 404
 
     async def test_noop_transfer_writes_no_audit_and_no_change(
         self, db_session: AsyncSession, seed: Seeder

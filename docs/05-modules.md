@@ -65,7 +65,7 @@ backend/
       mime.py
     tags/
       router.py            # API + HTML routes для /tags, /api/tags
-      service.py           # TagsService (create, update, delete, apply_to_existing, ensure_builtin_tags, apply_tags_to_message)
+      service.py           # TagsService (create, update, delete, apply_to_existing, apply_tags_to_message; ensure_builtin_tags — legacy/мёртв после ADR-0040, builtin сидируются глобально в lifespan seed_builtin_tags)
       schemas.py           # Pydantic для request/response
       builtin.py           # Список 4 builtin-тегов + правил (статичный)
       sql.py               # Готовые SQL для apply (используются service'ом и worker'ом)
@@ -454,15 +454,9 @@ async def get_visibility_scope(session: SessionData = Depends(get_current_sessio
 
 Все Service-методы, которые читают/листают `mail_accounts` или `messages`, принимают `scope: VisibilityScope` и используют его для построения SQL WHERE-фильтра (см. модули `accounts`, `messages`).
 
-### Post-login hook: builtin-теги (ADR-0017)
+### Post-login hook: builtin-теги (ADR-0017 — ОТМЕНЁН ADR-0040)
 
-После успешного создания сессии (в обоих flow — `complete_set_password` и `login`) и **до** возврата `LoginResult` auth-модуль вызывает:
-
-```python
-await tags_service.ensure_builtin_tags(user_id=user.id)
-```
-
-Метод идемпотентен (см. `03-data-model.md` секция "Заполнение builtin-тегов" и модуль 18 ниже). Ошибка вызова — пробрасывается (это безопасно: builtin-теги — функциональный must-have; если БД отвалилась — login не удался по тем же причинам).
+> **Отменено [ADR-0040](./adr/ADR-0040-global-tags.md).** Прежде auth-модуль в обоих flow (`complete_set_password`/`login`) до возврата `LoginResult` вызывал `await tags_service.ensure_builtin_tags(user_id=user.id)` — ленивое per-login-создание **персональных** builtin-тегов. С ADR-0040 builtin-теги **глобальны** (`user_id IS NULL`) и сидируются **один раз на старте приложения** (`seed_builtin_tags` в lifespan, по образцу `seed_super_admin`); post-login hook больше **не вызывается** (а с ADR-0041 UI-логина в агрегаторе не будет вовсе). См. `03-data-model.md` секция «Заполнение builtin-тегов» и модуль `tags` ниже.
 
 Логирование: `event=builtin_tags_created` (новые) или `event=builtin_tags_unchanged` (уже были).
 
@@ -2122,7 +2116,7 @@ class TagsService:
     async def add_rule(user_id: int, tag_id: int, type_: str, pattern: str) -> RuleDTO
     async def delete_rule(user_id: int, tag_id: int, rule_id: int) -> None
     async def apply_to_existing(user_id: int, tag_id: int) -> int          # returns applied_count
-    async def ensure_builtin_tags(user_id: int) -> None                    # idempotent; called from auth post-login hook
+    async def ensure_builtin_tags(user_id: int) -> None                    # LEGACY (per-login, персональные) — мёртв после ADR-0040; builtin теперь глобальны и сидируются в lifespan (seed_builtin_tags)
     async def apply_tags_to_message(*, message: _MessageLike, mail_account_id: int) -> int  # worker hook; навешивает теги ВСЕХ видящих письмо пользователей (owner + члены команды ящика через user_groups (ADR-0030) + super_admin), см. ADR-0017 §5/§5.1. round-29: message несёт body_text И body_html (_MessageLike.body_html) — body_contains матчит оба, см. §4.3
 ```
 
@@ -2151,10 +2145,10 @@ class MessageTagsRepo:
 ### Зависимости
 - repositories.tags, repositories.users (для ownership), repositories.messages (для apply_to_existing count guard).
 - Не зависит от Redis / MinIO.
-- Используется из `auth.AuthService` (ensure_builtin_tags), `messages.MessageService` (получение tags при list/get), `worker.sync_cycle.save_message` (apply_tags_to_message).
+- Используется из `messages.MessageService` (получение tags при list/get), `worker.sync_cycle.save_message` (apply_tags_to_message). Builtin-теги сидируются глобально в lifespan (`seed_builtin_tags`, ADR-0040); прежний вызов из `auth.AuthService` (`ensure_builtin_tags`, per-login) — отменён ADR-0040.
 
 ### Состояния
-- Таг не имеет lifecycle-FSM. `is_builtin=true` — флаг защиты от DELETE (выставляется только из `ensure_builtin_tags`); user не может включить его через API.
+- Таг не имеет lifecycle-FSM. `is_builtin=true` — флаг защиты от DELETE (выставляется только сидированием builtin — `seed_builtin_tags` в lifespan, ADR-0040; ранее — `ensure_builtin_tags` per-login); user не может включить его через API.
 
 ### SQL-helpers (`backend/app/tags/sql.py`)
 
@@ -2248,13 +2242,13 @@ backend передаёт сырые значения. В `APPLY_TAG_TO_EXISTING`
 - Pattern, обрамлённый пунктуацией (`Congratulations!`, `…attention.`) — матчится корректно благодаря граничным классам (round-27 fix; `\y` ломал такие); см. ADR-0017 §4.1.
 - Многословный pattern (`We noticed an issue …`) — матчится несмотря на `\n`/прогоны пробелов/U+00A0 в теле, т.к. обе стороны проходят `norm()`; см. ADR-0017 §4.2.
 - `apply_to_existing=true` при число messages > 100 000 → `tag_apply_too_many` (422). Перед heavy SQL делаем `count_messages_for_user(user_id)`; см. ADR-0017 §7.
-- `ensure_builtin_tags` race (одновременно два login одного user'а): первый создаст builtin, второй увидит `has_any_builtin=true` и сделает return. Если ровно одновременно оба прошли проверку и пытаются INSERT — UNIQUE `(user_id, name)` гарантирует, что второй получит IntegrityError; ловим его и treat as success (idempotent retry-safe).
+- (LEGACY, до ADR-0040) `ensure_builtin_tags` race при двух одновременных login одного user'а разрешался идемпотентно через UNIQUE `(user_id, name)` (второй INSERT ловил IntegrityError → treat as success). С ADR-0040 builtin сидируются один раз в lifespan (`seed_builtin_tags`, идемпотентность по `uq_tags_global_name`) — конкурентного per-login-пути больше нет.
 
 ### Тестируемые инварианты
 - `list_for_user(user_id)` возвращает **только** теги этого пользователя.
 - `get_owned(user_id, tag_id)` возвращает None, если tag не пользователя (используется для 404 в API).
 - DELETE builtin → `CannotDeleteBuiltinTagError` (преобразуется в 400 `cannot_delete_builtin_tag`).
-- `ensure_builtin_tags` вызванный дважды → только 4 builtin тега (idempotent).
+- `seed_builtin_tags` вызванный дважды (рестарт приложения) → только 4 глобальных builtin тега (idempotent, ADR-0040); legacy `ensure_builtin_tags` per-login — мёртв.
 - `apply_tags_to_message` для сообщения, у которого subject="DPLA report" и user имеет builtin "DPLA.PLA" → `message_tags` содержит link.
 - `apply_tags_to_message` навешивает теги только видящих письмо пользователей (owner ящика, члены команды ящика через `user_groups` — ADR-0030, super_admin — round-28). Тег обычного пользователя B не цепляется к письму команды A, в которой B не состоит (нет ветки видимости) — manual SQL test.
 - super_admin (round-28): видит письма ЛЮБОЙ команды через ветку `u.role='super_admin'` в `list_recipients_for_message` (ADR-0022 §2.2). Тег-предикат больше НЕ per-recipient (round-12: `EXISTS(message_tags)` для любого тега) и при `TG_NOTIFY_ALL_MESSAGES=true` (round-31, default) вообще не применяется → super_admin получает **TG**-уведомление по каждому письму системы (под per-chat throttle, §2.9).
@@ -3366,7 +3360,7 @@ class ExternalMessagesPage(BaseModel):
 - rate-limit: 6-я попытка login -> 429.
 - mime builder: text/plain charset=utf-8; In-Reply-To/References корректны; BCC отсутствует в headers.
 - providers.suggest_provider_defaults: правильные дефолты для всех **13** доменов (ADR-0032 follow-up: +`aol.com`, +`yahoo.com`); все password-провайдеры отдают `smtp_port=587`, `smtp_ssl=false`, `smtp_starttls=true` (никакого `465`); IMAP у всех `993 SSL`. JS-таблица `account_form.js` (`PROVIDERS`) совпадает с backend по этим значениям.
-- tags (ADR-0017): `ensure_builtin_tags` идемпотентен; per-user изоляция (cross-user — нет утечек); DELETE builtin → `CannotDeleteBuiltinTagError`; UNIQUE `(user_id, name)` — race на create возвращает 409.
+- tags (ADR-0017/ADR-0040): `seed_builtin_tags` (lifespan) идемпотентен, builtin **глобальны** (`user_id IS NULL`); per-user изоляция персональных тегов (cross-user — нет утечек); DELETE builtin → внутренний UI `400 cannot_delete_builtin_tag` (`CannotDeleteBuiltinTagError`) / external `409 conflict` (`delete_global`); UNIQUE `(user_id, name)` — race на create персонального возвращает 409.
 - telegram (ADR-0018): `POST /api/telegram/webhook/<wrong>` → 403; правильный secret + `/start` → 200 и Bot API получил `sendMessage` с inline-keyboard и web_app.url; правильный secret + `/help` или произвольный текст или body без `message` → 200 без вызова Bot API; `TELEGRAM_BOT_TOKEN` отсутствует во всех логах (redact-test).
 - webhooks (ADR-0023): `encrypt_webhook_secret`/`decrypt_webhook_secret` round-trip с `webhook_id` AAD; decrypt с другим `webhook_id` → `InvalidTag`; URL validation (https only, lexical localhost reject, SSRF DNS-резолв с приватными CIDR → 400); idempotency `try_reserve` (повторный вызов → None); `find_active_for_message` отсеивает inactive/dead/history-filter; `secret` plaintext отсутствует во всех логах (redact-test); FSM transitions (4xx×10 → dead, 410 → dead, 5xx → rollback, 2xx → success); `POST /test` не пишет `webhook_deliveries`.
 - send SMTP timeout (ADR-0032 follow-up): `_SMTP_TIMEOUT` ≤ 25 и `_SMTP_TIMEOUT + _IMAP_APPEND_TIMEOUT + 5 < 60` (nginx `proxy_read_timeout`); зависший/заблокированный SMTP-connect (mock-сервер не отвечает на 465) → `SMTPSendFailedError` (502/доменная ошибка) в пределах `_SMTP_TIMEOUT`, НЕ зависание до 60s; `TimeoutError`/`OSError`/`SMTPException` на send-пути → 502 JSON, не 500/504.

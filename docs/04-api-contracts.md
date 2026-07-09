@@ -58,11 +58,11 @@
 | 403 | `csrf_failed` | CSRF проверка не прошла. |
 | 404 | `not_found` | |
 | 409 | `conflict` | Например, username уже занят. |
-| 422 | `imap_login_failed`, `smtp_login_failed`, `smtp_failed` | Ошибки внешних систем при тесте/отправке. |
+| 422 | `imap_login_failed`, `smtp_login_failed`, `invalid_host` | Сбой IMAP/SMTP-логина/коннекта при тесте креденшелов (`accounts/testers.py`) + отказ SSRF-guard (`assert_public_host`). |
 | 423 | `account_locked` | login lockout (`Retry-After` присутствует). |
 | 429 | `rate_limited` | (`Retry-After` присутствует). |
 | 500 | `internal_error` | Непредвиденная ошибка (тело не утечка детали). |
-| 502 | `upstream_error` | Сбой IMAP/SMTP вне auth. |
+| 502 | `upstream_error`, `smtp_failed` | Upstream-сбой вне auth; либо фактическая SMTP-**отправка** не удалась (`SMTPSendFailedError` из send-ядра: коннект/AUTH/DATA/timeout — ADR-0035). Проверка соединения (`test`/create/update) сюда НЕ относится — она даёт `422`. |
 | 503 | `dependency_unavailable` | Postgres/Redis/MinIO недоступны (от healthcheck). |
 | 400 | `method_override_not_allowed` | Запрос `POST` с полем `_method` пришёл на роут, не входящий в whitelist form-fallback (см. ниже). |
 | 400 | `cannot_delete_builtin_tag` | DELETE на тег с `is_builtin=true`. |
@@ -1337,9 +1337,9 @@ Payload (`event="message_tagged"`):
 | Query `since_id` | `int ≥ 0`, default `0`. Только при `order=asc`. Семантика `WHERE id > since_id`. При `order=desc` — `400`. |
 | Query `before_id` | `int ≥ 1`, optional (нет default). Только при `order=desc`. Присутствует → `WHERE id < before_id`; отсутствует → latest N. При `order=asc` — `400`. |
 | Query `limit` | `int`, `1..200`, default `50` (hard cap 200). Оба режима. |
-| Query `mail_account_id` | `int ≥ 1`, optional (нет default). Только письма этого ящика. Эффективный набор = `{mail_account_id} ∩ canonical_ids`. Работает в **обоих** режимах `order`. Несуществующий/чужой/non-canonical id → **пустая страница** (не 404). [ADR-0037](./adr/ADR-0037-external-teams-mailboxes-message-filters.md) |
-| Query `group_id` | `int ≥ 1`, optional (нет default). Только письма ящиков этой команды. Эффективный набор = `list_account_ids_in_group(group_id) ∩ canonical_ids`. Оба режима. Несуществующая/пустая команда → **пустая страница** (не 404). ADR-0037 |
-| Взаимоисключение фильтров | `mail_account_id` **и** `group_id` заданы одновременно → `400 validation_error`, `field="filter"` (message «mail_account_id и group_id взаимоисключающи»). Прецедент ADR-0036 §5 (явный отказ, не молчаливый приоритет). ADR-0037 |
+| Query `mail_account_id` | `int ≥ 1`, optional, **повторяемый** (`list[int]`, ADR-0039). Письма этих ящиков. Эффективный набор = `{mail_account_id…} ∩ canonical_ids`. Работает в **обоих** режимах `order`. Несуществующий/чужой/non-canonical id → **пустая страница** (не 404). BC одиночного значения. [ADR-0037](./adr/ADR-0037-external-teams-mailboxes-message-filters.md) / [ADR-0039](./adr/ADR-0039-external-write-api.md) §3 |
+| Query `group_id` | `int ≥ 1`, optional, **повторяемый** (`list[int]`, ADR-0039). Письма ящиков этих команд (union). Эффективный набор = `⋃ list_account_ids_in_group(group_id) ∩ canonical_ids`. Оба режима. Несуществующая/пустая команда → **пустая страница** (не 404). BC одиночного значения. Используется CRM для ролевой видимости (`MailScope.group_ids`). ADR-0037 / [ADR-0039](./adr/ADR-0039-external-write-api.md) §3 |
+| Комбинирование фильтров | `mail_account_id` **и** `group_id` — **AND-комбинируемы** (ADR-0039 **supersedes** взаимоисключение ADR-0037): эффективный набор = `canonical ∩ (⋃ accounts of group_id, если задан) ∩ (set(mail_account_id), если задан)`. Пустое пересечение → **пустая страница** (не 404). Кода `field="filter"` больше нет. Используется CRM: scope-`group_id` (`MailScope.group_ids`) AND пользовательский `mail_account_id`. [ADR-0039](./adr/ADR-0039-external-write-api.md) §3 |
 | Семантика `asc` | `WHERE m.id > :since_id AND m.mail_account_id IN (:canonical_ids) ORDER BY m.id ASC LIMIT :limit` — keyset по `messages.id BIGSERIAL` (монотонный insert-order; без пропусков/дублей курсора) + canonical-дедуп дубль-ящиков. Внешний сервис хранит `last_id` = `next_since_id`. |
 | Семантика `desc` | latest: `WHERE m.mail_account_id IN (:canonical_ids) ORDER BY m.id DESC LIMIT :limit`; older: `+ AND m.id < :before_id`. Reverse-scan по PK `id` (без новых индексов). Потребитель хранит `next_before_id` и передаёт его в `before_id` для следующей (более старой) страницы. |
 | 200 (`asc`) | `{messages:[ExternalMessageDTO] (id ASC), next_since_id:int, has_more:bool}`. |
@@ -1348,7 +1348,7 @@ Payload (`event="message_tagged"`):
 | 200 (пусто, `desc`) | `{messages:[], next_before_id:null, has_more:false}`. |
 | 401 | `not_authenticated` — нет/неверный ключ **или** фича выключена (неперечислимо). |
 | 429 | `rate_limited` (+`Retry-After`). |
-| 400 | `validation_error` — `since_id<0`/нечисловой; `before_id<1`/нечисловой; `limit` вне `1..200`; `order`∉{asc,desc}; `before_id` при `order=asc`; `since_id` при `order=desc`; `since_id`+`before_id` одновременно; `mail_account_id<1`/нечисловой (`field=mail_account_id`); `group_id<1`/нечисловой (`field=group_id`); `mail_account_id`+`group_id` одновременно (`field=filter`, ADR-0037). |
+| 400 | `validation_error` — `since_id<0`/нечисловой; `before_id<1`/нечисловой; `limit` вне `1..200`; `order`∉{asc,desc}; `before_id` при `order=asc`; `since_id` при `order=desc`; `since_id`+`before_id` одновременно; `mail_account_id<1`/нечисловой (`field=mail_account_id`); `group_id<1`/нечисловой (`field=group_id`). **`mail_account_id`+`group_id` вместе — НЕ ошибка** (AND-комбинируемы, ADR-0039 §3; кода `field=filter` больше нет — взаимоисключение ADR-0037 снято). |
 
 `ExternalMessageDTO` (отдельный от UI `MessageDetail` — стабильный версионируемый контракт; **сырое stored** `body_text`/`body_html` без `collapse_blank_lines_*`):
 
@@ -1424,18 +1424,19 @@ DTO `ExternalTeamDTO{id:int, name:str}` (обёртка `ExternalTeamsResponse{t
 
 | | |
 | --- | --- |
-| Метод / путь | `GET /api/external/mailboxes` (query-параметров нет). |
+| Метод / путь | `GET /api/external/mailboxes`. Query (ADR-0039 §4): `is_active: bool\|null` (None=все), `group_id: list[int]` (повторяемый, union; пусто=без фильтра). |
 | Доступ | `EXTERNAL_API_KEY` (`X-API-Key` / `Bearer`). CSRF exempt. |
 | Rate-limit | `LIMIT_EXTERNAL_API` (тот же read-бюджет). |
 | Visibility | super_admin + **canonical-дедуп** (ADR-0029 §5): `MailAccountsRepo.list_by_ids(list_canonical_account_ids())` — один канонический (`MIN(id)`) ящик на `LOWER(email)`. Множество совпадает с ящиками, чьи письма отдаёт `GET /api/external/messages`. |
 | 200 | `{"mailboxes": [{"id": int, "email": str, "display_name": str\|null, "group_id": int\|null, "is_active": bool}]}`. Пусто → `{"mailboxes": []}`. |
 | 401 / 429 | как выше. |
 
-DTO `ExternalMailboxDTO{id:int, email:str, display_name:str|null, group_id:int|null, is_active:bool}` (обёртка `ExternalMailboxesResponse{mailboxes:[...]}`). Поля:
+DTO `ExternalMailboxDTO{id:int, email:str, display_name:str|null, group_id:int|null, is_active:bool, last_synced_at:datetime|null, last_sync_error:str|null, consecutive_failures:int}` (обёртка `ExternalMailboxesResponse{mailboxes:[...]}`). Поля:
 - `id` = `mail_accounts.id` = `ExternalMessageDTO.mail_account.id` → CRM джойнит письма с ящиками по этому ключу.
 - `display_name` — nullable (БД); хелпер `display_name || email`.
 - `group_id` — маппинг ящик→команда (`mail_accounts.group_id`, nullable; `null` = персональный). `group_id` = `teams[].id`. **Раскрыт осознанно** для CRM (ADR-0037 §Security).
 - `is_active` — статус (`false` = авто-отключён воркером, ADR-0033). Счётчики активные/неактивные CRM считает **клиентски** (server-side агрегатов нет).
+- **Статус синка (ADR-0039 §4):** `last_synced_at` (nullable), `last_sync_error` (nullable), `consecutive_failures` (`int`, 0=здоров) — из одноимённых полей `mail_accounts`; для кружка статуса/диагностики на вкладке «Почты» CRM. Аддитивно.
 - **Никаких** credentials/`user_id`/owner-структур/`oauth_*`/`smtp_*`/`imap_*`.
 
 > **Консистентность:** `teams[].id` = `groups.id` = `mailboxes[].group_id`; `mailboxes[].id` = `messages[].mail_account.id`. Трёхуровневый джойн письмо → ящик → команда замыкается на стороне CRM. `ExternalMessageDTO`/`ExternalMailAccountDTO` **не меняются** — `group_id`/`is_active` доступны **только** через `mailboxes`, не в письме (стабильность контракта ADR-0029 §6).
@@ -1498,6 +1499,62 @@ Content-Type: application/json
 
 {"body": "Спасибо, приняли в работу.", "cc": ["ops@corp.example"]}
 ```
+
+---
+
+## 4f. External write API — mailboxes + tags CRUD (ADR-0039 / ADR-0040)
+
+Источник истины — [ADR-0039](./adr/ADR-0039-external-write-api.md) (mailboxes + read-фильтры) и [ADR-0040](./adr/ADR-0040-global-tags.md) (глобальные теги). Headless-контур для CRM: полный CRUD почт и глобальных тегов под `EXTERNAL_API_KEY`.
+
+### Feature-gate + rate-limit
+
+- `EXTERNAL_API_KEY` (как ADR-0029): пусто ⇒ весь внешний API выключен.
+- **`EXTERNAL_WRITE_ENABLED`** (`bool`, default `false`) — отдельный write-гейт для всех mailboxes/tags CRUD (по образцу `EXTERNAL_REPLY_ENABLED`). `false` ⇒ write-эндпоинты отвечают `403 forbidden` даже при валидном ключе. Read (`GET /tags`, `GET /mailboxes`, `GET /messages`) — под `EXTERNAL_API_KEY` без write-гейта.
+- **`LIMIT_EXTERNAL_WRITE`** (env `EXTERNAL_WRITE_RATE_LIMIT_PER_MINUTE`, `int`, default `60`, `ge=1`; запросов/мин на IP) — **отдельный** бюджет, не делит с read `120` и reply `30`.
+- **Auth-flow (строго, ADR-0029 §4 / ADR-0035 §3):** `consume(LIMIT_EXTERNAL_WRITE, ip)` → `X-API-Key`/`Bearer` (constant-time) → `external_api_enabled` → **write-гейт `EXTERNAL_WRITE_ENABLED`** → валидация тела → delegate. CSRF exempt (`/api/external/`).
+
+### Владелец создаваемого ящика (Q-0039-1)
+
+Ящики, создаваемые через external write, принадлежат техпользователю **`crm-service`** (роль `super_admin`, `group_id NULL`, без `telegram_links`/пароля входа; сидируется в lifespan по образцу `seed_super_admin`). Обоснование и аудит каналов доставки — [ADR-0039](./adr/ADR-0039-external-write-api.md) §Q-0039-1. Следствие: `uq_mail_accounts_user_email (user_id, email)` делает email глобально-уникальным для headless-пути (дубль → `409 conflict`).
+
+### 4f-mailboxes. `/api/external/mailboxes` (write)
+
+Все — под `EXTERNAL_WRITE_ENABLED`. Переиспользуют `accounts/service.py` (create/test/update/delete + SSRF-guard `assert_public_host`). Полные тела/поля — [ADR-0039](./adr/ADR-0039-external-write-api.md) §2.
+
+| Метод / путь | Семантика | Ответ |
+| --- | --- | --- |
+| `POST /api/external/mailboxes/test` | Проверка IMAP/SMTP-соединения без сохранения. Тело `ExternalMailboxTestRequest{email, imap_host, imap_port, imap_ssl, smtp_host, smtp_port, smtp_ssl, smtp_starttls, smtp_username?, password, smtp_password?}`. | `200 {imap_ok:true, smtp_ok:true}`; иначе `422` (`imap_login_failed`/`smtp_login_failed` — сбой логина/коннекта, `invalid_host` — SSRF-guard) или `400 validation_error` (битое тело). **`502` путь `test` не отдаёт** (см. «Коды»). |
+| `POST /api/external/mailboxes` | Создание. Тело = поля `test` + `display_name?`, `group_id?` (валидируется на существование, иначе `404 group_not_found`; `null` — без команды). Owner=`crm-service`. | `201 ExternalMailboxDTO` (расширенный). `409 conflict field=email` при дубле. |
+| `PATCH /api/external/mailboxes/{id}` | Правка (креды/`is_active`/`group_id`/хосты; presence-семантика полей). | `200 ExternalMailboxDTO`; `404 not_found`. |
+| `DELETE /api/external/mailboxes/{id}` | Удаление (+каскад вложений/MinIO). | `204`; `404`. |
+| `POST /api/external/mailboxes/{id}/sync` | Форс-синк: Redis-маркер `force_sync:{id}` (ex=60). | `202 {queued:true}`; `404`. |
+
+Пароли (`password`/`smtp_password`) — только в запросе; в `ExternalMailboxDTO` не возвращаются; redact в логах.
+
+**Коды (все mailboxes-write):** `200`/`201`/`202`/`204` · `400 validation_error` (битое тело) · `401 not_authenticated` (нет/неверный ключ или `EXTERNAL_API_KEY` пуст) · `403 forbidden` (`EXTERNAL_WRITE_ENABLED=false`) · `404 not_found`/`group_not_found` · `409 conflict` (email) · `422 imap_login_failed`/`smtp_login_failed` (сбой IMAP/SMTP-логина или коннекта при `test`/create/update — переиспользуемый `MailAccountService.test`/`accounts/testers.py`) + `422 invalid_host` (SSRF-guard `assert_public_host`) · `429 rate_limited` (`LIMIT_EXTERNAL_WRITE`). **`502 smtp_failed` здесь не возникает** — это код фактической отправки (send-ядро, ADR-0035), не проверки соединения.
+
+### 4f-tags. `/api/external/tags` (CRUD, глобальные теги ADR-0040)
+
+Все от имени глобального владельца (`tags.user_id IS NULL`). Read (`GET`) — под `EXTERNAL_API_KEY`; write — дополнительно под `EXTERNAL_WRITE_ENABLED`. Модель глобальных тегов — [ADR-0040](./adr/ADR-0040-global-tags.md).
+
+| Метод / путь | Тело | Ответ |
+| --- | --- | --- |
+| `GET /api/external/tags` | — | `200 {tags:[ExternalTagFullDTO]}` |
+| `POST /api/external/tags` | `{name, color, match_mode?}` (`match_mode` default `any`; `color` ∈ палитра `^#[0-9A-Fa-f]{6}$`) | `201 ExternalTagFullDTO`; `409 conflict` (имя занято) |
+| `PATCH /api/external/tags/{id}` | `{name?, color?, match_mode?}` | `200 ExternalTagFullDTO`; `404` |
+| `DELETE /api/external/tags/{id}` | — | `204`; `409 conflict` (builtin — удалять нельзя); `404` |
+| `POST /api/external/tags/{id}/rules` | `{type, pattern}` (`type ∈ {subject_contains, body_contains, sender_contains, sender_exact}`; `pattern` 1..256) | `201 {id, type, pattern, created_at}`; `404` |
+| `DELETE /api/external/tags/{id}/rules/{rule_id}` | — | `204`; `404` |
+| `POST /api/external/tags/{id}/apply-to-existing` | — | `200 {applied_count}`; `404`; `422` (> `APPLY_TO_EXISTING_LIMIT`) |
+
+`ExternalTagFullDTO = {id, name, color, match_mode, is_builtin, rules:[{id, type, pattern, created_at}], created_at, updated_at}`.
+
+**Коды (tags):** как выше + `400/422 validation_error` (color/name/type), `401`, `403` (write-гейт), `429`.
+
+### Read-фильтры: расширение (ADR-0039 §3/§4)
+
+- **`GET /api/external/messages`** — `group_id` и `mail_account_id` становятся **повторяемыми** (`list[int]`; `?group_id=1&group_id=2`) **и AND-комбинируемыми** (взаимоисключение ADR-0037 **снято**, supersede). Эффективный набор = `canonical ∩ (⋃ accounts of group_id, если задан) ∩ (set(mail_account_id), если задан)`; пустое пересечение → пустая страница (не 404); незнакомый/чужой/non-canonical id просто не добавляется в пересечение; **BC** single-filter. Кода `field=filter` нет. Мотивация — безопасная ролевая видимость CRM (scope-`group_id` AND пользовательский `mail_account_id`).
+- **`GET /api/external/mailboxes`** — новые query `is_active: bool|null` (None=все) и повторяемый `group_id: list[int]`; **`ExternalMailboxDTO` += `last_synced_at:datetime|null`, `last_sync_error:str|null`, `consecutive_failures:int`** (аддитивно; секреты по-прежнему не раскрываются).
 
 ---
 
@@ -1707,7 +1764,7 @@ FastAPI автогенерит OpenAPI 3.1. UI:
 | PATCH | `/api/me/settings` | user | yes | — | — | user preferences (tg_notifications_enabled); см. ADR-0022 |
 | GET | `/api/oauth/outlook/authorize` | user | — | 30/h | — | сгенерить Microsoft authorize URL + state (ADR-0025) |
 | GET | `/api/oauth/outlook/callback` | state in Redis | exempt | 30/min per IP | — | OAuth callback: code→токены, create mail_account (ADR-0025) |
-| GET | `/api/external/messages` | `EXTERNAL_API_KEY` (X-API-Key \| Bearer) | exempt | 120/min per IP (`LIMIT_EXTERNAL_API`) | — | **ADR-0029:** external pull-API — keyset по `messages.id`, ВСЕ письма системы, сырое полное тело, no attachments. **ADR-0036:** + backward/latest режим `order=asc\|desc` (`desc`+`before_id` → newest-first лента, курсор `next_before_id`); forward BC неизменен, тот же rate-limit/auth. **ADR-0037:** + опц. фильтры `mail_account_id`/`group_id` (`ge=1`, оба режима, сужают набор ∩ canonical; вместе → `400 field=filter`; несовпадающий id → пустая страница, не 404) |
+| GET | `/api/external/messages` | `EXTERNAL_API_KEY` (X-API-Key \| Bearer) | exempt | 120/min per IP (`LIMIT_EXTERNAL_API`) | — | **ADR-0029:** external pull-API — keyset по `messages.id`, ВСЕ письма системы, сырое полное тело, no attachments. **ADR-0036:** + backward/latest режим `order=asc\|desc` (`desc`+`before_id` → newest-first лента, курсор `next_before_id`); forward BC неизменен, тот же rate-limit/auth. **ADR-0037 + ADR-0039 §3:** + опц. фильтры `mail_account_id`/`group_id` (`ge=1`, оба режима, **повторяемые `list[int]`**, сужают набор ∩ canonical; **AND-комбинируемы** — заданные вместе НЕ ошибка (взаимоисключение ADR-0037 снято, кода `field=filter` нет), пустое пересечение/несовпадающий id → пустая страница, не 404) |
 | GET | `/api/external/teams` | `EXTERNAL_API_KEY` (X-API-Key \| Bearer) | exempt | 120/min per IP (`LIMIT_EXTERNAL_API`) | — | **ADR-0037:** список команд `{teams:[{id,name}]}` (`GroupsRepo.list_all_groups()`), super_admin-visibility, минимальная проекция |
 | GET | `/api/external/mailboxes` | `EXTERNAL_API_KEY` (X-API-Key \| Bearer) | exempt | 120/min per IP (`LIMIT_EXTERNAL_API`) | — | **ADR-0037:** список ящиков `{mailboxes:[{id,email,display_name,group_id,is_active}]}` (canonical-дедуп), для дропдауна/счётчиков/маппинга ящик→команда CRM |
 | POST | `/api/external/messages/{id}/reply` | `EXTERNAL_API_KEY` (X-API-Key \| Bearer) + `EXTERNAL_REPLY_ENABLED` | exempt | 30/min per IP (`LIMIT_EXTERNAL_REPLY`) | — | **ADR-0035:** external reply — ответ на существующее письмо; `from`=ящик оригинала (не выбирается), threading по `{id}`; write opt-in (`EXTERNAL_REPLY_ENABLED`, default off) |

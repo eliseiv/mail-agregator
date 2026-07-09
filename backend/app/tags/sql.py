@@ -196,10 +196,15 @@ APPLY_TAGS_TO_MESSAGE: Final[str] = r"""
 INSERT INTO message_tags (message_id, tag_id)
 SELECT :message_id, t.id
 FROM tags t
-JOIN users u ON u.id = t.user_id
+LEFT JOIN users u ON u.id = t.user_id
 JOIN mail_accounts ma ON ma.id = :mail_account_id
 WHERE (
-        u.id = ma.user_id
+        -- ADR-0040: a global tag (t.user_id IS NULL) applies to EVERY message
+        -- of the system. The join to ``users`` is LEFT so a global tag (which
+        -- has no owner row) is not dropped by an INNER JOIN; the visibility
+        -- predicate below short-circuits on this branch (u is NULL for globals).
+        t.user_id IS NULL
+        OR u.id = ma.user_id
         OR (ma.group_id IS NOT NULL AND EXISTS (
                 SELECT 1 FROM user_groups ug
                 WHERE  ug.user_id = u.id

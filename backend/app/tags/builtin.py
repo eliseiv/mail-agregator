@@ -1,8 +1,11 @@
-"""Builtin tags catalogue (ADR-0017 §6).
+"""Builtin tags catalogue (ADR-0017 §6 + ADR-0040 §3).
 
-Source-of-truth for the system tags created lazily for every user on their
-first successful login (see
-:func:`backend.app.tags.service.TagsService.ensure_builtin_tags`).
+Source-of-truth for the system tags. ADR-0040: builtin tags are **global**
+(``user_id IS NULL``, ``is_builtin=TRUE``) and are seeded idempotently on
+application startup (see :func:`backend.app.tags.service.seed_builtin_tags`,
+by the pattern of ``seed_super_admin``), instead of the previous per-login
+lazy creation per user. The catalogue (names / colours / rules / match_mode)
+is unchanged — only ownership (global) and the seeding point (lifespan) moved.
 
 Schema mirrors ``docs/03-data-model.md`` "Заполнение builtin-тегов".
 
@@ -15,7 +18,7 @@ and therefore use ``'all'`` so the tag only attaches to the specific
 Apple notification — not to every Apple e-mail.
 
 Colours are reused from the fixed palette in
-``backend/app/tags/schemas.py`` (``PALETTE_COLORS``); ``ensure_builtin_tags``
+``backend/app/tags/schemas.py`` (``PALETTE_COLORS``); ``seed_builtin_tags``
 asserts membership defensively.
 """
 

@@ -1,7 +1,9 @@
 # ADR-0017: Теги для писем — rule-based авто-классификация и пользовательские правила
 
-- **Статус:** accepted
+- **Статус:** accepted (модель владения тегами и способ создания builtin-тегов **частично изменены [ADR-0040](./ADR-0040-global-tags.md)**, 2026-07-09)
 - **Дата:** 2026-05-07
+
+> **⚠️ Частично superseded — [ADR-0040](./ADR-0040-global-tags.md) (2026-07-09).** Изменены: (а) **персональная** модель владения (`tags.user_id NOT NULL`, `UNIQUE(user_id, name)`) → тег может быть **глобальным** (`user_id IS NULL`, единый админский каталог); (б) создание builtin-тегов через **post-login hook** `TagsService.ensure_builtin_tags(user_id)` (§6) → **глобальное идемпотентное сидирование в lifespan** (`seed_builtin_tags`, по образцу `seed_super_admin`), ленивый per-login hook отменён (UI-логина в агрегаторе не будет — ADR-0041). Семантика матчинга (§4/§4.1/§4.2 — whole-word/case-sensitive/escape), набор правил и запрет DELETE на builtin — **в силе**. Актуальная модель — `03-data-model.md` секция `tags` + ADR-0040. Текст ниже сохранён как исторический record исходного решения.
 
 ## Context
 

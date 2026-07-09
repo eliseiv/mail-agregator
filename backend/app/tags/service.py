@@ -302,50 +302,108 @@ class TagsService:
         rowcount = getattr(result, "rowcount", 0)
         return int(rowcount or 0)
 
-    async def ensure_builtin_tags(self, *, user_id: int) -> int:
-        """Create the builtin-tag catalogue for ``user_id`` if missing.
+    # --- Global tags (ADR-0040 — headless-CRM catalogue, external API) -----
+    #
+    # All operate on the global catalogue (``tags.user_id IS NULL``). "Owned"
+    # for the external path means "global" — :meth:`TagsRepo.get_global`
+    # 404s on a non-global / missing id. Reuses the same repos + apply SQL as
+    # the per-user path (ADR-0040 §4). Callers (the external router) wrap each
+    # write in ``async with db.begin():`` for atomicity.
 
-        Idempotent (ADR-0017 §6). Returns the number of tags created in
-        this call (0 if the user already had any builtin row).
+    async def list_global(self) -> list[TagDTO]:
+        tags = await self._tags.list_global()
+        rules_map = await self._rules.list_for_tags_bulk([t.id for t in tags])
+        return [_to_tag_dto(t, rules_map.get(t.id, [])) for t in tags]
 
-        Race-safe: a concurrent invocation that wins the ``has_any_builtin``
-        race will hit the ``UNIQUE(user_id, name)`` constraint on INSERT;
-        we treat that as success and short-circuit.
-
-        round-25: each spec now carries a ``match_mode`` (``'any'``/``'all'``)
-        that is persisted on the tag — see :mod:`backend.app.tags.builtin`.
-        Because the catalogue was reworked, migration
-        ``20260521_016_rebuild_builtin_tags`` DELETEs every existing builtin
-        row so that the next login re-runs this method and recreates the new
-        catalogue (the ``has_any_builtin`` short-circuit would otherwise keep
-        the stale set forever).
-        """
-        if await self._tags.has_any_builtin(user_id):
-            log.debug("builtin_tags_unchanged", user_id=user_id)
-            return 0
+    async def create_global(self, *, name: str, color: str, match_mode: str) -> TagDTO:
+        """Create a global tag (no rules yet, no apply). ``409`` on name clash."""
         try:
-            for spec in BUILTIN_TAGS:
-                color = spec["color"]
-                if color not in PALETTE_COLORS:
-                    # Defence-in-depth: keeps builtin.py honest if someone
-                    # edits a colour without updating the palette.
-                    raise ValidationError(f"Builtin tag {spec['name']!r} colour not in palette")
-                tag = await self._tags.create(
-                    user_id=user_id,
-                    name=spec["name"],
-                    color=color,
-                    is_builtin=True,
-                    match_mode=spec["match_mode"],
-                )
-                rule_pairs = [(r["type"], r["pattern"]) for r in spec["rules"]]
-                await self._rules.add_many(tag_id=tag.id, rules=rule_pairs)
-        except IntegrityError:
-            # Another login created the rows in parallel; treat as no-op.
-            log.info("builtin_tags_race_skipped", user_id=user_id)
-            return 0
-        created = len(BUILTIN_TAGS)
-        log.info("builtin_tags_created", user_id=user_id, count=created)
-        return created
+            tag = await self._tags.create(
+                user_id=None,
+                name=name,
+                color=color,
+                is_builtin=False,
+                match_mode=match_mode,
+            )
+        except IntegrityError as exc:
+            raise ConflictError("A tag with this name already exists", field="name") from exc
+        return _to_tag_dto(tag, [])
+
+    async def update_global(
+        self,
+        *,
+        tag_id: int,
+        name: str | None,
+        color: str | None,
+        match_mode: str | None = None,
+    ) -> TagDTO:
+        tag = await self._tags.get_global(tag_id)
+        if tag is None:
+            raise NotFoundError()
+        if name is None and color is None and match_mode is None:
+            rules = await self._rules.list_for_tag(tag_id)
+            return _to_tag_dto(tag, rules)
+        try:
+            await self._tags.update_meta(
+                tag_id=tag_id, name=name, color=color, match_mode=match_mode
+            )
+        except IntegrityError as exc:
+            raise ConflictError("A tag with this name already exists", field="name") from exc
+        updated = await self._tags.get_global(tag_id)
+        if updated is None:  # vanished mid-transaction
+            raise NotFoundError()
+        rules = await self._rules.list_for_tag(tag_id)
+        return _to_tag_dto(updated, rules)
+
+    async def delete_global(self, *, tag_id: int) -> None:
+        tag = await self._tags.get_global(tag_id)
+        if tag is None:
+            raise NotFoundError()
+        if tag.is_builtin:
+            # ADR-0040 §4 / 04-api-contracts §4f-tags: a builtin tag cannot be
+            # deleted — surfaced as ``409 conflict`` on the external contract
+            # (rename / rule edits stay allowed).
+            raise ConflictError("Builtin tags cannot be deleted; rename or edit rules instead")
+        await self._tags.delete(tag_id)
+
+    async def add_rule_global(self, *, tag_id: int, type_: str, pattern: str) -> RuleDTO:
+        tag = await self._tags.get_global(tag_id)
+        if tag is None:
+            raise NotFoundError()
+        rule = await self._rules.add(tag_id=tag_id, type_=type_, pattern=pattern)
+        return _to_rule_dto(rule)
+
+    async def delete_rule_global(self, *, tag_id: int, rule_id: int) -> None:
+        tag = await self._tags.get_global(tag_id)
+        if tag is None:
+            raise NotFoundError()
+        rule = await self._rules.get_owned(tag_id, rule_id)
+        if rule is None:
+            raise NotFoundError()
+        await self._rules.delete(rule_id)
+
+    async def apply_to_existing_global(self, *, tag_id: int) -> int:
+        """Apply a global tag's rules to EVERY existing message (ADR-0040 §4).
+
+        Global reach is expressed via the super-admin short-circuit already in
+        :data:`APPLY_TAG_TO_EXISTING` (``is_super_admin=True`` forces the
+        visibility filter to TRUE for all rows). ``user_id`` is irrelevant on
+        this path — a sentinel ``0`` is passed only to satisfy the bind. The
+        ``APPLY_TO_EXISTING_LIMIT`` guard counts the whole corpus (super-admin
+        count) exactly as the apply reaches it.
+        """
+        tag = await self._tags.get_global(tag_id)
+        if tag is None:
+            raise NotFoundError()
+        count = await self._links.count_messages_visible(
+            user_id=0, group_ids=[], is_super_admin=True
+        )
+        if count > APPLY_TO_EXISTING_LIMIT:
+            raise TagApplyTooManyError(
+                "Too many messages for synchronous apply",
+                details={"limit": APPLY_TO_EXISTING_LIMIT, "actual": count},
+            )
+        return await self._apply_tag_to_existing(user_id=0, tag_id=tag_id, is_super_admin=True)
 
     # --- Internal helpers --------------------------------------------------
 
@@ -374,3 +432,53 @@ class TagsService:
         )
         rowcount = getattr(result, "rowcount", 0)
         return int(rowcount or 0)
+
+
+async def seed_builtin_tags(session: AsyncSession) -> int:
+    """Idempotently seed the GLOBAL builtin-tag catalogue (ADR-0040 §3).
+
+    Called from the API lifespan (``backend.app.main.create_app``) by the
+    pattern of ``seed_super_admin`` — replaces the previous per-login lazy
+    creation. Each spec is created only when a global tag of that name does not
+    already exist (``uq_tags_global_name``), so re-running the boot is a no-op.
+
+    Race-safety: each tag+rules insert runs in its own SAVEPOINT
+    (``begin_nested``); if a concurrent process wins the name race the partial
+    unique index raises :class:`IntegrityError` which rolls back only that
+    savepoint (leaving the outer transaction and already-seeded tags intact).
+    Colours are validated against ``PALETTE_COLORS`` (defence-in-depth).
+
+    Returns the number of tags created in this call (0 if all already present).
+    """
+    tags = TagsRepo(session)
+    rules = TagRulesRepo(session)
+    created = 0
+    for spec in BUILTIN_TAGS:
+        color = spec["color"]
+        if color not in PALETTE_COLORS:
+            # Defence-in-depth: keeps builtin.py honest if someone edits a
+            # colour without updating the palette.
+            raise ValidationError(f"Builtin tag {spec['name']!r} colour not in palette")
+        if await tags.find_global_by_name(spec["name"]) is not None:
+            continue
+        try:
+            async with session.begin_nested():
+                tag = await tags.create(
+                    user_id=None,
+                    name=spec["name"],
+                    color=color,
+                    is_builtin=True,
+                    match_mode=spec["match_mode"],
+                )
+                rule_pairs = [(r["type"], r["pattern"]) for r in spec["rules"]]
+                await rules.add_many(tag_id=tag.id, rules=rule_pairs)
+            created += 1
+        except IntegrityError:
+            # Concurrent seed created this global name first — treat as present.
+            log.info("builtin_tags_seed_race_skipped", name=spec["name"])
+            continue
+    if created:
+        log.info("builtin_tags_seeded", count=created)
+    else:
+        log.debug("builtin_tags_seed_unchanged")
+    return created

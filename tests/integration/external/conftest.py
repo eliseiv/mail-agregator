@@ -83,6 +83,81 @@ def set_external_rate_limit(
     get_settings.cache_clear()
 
 
+@pytest.fixture
+def set_external_write_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[Callable[[bool], None]]:
+    """Flip ``EXTERNAL_WRITE_ENABLED`` and reload the lru-cached settings.
+
+    The write router reads ``settings.EXTERNAL_WRITE_ENABLED`` fresh on every
+    request (the write-gate, step 5), so setting the env var + clearing the
+    cache makes the very next request observe the change. Cache cleared again on
+    teardown (mirrors :func:`set_external_api_key`).
+    """
+
+    def _set(value: bool) -> None:
+        monkeypatch.setenv("EXTERNAL_WRITE_ENABLED", "true" if value else "false")
+        get_settings.cache_clear()
+        reloaded = get_settings()
+        assert reloaded.EXTERNAL_WRITE_ENABLED is value
+
+    yield _set
+    get_settings.cache_clear()
+
+
+@pytest.fixture
+def set_external_write_rate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[Callable[[int], None]]:
+    """Override ``EXTERNAL_WRITE_RATE_LIMIT_PER_MINUTE`` and reload settings.
+
+    The write router builds the runtime :class:`Limit` from
+    ``settings.EXTERNAL_WRITE_RATE_LIMIT_PER_MINUTE`` at consume-time, so a low
+    value here lets a test prove the 429 fires FIRST (before auth/gate/body).
+    """
+
+    def _set(value: int) -> None:
+        monkeypatch.setenv("EXTERNAL_WRITE_RATE_LIMIT_PER_MINUTE", str(value))
+        get_settings.cache_clear()
+        reloaded = get_settings()
+        assert value == reloaded.EXTERNAL_WRITE_RATE_LIMIT_PER_MINUTE
+
+    yield _set
+    get_settings.cache_clear()
+
+
+@pytest_asyncio.fixture
+async def write_api_on(
+    set_external_api_key: Callable[[str], None],
+    set_external_write_enabled: Callable[[bool], None],
+) -> str:
+    """Turn the whole external WRITE surface ON: valid key + write-gate enabled.
+
+    Order matters — ``set_external_write_enabled`` clears the settings cache
+    AFTER the key is set, so both env vars are live for the next request.
+    """
+    set_external_api_key(TEST_API_KEY)
+    set_external_write_enabled(True)
+    return TEST_API_KEY
+
+
+@pytest_asyncio.fixture
+async def make_group(db_engine: AsyncEngine) -> Callable[..., Any]:
+    """Create a bare ``groups`` row (no mailboxes); return its id."""
+    from shared.models import Group
+
+    async def _create(name: str) -> int:
+        factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
+        async with factory() as ses, ses.begin():
+            g = Group(name=name, leader_user_id=None)
+            ses.add(g)
+            await ses.flush()
+            await ses.refresh(g)
+            return int(g.id)
+
+    return _create
+
+
 async def _get_super_admin(db_engine: AsyncEngine) -> User:
     factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
     s = get_settings()
@@ -298,6 +373,38 @@ def add_sibling_tag(db_engine: AsyncEngine) -> Callable[..., Any]:
 @pytest_asyncio.fixture
 async def super_admin(db_engine: AsyncEngine) -> User:
     return await _get_super_admin(db_engine)
+
+
+@pytest_asyncio.fixture
+async def crm_service_user(db_engine: AsyncEngine) -> User:
+    """The ``crm-service`` technical user seeded at app startup (ADR-0039)."""
+    from backend.app.auth.service import CRM_SERVICE_USERNAME
+
+    factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
+    async with factory() as ses:
+        u = (
+            await ses.execute(select(User).where(User.username == CRM_SERVICE_USERNAME))
+        ).scalar_one_or_none()
+        assert u is not None, "crm-service must be seeded by app startup (seed_crm_service_user)"
+        return u
+
+
+@pytest.fixture
+def patch_mail_testers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the external IMAP/SMTP connectivity probe pass without a live server.
+
+    The mail servers are the EXTERNAL boundary (mocking our own code is
+    forbidden, mocking third-party services is allowed): the create flow calls
+    ``MailAccountService.test`` → ``imap_test_login`` / ``smtp_test_login`` which
+    open real sockets. We stub exactly those two boundary functions to no-op so
+    ``create`` reaches the persistence + owner-assignment logic under test.
+    """
+
+    async def _ok(**_kw: Any) -> None:
+        return None
+
+    monkeypatch.setattr("backend.app.accounts.service.imap_test_login", _ok)
+    monkeypatch.setattr("backend.app.accounts.service.smtp_test_login", _ok)
 
 
 @pytest_asyncio.fixture
