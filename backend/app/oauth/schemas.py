@@ -63,7 +63,21 @@ class OAuthAuthorizeResponse(BaseModel):
 
 
 class OAuthState(BaseModel):
-    """Server-side state stored in Redis under ``oauth_state:{state}``."""
+    """Server-side state stored in Redis under ``oauth_state:{state}``.
 
-    user_id: int
+    Transition-safe payload carrying two mutually-exclusive flows (ADR-0045 §1):
+
+    - ``user_id`` — the initiating session user (ADR-0025 session flow, served
+      by ``build_authorize_url`` / ``exchange_code``). Removed once the session
+      ``oauth/router.py`` is decommissioned.
+    - ``crm_state`` — the opaque CRM token (ADR-0045 headless flow, served by
+      ``build_authorize_url_headless`` / ``exchange_code_headless``). The
+      aggregator NEVER interprets it — it only stores it alongside the PKCE
+      verifier and echoes it back to the CRM ingest.
+
+    Exactly one of the two is set per state; ``code_verifier`` is always present.
+    """
+
     code_verifier: str
+    user_id: int | None = None
+    crm_state: str | None = None

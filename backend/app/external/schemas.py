@@ -468,3 +468,30 @@ class ExternalTagApplyResponse(BaseModel):
     """``200`` body of ``POST /api/external/tags/{id}/apply-to-existing``."""
 
     applied_count: int
+
+
+# --- External Outlook OAuth (headless) (ADR-0045 §2, 04-api-contracts §4f-oauth) ---
+
+
+class ExternalOAuthAuthorizeRequest(BaseModel):
+    """Body of ``POST /api/external/mailboxes/oauth/authorize`` (ADR-0045 §2).
+
+    ``crm_state`` is an OPAQUE CRM token (HMAC-signed blob) — the aggregator
+    never parses or trusts its contents, only stores it in the Redis
+    ``oauth_state:{state}`` payload alongside the PKCE verifier and echoes it
+    back verbatim to the CRM ingest (§3). Bounded to 512 chars (ADR-0045 §1).
+    """
+
+    crm_state: str = Field(min_length=1, max_length=512)
+
+
+class ExternalOAuthAuthorizeResponse(BaseModel):
+    """``200`` body of ``POST /api/external/mailboxes/oauth/authorize`` (ADR-0045 §2).
+
+    ``authorize_url`` is the Microsoft consent URL the CRM opens for the
+    operator; ``state`` is the one-shot Redis-bound anti-fixation token echoed
+    for tracking (the same value Microsoft returns to the callback).
+    """
+
+    authorize_url: str
+    state: str

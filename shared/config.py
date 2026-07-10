@@ -317,7 +317,11 @@ class Settings(BaseSettings):
     OUTLOOK_CLIENT_ID: str = ""
     # Marked redact in ``shared/logging.py`` (alongside MAIL_ENCRYPTION_KEY).
     OUTLOOK_CLIENT_SECRET: str = ""
-    # ``{APP_BASE_URL}/api/oauth/outlook/callback`` — must match Azure exactly.
+    # Registered Azure redirect_uri — must match Azure exactly. ADR-0045 §4
+    # (amends ADR-0044 Phase G): the headless external-OAuth callback replaces
+    # the removed session callback, so this is now
+    # ``{APP_BASE_URL}/api/external/mailboxes/oauth/callback`` (updated at
+    # cut-over by devops — the code only reads the env value).
     OUTLOOK_REDIRECT_URI: str = ""
     # tenant for the authorize/token endpoints. ADR-0025: ``consumers`` for
     # personal mailboxes — this is the working Sprint-B configuration that
@@ -417,6 +421,16 @@ class Settings(BaseSettings):
     CRM_STATUS_BATCH_SIZE: int = Field(default=30, ge=1, le=500)
     # Total httpx timeout (connect+read+write) for the CRM POSTs.
     CRM_PUSH_HTTP_TIMEOUT_SECONDS: int = Field(default=10, ge=1, le=120)
+
+    # --- External Outlook OAuth ingest (ADR-0045 §3) ----------------------
+    # After a successful headless Outlook create/relink, the external callback
+    # notifies the CRM of the mailbox↔team binding via
+    # ``POST {CRM_OAUTH_INGEST_URL}`` (= CRM ``/api/mail/oauth/ingest``), signed
+    # with the SAME HMAC scheme + reused ``CRM_PUSH_SECRET`` as
+    # ``/api/mail/ingest`` (ADR-0043 §2). Empty ⇒ the notification is not sent
+    # (headless-OAuth ingest effectively off — symmetric with
+    # ``crm_status_enabled``). Read by the BACKEND container. Never logged.
+    CRM_OAUTH_INGEST_URL: str = ""
 
     # --- Telegram delivery kill-switch (ADR-0043 cut-over) ----------------
     # Master mute for ALL outbound Telegram delivery from the aggregator
@@ -645,6 +659,17 @@ class Settings(BaseSettings):
         enqueued on a mailbox disable / re-enable transition.
         """
         return bool(self.CRM_MAILBOX_STATUS_URL and self.CRM_PUSH_SECRET)
+
+    @property
+    def crm_oauth_ingest_enabled(self) -> bool:
+        """True when the headless-OAuth CRM ingest notification is configured (ADR-0045 §3).
+
+        Requires ``CRM_OAUTH_INGEST_URL`` + ``CRM_PUSH_SECRET`` (reused). When
+        false the external callback creates/relinks the mailbox but does NOT
+        POST the binding to the CRM (best-effort, reconcile backfills — CRM
+        TD-047). Derived flag — symmetric with :pyattr:`crm_status_enabled`.
+        """
+        return bool(self.CRM_OAUTH_INGEST_URL and self.CRM_PUSH_SECRET)
 
     @property
     def outlook_authorize_endpoint(self) -> str:

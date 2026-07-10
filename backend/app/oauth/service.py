@@ -38,6 +38,7 @@ import httpx
 import redis.exceptions as redis_exceptions
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.app.auth.service import CRM_SERVICE_USERNAME
 from backend.app.oauth.schemas import (
     ACCESS_TOKEN_REFRESH_BUFFER_SECONDS,
     OAUTH_REFRESH_LOCK_PREFIX,
@@ -259,13 +260,22 @@ class OutlookOAuthService:
         self._cipher = MailPasswordCipher.from_settings(self._settings)
         self._token_client = _TokenClient(self._settings, http_client)
 
-    async def build_authorize_url(self, user_id: int) -> tuple[str, str]:
-        """Mint state + PKCE, store in Redis, return ``(authorize_url, state)``."""
+    async def _mint_state_and_url(
+        self, *, user_id: int | None, crm_state: str | None
+    ) -> tuple[str, str]:
+        """Mint state + PKCE (S256), persist the Redis payload, assemble the URL.
+
+        Shared by the session (``user_id``) and headless (``crm_state``) flows —
+        the only difference is which field the :class:`OAuthState` carries; the
+        Microsoft authorize URL (scopes/PKCE/prompt) is identical (ADR-0045 §1).
+        """
         state = secrets.token_urlsafe(32)
         verifier, challenge = _make_pkce_pair()
 
         redis = get_redis()
-        payload = OAuthState(user_id=user_id, code_verifier=verifier).model_dump_json()
+        payload = OAuthState(
+            code_verifier=verifier, user_id=user_id, crm_state=crm_state
+        ).model_dump_json()
         await redis.set(
             f"{OAUTH_STATE_KEY_PREFIX}{state}",
             payload,
@@ -283,7 +293,24 @@ class OutlookOAuthService:
             "prompt": "select_account",
         }
         authorize_url = f"{self._settings.outlook_authorize_endpoint}?{urlencode(params)}"
+        return authorize_url, state
+
+    async def build_authorize_url(self, user_id: int) -> tuple[str, str]:
+        """Session flow: mint state + PKCE bound to ``user_id`` (ADR-0025 §2)."""
+        authorize_url, state = await self._mint_state_and_url(user_id=user_id, crm_state=None)
         log.info("oauth_authorize_url_built", user_id=user_id)
+        return authorize_url, state
+
+    async def build_authorize_url_headless(self, crm_state: str) -> tuple[str, str]:
+        """Headless flow: mint state + PKCE carrying the opaque ``crm_state`` (ADR-0045 §1/§2).
+
+        The ``crm_state`` is stored verbatim in the Redis state payload (never
+        interpreted) and returned by :meth:`exchange_code_headless` so the
+        callback can echo it to the CRM ingest (§3). Owner of any created box is
+        the ``crm-service`` technical user — resolved at exchange time.
+        """
+        authorize_url, state = await self._mint_state_and_url(user_id=None, crm_state=crm_state)
+        log.info("oauth_authorize_url_built_headless")
         return authorize_url, state
 
     async def _consume_state(self, state: str) -> OAuthState:
@@ -301,20 +328,20 @@ class OutlookOAuthService:
         except ValueError as exc:
             raise OAuthError("oauth_state_invalid", "State payload corrupt") from exc
 
-    async def exchange_code(self, *, code: str, state: str) -> MailAccount:
-        """Validate state, exchange the code, create/update the oauth account.
+    async def _exchange_and_resolve(
+        self, code: str, code_verifier: str
+    ) -> tuple[_TokenResponse, str]:
+        """Exchange the code, assert a refresh token, resolve the mailbox email.
 
-        Returns the persisted :class:`MailAccount`. Caller (router) writes the
-        ``oauth_account_linked`` audit row and commits the transaction.
+        Shared token-endpoint step for both flows (ADR-0025 §3). Returns the
+        token response and the lower-cased mailbox email.
         """
-        st = await self._consume_state(state)
-
         # Single-step exchange (ADR-0025 §3, working Sprint-B config): one
         # ``code -> token`` request with the direct outlook.office.com resource
         # scopes yields the access token (used directly for IMAP/SMTP), the
         # refresh token and the id_token (for the mailbox email).
         try:
-            tokens = await self._token_client.exchange_code(code, st.code_verifier)
+            tokens = await self._token_client.exchange_code(code, code_verifier)
         except OAuthRefreshInvalidError as exc:
             # invalid_grant on an authorization-code exchange means the code
             # was already used / expired — treat as a generic exchange failure.
@@ -328,18 +355,26 @@ class OutlookOAuthService:
         email = _decode_email_from_id_token(tokens.id_token)
         if not email:
             raise OAuthError("oauth_exchange_failed", "Could not resolve mailbox email")
-        email = email.strip().lower()
+        return tokens, email.strip().lower()
 
-        owner = await self._users.get_by_id(st.user_id)
-        if owner is None:
-            raise OAuthError("oauth_state_invalid", "Initiating user no longer exists")
+    async def _create_or_relink(
+        self, *, owner_user_id: int, group_id: int | None, email: str, tokens: _TokenResponse
+    ) -> MailAccount:
+        """Create a new oauth mailbox or refresh the tokens of an existing one.
 
+        Owner is ``owner_user_id`` (session user or ``crm-service``); ``group_id``
+        is the owner's home group for the session flow and ``None`` for the
+        headless flow (ADR-0045 §1 — transition-safe: the column is still
+        present pre-demontage, so we pass ``None`` rather than omit it).
+        Re-consent is keyed by ``(owner_user_id, email)``.
+        """
         access_token = tokens.access_token
         refresh_token = tokens.refresh_token
+        assert refresh_token is not None  # guaranteed by :meth:`_exchange_and_resolve`
         scopes = tokens.scope
         expires_at = datetime.now(UTC) + timedelta(seconds=tokens.expires_in)
 
-        existing = await self._repo.find_by_user_email(st.user_id, email)
+        existing = await self._repo.find_by_user_email(owner_user_id, email)
         if existing is not None:
             # Re-consent of an existing account: refresh the stored tokens.
             refresh_enc = self._cipher.encrypt(refresh_token, existing.id)
@@ -354,7 +389,7 @@ class OutlookOAuthService:
             )
             refreshed = await self._repo.get_by_id(existing.id)
             assert refreshed is not None
-            log.info("oauth_account_relinked", mail_account_id=existing.id, user_id=st.user_id)
+            log.info("oauth_account_relinked", mail_account_id=existing.id, user_id=owner_user_id)
             return refreshed
 
         # New oauth account — predict the id so the AAD binds to it (ADR-0005).
@@ -363,8 +398,8 @@ class OutlookOAuthService:
         access_enc = self._cipher.encrypt(access_token, new_id)
         acc = await self._repo.insert_oauth_account_with_id(
             account_id=new_id,
-            user_id=st.user_id,
-            group_id=owner.group_id,
+            user_id=owner_user_id,
+            group_id=group_id,
             email=email,
             oauth_provider="outlook",
             oauth_refresh_token_encrypted=refresh_enc,
@@ -379,8 +414,54 @@ class OutlookOAuthService:
             smtp_ssl=False,
             smtp_starttls=True,
         )
-        log.info("oauth_account_linked", mail_account_id=acc.id, user_id=st.user_id)
+        log.info("oauth_account_linked", mail_account_id=acc.id, user_id=owner_user_id)
         return acc
+
+    async def exchange_code(self, *, code: str, state: str) -> MailAccount:
+        """Session flow: validate state, exchange the code, create/update the account.
+
+        Returns the persisted :class:`MailAccount`. Caller (router) writes the
+        ``oauth_account_linked`` audit row and commits the transaction.
+        """
+        st = await self._consume_state(state)
+        if st.user_id is None:
+            raise OAuthError("oauth_state_invalid", "Session state missing user")
+
+        tokens, email = await self._exchange_and_resolve(code, st.code_verifier)
+
+        owner = await self._users.get_by_id(st.user_id)
+        if owner is None:
+            raise OAuthError("oauth_state_invalid", "Initiating user no longer exists")
+
+        return await self._create_or_relink(
+            owner_user_id=st.user_id, group_id=owner.group_id, email=email, tokens=tokens
+        )
+
+    async def exchange_code_headless(self, *, code: str, state: str) -> tuple[MailAccount, str]:
+        """Headless flow: validate state, exchange the code, create/relink the box.
+
+        Owner is the ``crm-service`` technical user; ``group_id=None``
+        (transition-safe, ADR-0045 §1). Returns ``(mail_account, crm_state)`` —
+        the caller (external callback) writes the audit row, commits, then POSTs
+        the binding to the CRM ingest (§3). Raises :class:`OAuthError` on a bad
+        state / failed exchange (the callback maps it to the HTML error page).
+        """
+        st = await self._consume_state(state)
+        if st.crm_state is None:
+            raise OAuthError("oauth_state_invalid", "Headless state missing crm_state")
+
+        tokens, email = await self._exchange_and_resolve(code, st.code_verifier)
+
+        owner = await self._users.get_by_username(CRM_SERVICE_USERNAME)
+        if owner is None:
+            # Seeded at startup (``seed_crm_service_user``); an impossible
+            # post-boot state — surface as a recoverable OAuth error → HTML page.
+            raise OAuthError("oauth_exchange_failed", "crm-service user is not provisioned")
+
+        acc = await self._create_or_relink(
+            owner_user_id=owner.id, group_id=None, email=email, tokens=tokens
+        )
+        return acc, st.crm_state
 
 
 class OutlookTokenService:

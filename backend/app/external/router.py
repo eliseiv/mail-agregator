@@ -35,11 +35,13 @@ from typing import TypeVar
 
 from fastapi import APIRouter, Query, Request, Response, status
 from fastapi.exceptions import RequestValidationError
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from pydantic import ValidationError as PydanticValidationError
 
+from backend.app.audit import AuditWriter
 from backend.app.deps import DbSession
-from backend.app.exceptions import ForbiddenError, NotAuthenticatedError
+from backend.app.exceptions import ForbiddenError, NotAuthenticatedError, NotFoundError
 from backend.app.external.schemas import (
     ExternalMailboxCreateRequest,
     ExternalMailboxDTO,
@@ -50,6 +52,8 @@ from backend.app.external.schemas import (
     ExternalMailboxUpdateRequest,
     ExternalMessagesResponse,
     ExternalMessagesResponseDesc,
+    ExternalOAuthAuthorizeRequest,
+    ExternalOAuthAuthorizeResponse,
     ExternalReplyRequest,
     ExternalReplyResponse,
     ExternalTagApplyResponse,
@@ -66,6 +70,8 @@ from backend.app.external.write_service import (
     ExternalMailboxService,
     ExternalTagsService,
 )
+from backend.app.oauth.crm_ingest import notify_crm_oauth_ingest
+from backend.app.oauth.service import OAuthError, OutlookOAuthService
 from backend.app.rate_limit import (
     LIMIT_EXTERNAL_API,
     LIMIT_EXTERNAL_REPLY,
@@ -616,3 +622,183 @@ async def external_tag_apply_to_existing(
         result = await ExternalTagsService(db).apply_to_existing(tag_id)
     log.info("external_tag_applied", client_ip=ip, tag_id=tag_id, applied=result.applied_count)
     return result
+
+
+# ---------------------------------------------------------------------------
+# External Outlook OAuth (headless) — ADR-0045 / 04-api-contracts §4f-oauth.
+#
+# Restores the Outlook consent flow for adding/reconnecting mailboxes from the
+# CRM after the session ``oauth/router.py`` is decommissioned. The
+# ``OUTLOOK_CLIENT_SECRET`` + code→token exchange + refresh-token AES-GCM stay
+# in the aggregator; the CRM only initiates (opaque ``crm_state``) and receives
+# the binding via a signed server-to-server notification (§3).
+#
+#   POST /api/external/mailboxes/oauth/authorize  — EXTERNAL_WRITE_ENABLED gated
+#       (reuses ``_authorize_write``: rate-limit → key → gate → write-gate),
+#       then the ``outlook_oauth_enabled`` 404-gate, then body → build URL.
+#   GET  /api/external/mailboxes/oauth/callback   — the registered redirect_uri,
+#       NO key/session (authorised by the one-shot Redis ``state`` + PKCE);
+#       returns a self-contained HTML success/error page (no Jinja after the
+#       demontage). CSRF-exempt via the ``/api/external/`` prefix.
+# ---------------------------------------------------------------------------
+
+
+def _require_outlook_oauth_enabled(settings: Settings) -> None:
+    """Hide both OAuth routes (404) when the feature is off (ADR-0045 §2).
+
+    Symmetric with the old session ``_require_enabled`` — the feature is hidden,
+    not disclosed, when ``OUTLOOK_CLIENT_ID``/``_SECRET`` are unset.
+    """
+    if not settings.outlook_oauth_enabled:
+        raise NotFoundError()
+
+
+def _oauth_html_page(*, title: str, heading: str, message: str) -> HTMLResponse:
+    """Minimal self-contained HTML page for the callback (no Jinja/templates).
+
+    Inline strings only — the aggregator has no template engine after the
+    demontage (ADR-0045 §2). ``Cache-Control: no-store`` since it may briefly
+    reflect flow state. The static, non-user-controlled text is safe to inline
+    (no request-derived interpolation → no XSS surface).
+    """
+    html = (
+        '<!doctype html><html lang="ru"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        f"<title>{title}</title>"
+        "<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;"
+        "background:#0f172a;color:#e2e8f0;display:flex;min-height:100vh;margin:0;"
+        "align-items:center;justify-content:center}main{max-width:28rem;padding:2rem;"
+        "text-align:center}h1{font-size:1.25rem;margin:0 0 .75rem}p{color:#94a3b8;"
+        "line-height:1.5;margin:0}</style></head><body><main>"
+        f"<h1>{heading}</h1><p>{message}</p></main></body></html>"
+    )
+    return HTMLResponse(content=html, headers={"Cache-Control": "no-store"})
+
+
+# Static, non-user-controlled Russian page copy for the callback HTML.
+_OAUTH_OK_TITLE = "Outlook подключён"
+_OAUTH_OK_MESSAGE = "Ящик добавлен. Вернитесь в CRM — можно закрыть эту вкладку."
+_OAUTH_ERR_TITLE = "Не удалось подключить Outlook"  # noqa: RUF001
+_OAUTH_ERR_MESSAGE = (
+    "Подключение не завершено. Вернитесь в CRM и повторите попытку добавления ящика."
+)
+
+
+def _oauth_success_page() -> HTMLResponse:
+    return _oauth_html_page(
+        title=_OAUTH_OK_TITLE, heading=_OAUTH_OK_TITLE, message=_OAUTH_OK_MESSAGE
+    )
+
+
+def _oauth_error_page() -> HTMLResponse:
+    return _oauth_html_page(
+        title=_OAUTH_ERR_TITLE, heading=_OAUTH_ERR_TITLE, message=_OAUTH_ERR_MESSAGE
+    )
+
+
+@router.post(
+    "/mailboxes/oauth/authorize",
+    response_model=ExternalOAuthAuthorizeResponse,
+)
+async def external_oauth_authorize(
+    request: Request, db: DbSession
+) -> ExternalOAuthAuthorizeResponse:
+    """Mint a Microsoft authorize URL + state for a headless CRM consent (ADR-0045 §2).
+
+    Order (ADR-0045 §2): ``_authorize_write`` (rate-limit → key → feature-gate →
+    write-gate) → ``outlook_oauth_enabled`` 404-gate → body → delegate.
+    """
+    ip = client_ip(request)
+    settings = get_settings()
+    await _authorize_write(request, ip=ip, settings=settings)
+    _require_outlook_oauth_enabled(settings)
+    payload = await _parse_json_body(request, ExternalOAuthAuthorizeRequest)
+    authorize_url, state = await OutlookOAuthService(db).build_authorize_url_headless(
+        payload.crm_state
+    )
+    log.info("external_oauth_authorize", client_ip=ip)
+    return ExternalOAuthAuthorizeResponse(authorize_url=authorize_url, state=state)
+
+
+@router.get("/mailboxes/oauth/callback", response_model=None)
+async def external_oauth_callback(
+    request: Request,
+    db: DbSession,
+    code: str | None = Query(default=None),
+    state: str | None = Query(default=None),
+    error: str | None = Query(default=None),
+    error_description: str | None = Query(default=None),
+) -> HTMLResponse:
+    """Microsoft redirect target: exchange the code, create/relink, notify CRM (ADR-0045 §2).
+
+    No API key/session — authorised by the one-shot Redis ``state`` (+ PKCE),
+    consumed atomically inside ``exchange_code_headless``. Rate-limited by IP
+    (the ``LIMIT_EXTERNAL_WRITE`` budget) since the redirect arrives without a
+    key. Any failure (consent declined, missing/bad ``state``, exchange error)
+    yields the HTML error page and creates NO mailbox.
+    """
+    ip = client_ip(request)
+    settings = get_settings()
+
+    # Rate-limit by IP — the redirect carries no key (ADR-0045 §2).
+    runtime_limit = Limit(
+        name=LIMIT_EXTERNAL_WRITE.name,
+        capacity=settings.EXTERNAL_WRITE_RATE_LIMIT_PER_MINUTE,
+        window_seconds=LIMIT_EXTERNAL_WRITE.window_seconds,
+    )
+    await consume(runtime_limit, f"ip:{ip}")
+
+    # Feature hidden when Azure App creds are unset (404, symmetric with authorize).
+    _require_outlook_oauth_enabled(settings)
+
+    # Consent declined / Microsoft returned an error — no code to exchange.
+    if error:
+        log.info("external_oauth_consent_denied", client_ip=ip, error=error)
+        return _oauth_error_page()
+
+    if not code or not state:
+        log.info("external_oauth_missing_params", client_ip=ip)
+        return _oauth_error_page()
+
+    try:
+        async with db.begin():
+            account, crm_state = await OutlookOAuthService(db).exchange_code_headless(
+                code=code, state=state
+            )
+            # Capture the values BEFORE the transaction closes (expire-on-commit
+            # would otherwise re-load these lazily outside a transaction).
+            mail_account_id = int(account.id)
+            email = account.email
+            display_name = account.display_name
+            is_active = bool(account.is_active)
+            await AuditWriter(db).log(
+                actor_user_id=account.user_id,
+                action="oauth_account_linked",
+                target_user_id=account.user_id,
+                details={
+                    "mail_account_id": mail_account_id,
+                    "email": email,
+                    "scopes": account.oauth_scopes,
+                },
+                ip=ip,
+                user_agent=request.headers.get("user-agent", "")[:256] or None,
+            )
+    except OAuthError as exc:
+        log.info("external_oauth_exchange_failed", client_ip=ip, code=exc.code)
+        return _oauth_error_page()
+
+    # Best-effort CRM notification (§3) — a failure never rolls back the box.
+    notified = await notify_crm_oauth_ingest(
+        crm_state=crm_state,
+        mail_account_id=mail_account_id,
+        email=email,
+        display_name=display_name,
+        is_active=is_active,
+    )
+    log.info(
+        "external_oauth_connected",
+        client_ip=ip,
+        mail_account_id=mail_account_id,
+        crm_notified=notified,
+    )
+    return _oauth_success_page()

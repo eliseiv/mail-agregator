@@ -1569,6 +1569,21 @@ Content-Type: application/json
 - **`GET /api/external/messages`** — `group_id` и `mail_account_id` становятся **повторяемыми** (`list[int]`; `?group_id=1&group_id=2`) **и AND-комбинируемыми** (взаимоисключение ADR-0037 **снято**, supersede). Эффективный набор = `canonical ∩ (⋃ accounts of group_id, если задан) ∩ (set(mail_account_id), если задан)`; пустое пересечение → пустая страница (не 404); незнакомый/чужой/non-canonical id просто не добавляется в пересечение; **BC** single-filter. Кода `field=filter` нет. Мотивация — безопасная ролевая видимость CRM (scope-`group_id` AND пользовательский `mail_account_id`).
 - **`GET /api/external/mailboxes`** — новые query `is_active: bool|null` (None=все) и повторяемый `group_id: list[int]`; **`ExternalMailboxDTO` += `last_synced_at:datetime|null`, `last_sync_error:str|null`, `consecutive_failures:int`** (аддитивно; секреты по-прежнему не раскрываются).
 
+### 4f-oauth. `/api/external/mailboxes/oauth/*` (External Outlook OAuth, ADR-0045)
+
+Источник истины — [ADR-0045](./adr/ADR-0045-external-outlook-oauth-headless.md) (парный CRM `ADR-045`; закрывает `TD-052`). Headless-восстановление Outlook OAuth-consent для добавления/переподключения ящиков из CRM. `OutlookOAuthService` (реюз `build_authorize_url`/`exchange_code`, ADR-0025) остаётся и адаптирован: `OAuthState = {code_verifier, crm_state}`, owner создаваемого ящика = **`crm-service`**, **без `group_id`** (колонка дропнута `ADR-0044`).
+
+Требуется `outlook_oauth_enabled` (`bool(OUTLOOK_CLIENT_ID and OUTLOOK_CLIENT_SECRET)`); при `false` оба эндпоинта → `404 not_found` (фича скрыта, симметрично старому `_require_enabled`). `redirect_uri` (Azure App + env `OUTLOOK_REDIRECT_URI`) = **`{APP_BASE_URL}/api/external/mailboxes/oauth/callback`** (обновляется при cut-over — devops).
+
+| Метод / путь | Auth | Семантика | Ответ |
+| --- | --- | --- | --- |
+| `POST /api/external/mailboxes/oauth/authorize` | `EXTERNAL_WRITE_ENABLED` (auth-flow ADR-0039 §1) | Тело `ExternalOAuthAuthorizeRequest{crm_state: str}` (непрозрачный CRM-токен, ≤512; агрегатор не интерпретирует). `build_authorize_url(crm_state)`: state+PKCE S256 → Redis `oauth_state:{state}={code_verifier, crm_state}` TTL `OUTLOOK_OAUTH_STATE_TTL_SECONDS`; собирает Microsoft authorize URL. | `200 ExternalOAuthAuthorizeResponse{authorize_url:str, state:str}`; `404 not_found` (`outlook_oauth_enabled=false`); `401`/`403`/`400`/`429`. |
+| `GET /api/external/mailboxes/oauth/callback` | одноразовый `state` в Redis + PKCE (**без ключа/сессии** — Microsoft-редирект; CSRF-exempt по префиксу) | Query `code`/`state`/`error`/`error_description`. Атомарный GET+DEL `state` → `exchange_code` (code→токены, resolve email из `id_token`, create owner=`crm-service`/relink existing) → уведомить CRM (§ниже) → минимальная self-contained HTML-страница **«Outlook подключён — вернитесь в CRM»**. `error`/битый state/сбой обмена → HTML-страница ошибки (ящик НЕ создаётся). | `200` (HTML success/error); `404` (`outlook_oauth_enabled=false`). |
+
+**Уведомление CRM (server-to-server, HMAC).** После успешного create/relink (ДО первого push письма ящика) агрегатор POST'ит **`{CRM_OAUTH_INGEST_URL}` (= CRM `/api/mail/oauth/ingest`)** тем же HMAC-механизмом и секретом **`CRM_PUSH_SECRET`**, что `/api/mail/ingest` (`ADR-0043` §2): заголовки `X-Mail-Signature: sha256=<hex>` + `X-Mail-Timestamp`, каноническая подпись `str(ts).encode("ascii") + b"." + raw_body_bytes`. Тело `{crm_state, mail_account_id:int, email:str, display_name:str|null, is_active:bool}`. **Connect-only-ретрай** (анти-двойная-запись; CRM upsert идемпотентен по `mail_account_id`); best-effort — сбой не откатывает созданный ящик (reconcile добирает, CRM `TD-047`). `CRM_OAUTH_INGEST_URL` пуст → уведомление не шлётся (endpoint фактически выключен).
+
+**Env (ADR-0045 §4, амендмент `ADR-0044` Phase G — НЕ удалять):** `OUTLOOK_CLIENT_ID`, `OUTLOOK_CLIENT_SECRET` (redact), `OUTLOOK_REDIRECT_URI` (→ callback выше), `OUTLOOK_TENANT`, `OUTLOOK_OAUTH_STATE_TTL_SECONDS`; **новый** `CRM_OAUTH_INGEST_URL`; реюз `CRM_PUSH_SECRET`.
+
 ---
 
 ## 4e. Mail forwarding — переадресация писем команды лидеру (ADR-0034)
