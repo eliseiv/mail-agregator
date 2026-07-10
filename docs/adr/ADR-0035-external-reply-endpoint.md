@@ -2,7 +2,7 @@
 
 | | |
 | --- | --- |
-| Статус | accepted |
+| Статус | **superseded by [ADR-0043](./ADR-0043-strip-to-connector-push-to-crm.md)** (2026-07-10) — message-scoped reply заменён обобщённым `POST /api/external/mailboxes/{id}/send` (письма в CRM); ранее accepted |
 | Дата | 2026-07-03 |
 | Заменяет / отменён | — (extends [ADR-0029](./ADR-0029-external-pull-api.md); read-контракт ADR-0029 **не отменяется** и остаётся источником истины для pull) |
 

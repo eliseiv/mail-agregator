@@ -59,6 +59,12 @@ class Message(Base):
     fetched_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("now()")
     )
+    # ADR-0043 §2: push-outbox marker. NULL = not yet delivered to the CRM
+    # (`POST {CRM_INGEST_URL}/api/mail/ingest`); set ``= now()`` once the CRM
+    # accepts the message (2xx). The ``crm_push_recovery`` scan re-enqueues
+    # rows that are still NULL within the retention window. Migration
+    # ``20260710_024``.
+    pushed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         UniqueConstraint(
@@ -79,4 +85,11 @@ class Message(Base):
             postgresql_where=text("is_read = false"),
         ),
         Index("ix_messages_internal_date", "internal_date"),
+        # ADR-0043 §2: partial index over undelivered rows for the CRM
+        # push-outbox recovery scan (``crm_push_recovery``).
+        Index(
+            "ix_messages_pushed_at_pending",
+            "id",
+            postgresql_where=text("pushed_at IS NULL"),
+        ),
     )

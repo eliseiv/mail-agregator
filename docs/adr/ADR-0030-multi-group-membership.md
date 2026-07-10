@@ -2,7 +2,7 @@
 
 | | |
 | --- | --- |
-| Статус | accepted |
+| Статус | **superseded by [ADR-0043](./ADR-0043-strip-to-connector-push-to-crm.md)** (2026-07-10) — группы/членство снимаются (владение ящиком командой — только в CRM); ранее accepted |
 | Дата | 2026-06-23 |
 | Связь с другими ADR | **Supersedes ADR-0019 §11 / Alternative A2 (partial)** — отменяет только пункт отказа от multi-group. Всё остальное в ADR-0019 (роли `super_admin`/`group_leader`/`group_member`, инвариант лидера, visibility-модель) остаётся **accepted** и в силе. **ADR-0027** (push-only боты по командам) — **не меняется** (см. §Decision 6). Расширяет visibility-модель ADR-0019 §7 и recipient-SQL ADR-0022 §2.2. |
 

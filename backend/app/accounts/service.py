@@ -51,6 +51,31 @@ from shared.storage import get_storage
 log = get_logger(__name__)
 
 
+async def _enqueue_crm_status(account_id: int) -> None:
+    """LPUSH one mailbox-status event onto ``crm_status_queue`` (ADR-0043 §2).
+
+    Called on a mailbox re-enable / activate / deactivate so the CRM status
+    mirror stays in sync. Gated by ``crm_status_enabled`` (URL + secret) and
+    wrapped best-effort — a Redis outage must never break the admin request.
+    The worker ``crm_status_dispatch`` loads the live snapshot, so enqueuing
+    the account_id (even before the request transaction commits) is safe.
+    """
+    from shared.config import get_settings
+
+    if not get_settings().crm_status_enabled:
+        return
+    try:
+        from backend.app.crm_push.service import enqueue_crm_status
+
+        await enqueue_crm_status(account_id)
+    except Exception as exc:
+        log.warning(
+            "crm_status_enqueue_failed",
+            mail_account_id=account_id,
+            detail=str(exc)[:200],
+        )
+
+
 def _require(value: str | None, field: str) -> str:
     """Narrow an optional credential field to ``str`` for the ad-hoc test path.
 
@@ -694,6 +719,10 @@ class MailAccountService:
         await self._repo.update_fields(account_id, **update_fields)
         refreshed = await self._repo.get_by_id(account_id)
         assert refreshed is not None
+        # ADR-0043 §2: on a credential re-enable (Disabled → Active) mirror the
+        # mailbox status change to the CRM so it clears the down-alert.
+        if creds_changed:
+            await _enqueue_crm_status(account_id)
         owner = await self._users.get_by_id(refreshed.user_id)
         assert owner is not None
         return _to_dto(refreshed, owner)
@@ -724,6 +753,10 @@ class MailAccountService:
         await self._repo.update_fields(account_id, **update_fields)
         refreshed = await self._repo.get_by_id(account_id)
         assert refreshed is not None
+        # ADR-0043 §2: mirror the mailbox status change (activate / deactivate)
+        # to the CRM. On activate this clears the CRM down-alert; on deactivate
+        # it records the manual disable.
+        await _enqueue_crm_status(account_id)
         owner = await self._users.get_by_id(refreshed.user_id)
         assert owner is not None
         return _to_dto(refreshed, owner)

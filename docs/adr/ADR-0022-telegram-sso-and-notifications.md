@@ -2,7 +2,7 @@
 
 | | |
 | --- | --- |
-| Статус | accepted |
+| Статус | **superseded by [ADR-0043](./ADR-0043-strip-to-connector-push-to-crm.md)** (2026-07-10) — Telegram SSO/нотификации переносятся в CRM (CRM `ADR-044` §6); ранее accepted |
 | Дата | 2026-05-13 |
 | Заменяет / отменён | частично отменяет/superseded'ит ADR-0018 §5 (запрет линковки) и §«Alternatives 1–2»; закрывает TD-013 |
 

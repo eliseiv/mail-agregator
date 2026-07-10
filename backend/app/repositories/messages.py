@@ -513,6 +513,56 @@ class MessagesRepo:
             update(Message).where(Message.id == message_id).values(is_read=is_read)
         )
 
+    # --- CRM push-outbox (ADR-0043 §2, used by worker.crm_push_*) ----------
+
+    async def list_for_crm_push(self, message_ids: list[int]) -> list[Message]:
+        """Bulk-load ``messages`` by id for the CRM ingest payload.
+
+        Rows are returned regardless of ``pushed_at`` (a re-enqueued /
+        recovered id may already be marked; the CRM ingest is idempotent, so a
+        redundant push is harmless). Ordered by ``id`` for stable batching.
+        Missing ids are simply absent from the result.
+        """
+        if not message_ids:
+            return []
+        stmt = select(Message).where(Message.id.in_(message_ids)).order_by(Message.id)
+        return list((await self._s.execute(stmt)).scalars().all())
+
+    async def mark_pushed(self, message_ids: list[int]) -> int:
+        """Stamp ``pushed_at = now()`` for delivered messages (guarded).
+
+        Only rows still ``pushed_at IS NULL`` are updated (idempotent — a
+        double delivery does not move the timestamp). Returns the number of
+        rows transitioned.
+        """
+        if not message_ids:
+            return 0
+        stmt = (
+            update(Message)
+            .where(Message.id.in_(message_ids), Message.pushed_at.is_(None))
+            .values(pushed_at=func.now())
+        )
+        result = await self._s.execute(stmt)
+        return int(result.rowcount or 0)
+
+    async def list_pending_push(self, *, window_start: datetime, limit: int) -> list[int]:
+        """``messages.id`` not yet delivered to the CRM (recovery scan).
+
+        Returns ids with ``pushed_at IS NULL`` fetched within the lookback
+        window (``fetched_at > window_start``), oldest first, capped at
+        ``limit``. Uses the ``ix_messages_pushed_at_pending`` partial index.
+        """
+        stmt = (
+            select(Message.id)
+            .where(
+                Message.pushed_at.is_(None),
+                Message.fetched_at > window_start,
+            )
+            .order_by(Message.id)
+            .limit(limit)
+        )
+        return [int(r[0]) for r in (await self._s.execute(stmt)).all()]
+
     # --- Retention / deletion (used by worker.cleanup) --------------------
 
     async def select_expired(self, threshold: datetime, limit: int) -> list[tuple[int, int, int]]:

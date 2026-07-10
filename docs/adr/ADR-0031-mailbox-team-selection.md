@@ -2,7 +2,7 @@
 
 | | |
 | --- | --- |
-| Статус | accepted |
+| Статус | **superseded by [ADR-0043](./ADR-0043-strip-to-connector-push-to-crm.md)** (2026-07-10) — выбор/смена команды ящика переезжает в CRM (`mail_accounts.team_id`); ранее accepted |
 | Дата | 2026-06-23 |
 | Связь с другими ADR | **Расширяет** [ADR-0019](./ADR-0019-groups-and-roles.md) §8 (авторизация create mail-account / `target_user_id`) и [ADR-0030](./ADR-0030-multi-group-membership.md) (multi-group; `mail_accounts.group_id` остаётся 1:1, видимость по `scope.group_ids`). Использует механику no-JS form-fallback [ADR-0015](./ADR-0015-no-js-fallback.md). Шифрование/AAD не затрагивает ([ADR-0005](./ADR-0005-encryption.md)). |
 

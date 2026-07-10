@@ -2,7 +2,7 @@
 
 | | |
 | --- | --- |
-| Статус | accepted |
+| Статус | **superseded by [ADR-0043](./ADR-0043-strip-to-connector-push-to-crm.md)** (2026-07-10) — мульти-линк переносится в CRM (`mail_telegram_links`); ранее accepted |
 | Дата | 2026-05-27 |
 | Расширяет | [ADR-0022](./ADR-0022-telegram-sso-and-notifications.md) §1 (telegram_links) и §2 (push-нотификации). ADR-0022 остаётся `accepted`; настоящий ADR снимает инвариант «один user — один TG» и пересматривает ключ идемпотентности доставки. |
 | Спринт | A (независим от ADR-0025 / Outlook OAuth2) |

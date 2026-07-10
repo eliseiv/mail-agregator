@@ -1,6 +1,6 @@
 # ADR-0019: Роли пользователей и группы — иерархия доступа
 
-- **Статус:** accepted
+- **Статус:** **superseded by [ADR-0043](./ADR-0043-strip-to-connector-push-to-crm.md)** (2026-07-10) — группы/роли/human-пользователи снимаются (остаётся служебный `crm-service`); ранее accepted (§11/A2 superseded by ADR-0030)
 - **Дата:** 2026-05-08
 
 ## Context

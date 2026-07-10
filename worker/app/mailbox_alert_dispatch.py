@@ -202,6 +202,12 @@ async def _dispatch_one(raw: str) -> None:
 async def mailbox_alert_dispatch() -> None:
     """One dispatcher tick (ADR-0033 §4)."""
     settings = get_settings()
+    # ADR-0043 cut-over kill-switch: drop this tick silently while Telegram
+    # delivery is muted. The disable transaction still stamps
+    # ``disabled_alert_sent_at`` (idempotency preserved); the CRM status channel
+    # carries the mailbox-down signal during/after cut-over.
+    if not settings.TELEGRAM_DELIVERY_ENABLED:
+        return
     redis = get_redis()
     batch_size = settings.MAILBOX_ALERT_BATCH_SIZE
 

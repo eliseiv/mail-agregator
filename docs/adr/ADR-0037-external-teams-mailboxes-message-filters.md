@@ -4,7 +4,7 @@
 
 | | |
 | --- | --- |
-| Статус | accepted (взаимоисключение `mail_account_id` × `group_id` **superseded by ADR-0039** §3 — фильтры стали AND-комбинируемыми) |
+| Статус | **superseded by [ADR-0043](./ADR-0043-strip-to-connector-push-to-crm.md)** (2026-07-10) — `GET /api/external/teams` и фильтр `group_id` снимаются (групп в агрегаторе нет); `GET /mailboxes` может остаться для сверки. Ранее: accepted (взаимоисключение `mail_account_id` × `group_id` **superseded by ADR-0039** §3) |
 | Дата | 2026-07-06 |
 | Заменяет / отменён | взаимоисключение фильтров — **superseded by [ADR-0039](./ADR-0039-external-write-api.md) §3** (2026-07-09); в остальном **extends ADR-0029** (переиспользует canonical-дедуп ADR-0029 §5 и оба режима пагинации ADR-0036) |
 

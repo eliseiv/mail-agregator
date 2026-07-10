@@ -84,6 +84,10 @@ REDACT_KEYS: frozenset[str] = frozenset(
         # relay account password lets an attacker send mail as the relay.
         # Same leak class as the mailbox SMTP passwords above.
         "FORWARD_SMTP_PASSWORD",
+        # CRM push connector (ADR-0043 §2): the shared HMAC secret signs every
+        # push/status request to the CRM. A leak lets an attacker forge ingest
+        # payloads. Same leak class as the mailbox / relay secrets above.
+        "CRM_PUSH_SECRET",
     }
 )
 

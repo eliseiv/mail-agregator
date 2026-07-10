@@ -2,7 +2,7 @@
 
 | | |
 | --- | --- |
-| Статус | accepted |
+| Статус | **superseded by [ADR-0043](./ADR-0043-strip-to-connector-push-to-crm.md)** (2026-07-10) — forwarding переносится в CRM (по team, CRM `ADR-044` §8); SMTP-ядро реюзается новым send-эндпоинтом; ранее accepted |
 | Дата | 2026-07-03 |
 | Связь с другими ADR | **Форкает паттерн** [ADR-0023](./ADR-0023-outbound-webhooks.md) (per-group конфиг «одна запись на команду» + Redis-очередь + APScheduler-диспатчер + DB-дедуп через UNIQUE-claim). **Видимость/ACL получателя-конфигуратора** — по модели членств [ADR-0030](./ADR-0030-multi-group-membership.md) (`user_groups`) и visibility-scope [ADR-0019](./ADR-0019-groups-and-roles.md) §7. **Dispatch-паттерн fire-and-forget** — как [ADR-0033](./ADR-0033-mailbox-down-telegram-alert.md) (очередь + диспатчер, без recovery-scan). **Переиспользует** SMTP-ядро отправки (`send/service.py`, ADR-0002/ADR-0025 XOAUTH2), шифрование кредов (ADR-0005), storage вложений (ADR-0007), no-JS fallback (ADR-0015), CSRF (ADR-0010). UI встраивается в существующую страницу «Интеграции» (ADR-0023 §2.7). |
 

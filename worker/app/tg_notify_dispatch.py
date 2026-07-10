@@ -33,6 +33,10 @@ _QUEUE_KEY = "tg_notify_queue"
 async def tg_notify_dispatch() -> None:
     """One dispatcher tick."""
     settings = get_settings()
+    # ADR-0043 cut-over kill-switch: when Telegram delivery is muted, drop this
+    # tick silently (the queue keeps filling; nothing is sent).
+    if not settings.TELEGRAM_DELIVERY_ENABLED:
+        return
     redis = get_redis()
     batch_size = settings.TG_NOTIFY_BATCH_SIZE
 

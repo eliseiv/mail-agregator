@@ -30,6 +30,10 @@ log = get_logger(__name__)
 async def tg_notify_recovery_scan() -> None:
     """One recovery-scan tick."""
     settings = get_settings()
+    # ADR-0043 cut-over kill-switch: skip recovery re-enqueue while Telegram
+    # delivery is muted (nothing would be delivered anyway).
+    if not settings.TELEGRAM_DELIVERY_ENABLED:
+        return
 
     # Local imports — same reasoning as in tg_notify_dispatch.
     from backend.app.repositories.telegram_notifications import (

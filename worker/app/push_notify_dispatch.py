@@ -42,6 +42,10 @@ async def push_notify_dispatch() -> None:
         # Feature off (no configured bots or no admin recipients). Nothing to
         # drain — the queue is never written to when disabled (sync_cycle §3.1).
         return
+    # ADR-0043 cut-over kill-switch: drop this tick silently while Telegram
+    # delivery is muted (the queue keeps filling; nothing is sent).
+    if not settings.TELEGRAM_DELIVERY_ENABLED:
+        return
 
     redis = get_redis()
     batch_size = settings.PUSH_NOTIFY_BATCH_SIZE

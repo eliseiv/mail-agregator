@@ -2,7 +2,7 @@
 
 | | |
 | --- | --- |
-| Статус | accepted |
+| Статус | **superseded by [ADR-0043](./ADR-0043-strip-to-connector-push-to-crm.md)** (2026-07-10) — статус синка ящика зеркалится в CRM, алерты — в CRM; ранее accepted |
 | Дата | 2026-07-03 |
 | Связь с другими ADR | **Расширяет** [ADR-0022](./ADR-0022-telegram-sso-and-notifications.md) §2 (Telegram push-инфраструктура: `telegram_links`, `send_notification`, диспатчер, opt-out `users_settings`). **Триггерится** событием auto-disable из [ADR-0026](./ADR-0026-sync-error-resilience.md) §2/§3 (permanent-ошибка → `is_active=false`) и [ADR-0028](./ADR-0028-oauth-login-failed-transient.md) (контекстная классификация OAuth). Видимость получателей — по модели членств [ADR-0030](./ADR-0030-multi-group-membership.md) (`user_groups`), консистентно с [ADR-0019](./ADR-0019-groups-and-roles.md) §7. Доставка — **основным** ботом ADR-0022; push-боты [ADR-0027](./ADR-0027-push-team-bots.md) **не** участвуют. |
 

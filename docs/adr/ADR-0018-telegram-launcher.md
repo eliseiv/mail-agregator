@@ -2,7 +2,7 @@
 
 | | |
 | --- | --- |
-| Статус | accepted |
+| Статус | **superseded by [ADR-0043](./ADR-0043-strip-to-connector-push-to-crm.md)** (2026-07-10) — Telegram/Mini App переносятся в CRM (`/tg/mail`); ранее partially superseded by ADR-0022 |
 | Дата | 2026-05-07 |
 | Заменяет / отменён | — |
 

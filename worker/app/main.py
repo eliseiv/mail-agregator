@@ -35,6 +35,9 @@ from shared.logging import configure_logging, get_logger
 from shared.redis_client import close_redis
 from shared.storage import get_storage
 from worker.app.cleanup import retention_cleanup
+from worker.app.crm_push_dispatch import crm_push_dispatch
+from worker.app.crm_push_recovery import crm_push_recovery_scan
+from worker.app.crm_status_dispatch import crm_status_dispatch
 from worker.app.forward_dispatch import forward_dispatch
 from worker.app.mailbox_alert_dispatch import mailbox_alert_dispatch
 from worker.app.push_notify_dispatch import push_notify_dispatch
@@ -178,6 +181,42 @@ async def _safe_forward_dispatch() -> None:
         )
 
 
+async def _safe_crm_push_dispatch() -> None:
+    """Wrapper for the CRM ingest-push dispatcher (ADR-0043 §2)."""
+    try:
+        await crm_push_dispatch()
+    except Exception as exc:
+        log.error(
+            "crm_push_dispatch_unhandled",
+            detail=str(exc)[:300],
+            exc_info=True,
+        )
+
+
+async def _safe_crm_push_recovery() -> None:
+    """Wrapper for the CRM push recovery scan (ADR-0043 §2)."""
+    try:
+        await crm_push_recovery_scan()
+    except Exception as exc:
+        log.error(
+            "crm_push_recovery_unhandled",
+            detail=str(exc)[:300],
+            exc_info=True,
+        )
+
+
+async def _safe_crm_status_dispatch() -> None:
+    """Wrapper for the CRM mailbox-status dispatcher (ADR-0043 §2)."""
+    try:
+        await crm_status_dispatch()
+    except Exception as exc:
+        log.error(
+            "crm_status_dispatch_unhandled",
+            detail=str(exc)[:300],
+            exc_info=True,
+        )
+
+
 async def _bootstrap() -> None:
     """One-time async startup: ensure bucket etc."""
     try:
@@ -304,6 +343,40 @@ async def main() -> None:
             misfire_grace_time=30,
         )
 
+    # ADR-0043 §2: CRM ingest-push dispatcher + recovery scan. Registered ONLY
+    # when the CRM push is configured (``CRM_INGEST_URL`` + ``CRM_PUSH_SECRET``)
+    # — a pre-cut-over deployment runs unchanged (jobs absent, sync_cycle does
+    # not enqueue).
+    if settings.crm_push_enabled:
+        scheduler.add_job(
+            _safe_crm_push_dispatch,
+            trigger=IntervalTrigger(seconds=settings.CRM_PUSH_DISPATCH_INTERVAL_SECONDS),
+            id="crm_push_dispatch",
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=30,
+        )
+        scheduler.add_job(
+            _safe_crm_push_recovery,
+            trigger=IntervalTrigger(seconds=settings.CRM_PUSH_RECOVERY_INTERVAL_SECONDS),
+            id="crm_push_recovery",
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=600,
+        )
+    # ADR-0043 §2: CRM mailbox-status dispatcher. Registered ONLY when the
+    # status channel is configured (``CRM_MAILBOX_STATUS_URL`` +
+    # ``CRM_PUSH_SECRET``).
+    if settings.crm_status_enabled:
+        scheduler.add_job(
+            _safe_crm_status_dispatch,
+            trigger=IntervalTrigger(seconds=settings.CRM_STATUS_DISPATCH_INTERVAL_SECONDS),
+            id="crm_status_dispatch",
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=30,
+        )
+
     # Touch once immediately so the health-check works even before the first
     # 30-second tick.
     _touch_alive()
@@ -321,6 +394,9 @@ async def main() -> None:
         webhook_dispatch_seconds=settings.WEBHOOK_DISPATCH_INTERVAL_SECONDS,
         webhook_recovery_seconds=settings.WEBHOOK_RECOVERY_INTERVAL_SECONDS,
         forwarding_enabled=settings.FORWARDING_ENABLED,
+        crm_push_enabled=settings.crm_push_enabled,
+        crm_status_enabled=settings.crm_status_enabled,
+        telegram_delivery_enabled=settings.TELEGRAM_DELIVERY_ENABLED,
     )
 
     # Optional: kick off one sync immediately on boot, so we don't wait the

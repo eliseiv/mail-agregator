@@ -383,6 +383,51 @@ class Settings(BaseSettings):
     FORWARD_SMTP_STARTTLS: bool = True
     FORWARD_SMTP_SSL: bool = False
 
+    # --- CRM push connector (ADR-0043 §2) ---------------------------------
+    # The aggregator PUSHes every newly synced message to the CRM and mirrors
+    # mailbox sync-status changes. All three CRM_* below are read by the WORKER
+    # container. Secrets/URLs are never logged (``CRM_PUSH_SECRET`` is in the
+    # ``shared/logging.py`` redact-list).
+    #
+    # Ingest endpoint (new mail): ``POST {CRM_INGEST_URL}/api/mail/ingest``.
+    CRM_INGEST_URL: str = ""
+    # Mailbox status-channel: ``POST {CRM_MAILBOX_STATUS_URL}/api/mail/mailbox-status``.
+    CRM_MAILBOX_STATUS_URL: str = ""
+    # Shared HMAC-SHA256 secret (= CRM ``MAIL_PUSH_SECRET``). Empty on EITHER
+    # side ⇒ the push channel stays OFF (jobs are not registered, sync_cycle
+    # does not enqueue) so a pre-cut-over deployment keeps working unchanged.
+    CRM_PUSH_SECRET: str = ""  # secret
+    # Per-tick ``LPOP count`` from ``crm_push_queue`` = batch size POSTed to
+    # ``/api/mail/ingest`` in one request. CRM caps the batch at 100
+    # (ADR-044 §3 ``MAIL_INGEST_MAX_BATCH``); never exceed it.
+    CRM_PUSH_BATCH_SIZE: int = Field(default=100, ge=1, le=100)
+    # How often ``crm_push_dispatch`` drains ``crm_push_queue`` (~5s).
+    CRM_PUSH_DISPATCH_INTERVAL_SECONDS: int = Field(default=5, ge=1, le=600)
+    # ``crm_push_recovery`` cadence — re-enqueues messages with
+    # ``pushed_at IS NULL`` (lost between sync and push, or a failed POST).
+    CRM_PUSH_RECOVERY_INTERVAL_SECONDS: int = Field(default=3600, ge=60, le=86_400)
+    # Lookback window for the recovery scan (bounded by the retention window,
+    # ADR-0011 30 days). Rows older than this are past retention anyway.
+    CRM_PUSH_RECOVERY_WINDOW_HOURS: int = Field(default=720, ge=1, le=8760)
+    # Per-tick recovery re-enqueue batch cap.
+    CRM_PUSH_RECOVERY_BATCH_SIZE: int = Field(default=500, ge=1, le=10_000)
+    # How often ``crm_status_dispatch`` drains ``crm_status_queue`` (~5s).
+    CRM_STATUS_DISPATCH_INTERVAL_SECONDS: int = Field(default=5, ge=1, le=600)
+    # Per-tick ``LPOP count`` from ``crm_status_queue``.
+    CRM_STATUS_BATCH_SIZE: int = Field(default=30, ge=1, le=500)
+    # Total httpx timeout (connect+read+write) for the CRM POSTs.
+    CRM_PUSH_HTTP_TIMEOUT_SECONDS: int = Field(default=10, ge=1, le=120)
+
+    # --- Telegram delivery kill-switch (ADR-0043 cut-over) ----------------
+    # Master mute for ALL outbound Telegram delivery from the aggregator
+    # (``tg_notify_dispatch``, ``tg_notify_recovery``, ``push_notify_dispatch``,
+    # ``mailbox_alert_dispatch``). ``true`` (default) = unchanged behaviour.
+    # ``false`` = those dispatchers quietly no-op (send nothing). Used during
+    # cut-over to silence the aggregator BEFORE the CRM dispatcher starts, so
+    # notifications are not delivered twice. Incoming webhooks are NOT gated by
+    # this flag (they are switched off via ``setWebhook``, not here).
+    TELEGRAM_DELIVERY_ENABLED: bool = Field(default=True)
+
     @field_validator("MAIL_ENCRYPTION_KEY")
     @classmethod
     def _validate_master_key(cls, v: str) -> str:
@@ -578,6 +623,28 @@ class Settings(BaseSettings):
         return bool(
             self.FORWARD_SMTP_HOST and self.FORWARD_SMTP_FROM and self.FORWARD_SMTP_USERNAME
         )
+
+    @property
+    def crm_push_enabled(self) -> bool:
+        """True when the CRM ingest push is fully configured (ADR-0043 §2).
+
+        Requires ``CRM_INGEST_URL`` + ``CRM_PUSH_SECRET``. When false the
+        ``crm_push_dispatch`` / ``crm_push_recovery`` jobs are NOT registered
+        and ``sync_cycle`` does NOT enqueue to ``crm_push_queue`` — the
+        pre-cut-over aggregator keeps working unchanged. Derived flag —
+        symmetric with :pyattr:`external_api_enabled`.
+        """
+        return bool(self.CRM_INGEST_URL and self.CRM_PUSH_SECRET)
+
+    @property
+    def crm_status_enabled(self) -> bool:
+        """True when the CRM mailbox-status channel is configured (ADR-0043 §2).
+
+        Requires ``CRM_MAILBOX_STATUS_URL`` + ``CRM_PUSH_SECRET``. When false
+        the ``crm_status_dispatch`` job is NOT registered and no status event is
+        enqueued on a mailbox disable / re-enable transition.
+        """
+        return bool(self.CRM_MAILBOX_STATUS_URL and self.CRM_PUSH_SECRET)
 
     @property
     def outlook_authorize_endpoint(self) -> str:

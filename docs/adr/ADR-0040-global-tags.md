@@ -1,6 +1,6 @@
 # ADR-0040 — Глобальные теги (единый админский каталог)
 
-Статус: `accepted` · Дата: 2026-07-09
+Статус: **superseded by [ADR-0043](./ADR-0043-strip-to-connector-push-to-crm.md)** (2026-07-10) — теги переносятся в CRM (глобальный каталог там). Ранее: `accepted` · Дата: 2026-07-09
 
 Extends [ADR-0017](./ADR-0017-tags.md) (теги) / [ADR-0022](./ADR-0022-telegram-sso-and-notifications.md) (уведомления). Парные ADR — `ADR-0039` (external write API, раздел `/api/external/tags`), CRM `ADR-038`. Реализация раздела `/api/external/tags` описана здесь (модель) + в ADR-0039/04-api-contracts (контракт).
 

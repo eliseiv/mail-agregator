@@ -245,6 +245,10 @@ async def sync_one_account(
     # (group_id NOT NULL) and only messages that do not already carry our
     # forward stamp (loop-guard part 1) are collected.
     forward_ids: list[int] = []
+    # ADR-0043 §2: CRM push-outbox — EVERY newly-inserted message is pushed to
+    # the CRM (not tag-gated, unlike the Telegram accumulator). Enqueued after
+    # COMMIT so the ``crm_push_dispatch`` job can load the committed rows.
+    crm_push_ids: list[int] = []
     async with make_session() as s, s.begin():
         repo = MessagesRepo(s)
         tags_service = TagsService(s)
@@ -271,6 +275,8 @@ async def sync_one_account(
                 conflict_count += 1
                 continue
             new_count += 1
+            # ADR-0043 §2: every inserted message is an outbox item for the CRM.
+            crm_push_ids.append(inserted_id)
             # ADR-0034 §3.2: collect for forwarding — team mailbox only,
             # loop-guard part 1 (skip our own already-forwarded copies).
             if account.group_id is not None and not _carries_own_forward_stamp(fmsg):
@@ -349,6 +355,27 @@ async def sync_one_account(
             last_synced_uidnext=box.uidnext,
             last_uidvalidity=box.uidvalidity,
         )
+
+    # ADR-0043 §2: enqueue every newly-inserted message onto ``crm_push_queue``
+    # for delivery to the CRM. Gated by ``crm_push_enabled`` (URL + secret) so
+    # a pre-cut-over deployment does not enqueue. Independent try/except — a
+    # Redis outage must NEVER abort the sync cycle nor the other channels.
+    if crm_push_ids and settings.crm_push_enabled:
+        try:
+            from backend.app.crm_push.service import enqueue_push_ids
+
+            pushed = await enqueue_push_ids(crm_push_ids, source="sync")
+            cycle_log.info(
+                "crm_push_enqueued",
+                count=pushed,
+                mail_account_id=account.id,
+            )
+        except Exception as exc:
+            cycle_log.warning(
+                "crm_push_enqueue_failed",
+                detail=str(exc)[:200],
+                count=len(crm_push_ids),
+            )
 
     # ADR-0022 §2.1 (round-31): enqueue Telegram-notifications for the
     # collected message_ids — every inserted message when
@@ -690,6 +717,29 @@ async def _enqueue_mailbox_alert(account_id: int, *, reason: str) -> None:
         )
 
 
+async def _enqueue_crm_status(account_id: int) -> None:
+    """LPUSH one mailbox-status event onto ``crm_status_queue`` (ADR-0043 §2).
+
+    Gated by ``crm_status_enabled`` (CRM_MAILBOX_STATUS_URL + CRM_PUSH_SECRET).
+    Wrapped in ``try/except`` with a log — a Redis outage must NEVER abort the
+    sync cycle. The dispatcher loads the live status snapshot, so a lost
+    enqueue is corrected by the next status event / reconcile.
+    """
+    if not get_settings().crm_status_enabled:
+        return
+    try:
+        from backend.app.crm_push.service import enqueue_crm_status
+
+        await enqueue_crm_status(account_id)
+        log.info("crm_status_enqueued", mail_account_id=account_id)
+    except Exception as exc:
+        log.warning(
+            "crm_status_enqueue_failed",
+            mail_account_id=account_id,
+            detail=str(exc)[:200],
+        )
+
+
 async def _disable_after_failures(account_id: int, *, user_id: int, reason: str) -> None:
     """Disable the account and write an ``account_auto_disabled`` audit row.
 
@@ -729,6 +779,13 @@ async def _disable_after_failures(account_id: int, *, user_id: int, reason: str)
     # is gated by ``MAILBOX_DOWN_ALERT_ENABLED`` (ADR-0033 §8).
     if stamped and get_settings().MAILBOX_DOWN_ALERT_ENABLED:
         await _enqueue_mailbox_alert(account_id, reason=reason)
+
+    # ADR-0043 §2: mirror the mailbox status change (is_active true→false) to
+    # the CRM. Best-effort — the CRM dedups the down-alert on its side
+    # (``down_alert_sent_at``), so sending on every disable is safe. Gated by
+    # ``crm_status_enabled`` (URL + secret). Runs in parallel with the legacy
+    # Telegram ``mailbox_alert`` above until cut-over.
+    await _enqueue_crm_status(account_id)
 
 
 async def _audit_mass_failure_suppressed(
