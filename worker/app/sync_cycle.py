@@ -39,6 +39,7 @@ from cryptography.exceptions import InvalidTag
 # without architect sign-off. Both containers ship `backend/` + `worker/` +
 # `shared/` per ``deploy/Dockerfile``.
 from backend.app.audit import AuditWriter
+from backend.app.crm_push.service import enqueue_crm_status_best_effort
 from backend.app.exceptions import InvalidHostError
 from backend.app.oauth.service import OAuthError, OAuthRefreshInvalidError, OutlookTokenService
 from backend.app.repositories.mail_accounts import MailAccountsRepo
@@ -362,7 +363,7 @@ async def sync_one_account(
     # from the DB. No dedup: the ADR explicitly allows sending the status on
     # every cycle (idempotency "one alert per transition" lives in the CRM,
     # ``mail_accounts.down_alert_sent_at``). Gated + try/except inside.
-    await _enqueue_crm_status(account.id)
+    await enqueue_crm_status_best_effort(account.id)
 
     # ADR-0043 §2: enqueue every newly-inserted message onto ``crm_push_queue``
     # for delivery to the CRM. Gated by ``crm_push_enabled`` (URL + secret) so
@@ -615,6 +616,12 @@ async def _resolve_credentials(
             # Refresh invalidated by Microsoft — skip without bumping the
             # failure counter (ADR-0025 §3 step 5); UI prompts re-consent.
             cycle_log.info("sync_account_oauth_needs_consent")
+            # ADR-0046 §3 (H7b): this branch short-circuits BEFORE the refresh,
+            # so a mailbox that ALREADY carries ``oauth_needs_consent`` never
+            # reaches the transition point (H7a) again. Without the marker it
+            # would mirror to the CRM as green forever while not syncing at all.
+            # Guarded + idempotent: writes (and pushes) at most once.
+            await _record_needs_consent_marker(account.id)
             return None
         return await _resolve_oauth_access_token(account, cycle_log)
 
@@ -693,7 +700,7 @@ async def _record_transient(account_id: int, *, error: str) -> None:
         await MailAccountsRepo(s).mark_transient_error(account_id, error=error)
 
     # After COMMIT — the dispatcher loads the live status snapshot from the DB.
-    await _enqueue_crm_status(account_id)
+    await enqueue_crm_status_best_effort(account_id)
 
 
 async def _record_failure(account_id: int, *, error: str, disable: bool) -> int:
@@ -701,9 +708,37 @@ async def _record_failure(account_id: int, *, error: str, disable: bool) -> int:
 
     Used in phase 2 of :func:`_run_for_accounts` for PERMANENT accounts when the
     circuit-breaker did NOT trip.
+
+    ADR-0046 §3 (H3): ``mark_sync_failure`` writes two mirrored columns
+    (``consecutive_failures``, ``last_sync_error``), so the new status is
+    mirrored to the CRM AFTER the COMMIT — never inside the transaction (the
+    dispatcher reads the live DB snapshot; enqueuing early would race and ship
+    the pre-commit state).
     """
     async with make_session() as s, s.begin():
-        return await MailAccountsRepo(s).mark_sync_failure(account_id, error=error, disable=disable)
+        failures = await MailAccountsRepo(s).mark_sync_failure(
+            account_id, error=error, disable=disable
+        )
+
+    # After COMMIT — best-effort, gated (ADR-0046 §2).
+    await enqueue_crm_status_best_effort(account_id)
+    return failures
+
+
+async def _record_needs_consent_marker(account_id: int) -> None:
+    """Stamp the needs-consent marker on a clean-skipped mailbox (ADR-0046 §3 H7b).
+
+    Guarded, idempotent single ``UPDATE`` (``last_sync_error IS DISTINCT FROM``
+    the marker). The CRM hook fires ONLY when a row was really updated — a
+    mailbox that already carries the marker produces neither a write nor a push,
+    so a dead mailbox does not emit a status event every ``SYNC_INTERVAL``.
+    Enqueue happens AFTER the COMMIT (ADR-0046 §2).
+    """
+    async with make_session() as s, s.begin():
+        written = await MailAccountsRepo(s).mark_oauth_needs_consent_error(account_id)
+
+    if written:
+        await enqueue_crm_status_best_effort(account_id)
 
 
 async def _enqueue_mailbox_alert(account_id: int, *, reason: str) -> None:
@@ -727,29 +762,6 @@ async def _enqueue_mailbox_alert(account_id: int, *, reason: str) -> None:
     except Exception as exc:
         log.warning(
             "mailbox_alert_enqueue_failed",
-            mail_account_id=account_id,
-            detail=str(exc)[:200],
-        )
-
-
-async def _enqueue_crm_status(account_id: int) -> None:
-    """LPUSH one mailbox-status event onto ``crm_status_queue`` (ADR-0043 §2).
-
-    Gated by ``crm_status_enabled`` (CRM_MAILBOX_STATUS_URL + CRM_PUSH_SECRET).
-    Wrapped in ``try/except`` with a log — a Redis outage must NEVER abort the
-    sync cycle. The dispatcher loads the live status snapshot, so a lost
-    enqueue is corrected by the next status event / reconcile.
-    """
-    if not get_settings().crm_status_enabled:
-        return
-    try:
-        from backend.app.crm_push.service import enqueue_crm_status
-
-        await enqueue_crm_status(account_id)
-        log.info("crm_status_enqueued", mail_account_id=account_id)
-    except Exception as exc:
-        log.warning(
-            "crm_status_enqueue_failed",
             mail_account_id=account_id,
             detail=str(exc)[:200],
         )
@@ -800,7 +812,7 @@ async def _disable_after_failures(account_id: int, *, user_id: int, reason: str)
     # (``down_alert_sent_at``), so sending on every disable is safe. Gated by
     # ``crm_status_enabled`` (URL + secret). Runs in parallel with the legacy
     # Telegram ``mailbox_alert`` above until cut-over.
-    await _enqueue_crm_status(account_id)
+    await enqueue_crm_status_best_effort(account_id)
 
 
 async def _audit_mass_failure_suppressed(

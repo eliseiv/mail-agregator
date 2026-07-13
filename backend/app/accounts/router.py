@@ -286,11 +286,10 @@ async def update_account(
         except PydanticValidationError as exc:
             raise ValidationError("Invalid JSON payload") from exc
 
+    service = MailAccountService(db)
     try:
         async with db.begin():
-            dto = await MailAccountService(db).update(
-                scope=scope, account_id=account_id, payload=payload
-            )
+            dto = await service.update(scope=scope, account_id=account_id, payload=payload)
     except DomainError as exc:
         if is_form:
             # Try to keep the edit form populated with persisted values.
@@ -311,6 +310,13 @@ async def update_account(
                 status_code=exc.status_code,
             )
         raise
+
+    # ADR-0046 §2 (H5): the mailbox-status hook fires only here — OUTSIDE the
+    # ``db.begin()`` block, i.e. strictly AFTER the COMMIT. The dispatcher loads
+    # the live DB snapshot, so an enqueue from inside the transaction could be
+    # served the pre-commit state and never be corrected. Best-effort: a Redis
+    # outage must not fail an already-committed update.
+    await service.flush_crm_status_events()
 
     if is_form:
         await flash(request, "success", "Изменения сохранены")

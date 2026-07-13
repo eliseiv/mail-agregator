@@ -73,6 +73,17 @@ class ExternalMailboxService:
         self._accounts = MailAccountService(db)
         self._repo = MailAccountsRepo(db)
 
+    async def flush_crm_status_events(self) -> None:
+        """Fire the deferred mailbox-status hooks (ADR-0046 §2 — H5/H6).
+
+        Delegates to the reused :class:`MailAccountService`. The router MUST call
+        this AFTER leaving its ``async with db.begin():`` block: the dispatcher
+        reads the live DB snapshot, and for a ``is_active=false`` PATCH there is
+        no second chance — a deactivated mailbox leaves ``list_active()`` and
+        never emits another status event.
+        """
+        await self._accounts.flush_crm_status_events()
+
     async def _crm_scope(self) -> VisibilityScope:
         """Synthetic super_admin scope for the ``crm-service`` owner (ADR-0039)."""
         user = await UsersRepo(self._db).get_by_username(CRM_SERVICE_USERNAME)

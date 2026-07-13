@@ -1509,11 +1509,12 @@ def error_prefix(exc_or_text) -> str   # UI-текст: invalid_host | auth_fail
 | --- | --- | --- |
 | `last_sync_error` | пишется (для UI), **кроме подавления спорадики** — см. ниже | пишется (в т.ч. при подавлении брейкером — см. ниже) |
 | `consecutive_failures` | **НЕ** инкрементится | `+1` |
-| `last_synced_at` | **НЕ** трогается (= «последний успех» для UI) | `now()` |
+| `last_synced_at` | **НЕ** трогается (= «последний успех» для UI) | **НЕ** трогается (**ADR-0046 §1**: поле = «последний успех», ошибочные ветки его не пишут; ⚠️ до выкатки фикса `mark_sync_failure` код ещё пишет `now()` — `TD-053`) |
 | `is_active` | **НЕ** трогается | disable при пороге (см. ниже) |
 | следующий цикл | повторит; success само-восстановит | продолжит инкремент до disable |
 
-**Инвариант полноты выборки (нет starvation, ADR-0026 §2):** transient оставляет `last_synced_at`
+**Инвариант полноты выборки (нет starvation, ADR-0026 §2; после [ADR-0046](adr/ADR-0046-mailbox-status-hook-points.md) §1 —
+и для permanent):** ошибочная ветка оставляет `last_synced_at`
 нетронутым **безопасно**, потому что `list_active()` (`backend/app/repositories/mail_accounts.py`)
 **НЕ лимитирует** выборку — `SELECT … WHERE is_active ORDER BY last_synced_at NULLS FIRST, id` **без
 LIMIT**. `sync_cycle` прогоняет **всех** активных под семафором каждый цикл; `ORDER BY` влияет

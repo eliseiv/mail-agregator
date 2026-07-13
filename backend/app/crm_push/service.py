@@ -184,6 +184,36 @@ async def enqueue_crm_status(account_id: int) -> None:
     await cast(Awaitable[int], redis.lpush(CRM_STATUS_QUEUE_KEY, payload))
 
 
+async def enqueue_crm_status_best_effort(account_id: int) -> None:
+    """The ONE mailbox-status hook helper (ADR-0046 §2) — every H-point calls this.
+
+    Single implementation shared by all hook points (H1-H4 in
+    ``worker/app/sync_cycle.py``, H5/H6 in ``backend/app/accounts``, H7a in
+    ``backend/app/oauth/service.py``): gate on ``crm_status_enabled``
+    (``CRM_MAILBOX_STATUS_URL`` + ``CRM_PUSH_SECRET``), enqueue, log — wrapped
+    best-effort so a Redis outage NEVER breaks the sync cycle or an admin/API
+    request.
+
+    MUST be called strictly AFTER the COMMIT of the transaction that changed the
+    status (ADR-0046 §2): the dispatcher loads the live snapshot from the DB, so
+    an enqueue inside the open transaction can be served the pre-commit state and
+    the mirrored status would stick until the next status event (for a mailbox
+    deactivated via ``is_active=false`` — forever: it drops out of
+    ``list_active()`` and never syncs again).
+    """
+    if not get_settings().crm_status_enabled:
+        return
+    try:
+        await enqueue_crm_status(account_id)
+        log.info("crm_status_enqueued", mail_account_id=account_id)
+    except Exception as exc:
+        log.warning(
+            "crm_status_enqueue_failed",
+            mail_account_id=account_id,
+            detail=str(exc)[:200],
+        )
+
+
 # --- Payload builders -------------------------------------------------------
 
 

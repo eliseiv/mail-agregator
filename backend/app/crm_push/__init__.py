@@ -20,6 +20,7 @@ from backend.app.crm_push.service import (
     CrmStatusService,
     build_signature,
     enqueue_crm_status,
+    enqueue_crm_status_best_effort,
     enqueue_push_ids,
 )
 
@@ -30,5 +31,6 @@ __all__ = [
     "CrmStatusService",
     "build_signature",
     "enqueue_crm_status",
+    "enqueue_crm_status_best_effort",
     "enqueue_push_ids",
 ]

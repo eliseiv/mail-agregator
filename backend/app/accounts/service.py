@@ -28,6 +28,7 @@ from backend.app.accounts.testers import (
     smtp_test_oauth,
 )
 from backend.app.audit import AuditWriter
+from backend.app.crm_push.service import enqueue_crm_status_best_effort
 from backend.app.deps import VisibilityScope
 from backend.app.exceptions import (
     ConflictError,
@@ -49,31 +50,6 @@ from shared.redis_client import get_redis
 from shared.storage import get_storage
 
 log = get_logger(__name__)
-
-
-async def _enqueue_crm_status(account_id: int) -> None:
-    """LPUSH one mailbox-status event onto ``crm_status_queue`` (ADR-0043 §2).
-
-    Called on a mailbox re-enable / activate / deactivate so the CRM status
-    mirror stays in sync. Gated by ``crm_status_enabled`` (URL + secret) and
-    wrapped best-effort — a Redis outage must never break the admin request.
-    The worker ``crm_status_dispatch`` loads the live snapshot, so enqueuing
-    the account_id (even before the request transaction commits) is safe.
-    """
-    from shared.config import get_settings
-
-    if not get_settings().crm_status_enabled:
-        return
-    try:
-        from backend.app.crm_push.service import enqueue_crm_status
-
-        await enqueue_crm_status(account_id)
-    except Exception as exc:
-        log.warning(
-            "crm_status_enqueue_failed",
-            mail_account_id=account_id,
-            detail=str(exc)[:200],
-        )
 
 
 def _require(value: str | None, field: str) -> str:
@@ -126,6 +102,28 @@ class MailAccountService:
         self._groups = GroupsRepo(session)
         self._audit = AuditWriter(session)
         self._storage = get_storage()
+        # ADR-0046 §2 — mailbox-status hooks (H5 creds re-enable / H6 set_active)
+        # are DEFERRED here and fired by the router AFTER the request
+        # transaction commits (see :meth:`flush_crm_status_events`). This
+        # service runs INSIDE the caller's ``async with db.begin():`` block, so
+        # enqueuing here would let the dispatcher (which loads the live DB
+        # snapshot) ship the pre-commit state and stick.
+        self._pending_status_account_ids: list[int] = []
+
+    # --- CRM status hooks (ADR-0046 §2) ------------------------------------
+
+    async def flush_crm_status_events(self) -> None:
+        """Fire the mailbox-status hooks collected during this unit of work.
+
+        MUST be called by the caller STRICTLY AFTER the COMMIT of the request
+        transaction (ADR-0046 §2) — never inside ``async with db.begin():``.
+        Best-effort and idempotent: the queue is drained, so a repeated call is
+        a no-op, and a rolled-back transaction simply never reaches the flush.
+        """
+        pending = self._pending_status_account_ids
+        self._pending_status_account_ids = []
+        for account_id in pending:
+            await enqueue_crm_status_best_effort(account_id)
 
     # --- Visibility helpers ------------------------------------------------
 
@@ -719,10 +717,12 @@ class MailAccountService:
         await self._repo.update_fields(account_id, **update_fields)
         refreshed = await self._repo.get_by_id(account_id)
         assert refreshed is not None
-        # ADR-0043 §2: on a credential re-enable (Disabled → Active) mirror the
-        # mailbox status change to the CRM so it clears the down-alert.
+        # ADR-0046 §3 H5: on a credential re-enable (Disabled → Active) mirror
+        # the mailbox status change to the CRM so it clears the down-alert. The
+        # hook is DEFERRED — it fires in the router AFTER COMMIT (ADR-0046 §2),
+        # never inside this still-open transaction.
         if creds_changed:
-            await _enqueue_crm_status(account_id)
+            self._pending_status_account_ids.append(account_id)
         owner = await self._users.get_by_id(refreshed.user_id)
         assert owner is not None
         return _to_dto(refreshed, owner)
@@ -740,6 +740,13 @@ class MailAccountService:
         ``consecutive_failures`` and clear the alert idempotency stamp so a
         subsequent honest auto-disable re-alerts. On **deactivate** we only set
         the flag (a manual disable never stamps an alert).
+
+        ADR-0046 §3 H6: the mailbox-status hook is DEFERRED to
+        :meth:`flush_crm_status_events` (fired by the router after COMMIT). A
+        deactivation is the one status change that can NEVER be re-derived: the
+        box drops out of ``list_active()``, so no further sync cycle — and no
+        further status event — will ever run for it. Enqueuing before COMMIT
+        could ship ``is_active=true`` to the CRM and stick forever.
         """
         visible = await self._visible_user_ids(scope)
         acc = await self._repo.get_for_user_ids(visible, account_id)
@@ -753,10 +760,10 @@ class MailAccountService:
         await self._repo.update_fields(account_id, **update_fields)
         refreshed = await self._repo.get_by_id(account_id)
         assert refreshed is not None
-        # ADR-0043 §2: mirror the mailbox status change (activate / deactivate)
-        # to the CRM. On activate this clears the CRM down-alert; on deactivate
-        # it records the manual disable.
-        await _enqueue_crm_status(account_id)
+        # ADR-0046 §3 H6: mirror the mailbox status change (activate /
+        # deactivate) to the CRM. On activate this clears the CRM down-alert; on
+        # deactivate it records the manual disable. Deferred to after COMMIT.
+        self._pending_status_account_ids.append(account_id)
         owner = await self._users.get_by_id(refreshed.user_id)
         assert owner is not None
         return _to_dto(refreshed, owner)

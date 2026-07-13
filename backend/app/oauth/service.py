@@ -39,6 +39,7 @@ import redis.exceptions as redis_exceptions
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.auth.service import CRM_SERVICE_USERNAME
+from backend.app.crm_push.service import enqueue_crm_status_best_effort
 from backend.app.oauth.schemas import (
     ACCESS_TOKEN_REFRESH_BUFFER_SECONDS,
     OAUTH_REFRESH_LOCK_PREFIX,
@@ -654,5 +655,21 @@ class OutlookTokenService:
             )
 
     async def _mark_needs_consent(self, account_id: int) -> None:
+        """Flag the mailbox needs-consent + mirror the status to the CRM (ADR-0046 §3 H7).
+
+        The repo writes ``oauth_needs_consent=true`` AND ``last_sync_error`` in
+        one transaction (``is_active`` / ``consecutive_failures`` untouched —
+        ADR-0025 §3 step 5). The CRM hook runs strictly AFTER the COMMIT: the
+        dispatcher loads the live snapshot from the DB, so enqueuing inside the
+        open transaction would race and mirror the pre-commit state (leaving the
+        mailbox green in the CRM until the next status event).
+
+        Recovery is automatic: after a successful re-consent (ADR-0045) the
+        first successful cycle calls ``mark_sync_success`` — ``last_sync_error``
+        is cleared and pushed by H1, so the CRM dot turns green again.
+        """
         async with make_session() as s, s.begin():
             await MailAccountsRepo(s).mark_oauth_needs_consent(account_id)
+
+        # After COMMIT — best-effort, gated (ADR-0046 §2).
+        await enqueue_crm_status_best_effort(account_id)

@@ -500,8 +500,15 @@ async def external_mailbox_update(
     settings = get_settings()
     await _authorize_write(request, ip=ip, settings=settings)
     payload = await _parse_json_body(request, ExternalMailboxUpdateRequest)
+    service = ExternalMailboxService(db)
     async with db.begin():
-        dto = await ExternalMailboxService(db).update(account_id, payload)
+        dto = await service.update(account_id, payload)
+    # ADR-0046 §2 (H5/H6): mailbox-status hook fires AFTER the COMMIT, outside
+    # the transaction — the dispatcher pushes the live DB snapshot, so an
+    # enqueue from inside ``db.begin()`` could mirror the pre-commit state. For
+    # a deactivation (``is_active=false``) that would stick FOREVER: the mailbox
+    # leaves ``list_active()`` and never produces another status event.
+    await service.flush_crm_status_events()
     log.info("external_mailbox_updated", client_ip=ip, mailbox_id=account_id)
     return dto
 

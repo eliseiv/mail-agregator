@@ -15,6 +15,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.models import MailAccount
 
+#: ``last_sync_error`` written when Microsoft invalidates the refresh token and
+#: the mailbox is flagged ``oauth_needs_consent`` (ADR-0046 §3 H7). Same
+#: ``"<prefix>: <detail>"`` shape as the worker's sync errors; mirrored to the
+#: CRM so the box stops reading as "green and healthy" while it is not syncing.
+OAUTH_NEEDS_CONSENT_SYNC_ERROR = "oauth_needs_consent: требуется переподключение Outlook"
+
 
 class MailAccountsRepo:
     def __init__(self, session: AsyncSession) -> None:
@@ -382,12 +388,55 @@ class MailAccountsRepo:
 
         ADR-0025 §3 step 5: leave ``is_active`` untouched; the worker skips
         sync while ``oauth_needs_consent`` is true and the UI shows "reconnect".
+
+        ADR-0046 §3 (H7): additionally write ``last_sync_error`` in the SAME
+        transaction. Without it the mailbox mirrors to the CRM as
+        ``is_active=true / consecutive_failures=0 / last_sync_error=NULL`` — a
+        green dot on a box that is not syncing at all (the worker clean-skips
+        it every cycle). ``is_active`` / ``consecutive_failures`` stay untouched
+        so the ADR-0025 §3 step 5 invariant holds (needs-consent never disables
+        the mailbox and never feeds auto-disable). The call-site enqueues the
+        CRM status event after COMMIT.
         """
         await self._s.execute(
             update(MailAccount)
             .where(MailAccount.id == account_id)
-            .values(oauth_needs_consent=True, updated_at=datetime.now(UTC))
+            .values(
+                oauth_needs_consent=True,
+                last_sync_error=OAUTH_NEEDS_CONSENT_SYNC_ERROR,
+                updated_at=datetime.now(UTC),
+            )
         )
+
+    async def mark_oauth_needs_consent_error(self, account_id: int) -> bool:
+        """Guarded write of the needs-consent marker into ``last_sync_error`` (ADR-0046 §3 H7b).
+
+        Single ``UPDATE ... WHERE last_sync_error IS DISTINCT FROM <marker>`` (no
+        preceding SELECT — no race window). Returns ``True`` only when a row was
+        actually updated; the caller then (and only then) enqueues the CRM status
+        event after COMMIT. A mailbox that already carries the marker is a no-op:
+        no write, no push — otherwise every sync interval would emit a status
+        event for every dead mailbox.
+
+        Used by the worker's clean-skip branch, which short-circuits BEFORE the
+        token refresh and therefore never reaches the transition point (H7a).
+        ``is_active`` / ``consecutive_failures`` / ``last_synced_at`` are NOT
+        touched (ADR-0025 §3 step 5 + ADR-0046 §1).
+        """
+        stmt = (
+            update(MailAccount)
+            .where(
+                MailAccount.id == account_id,
+                MailAccount.last_sync_error.is_distinct_from(OAUTH_NEEDS_CONSENT_SYNC_ERROR),
+            )
+            .values(
+                last_sync_error=OAUTH_NEEDS_CONSENT_SYNC_ERROR,
+                updated_at=datetime.now(UTC),
+            )
+            .returning(MailAccount.id)
+        )
+        row = (await self._s.execute(stmt)).one_or_none()
+        return row is not None
 
     async def update_group(self, account_id: int, group_id: int | None) -> None:
         """Re-assign ``mail_accounts.group_id`` (ADR-0031 §3 team transfer).
@@ -498,11 +547,20 @@ class MailAccountsRepo:
         """Bump ``consecutive_failures``; optionally flip ``is_active=false``.
 
         Returns the new ``consecutive_failures`` value.
+
+        Deliberately does NOT touch ``last_synced_at``: ADR-0046 §1 makes its
+        semantics normative and single-valued — "time of the last SUCCESSFUL
+        sync", written only by :meth:`mark_sync_success`. Bumping it on a
+        PERMANENT failure used to make a broken mailbox look freshly synced,
+        which (a) silently suppressed the next TRANSIENT error via
+        ``_should_suppress_transient`` (its window measures the age of the last
+        *success*) and (b) contradicted the CRM contract/UI ("last successful
+        sync"). Freezing it keeps the failing box at the head of the
+        ``list_active()`` ORDER BY — no starvation (the cycle has no LIMIT).
         """
         values: dict[str, object] = {
             "consecutive_failures": MailAccount.consecutive_failures + 1,
             "last_sync_error": error[:500],
-            "last_synced_at": datetime.now(UTC),
             "updated_at": datetime.now(UTC),
         }
         if disable:

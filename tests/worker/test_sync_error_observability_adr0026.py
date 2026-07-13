@@ -137,11 +137,22 @@ class TestRule10ErrorLogging:
 
 
 class TestPhase2TimestampSemantics:
-    async def test_permanent_failure_sets_last_synced_at(
+    async def test_permanent_failure_does_not_set_last_synced_at(
         self, seeded_account: dict[str, Any], db_engine: AsyncEngine
     ) -> None:
-        """Scope C: the PERMANENT phase-2 bump (mark_sync_failure) advances
-        ``last_synced_at`` to now() (documented behaviour)."""
+        """The PERMANENT phase-2 bump (``mark_sync_failure``) must NOT touch
+        ``last_synced_at``.
+
+        SUPERSEDED by ADR-0046 §1: ``last_synced_at`` is the time of the last
+        **successful** sync and ``mark_sync_success`` is its only writer — no error
+        branch (TRANSIENT / PERMANENT / disable / needs-consent) advances it. The
+        previous expectation (permanent stamps ``now()``) made a failing mailbox look
+        "freshly synced", which silently suppressed the next TRANSIENT error via
+        ``_should_suppress_transient`` and kept the CRM column green. Kept here as the
+        regression guard for the repo-level writer; the end-to-end suppression fallout
+        is covered in ``test_crm_status_hooks_adr0046.py``
+        (``TestSuppressionWindowRegression``).
+        """
         from backend.app.repositories.mail_accounts import MailAccountsRepo
 
         account_id = seeded_account["account_id"]
@@ -155,8 +166,9 @@ class TestPhase2TimestampSemantics:
             )
 
         fresh = await _reload(db_engine, account_id)
-        assert fresh.last_synced_at is not None  # permanent advances it
+        assert fresh.last_synced_at is None  # ADR-0046 §1 — errors never stamp it
         assert fresh.consecutive_failures == 1
+        assert fresh.last_sync_error == "auth_failed: bad"
 
     async def test_transient_does_not_set_last_synced_at(
         self, seeded_account: dict[str, Any], db_engine: AsyncEngine

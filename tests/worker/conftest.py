@@ -1,15 +1,21 @@
-"""Re-use integration fixtures (truncate DB, flush Redis, clean MinIO).
+"""Re-use integration fixtures (truncate DB, flush Redis, clean MinIO, app/client).
 
 Worker tests need the same DB/Redis/MinIO state as integration tests, so
-we just import the autouse fixtures.
+we just import the autouse fixtures. ``app`` / ``client`` are re-exported as
+well: the ADR-0046 status-hook suite drives the backend HTTP surface (H5/H6 fire
+in the routers) and lives here because ``tests/worker`` — unlike ``tests/unit`` —
+carries the DB/Redis cleanup fixtures and is inside the CI test scope.
 """
 
 from __future__ import annotations
 
-# Re-export autouse fixtures from the integration package so pytest picks
-# them up for tests/worker/ too.
+# Re-export fixtures from the integration package so pytest picks them up for
+# tests/worker/ too (``_db_truncate_all`` / ``_redis_flush`` / ``_minio_clean``
+# are autouse).
 from tests.integration.conftest import (  # noqa: F401
     _db_truncate_all,
     _minio_clean,
     _redis_flush,
+    app,
+    client,
 )
