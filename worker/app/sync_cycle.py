@@ -356,6 +356,14 @@ async def sync_one_account(
             last_uidvalidity=box.uidvalidity,
         )
 
+    # ADR-0043 §2: mirror the mailbox sync-status change (success:
+    # ``last_synced_at=now()``, ``consecutive_failures=0``, ``last_sync_error=NULL``)
+    # to the CRM. AFTER COMMIT — the dispatcher loads the live status snapshot
+    # from the DB. No dedup: the ADR explicitly allows sending the status on
+    # every cycle (idempotency "one alert per transition" lives in the CRM,
+    # ``mail_accounts.down_alert_sent_at``). Gated + try/except inside.
+    await _enqueue_crm_status(account.id)
+
     # ADR-0043 §2: enqueue every newly-inserted message onto ``crm_push_queue``
     # for delivery to the CRM. Gated by ``crm_push_enabled`` (URL + secret) so
     # a pre-cut-over deployment does not enqueue. Independent try/except — a
@@ -676,9 +684,16 @@ def _should_suppress_transient(last_synced_at: _dt.datetime | None) -> bool:
 
 
 async def _record_transient(account_id: int, *, error: str) -> None:
-    """Write ``last_sync_error`` without bumping the counter (ADR-0026 §2)."""
+    """Write ``last_sync_error`` without bumping the counter (ADR-0026 §2).
+
+    ADR-0043 §2: this is one of the three sync-status update points, so after
+    the COMMIT we mirror the new status to the CRM (best-effort, gated).
+    """
     async with make_session() as s, s.begin():
         await MailAccountsRepo(s).mark_transient_error(account_id, error=error)
+
+    # After COMMIT — the dispatcher loads the live status snapshot from the DB.
+    await _enqueue_crm_status(account_id)
 
 
 async def _record_failure(account_id: int, *, error: str, disable: bool) -> int:
