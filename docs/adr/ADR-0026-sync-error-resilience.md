@@ -4,7 +4,7 @@
 - **Дата:** 2026-05-28
 - **Связь:** extends [ADR-0008](./ADR-0008-sync-strategy.md) (стратегия синхронизации), уточняет error-handling из [ADR-0013](./ADR-0013-concurrency-model.md). НЕ supersede.
 - **Уточнён** [ADR-0028](./ADR-0028-oauth-login-failed-transient.md) (2026-06-10): для `auth_type='oauth_outlook'` IMAP-`login failed`/`authenticationfailed` = **transient** (rule 7b, контекст по `auth_type`), не permanent — refresh подтверждает токен ДО IMAP. Таблица §1 ниже остаётся в силе для password-аккаунтов; OAuth-ветка — в ADR-0028 §1.
-- **Амендирован** [ADR-0046](./ADR-0046-mailbox-status-hook-points.md) (2026-07-13): `last_synced_at` = «время последнего **успешного** sync» **нормативно и без исключений** — запись `last_synced_at=now()` в PERMANENT-ветке (§2 «PERMANENT» и §«Текущая реализация» ниже) **отменена**. Остальные положения ADR-0026 (классификация, счётчик, circuit-breaker, подавление спорадики) — в силе.
+- **Амендирован** [ADR-0046](./ADR-0046-mailbox-status-hook-points.md) (2026-07-13, **реализовано** — коммит `e7c7b52`): `last_synced_at` = «время последнего **успешного** sync» **нормативно и без исключений** — запись `last_synced_at=now()` в PERMANENT-ветке (§2 «PERMANENT» и §«Текущая реализация» ниже) **отменена**. Единственный писатель поля — `MailAccountsRepo.mark_sync_success` (`backend/app/repositories/mail_accounts.py:480`); `mark_sync_failure` (`:540-575`) его не пишет. Остальные положения ADR-0026 (классификация, счётчик, circuit-breaker, подавление спорадики) — в силе.
 
 ---
 
@@ -53,11 +53,12 @@
   `_DISABLE_AFTER_FAILS=3` захардкожены в модуле (в `shared/config.py` порога нет).
 - `_record_failure(account_id, *, error, disable) -> int`, `_disable_after_failures(...)`.
 - `MailAccountsRepo.mark_sync_failure(account_id, *, error, disable) -> int` — bump
-  `consecutive_failures`, пишет `last_sync_error`, `last_synced_at=now()`, опц. `is_active=false`.
-  > **Амендмент [ADR-0046](./ADR-0046-mailbox-status-hook-points.md) §1:** запись `last_synced_at=now()`
-  > на PERMANENT-ошибке **отменена** — поле нормативно значит «время последней **успешной**
-  > синхронизации» (как и объявлено в §2 ниже), ошибочные ветки его не трогают. До выкатки фикса
-  > (`backend/app/repositories/mail_accounts.py:505`) код ещё пишет его на сбое — ведётся как `TD-053`.
+  `consecutive_failures`, пишет `last_sync_error`, ~~`last_synced_at=now()`~~, опц. `is_active=false`.
+  > **Амендмент [ADR-0046](./ADR-0046-mailbox-status-hook-points.md) §1 (реализован, `e7c7b52`):** запись
+  > `last_synced_at=now()` на PERMANENT-ошибке **отменена** — поле нормативно значит «время последней
+  > **успешной** синхронизации» (как и объявлено в §2 ниже), ошибочные ветки его не трогают. В коде
+  > `values` метода содержит только `consecutive_failures+1` / `last_sync_error` / `updated_at`
+  > (+ опц. `is_active`) — `backend/app/repositories/mail_accounts.py:561-568`.
 - `MailAccountsRepo.mark_sync_success(...)` — **уже** сбрасывает `consecutive_failures=0` и
   `last_sync_error=NULL` (инвариант само-восстановления на стороне success уже есть, требуется лишь
   чтобы аккаунт не был отключён до этого success).
@@ -197,10 +198,10 @@ transient-ошибкой (вечно недоступный self-hosted IMAP, в
 
 **PERMANENT:**
 - Инкремент `consecutive_failures` + запись `last_sync_error`.
-  ~~+ `last_synced_at=now()`~~ — **отменено [ADR-0046](./ADR-0046-mailbox-status-hook-points.md) §1**:
-  `last_synced_at` = «время последнего **успешного** sync», ошибочные ветки его не пишут (иначе окно
-  `SYNC_TRANSIENT_SUPPRESS_MINUTES` мерит давность permanent-попытки, а не успеха, и сбойный ящик
-  выглядит «свежесинканным»). До выкатки фикса `mark_sync_failure` — `TD-053`.
+  ~~+ `last_synced_at=now()`~~ — **отменено [ADR-0046](./ADR-0046-mailbox-status-hook-points.md) §1**
+  (реализовано, `e7c7b52`): `last_synced_at` = «время последнего **успешного** sync», ошибочные ветки его
+  не пишут (иначе окно `SYNC_TRANSIENT_SUPPRESS_MINUTES` мерит давность permanent-попытки, а не успеха,
+  и сбойный ящик выглядит «свежесинканным»).
 - Авто-disable при `consecutive_failures >= SYNC_MAX_CONSECUTIVE_FAILURES` (новый config, default 3),
   **с учётом circuit-breaker (см. §3)**.
 - Явные `auth_failed` (приоритет 8) и `decrypt_fail` (приоритет 9) — это достоверно настройки/данные.

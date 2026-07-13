@@ -1509,7 +1509,7 @@ def error_prefix(exc_or_text) -> str   # UI-текст: invalid_host | auth_fail
 | --- | --- | --- |
 | `last_sync_error` | пишется (для UI), **кроме подавления спорадики** — см. ниже | пишется (в т.ч. при подавлении брейкером — см. ниже) |
 | `consecutive_failures` | **НЕ** инкрементится | `+1` |
-| `last_synced_at` | **НЕ** трогается (= «последний успех» для UI) | **НЕ** трогается (**ADR-0046 §1**: поле = «последний успех», ошибочные ветки его не пишут; ⚠️ до выкатки фикса `mark_sync_failure` код ещё пишет `now()` — `TD-053`) |
+| `last_synced_at` | **НЕ** трогается (= «последний успех» для UI) | **НЕ** трогается (**ADR-0046 §1**: поле = «последний успех», ошибочные ветки его не пишут; единственный писатель — `mark_sync_success`, `backend/app/repositories/mail_accounts.py:480`) |
 | `is_active` | **НЕ** трогается | disable при пороге (см. ниже) |
 | следующий цикл | повторит; success само-восстановит | продолжит инкремент до disable |
 
@@ -1573,6 +1573,57 @@ audit `account_auto_disabled`, guarded-UPDATE ставит штамп
 OAuth needs-consent и **ручное** отключение пользователем алерт **не** триггерят (штамп ставится только
 здесь). Доставка — §14.3. Сброс штампа в `NULL` — при re-enable ящика (`MailAccountService.update`,
 ветка `creds_changed`, §9).
+
+#### Status-канал ящика в CRM (ADR-0046) — восемь hook-точек
+
+Источник истины: [ADR-0046](./adr/ADR-0046-mailbox-status-hook-points.md) §3 (перечень) / §4 (не-hook
+точки) / §2 (инвариант). Здесь — карта для навигации; перечень **нормативен только в ADR**.
+
+Любое изменение зеркалимых полей (`is_active` / `last_synced_at` / `last_sync_error` /
+`consecutive_failures`) обязано попасть в CRM статус-событием. Все восемь точек **реализованы**
+(коммит `e7c7b52`) и зовут **единый** хелпер `enqueue_crm_status_best_effort(account_id)`
+(`backend/app/crm_push/service.py:187` — gate `crm_status_enabled` + `try/except`; сбой Redis не роняет
+ни цикл синка, ни HTTP-запрос):
+
+| Точка | Где | Hook |
+| --- | --- | --- |
+| **H1** успешный цикл | `worker/app/sync_cycle.py:354` | `:366` |
+| **H2** transient / permanent-фаза-0 / unexpected | `_record_transient` (`:693`) | `:703` |
+| **H3** bump `consecutive_failures` (фаза 2) | `_record_failure` (`:706`) | `:724` |
+| **H4** авто-disable | `_disable_after_failures` (`:770`) | `:815` |
+| **H5** re-enable по смене кредов | `backend/app/accounts/service.py:708` | deferred → `accounts/router.py:319` |
+| **H6** `set_active` (внешний PATCH) | `backend/app/accounts/service.py:732` | deferred → `external/router.py:511` |
+| **H7a** переход в `oauth_needs_consent` | `backend/app/oauth/service.py:657` | `:675` |
+| **H7b** clean-skip уже помеченного ящика | `sync_cycle.py:624` → `_record_needs_consent_marker` (`:728`) | `:741` — **только при фактической записи** |
+
+**Инвариант (ADR-0046 §2): enqueue строго ПОСЛЕ COMMIT.** Диспетчер `crm_status_dispatch` грузит
+**живой снапшот из БД** (`worker/app/crm_status_dispatch.py:78` → `CrmStatusService.push_status`), поэтому
+enqueue из **открытой** транзакции может отправить в CRM **до**-состояние. Для деактивации это
+невосстановимо: ящик выпадает из `list_active()` → следующего цикла синка (и следующего статус-события)
+у него не будет **никогда**.
+
+**Архитектурное правило (ADR-0046 §2.1): доменный сервис статус-событие НЕ отправляет.** В HTTP-слое
+транзакцией владеет **роутер** (`async with db.begin():`), а зависимость сессии на teardown **не
+коммитит** (`shared/db.py:93-104`) — значит сервис, вызванный изнутри транзакции, дождаться COMMIT
+физически не может. Конструкция: `MailAccountService` **копит** id в `_pending_status_account_ids`
+(`backend/app/accounts/service.py:111`) → роутер зовёт `flush_crm_status_events()`
+(`accounts/service.py:115-126`) **вне** блока `db.begin()`. `ExternalMailboxService` пробрасывает тот же
+flush (`backend/app/external/write_service.py:76-85`). Прямой вызов `enqueue_crm_status_best_effort` из
+сервиса = нарушение нормы.
+
+**Обязанность роутера (ADR-0046 §2.1.1).** Статус-пишущих методов у сервиса ровно **два** (закрытый
+перечень): `MailAccountService.update` в ветке `creds_changed` (`accounts/service.py:708-715`, append
+`:725` — **H5**) и `MailAccountService.set_active` (`:732`, append `:766` — **H6**). **Любой** роутер,
+зовущий их (в т.ч. через `ExternalMailboxService`), ОБЯЗАН вызвать `flush_crm_status_events()` вне
+`db.begin()` (`accounts/router.py:319`, `external/router.py:511`). Забытый flush **не даёт ни исключения,
+ни лога** — накопленные id молча теряются (для деактивации невосстановимо). Проверка — парный греп
+`_pending_status_account_ids` (ADR-0046 §5 п.4); рантайм-детектор — `TD-054`.
+
+**Идемпотентность H7b.** Маркер `OAUTH_NEEDS_CONSENT_SYNC_ERROR`
+(`backend/app/repositories/mail_accounts.py:22`) ставится guarded-`UPDATE`'ом
+`… WHERE last_sync_error IS DISTINCT FROM <маркер>` c `RETURNING` (`mark_oauth_needs_consent_error`,
+`:411-439`); push — только если строка реально обновлена. Мёртвый needs-consent-ящик **не** эмитит
+статус-событие каждый `SYNC_INTERVAL`.
 
 **Наблюдаемость подавлённых permanent (ADR-0026 §3):** `last_sync_error` пишется в фазе 1 для **ВСЕХ**
 ошибок, **включая permanent, подавлённые брейкером** — поэтому в UI у каждого реально-протухшего
