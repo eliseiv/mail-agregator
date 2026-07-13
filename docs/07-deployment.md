@@ -221,6 +221,25 @@ Server-блок отвечает `200 ok\n` на `/_health_nginx` (HTTP, не HT
 | `SETUP_SESSION_TTL_SECONDS` | `900` | no | 15 минут. |
 | `COOKIE_DOMAIN` | (none) | no | Если задан — кладётся в Set-Cookie domain. |
 
+### Session guards: рантайм-детектор потерянных статус-событий (ADR-0046 §2.1.1 / `TD-054`)
+
+Речь о **DB-сессии** (SQLAlchemy `AsyncSession`), а **не** о пользовательской сессии из блока «Sessions / auth» выше — совпадение префикса `SESSION_` случайно.
+
+| Переменная | Default | Required | Описание |
+| --- | --- | --- | --- |
+| `SESSION_GUARD_STRICT` | (не задана) ⇒ strict **только** под pytest | no | **ADR-0046 §2.1.1 / `TD-054`:** режим детектора незакрытых post-COMMIT side-effect'ов (забытый `flush_crm_status_events()`). Читается **напрямую из окружения**, минуя pydantic-`Settings` (`shared/session_guards.py:47`, `strict_mode()` `:95-100`) → валидации типа нет. **Не задана** (прод) ⇒ strict включается, только если в окружении есть `PYTEST_CURRENT_TEST` (т.е. под pytest); на проде такой переменной нет ⇒ **strict выключен**. **Задана** ⇒ truthy-набор `1` / `true` / `yes` / `on` (регистронезависимо, с trim, `_TRUTHY` `:49`) ⇒ strict **ON**; **любое** другое значение, включая пустую строку, ⇒ strict **OFF** — в том числе под pytest (осознанный аварийный выключатель). |
+
+**Что делает детектор.** На закрытии **любой** DB-сессии (`shared/db.py:110` — FastAPI-зависимость `get_session`; `:127` — `make_session` воркера/CLI: других способов получить сессию в кодовой базе нет) проверяются guard'ы, зарегистрированные компонентами с отложенными post-COMMIT эффектами (сегодня один — `MailAccountService`, `backend/app/accounts/service.py:149-157`, probe = непустой `_pending_status_account_ids`).
+
+| Режим | Поведение при непустой очереди |
+| --- | --- |
+| strict **OFF** (прод, дефолт) | structlog-`warning` `crm_status_pending_dropped` с `owner=MailAccountService` и `mail_account_ids=[…]` (`session_guards.py:119`; имя события — константа `CRM_STATUS_PENDING_DROPPED_EVENT`, `accounts/service.py:61`). Запрос/цикл **НЕ** падает: уже закоммиченный `PATCH` возвращает свой `200`. |
+| strict **ON** (pytest / явный truthy) | тот же `warning`, затем жёсткий `AssertionError` (`session_guards.py:122-126`) — забытый flush падает на CI, а не молча теряется. |
+
+Детектор **никогда не отправляет** событие сам (авто-flush отклонён в ADR-0046 §Alternatives: teardown не знает, был ли COMMIT). Он только делает молчаливую потерю шумной.
+
+**Прод:** переменную задавать **не нужно и не рекомендуется** — `SESSION_GUARD_STRICT=true` на проде превратил бы забытый flush в `500` на **уже закоммиченном** запросе (данные записаны, клиент получил ошибку). Аварийное применение: временно выставить в `true` на staging/dev, чтобы поймать вызывающего без flush. Приходит в `api` и `worker` через `env_file: .env` (в `environment:` compose поимённо не перечисляется — правка `docker-compose.yml` не требуется).
+
 ### Reverse proxy + TLS (nginx-контейнер + host certbot)
 
 `SERVER_DOMAIN` — единственная env-переменная, которую читает контейнер `nginx`. Host-level `certbot` (пакет + `certbot.timer`) конфигурируется на хосте (домен и e-mail задаются при первом выпуске cert, секция 6), а **не** через `.env` docker-стека.

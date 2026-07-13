@@ -10,8 +10,11 @@ from __future__ import annotations
 
 from typing import Literal
 
+from sqlalchemy import event as sa_event
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session as SyncSession
+from sqlalchemy.orm import SessionTransaction
 
 from backend.app.accounts.schemas import (
     MailAccountCreateRequest,
@@ -47,9 +50,15 @@ from shared.crypto import decrypt_mail_password, encrypt_mail_password
 from shared.logging import get_logger
 from shared.models import MailAccount, User
 from shared.redis_client import get_redis
+from shared.session_guards import SessionGuard, register_session_guard
 from shared.storage import get_storage
 
 log = get_logger(__name__)
+
+#: Structured-log event of the TD-054 detector: a caller committed a
+#: status-writing change and never called ``flush_crm_status_events()`` — the
+#: mailbox-status event is lost (for a deactivation: forever, ADR-0046 §2.1.1).
+CRM_STATUS_PENDING_DROPPED_EVENT = "crm_status_pending_dropped"
 
 
 def _require(value: str | None, field: str) -> str:
@@ -109,8 +118,85 @@ class MailAccountService:
         # enqueuing here would let the dispatcher (which loads the live DB
         # snapshot) ship the pre-commit state and stick.
         self._pending_status_account_ids: list[int] = []
+        # Number of LEADING entries of ``_pending_status_account_ids`` whose
+        # transaction already COMMITted (see :meth:`_mark_pending_status_committed`).
+        # Those ids describe status ALREADY WRITTEN to the DB: the flush stays
+        # mandatory for them, so a LATER rollback (a failed SELECT in the next
+        # implicit txn, an explicit ``db.rollback()`` in an error handler) must
+        # NOT drain them — otherwise the detector would go silent exactly where
+        # the event is genuinely lost (TD-054 false negative).
+        self._status_committed_count = 0
+        # TD-054 — runtime DETECTOR for the failure mode deferred-flush creates:
+        # a caller that invokes a status-writing method (``update`` on
+        # ``creds_changed`` / ``set_active`` — the closed list of ADR-0046
+        # §2.1.1) and never calls :meth:`flush_crm_status_events` used to lose
+        # the event SILENTLY. The guard fires at session teardown
+        # (``shared.db.get_session`` / ``make_session`` — the only two session
+        # sources, so ANY caller is covered): warning in prod, hard fail under
+        # pytest. It never sends the event itself (auto-flush is rejected in
+        # ADR-0046 §Alternatives: teardown cannot know whether the txn
+        # committed).
+        #
+        # The probe closes over the pending LIST, never over ``self``: the guard
+        # is stored as the VALUE of a ``WeakKeyDictionary`` keyed by the session
+        # (``shared.session_guards``), and ``self._db`` IS that session — a probe
+        # capturing ``self`` would make the value hold a strong ref to its own
+        # key and defeat the weakness (any session that skips the ``shared.db``
+        # teardown would then be pinned for the life of the process). The list
+        # object is never rebound (drained in place), so it stays the single
+        # source of truth for both the service and the probe.
+        pending_status_account_ids = self._pending_status_account_ids
+        register_session_guard(
+            session,
+            SessionGuard(
+                event=CRM_STATUS_PENDING_DROPPED_EVENT,
+                field="mail_account_ids",
+                owner="MailAccountService",
+                probe=lambda: tuple(pending_status_account_ids),
+            ),
+        )
+        # A ROLLED BACK transaction wrote no status, so there is nothing to
+        # mirror and nothing was "dropped" — drain the queue so the detector
+        # never cries wolf on the legitimate error path (e.g. a 409 raised
+        # inside the router's ``db.begin()``). Savepoint rollbacks
+        # (``begin_nested``) do not end the unit of work → ignored. Only the
+        # ids appended in the ROLLED BACK transaction are dropped — ids already
+        # COMMITted survive (see ``_status_committed_count``).
+        sa_event.listen(
+            session.sync_session,
+            "after_commit",
+            self._mark_pending_status_committed,
+        )
+        sa_event.listen(
+            session.sync_session,
+            "after_soft_rollback",
+            self._discard_pending_status_on_rollback,
+        )
 
     # --- CRM status hooks (ADR-0046 §2) ------------------------------------
+
+    def _mark_pending_status_committed(self, session: SyncSession) -> None:
+        """Freeze the ids whose status write reached the DB (TD-054).
+
+        SQLAlchemy dispatches ``after_commit`` for a SAVEPOINT release too
+        (``SessionTransaction.commit``: ``if self._parent is None or self.nested``),
+        and a savepoint release does not end the unit of work — the outer
+        transaction may still roll back. ``get_nested_transaction()`` is the
+        discriminator: it is non-``None`` exactly while the committing
+        transaction is the nested one, so only a REAL (outermost) commit marks
+        the queue as durable.
+        """
+        if session.get_nested_transaction() is not None:
+            return
+        self._status_committed_count = len(self._pending_status_account_ids)
+
+    def _discard_pending_status_on_rollback(
+        self, session: SyncSession, previous_transaction: SessionTransaction
+    ) -> None:
+        """Drop deferred status events whose transaction rolled back (TD-054)."""
+        if previous_transaction.nested:
+            return
+        del self._pending_status_account_ids[self._status_committed_count :]
 
     async def flush_crm_status_events(self) -> None:
         """Fire the mailbox-status hooks collected during this unit of work.
@@ -120,8 +206,12 @@ class MailAccountService:
         Best-effort and idempotent: the queue is drained, so a repeated call is
         a no-op, and a rolled-back transaction simply never reaches the flush.
         """
-        pending = self._pending_status_account_ids
-        self._pending_status_account_ids = []
+        pending = list(self._pending_status_account_ids)
+        # Drained IN PLACE (never rebound): the TD-054 guard holds this very
+        # list object, so a rebind would leave the detector probing a stale
+        # queue and fire on an already-flushed request.
+        self._pending_status_account_ids.clear()
+        self._status_committed_count = 0
         for account_id in pending:
             await enqueue_crm_status_best_effort(account_id)
 

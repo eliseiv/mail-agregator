@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import DeclarativeBase
 
 from shared.config import Settings, get_settings
+from shared.session_guards import check_session_guards
 
 
 class Base(DeclarativeBase):
@@ -101,7 +102,14 @@ async def get_session() -> AsyncIterator[AsyncSession]:
         try:
             yield session
         finally:
-            await session.close()
+            # TD-054 / ADR-0046 §2.1.1 — detect (never repair) deferred
+            # post-COMMIT side effects the caller forgot to flush. Warning in
+            # prod (the already-committed request still returns 200), hard fail
+            # under pytest. Runs BEFORE close() so the pending state is intact.
+            try:
+                check_session_guards(session)
+            finally:
+                await session.close()
 
 
 @asynccontextmanager
@@ -112,4 +120,10 @@ async def make_session() -> AsyncIterator[AsyncSession]:
         try:
             yield session
         finally:
-            await session.close()
+            # TD-054 — same detector for the non-HTTP callers (worker job, CLI,
+            # script): the norm of ADR-0046 §2.1.1 is addressed to the CALLER as
+            # such, not to "a file named router.py".
+            try:
+                check_session_guards(session)
+            finally:
+                await session.close()
