@@ -1,4 +1,4 @@
-"""Health endpoints (``/healthz``, ``/readyz``) and ``/api/me``."""
+"""Health endpoints (``/healthz``, ``/readyz``)."""
 
 from backend.app.health.router import router
 

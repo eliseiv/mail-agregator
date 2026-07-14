@@ -1,5 +1,5 @@
-"""Mail accounts module: CRUD + IMAP/SMTP test login + force-sync marker."""
+"""Mail accounts module: CRUD + IMAP/SMTP test login + force-sync marker.
 
-from backend.app.accounts.router import router
-
-__all__ = ["router"]
+ADR-0044 §4 (phase A3): the HTML router went away with the UI; the service is
+reused by the external write API (``backend/app/external/write_service.py``).
+"""

@@ -5,10 +5,13 @@ so we don't exercise it end-to-end. We *do* exercise:
 
 - ``_touch_alive``: filesystem touch + permission-error path.
 - ``_safe_sync_cycle`` / ``_safe_cleanup``: never re-raise; log on failure.
-- ``_bootstrap``: never re-raise; logs warning on bucket failure.
 - ``_entrypoint``: handles KeyboardInterrupt gracefully.
+- the DECOMMISSION surface (ADR-0044 §4, phase A3): the MinIO ``_bootstrap`` /
+  ``ensure_bucket`` and every dispatcher of a dismantled subsystem
+  (``tg_notify`` / ``webhook`` / ``forward`` / ``push_notify`` / ``mailbox_alert``)
+  are GONE from the module; only the connector jobs survive.
 
-Source of truth: ``worker/app/main.py``.
+Source of truth: ``worker/app/main.py`` + ADR-0044 §4.
 """
 
 from __future__ import annotations
@@ -117,31 +120,49 @@ class TestSafeCleanup:
 
 
 # ---------------------------------------------------------------------------
-# _bootstrap
+# Decommission surface (ADR-0044 §4, phase A3)
 # ---------------------------------------------------------------------------
 
 
-class TestBootstrap:
-    @pytest.mark.asyncio
-    async def test_swallows_bucket_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        class _BadStorage:
-            async def ensure_bucket(self) -> None:
-                raise RuntimeError("minio down")
+class TestDecommissionedJobsAreGone:
+    """The MinIO bootstrap and every dismantled dispatcher left the worker.
 
-        monkeypatch.setattr(worker_main, "get_storage", lambda: _BadStorage())
-        await worker_main._bootstrap()  # — must not raise
+    These used to be real attributes of the module (``get_storage`` /
+    ``_bootstrap`` / ``_safe_tg_notify_dispatch`` / ``_safe_webhook_dispatch`` /
+    ``_safe_forward_dispatch`` / ``_safe_push_notify_dispatch`` /
+    ``_safe_mailbox_alert_dispatch``). A leftover would mean a job still runs
+    against a dropped table/queue after the DDL phases.
+    """
 
-    @pytest.mark.asyncio
-    async def test_calls_ensure_bucket(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        called: list[bool] = []
+    @pytest.mark.parametrize(
+        "attr",
+        [
+            "get_storage",
+            "_bootstrap",
+            "_safe_tg_notify_dispatch",
+            "_safe_tg_notify_recovery",
+            "_safe_webhook_dispatch",
+            "_safe_webhook_recovery",
+            "_safe_forward_dispatch",
+            "_safe_push_notify_dispatch",
+            "_safe_mailbox_alert_dispatch",
+        ],
+    )
+    def test_attribute_is_gone(self, attr: str) -> None:
+        assert not hasattr(worker_main, attr), f"worker.app.main still exposes {attr}"
 
-        class _OkStorage:
-            async def ensure_bucket(self) -> None:
-                called.append(True)
-
-        monkeypatch.setattr(worker_main, "get_storage", lambda: _OkStorage())
-        await worker_main._bootstrap()
-        assert called == [True]
+    def test_connector_jobs_survive(self) -> None:
+        # The jobs the thin connector still runs (ADR-0043 §2 + ADR-0011).
+        for attr in (
+            "_safe_sync_cycle",
+            "_safe_force_sync_dispatch",
+            "_safe_cleanup",
+            "_safe_crm_push_dispatch",
+            "_safe_crm_push_recovery",
+            "_safe_crm_status_dispatch",
+            "_touch_alive",
+        ):
+            assert hasattr(worker_main, attr), f"worker.app.main lost {attr}"
 
 
 # ---------------------------------------------------------------------------

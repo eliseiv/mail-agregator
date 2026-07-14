@@ -214,13 +214,13 @@ class TestReplyHappyPath:
         self,
         client: httpx.AsyncClient,
         reply_on: str,
-        super_admin: User,
+        owner: User,
         make_mail_account: Callable[..., Any],
         make_original: Callable[..., Any],
         stub_smtp: dict[str, Any],
         db_engine: AsyncEngine,
     ) -> None:
-        acc = await make_mail_account(super_admin.id, "canon@example.com")
+        acc = await make_mail_account(owner.id, "canon@example.com")
         original = await make_original(
             acc.id,
             from_addr="alice@corp.example",
@@ -259,7 +259,7 @@ class TestReplyHappyPath:
         # ``sent_messages.user_id`` = the mailbox OWNER (ADR-0035 §7).
         rows = await _sent_rows(db_engine)
         assert len(rows) == 1
-        assert rows[0].user_id == super_admin.id
+        assert rows[0].user_id == owner.id
         assert rows[0].from_account_id == acc.id
         assert rows[0].smtp_message_id == body["smtp_message_id"]
 
@@ -267,12 +267,12 @@ class TestReplyHappyPath:
         self,
         client: httpx.AsyncClient,
         reply_on: str,
-        super_admin: User,
+        owner: User,
         make_mail_account: Callable[..., Any],
         make_original: Callable[..., Any],
         stub_smtp: dict[str, Any],
     ) -> None:
-        acc = await make_mail_account(super_admin.id, "canon2@example.com")
+        acc = await make_mail_account(owner.id, "canon2@example.com")
         original = await make_original(acc.id, subject=None, message_id_header="<n@x>")
         resp = await client.post(
             _url(original.id), headers={"X-API-Key": reply_on}, json={"body": "hi"}
@@ -285,12 +285,12 @@ class TestReplyHappyPath:
         self,
         client: httpx.AsyncClient,
         reply_on: str,
-        super_admin: User,
+        owner: User,
         make_mail_account: Callable[..., Any],
         make_original: Callable[..., Any],
         stub_smtp: dict[str, Any],
     ) -> None:
-        acc = await make_mail_account(super_admin.id, "canon3@example.com")
+        acc = await make_mail_account(owner.id, "canon3@example.com")
         original = await make_original(acc.id, from_addr="alice@corp.example")
         resp = await client.post(
             _url(original.id),
@@ -314,12 +314,12 @@ class TestReplyHappyPath:
         self,
         client: httpx.AsyncClient,
         reply_on: str,
-        super_admin: User,
+        owner: User,
         make_mail_account: Callable[..., Any],
         make_original: Callable[..., Any],
         stub_smtp: dict[str, Any],
     ) -> None:
-        acc = await make_mail_account(super_admin.id, "canon4@example.com")
+        acc = await make_mail_account(owner.id, "canon4@example.com")
         # No Message-ID header on the original -> nothing to thread onto.
         original = await make_original(acc.id, message_id_header=None)
         resp = await client.post(
@@ -451,12 +451,12 @@ class TestAuthAndGate:
         self,
         client: httpx.AsyncClient,
         reply_on: str,
-        super_admin: User,
+        owner: User,
         make_mail_account: Callable[..., Any],
         make_original: Callable[..., Any],
         stub_smtp: dict[str, Any],
     ) -> None:
-        acc = await make_mail_account(super_admin.id, "bearer@example.com")
+        acc = await make_mail_account(owner.id, "bearer@example.com")
         original = await make_original(acc.id, message_id_header="<b@x>")
         resp = await client.post(
             _url(original.id),
@@ -508,18 +508,18 @@ class TestScopeAndNotFound:
         self,
         client: httpx.AsyncClient,
         reply_on: str,
-        super_admin: User,
+        owner: User,
         make_mail_account: Callable[..., Any],
-        make_secondary_team_mailbox: Callable[..., Any],
+        make_secondary_owner_mailbox: Callable[..., Any],
         make_original: Callable[..., Any],
         stub_smtp: dict[str, Any],
     ) -> None:
         # Two mailboxes, SAME lower(email). Canonical = MIN(id) (the admin's).
         # A message on the NON-canonical duplicate is never in the pull feed, so
         # replying to its id must 404 (existence outside scope not disclosed).
-        acc_canon = await make_mail_account(super_admin.id, "Shared@Example.com")
-        acc_dup = await make_secondary_team_mailbox(
-            username="dup_owner", group_name="Dup Team", email="shared@example.com"
+        acc_canon = await make_mail_account(owner.id, "Shared@Example.com")
+        acc_dup = await make_secondary_owner_mailbox(
+            username="dup_owner", email="shared@example.com"
         )
         assert acc_canon.id < acc_dup.id
         dup_msg = await make_original(acc_dup.id, message_id_header="<dup@x>")
@@ -549,12 +549,12 @@ class TestBodyValidation:
     @pytest_asyncio.fixture
     async def repliable(
         self,
-        super_admin: User,
+        owner: User,
         make_mail_account: Callable[..., Any],
         make_original: Callable[..., Any],
     ) -> int:
         """A real, in-scope message id so validation is what rejects (not 404)."""
-        acc = await make_mail_account(super_admin.id, "valid@example.com")
+        acc = await make_mail_account(owner.id, "valid@example.com")
         m = await make_original(acc.id, message_id_header="<v@x>")
         return m.id
 
@@ -651,7 +651,7 @@ class TestFaultTolerance:
         self,
         client: httpx.AsyncClient,
         reply_on: str,
-        super_admin: User,
+        owner: User,
         make_mail_account: Callable[..., Any],
         make_original: Callable[..., Any],
         monkeypatch: pytest.MonkeyPatch,
@@ -664,7 +664,7 @@ class TestFaultTolerance:
 
         monkeypatch.setattr(aiosmtplib, "send", _boom)
 
-        acc = await make_mail_account(super_admin.id, "smtpfail@example.com")
+        acc = await make_mail_account(owner.id, "smtpfail@example.com")
         original = await make_original(acc.id, message_id_header="<s@x>")
         resp = await client.post(
             _url(original.id), headers={"X-API-Key": reply_on}, json={"body": "hi"}
@@ -678,12 +678,12 @@ class TestFaultTolerance:
         self,
         client: httpx.AsyncClient,
         reply_on: str,
-        super_admin: User,
+        owner: User,
         make_original: Callable[..., Any],
         db_engine: AsyncEngine,
     ) -> None:
         acc = await _oauth_account(
-            db_engine, user_id=super_admin.id, email="oauth@example.com", needs_consent=True
+            db_engine, user_id=owner.id, email="oauth@example.com", needs_consent=True
         )
         original = await make_original(acc.id, message_id_header="<o@x>")
         resp = await client.post(
@@ -697,7 +697,7 @@ class TestFaultTolerance:
         self,
         client: httpx.AsyncClient,
         reply_on: str,
-        super_admin: User,
+        owner: User,
         make_mail_account: Callable[..., Any],
         make_original: Callable[..., Any],
         monkeypatch: pytest.MonkeyPatch,
@@ -716,7 +716,7 @@ class TestFaultTolerance:
         monkeypatch.setattr(aiosmtplib, "send", _ok_send)
         monkeypatch.setattr(svc_mod, "_imap_append_blocking", _bad_append)
 
-        acc = await make_mail_account(super_admin.id, "imapfail@example.com")
+        acc = await make_mail_account(owner.id, "imapfail@example.com")
         original = await make_original(acc.id, message_id_header="<i@x>")
         resp = await client.post(
             _url(original.id), headers={"X-API-Key": reply_on}, json={"body": "hi"}
@@ -777,11 +777,11 @@ class TestRegression:
         self,
         client: httpx.AsyncClient,
         reply_on: str,
-        super_admin: User,
+        owner: User,
         make_mail_account: Callable[..., Any],
         make_original: Callable[..., Any],
     ) -> None:
-        acc = await make_mail_account(super_admin.id, "regress@example.com")
+        acc = await make_mail_account(owner.id, "regress@example.com")
         original = await make_original(acc.id, message_id_header="<r@x>")
         pull = await client.get("/api/external/messages", headers={"X-API-Key": reply_on})
         assert pull.status_code == 200, pull.text

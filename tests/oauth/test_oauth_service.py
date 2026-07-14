@@ -5,11 +5,18 @@ real Postgres + Redis (rows are committed via ``make_session`` so the service's
 own ``_persist_refresh`` session sees them; the autouse truncate fixture cleans
 up between tests).
 
-SINGLE-STEP flow (working Sprint-B config, P1/P2 reverted): ``exchange_code``
-makes exactly ONE ``code -> token`` request with the direct
-``https://outlook.office.com/…`` resource scopes; ``authorize_url`` carries the
-same ``OUTLOOK_SCOPES``. The persisted access token is the one returned by that
+SINGLE-STEP flow: the code exchange makes exactly ONE ``code -> token`` request with
+the direct ``https://outlook.office.com/…`` resource scopes; the authorize URL carries
+the same ``OUTLOOK_SCOPES``. The persisted access token is the one returned by that
 single request; the email comes from its ``id_token``.
+
+ADR-0044 §5 / ADR-0045: the SESSION pair (``build_authorize_url(user_id)`` /
+``exchange_code(code, state)``) went away with the cookie UI. The surviving flow is the
+HEADLESS one (``build_authorize_url_headless(crm_state)`` /
+``exchange_code_headless(code, state)``) — same PKCE/state machinery, same token
+exchange, same encryption-at-rest, but the owner of a linked mailbox is the technical
+``crm-service`` user (ADR-0045 §1) instead of a logged-in human. Every case below is
+retargeted onto it; the state payload therefore carries ``crm_state``, never ``user_id``.
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ import httpx
 import pytest
 from cryptography.exceptions import InvalidTag
 
+from backend.app.auth.service import seed_crm_service_user
 from backend.app.oauth.schemas import (
     OAUTH_STATE_KEY_PREFIX,
     OUTLOOK_SCOPES,
@@ -27,7 +35,6 @@ from backend.app.oauth.schemas import (
 )
 from backend.app.oauth.service import OAuthError, OutlookOAuthService
 from backend.app.repositories.mail_accounts import MailAccountsRepo
-from backend.app.repositories.users import UsersRepo
 from shared.crypto import MailPasswordCipher
 from shared.db import make_session
 from shared.redis_client import get_redis
@@ -36,10 +43,17 @@ from tests.oauth._mock_token import TokenEndpoint, token_success_body
 pytestmark = pytest.mark.integration
 
 
-async def _seed_user(username: str = "oauth_owner") -> int:
+_CRM_STATE = "crm-opaque-state"
+
+
+async def _seed_owner() -> None:
+    """Seed the ``crm-service`` technical user — the owner of any headless-linked box.
+
+    The autouse truncate wipes it between tests, so each case re-seeds (the app
+    lifespan does the same on boot, ``seed_crm_service_user`` is idempotent).
+    """
     async with make_session() as s, s.begin():
-        u = await UsersRepo(s).create(username=username, email=None, role="group_member")
-        return u.id
+        await seed_crm_service_user(s)
 
 
 def _scope_set(form: dict[str, str]) -> set[str]:
@@ -56,9 +70,9 @@ class TestBuildAuthorizeUrl:
     async def test_url_contains_required_params(
         self, enable_outlook_oauth: None, redis_client: object
     ) -> None:
-        uid = await _seed_user()
+        await _seed_owner()
         async with make_session() as s:
-            url, state = await OutlookOAuthService(s).build_authorize_url(uid)
+            url, state = await OutlookOAuthService(s).build_authorize_url_headless(_CRM_STATE)
 
         q = parse_qs(urlsplit(url).query)
         assert q["response_type"] == ["code"]
@@ -71,16 +85,19 @@ class TestBuildAuthorizeUrl:
     async def test_state_and_pkce_stored_in_redis_with_ttl(
         self, enable_outlook_oauth: None, redis_client: object
     ) -> None:
-        uid = await _seed_user()
+        await _seed_owner()
         async with make_session() as s:
-            _url, state = await OutlookOAuthService(s).build_authorize_url(uid)
+            _url, state = await OutlookOAuthService(s).build_authorize_url_headless(_CRM_STATE)
 
         redis = get_redis()
         key = f"{OAUTH_STATE_KEY_PREFIX}{state}"
         raw = await redis.get(key)
         assert raw is not None
         parsed = OAuthState.model_validate_json(raw)
-        assert parsed.user_id == uid
+        # Headless payload: the opaque CRM state is stored verbatim and there is NO
+        # user_id — the flow has no logged-in human (ADR-0045 §1).
+        assert parsed.crm_state == _CRM_STATE
+        assert parsed.user_id is None
         assert parsed.code_verifier  # PKCE verifier persisted
         ttl = await redis.ttl(key)
         assert 0 < ttl <= 600
@@ -88,9 +105,9 @@ class TestBuildAuthorizeUrl:
     async def test_authorize_url_uses_outlook_scopes(
         self, enable_outlook_oauth: None, redis_client: object
     ) -> None:
-        uid = await _seed_user()
+        await _seed_owner()
         async with make_session() as s:
-            url, _state = await OutlookOAuthService(s).build_authorize_url(uid)
+            url, _state = await OutlookOAuthService(s).build_authorize_url_headless(_CRM_STATE)
         q = parse_qs(urlsplit(url).query)
         scopes = set(q["scope"][0].split())
         assert scopes == set(OUTLOOK_SCOPES)
@@ -102,28 +119,29 @@ class TestBuildAuthorizeUrl:
 
 
 # ---------------------------------------------------------------------------
-# D. exchange_code (callback core) — SINGLE-step.
+# D. exchange_code_headless (callback core) — SINGLE-step.
 # ---------------------------------------------------------------------------
 
 
-async def _store_state(state: str, user_id: int, verifier: str = "verifier-xyz") -> None:
+async def _store_state(state: str, verifier: str = "verifier-xyz") -> None:
+    """Put a HEADLESS state payload (``crm_state`` set, ``user_id`` None) in Redis."""
     redis = get_redis()
-    payload = OAuthState(user_id=user_id, code_verifier=verifier).model_dump_json()
+    payload = OAuthState(crm_state=_CRM_STATE, code_verifier=verifier).model_dump_json()
     await redis.set(f"{OAUTH_STATE_KEY_PREFIX}{state}", payload, ex=600)
 
 
-class TestExchangeCode:
+class TestExchangeCodeHeadless:
     async def test_happy_path_creates_oauth_account(
         self, enable_outlook_oauth: None, redis_client: object
     ) -> None:
-        uid = await _seed_user()
-        await _store_state("st-1", uid)
+        await _seed_owner()
+        await _store_state("st-1")
         ep = TokenEndpoint([httpx.Response(200, json=token_success_body(email="me@outlook.com"))])
 
         async with make_session() as s, s.begin():
-            acc = await OutlookOAuthService(s, http_client=ep.client()).exchange_code(
-                code="auth-code", state="st-1"
-            )
+            acc, _crm = await OutlookOAuthService(
+                s, http_client=ep.client()
+            ).exchange_code_headless(code="auth-code", state="st-1")
             acc_id = acc.id
 
         # Single-step: exactly one authorization_code token call.
@@ -145,15 +163,15 @@ class TestExchangeCode:
     async def test_refresh_token_encrypted_at_rest(
         self, enable_outlook_oauth: None, redis_client: object
     ) -> None:
-        uid = await _seed_user()
-        await _store_state("st-2", uid)
+        await _seed_owner()
+        await _store_state("st-2")
         ep = TokenEndpoint(
             [httpx.Response(200, json=token_success_body(refresh_token="RT-secret-123"))]
         )
         async with make_session() as s, s.begin():
-            acc = await OutlookOAuthService(s, http_client=ep.client()).exchange_code(
-                code="c", state="st-2"
-            )
+            acc, _crm = await OutlookOAuthService(
+                s, http_client=ep.client()
+            ).exchange_code_headless(code="c", state="st-2")
             acc_id = acc.id
 
         async with make_session() as s:
@@ -171,7 +189,7 @@ class TestExchangeCode:
         ep = TokenEndpoint()
         async with make_session() as s:
             with pytest.raises(OAuthError) as exc:
-                await OutlookOAuthService(s, http_client=ep.client()).exchange_code(
+                await OutlookOAuthService(s, http_client=ep.client()).exchange_code_headless(
                     code="c", state="does-not-exist"
                 )
         assert exc.value.code == "oauth_state_invalid"
@@ -180,17 +198,17 @@ class TestExchangeCode:
     async def test_state_is_one_shot(
         self, enable_outlook_oauth: None, redis_client: object
     ) -> None:
-        uid = await _seed_user()
-        await _store_state("st-3", uid)
+        await _seed_owner()
+        await _store_state("st-3")
         ep = TokenEndpoint([httpx.Response(200, json=token_success_body(email="x@outlook.com"))])
         async with make_session() as s, s.begin():
-            await OutlookOAuthService(s, http_client=ep.client()).exchange_code(
+            await OutlookOAuthService(s, http_client=ep.client()).exchange_code_headless(
                 code="c", state="st-3"
             )
         # Replay the same state -> rejected (GET+DEL consumed it).
         async with make_session() as s:
             with pytest.raises(OAuthError) as exc:
-                await OutlookOAuthService(s, http_client=ep.client()).exchange_code(
+                await OutlookOAuthService(s, http_client=ep.client()).exchange_code_headless(
                     code="c", state="st-3"
                 )
         assert exc.value.code == "oauth_state_invalid"
@@ -198,12 +216,12 @@ class TestExchangeCode:
     async def test_token_endpoint_non_200_raises_exchange_failed(
         self, enable_outlook_oauth: None, redis_client: object
     ) -> None:
-        uid = await _seed_user()
-        await _store_state("st-4", uid)
+        await _seed_owner()
+        await _store_state("st-4")
         ep = TokenEndpoint([httpx.Response(400, json={"error": "invalid_request"})])
         async with make_session() as s:
             with pytest.raises(OAuthError) as exc:
-                await OutlookOAuthService(s, http_client=ep.client()).exchange_code(
+                await OutlookOAuthService(s, http_client=ep.client()).exchange_code_headless(
                     code="c", state="st-4"
                 )
         assert exc.value.code == "oauth_exchange_failed"
@@ -214,12 +232,12 @@ class TestExchangeCode:
         # invalid_grant on the authorization_code exchange means the code was
         # already used / expired — surfaced as a generic exchange failure (NOT
         # needs-consent: there is no account yet to flag). ADR-0025 §3.
-        uid = await _seed_user()
-        await _store_state("st-ig", uid)
+        await _seed_owner()
+        await _store_state("st-ig")
         ep = TokenEndpoint([httpx.Response(400, json={"error": "invalid_grant"})])
         async with make_session() as s:
             with pytest.raises(OAuthError) as exc:
-                await OutlookOAuthService(s, http_client=ep.client()).exchange_code(
+                await OutlookOAuthService(s, http_client=ep.client()).exchange_code_headless(
                     code="c", state="st-ig"
                 )
         assert exc.value.code == "oauth_exchange_failed"
@@ -228,12 +246,12 @@ class TestExchangeCode:
     async def test_no_refresh_token_raises_exchange_failed(
         self, enable_outlook_oauth: None, redis_client: object
     ) -> None:
-        uid = await _seed_user()
-        await _store_state("st-5", uid)
+        await _seed_owner()
+        await _store_state("st-5")
         ep = TokenEndpoint([httpx.Response(200, json=token_success_body(refresh_token=None))])
         async with make_session() as s:
             with pytest.raises(OAuthError) as exc:
-                await OutlookOAuthService(s, http_client=ep.client()).exchange_code(
+                await OutlookOAuthService(s, http_client=ep.client()).exchange_code_headless(
                     code="c", state="st-5"
                 )
         assert exc.value.code == "oauth_exchange_failed"
@@ -243,12 +261,12 @@ class TestExchangeCode:
     ) -> None:
         # The single exchange response carries no email-bearing id_token claim
         # -> cannot resolve the mailbox -> oauth_exchange_failed.
-        uid = await _seed_user()
-        await _store_state("st-noemail", uid)
+        await _seed_owner()
+        await _store_state("st-noemail")
         ep = TokenEndpoint([httpx.Response(200, json=token_success_body(email=None))])
         async with make_session() as s:
             with pytest.raises(OAuthError) as exc:
-                await OutlookOAuthService(s, http_client=ep.client()).exchange_code(
+                await OutlookOAuthService(s, http_client=ep.client()).exchange_code_headless(
                     code="c", state="st-noemail"
                 )
         assert exc.value.code == "oauth_exchange_failed"
@@ -257,15 +275,15 @@ class TestExchangeCode:
     async def test_email_resolved_and_normalised_from_id_token(
         self, enable_outlook_oauth: None, redis_client: object
     ) -> None:
-        uid = await _seed_user()
-        await _store_state("st-email", uid)
+        await _seed_owner()
+        await _store_state("st-email")
         ep = TokenEndpoint(
             [httpx.Response(200, json=token_success_body(email="Mailbox.Owner@Outlook.com"))]
         )
         async with make_session() as s, s.begin():
-            acc = await OutlookOAuthService(s, http_client=ep.client()).exchange_code(
-                code="c", state="st-email"
-            )
+            acc, _crm = await OutlookOAuthService(
+                s, http_client=ep.client()
+            ).exchange_code_headless(code="c", state="st-email")
             acc_id = acc.id
         async with make_session() as s:
             stored = await MailAccountsRepo(s).get_by_id(acc_id)
@@ -298,8 +316,8 @@ class TestEncryptionAtRest:
     async def test_access_and_refresh_tokens_both_decrypt(
         self, enable_outlook_oauth: None, redis_client: object
     ) -> None:
-        uid = await _seed_user()
-        await _store_state("st-6", uid)
+        await _seed_owner()
+        await _store_state("st-6")
         # Single-step: the persisted access + refresh tokens are exactly the
         # ones returned by the one ``code -> token`` request.
         ep = TokenEndpoint(
@@ -311,9 +329,9 @@ class TestEncryptionAtRest:
             ]
         )
         async with make_session() as s, s.begin():
-            acc = await OutlookOAuthService(s, http_client=ep.client()).exchange_code(
-                code="c", state="st-6"
-            )
+            acc, _crm = await OutlookOAuthService(
+                s, http_client=ep.client()
+            ).exchange_code_headless(code="c", state="st-6")
             acc_id = acc.id
         async with make_session() as s:
             stored = await MailAccountsRepo(s).get_by_id(acc_id)

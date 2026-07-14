@@ -6,7 +6,9 @@ Pure, no-I/O coverage of:
 - ``backend.app.external.router._api_key_matches`` — constant-time compare,
   feature-off short-circuit.
 - ``ExternalMessage*`` Pydantic schemas — field whitelist / nullability /
-  ``to_addrs`` always-string contract (ADR-0029 §2/§6).
+  ``to_addrs`` always-string contract (ADR-0029 §2/§6) and the ABSENCE of the
+  ``tags`` field after the decommission (ADR-0044 §4 phase A1: tags are gone —
+  the matching logic moved to the CRM).
 
 The auth-flow / keyset / canonical-dedup behaviours are covered end-to-end in
 ``tests/integration/external/test_external_pull_api.py``.
@@ -24,7 +26,6 @@ from backend.app.external.schemas import (
     ExternalMessageDTO,
     ExternalMessagesPage,
     ExternalMessagesResponse,
-    ExternalTagDTO,
 )
 
 
@@ -86,7 +87,6 @@ class TestSchemas:
             "body_html": None,
             "body_present": True,
             "body_truncated": False,
-            "tags": [],
         }
         base.update(over)
         return ExternalMessageDTO(**base)  # type: ignore[arg-type]
@@ -111,11 +111,23 @@ class TestSchemas:
             "body_html",
             "body_present",
             "body_truncated",
-            "tags",
         }
         # No secret / internal columns leak via the DTO.
         for forbidden in ("uid", "uidvalidity", "encrypted_password", "mail_account_id", "user_id"):
             assert forbidden not in dumped
+
+    def test_message_dto_has_no_tags_field_after_decommission(self) -> None:
+        # ADR-0044 §4 (phase A1) / §1: tags are DROPPED — the pull DTO must not
+        # carry a ``tags`` key any more (the CRM owns tag matching).
+        assert "tags" not in self._msg().model_dump()
+        assert "tags" not in ExternalMessageDTO.model_fields
+
+    def test_mailbox_dto_has_no_group_field_after_decommission(self) -> None:
+        # ADR-0044 §4 (phase A1): ``group_id`` went away with teams/groups.
+        from backend.app.external.schemas import ExternalMailboxDTO
+
+        assert "group_id" not in ExternalMailboxDTO.model_fields
+        assert "group" not in ExternalMailboxDTO.model_fields
 
     def test_nullable_fields_accept_none(self) -> None:
         dumped = self._msg(subject=None, from_name=None, cc_addrs=None, body_html=None).model_dump()
@@ -128,10 +140,6 @@ class TestSchemas:
         dumped = self._msg(to_addrs="").model_dump()
         assert isinstance(dumped["to_addrs"], str)
         assert dumped["to_addrs"] == ""
-
-    def test_tag_dto_shape(self) -> None:
-        t = ExternalTagDTO(id=3, name="X", color="#abcdef")
-        assert t.model_dump() == {"id": 3, "name": "X", "color": "#abcdef"}
 
     def test_page_envelope_shape(self) -> None:
         page = ExternalMessagesResponse(messages=[self._msg()], next_since_id=1, has_more=True)

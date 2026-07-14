@@ -47,7 +47,6 @@ from shared.config import get_settings
 from shared.crypto import encrypt_mail_password
 from shared.models import MailAccount, User
 from shared.redis_client import get_redis
-from tests.integration.conftest import login_as_admin
 
 pytestmark = pytest.mark.integration  # needs DB + Redis + MinIO (app lifespan)
 
@@ -203,7 +202,14 @@ def _key_headers() -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# H5 — PATCH /api/mail-accounts/{id} with new credentials (re-enable)
+# H5 — credential change → re-enable.
+#
+# ADR-0044 §5: the session route ``PATCH /api/mail-accounts/{id}`` went away with
+# the cookie UI. The SAME service call-site (``MailAccountService.update`` →
+# ``creds_changed`` → ``is_active=true`` + counter reset) is now reached through the
+# surviving machine route ``PATCH /api/external/mailboxes/{id}`` with a password in
+# the body (``external/write_service.py::update`` delegates to it). The hook is
+# unchanged — only the door in front of it is.
 # ---------------------------------------------------------------------------
 
 
@@ -223,13 +229,12 @@ class TestH5CredentialReEnable:
             consecutive_failures=3,
             last_sync_error="auth_failed: bad password",
         )
-        csrf = await login_as_admin(client)
         seen = _spy_hook(monkeypatch)
 
         resp = await client.patch(
-            f"/api/mail-accounts/{account_id}",
+            f"/api/external/mailboxes/{account_id}",
             json={"password": "new-app-password"},
-            headers={"X-CSRF-Token": csrf, "Content-Type": "application/json"},
+            headers=_key_headers(),
         )
         assert resp.status_code == 200, resp.text
 
@@ -257,12 +262,10 @@ class TestH5CredentialReEnable:
             consecutive_failures=3,
             last_sync_error="auth_failed: bad password",
         )
-        csrf = await login_as_admin(client)
-
         resp = await client.patch(
-            f"/api/mail-accounts/{account_id}",
+            f"/api/external/mailboxes/{account_id}",
             json={"password": "new-app-password", "smtp_ssl": True, "smtp_starttls": True},
-            headers={"X-CSRF-Token": csrf, "Content-Type": "application/json"},
+            headers=_key_headers(),
         )
         assert resp.status_code == 409, resp.text
 
@@ -411,12 +414,10 @@ class TestN7NonStatusUpdateFields:
             consecutive_failures=2,
             last_sync_error="auth_failed: bad password",
         )
-        csrf = await login_as_admin(client)
-
         resp = await client.patch(
-            f"/api/mail-accounts/{account_id}",
+            f"/api/external/mailboxes/{account_id}",
             json={"display_name": "Renamed box"},
-            headers={"X-CSRF-Token": csrf, "Content-Type": "application/json"},
+            headers=_key_headers(),
         )
         assert resp.status_code == 200, resp.text
 

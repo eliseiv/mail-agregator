@@ -3,9 +3,8 @@
 Covers the mailbox write surface owned by the ``crm-service`` technical user:
 
 - ``POST /mailboxes``        create → owner == ``crm-service``; 409 on dup email;
-                             404 ``group_not_found`` for a bogus team.
 - ``PATCH /mailboxes/{id}``  ``is_active`` toggle (activate resets the failure
-                             counter + alert stamp — ADR-0033); team transfer.
+                             counter + alert stamp — ADR-0033).
 - ``DELETE /mailboxes/{id}`` 204 + row gone.
 - ``POST /mailboxes/{id}/sync`` 202 + Redis ``force_sync:{id}`` marker set.
 - ``POST /mailboxes/test``   422 (never 502) on a connection failure; 400 on the
@@ -97,50 +96,20 @@ class TestCreate:
         assert err["code"] == "conflict"
         assert err.get("field") == "email"
 
-    async def test_bogus_group_id_is_404_group_not_found(
-        self,
-        client: httpx.AsyncClient,
-        write_api_on: str,
-        patch_mail_testers: None,
-    ) -> None:
-        resp = await client.post(
-            _MB,
-            headers={"X-API-Key": write_api_on},
-            json=_create_body("grp@example.com", group_id=987_654),
-        )
-        assert resp.status_code == 404, resp.text
-        assert resp.json()["error"]["code"] == "group_not_found"
-
-    async def test_create_into_existing_group(
-        self,
-        client: httpx.AsyncClient,
-        write_api_on: str,
-        patch_mail_testers: None,
-        make_group: Callable[..., Any],
-    ) -> None:
-        gid = await make_group("CRM Team")
-        resp = await client.post(
-            _MB,
-            headers={"X-API-Key": write_api_on},
-            json=_create_body("team@example.com", group_id=gid),
-        )
-        assert resp.status_code == 201, resp.text
-        assert resp.json()["group_id"] == gid
-
 
 class TestPatchIsActive:
     async def test_activate_resets_failure_counter_and_alert_stamp(
         self,
         client: httpx.AsyncClient,
         write_api_on: str,
-        super_admin: User,
+        owner: User,
         make_mail_account: Callable[..., Any],
         db_engine: AsyncEngine,
     ) -> None:
         """A disabled mailbox with a failure history: ``PATCH is_active=true``
         re-enables it AND clears ``consecutive_failures`` / ``last_sync_error`` /
         the ADR-0033 alert idempotency stamp."""
-        acc = await make_mail_account(super_admin.id, "toggle@example.com")
+        acc = await make_mail_account(owner.id, "toggle@example.com")
         # Simulate a worker auto-disable with an alert already sent.
         factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
         async with factory() as ses, ses.begin():
@@ -176,10 +145,10 @@ class TestPatchIsActive:
         self,
         client: httpx.AsyncClient,
         write_api_on: str,
-        super_admin: User,
+        owner: User,
         make_mail_account: Callable[..., Any],
     ) -> None:
-        acc = await make_mail_account(super_admin.id, "deact@example.com")
+        acc = await make_mail_account(owner.id, "deact@example.com")
         resp = await client.patch(
             f"{_MB}/{acc.id}", headers={"X-API-Key": write_api_on}, json={"is_active": False}
         )
@@ -187,37 +156,7 @@ class TestPatchIsActive:
         assert resp.json()["is_active"] is False
 
 
-class TestPatchGroupTransfer:
-    async def test_transfer_moves_mailbox_to_new_group(
-        self,
-        client: httpx.AsyncClient,
-        write_api_on: str,
-        super_admin: User,
-        make_mail_account: Callable[..., Any],
-        make_group: Callable[..., Any],
-    ) -> None:
-        acc = await make_mail_account(super_admin.id, "xfer@example.com")
-        gid = await make_group("Dest Team")
-        resp = await client.patch(
-            f"{_MB}/{acc.id}", headers={"X-API-Key": write_api_on}, json={"group_id": gid}
-        )
-        assert resp.status_code == 200, resp.text
-        assert resp.json()["group_id"] == gid
-
-    async def test_transfer_to_bogus_group_is_404(
-        self,
-        client: httpx.AsyncClient,
-        write_api_on: str,
-        super_admin: User,
-        make_mail_account: Callable[..., Any],
-    ) -> None:
-        acc = await make_mail_account(super_admin.id, "xfer2@example.com")
-        resp = await client.patch(
-            f"{_MB}/{acc.id}", headers={"X-API-Key": write_api_on}, json={"group_id": 987_654}
-        )
-        assert resp.status_code == 404, resp.text
-        assert resp.json()["error"]["code"] == "group_not_found"
-
+class TestPatchUnknown:
     async def test_patch_unknown_mailbox_is_404(
         self, client: httpx.AsyncClient, write_api_on: str
     ) -> None:
@@ -232,11 +171,11 @@ class TestDelete:
         self,
         client: httpx.AsyncClient,
         write_api_on: str,
-        super_admin: User,
+        owner: User,
         make_mail_account: Callable[..., Any],
         db_engine: AsyncEngine,
     ) -> None:
-        acc = await make_mail_account(super_admin.id, "del@example.com")
+        acc = await make_mail_account(owner.id, "del@example.com")
         resp = await client.delete(f"{_MB}/{acc.id}", headers={"X-API-Key": write_api_on})
         assert resp.status_code == 204, resp.text
         factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
@@ -255,10 +194,10 @@ class TestSync:
         self,
         client: httpx.AsyncClient,
         write_api_on: str,
-        super_admin: User,
+        owner: User,
         make_mail_account: Callable[..., Any],
     ) -> None:
-        acc = await make_mail_account(super_admin.id, "sync@example.com")
+        acc = await make_mail_account(owner.id, "sync@example.com")
         resp = await client.post(f"{_MB}/{acc.id}/sync", headers={"X-API-Key": write_api_on})
         assert resp.status_code == 202, resp.text
         assert resp.json()["queued"] is True

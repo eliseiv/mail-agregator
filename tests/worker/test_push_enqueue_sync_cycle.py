@@ -1,40 +1,40 @@
-"""ADR-0027 §3.1 — sync_cycle push-queue enqueue behaviour.
+"""ADR-0043 §2 — ``sync_cycle`` enqueues every inserted message onto ``crm_push_queue``.
 
-Source of truth: ``worker/app/sync_cycle.py`` (the third independent
-``if settings.push_team_bots_enabled:`` block after the TG + webhook enqueue).
+Source of truth: ``worker/app/sync_cycle.py`` (the ``if crm_push_ids and
+settings.crm_push_enabled:`` block after the ``mark_sync_success`` commit) +
+``backend/app/crm_push/service.py`` (``enqueue_push_ids`` / ``CRM_PUSH_QUEUE_KEY``).
 
-We drive ``sync_one_account`` with a mocked IMAP fetch (one inserted message)
-and a mocked tag-apply, then assert on the real Redis ``push_notify_queue``.
-The TG + webhook enqueues are stubbed so they neither touch Redis nor fail —
-this test isolates the push branch.
+ADR-0044 §4 (phase A3): the Telegram ``push_notify_queue`` (ADR-0027 team bots),
+the ``tg_notify`` / ``webhook`` / ``forward`` enqueues and the tag-apply hook were
+all removed from the cycle. The ONLY message fan-out left is the CRM push-outbox
+— which is what this suite now pins:
 
-Covered:
-- enabled → LPUSH push_notify_queue with the SAME message_id(s) as the main
-  channel; the main ``tg_notify_queue`` is independently enqueued (real call).
-- disabled → push_notify_queue untouched.
-- a Redis error on the push LPUSH is swallowed (the per-account commit and the
-  main enqueue path are unaffected; ``sync_one_account`` returns ``ok``).
+- gate ON  → the inserted message id lands on ``crm_push_queue`` with ``source="sync"``;
+- gate OFF (no ``CRM_INGEST_URL`` / ``CRM_PUSH_SECRET``) → the queue stays empty;
+- a Redis outage on the LPUSH is swallowed — the message is still persisted and the
+  account sync still reports ``ok`` (independent try/except, ADR-0043 §2).
+
+We drive ``sync_one_account`` with a mocked IMAP fetch (one message) and assert on the
+REAL Redis queue — nothing of our own code is mocked besides the IMAP boundary.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
+from backend.app.crm_push.service import CRM_PUSH_QUEUE_KEY
 from shared.config import get_settings
 from shared.crypto import encrypt_mail_password
 from shared.models import MailAccount, User
-from worker.app import push_notify_dispatch as pnd
 from worker.app import sync_cycle as sc
 
 pytestmark = pytest.mark.integration  # needs DB + Redis
-
-_PUSH_QUEUE = pnd._QUEUE_KEY
-_TG_QUEUE = "tg_notify_queue"
 
 
 # ---------------------------------------------------------------------------
@@ -43,44 +43,39 @@ _TG_QUEUE = "tg_notify_queue"
 
 
 @pytest.fixture
-def enable_push(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    monkeypatch.setenv("BOT_IVAN_TOKEN", "IVAN_TOK")
-    monkeypatch.setenv("BOT_IVAN_GROUP_ID", "1")
-    monkeypatch.setenv("ADMIN_TELEGRAM_IDS", "111,222")
+def enable_crm_push(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Turn the CRM push gate ON (``crm_push_enabled`` = URL + secret)."""
+    monkeypatch.setenv("CRM_INGEST_URL", "https://crm.example.com/api/mail/ingest")
+    monkeypatch.setenv("CRM_PUSH_SECRET", "test_push_secret")
     get_settings.cache_clear()
-    assert get_settings().push_team_bots_enabled is True
+    assert get_settings().crm_push_enabled is True
     yield
     get_settings.cache_clear()
 
 
 @pytest.fixture
-def disable_push(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    monkeypatch.delenv("BOT_IVAN_TOKEN", raising=False)
-    monkeypatch.delenv("BOT_ALEXANDRA_TOKEN", raising=False)
-    monkeypatch.delenv("BOT_ANDREI_TOKEN", raising=False)
-    monkeypatch.delenv("ADMIN_TELEGRAM_IDS", raising=False)
+def disable_crm_push(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Turn the CRM push gate OFF (pre-cut-over deployment: no URL / secret)."""
+    monkeypatch.setenv("CRM_INGEST_URL", "")
+    monkeypatch.setenv("CRM_PUSH_SECRET", "")
     get_settings.cache_clear()
-    assert get_settings().push_team_bots_enabled is False
+    assert get_settings().crm_push_enabled is False
     yield
     get_settings.cache_clear()
 
 
 @pytest.fixture
-async def account_in_group1(db_engine: AsyncEngine) -> dict[str, Any]:
-    """Seed a user + a mail account whose group_id is 1 (ivan's team)."""
+async def synced_account(db_engine: AsyncEngine) -> dict[str, Any]:
+    """Seed a user + one mailbox (no group — groups are decommissioned)."""
     factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
     async with factory() as ses, ses.begin():
-        from shared.models import Group
-
-        # group_id=1 is ivan's team (FK target for the account below).
-        ses.add(Group(id=1, name="team1", leader_user_id=None))
-        admin = User(
+        owner = User(
             username="push_sync_admin",
             role="super_admin",
             password_hash="$argon2id$v=19$m=65536,t=3,p=4$abc$def",
             password_reset_required=False,
         )
-        ses.add(admin)
+        ses.add(owner)
         await ses.flush()
         from backend.app.repositories.mail_accounts import MailAccountsRepo
 
@@ -89,8 +84,7 @@ async def account_in_group1(db_engine: AsyncEngine) -> dict[str, Any]:
         blob = encrypt_mail_password("p", new_id)
         acc = MailAccount(
             id=new_id,
-            user_id=admin.id,
-            group_id=1,
+            user_id=owner.id,
             email="pushsync@example.com",
             encrypted_password=blob,
             imap_host="imap.example.com",
@@ -103,7 +97,7 @@ async def account_in_group1(db_engine: AsyncEngine) -> dict[str, Any]:
         )
         ses.add(acc)
         await ses.flush()
-        return {"user_id": admin.id, "account_id": acc.id}
+        return {"user_id": owner.id, "account_id": acc.id}
 
 
 def _single_message_box(uid: int) -> Any:
@@ -138,20 +132,13 @@ def _single_message_box(uid: int) -> Any:
     )
 
 
-def _patch_fetch_and_tags(monkeypatch: pytest.MonkeyPatch, *, uid: int) -> None:
-    """Mock IMAP fetch (one message) + a tag-apply that records the message id."""
+def _patch_fetch(monkeypatch: pytest.MonkeyPatch, *, uid: int) -> None:
+    """Mock the IMAP boundary only (one fetched message)."""
 
     async def _fake_to_thread(_func: Any, *_a: Any, **_k: Any) -> Any:
         return _single_message_box(uid)
 
     monkeypatch.setattr(asyncio, "to_thread", _fake_to_thread)
-
-    from backend.app.tags.service import TagsService
-
-    async def _fake_apply(self: Any, *, message: Any, mail_account_id: int) -> int:
-        return 0  # 0 tags; TG_NOTIFY_ALL_MESSAGES default-true still enqueues
-
-    monkeypatch.setattr(TagsService, "apply_tags_to_message", _fake_apply)
 
 
 async def _run_account(db_engine: AsyncEngine, account_id: int) -> Any:
@@ -168,13 +155,11 @@ async def _run_account(db_engine: AsyncEngine, account_id: int) -> Any:
     )
 
 
-def _decode_message_ids(items: list[Any]) -> list[int]:
-    import json
-
-    out: list[int] = []
+def _payloads(items: list[Any]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
     for raw in items:
         decoded = raw.decode() if isinstance(raw, bytes) else raw
-        out.append(json.loads(decoded)["message_id"])
+        out.append(cast(dict[str, Any], json.loads(decoded)))
     return out
 
 
@@ -183,96 +168,87 @@ def _decode_message_ids(items: list[Any]) -> list[int]:
 # ---------------------------------------------------------------------------
 
 
-class TestPushEnqueueEnabled:
-    async def test_push_queue_gets_same_message_ids_as_main(
+class TestCrmPushEnqueueEnabled:
+    async def test_inserted_message_is_enqueued_with_source_sync(
         self,
         db_engine: AsyncEngine,
-        enable_push: None,
-        account_in_group1: dict[str, Any],
+        enable_crm_push: None,
+        synced_account: dict[str, Any],
+        redis_client: Any,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        _patch_fetch_and_tags(monkeypatch, uid=220001)
+        _patch_fetch(monkeypatch, uid=220001)
 
-        result = await _run_account(db_engine, account_in_group1["account_id"])
+        result = await _run_account(db_engine, synced_account["account_id"])
         assert result.new_count == 1
         assert result.outcome == "ok"
 
-        from shared.redis_client import get_redis
+        items = await cast(Any, redis_client.lrange(CRM_PUSH_QUEUE_KEY, 0, -1))
+        payloads = _payloads(items)
+        assert len(payloads) == 1
+        assert payloads[0]["message_id"] > 0
+        assert payloads[0]["source"] == "sync"
 
-        r = get_redis()
-        push_items = await r.lrange(_PUSH_QUEUE, 0, -1)
-        tg_items = await r.lrange(_TG_QUEUE, 0, -1)
-
-        push_ids = _decode_message_ids(push_items)
-        tg_ids = _decode_message_ids(tg_items)
-
-        # Exactly one message enqueued, identical id on both queues.
-        assert len(push_ids) == 1
-        assert push_ids == tg_ids
-        assert push_ids[0] > 0
-
-    async def test_push_payload_uses_source_sync(
+    async def test_conflicting_uid_is_not_enqueued_twice(
         self,
         db_engine: AsyncEngine,
-        enable_push: None,
-        account_in_group1: dict[str, Any],
+        enable_crm_push: None,
+        synced_account: dict[str, Any],
+        redis_client: Any,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        import json
+        """Idempotency: only NEWLY inserted rows become outbox items.
 
-        _patch_fetch_and_tags(monkeypatch, uid=220002)
-        await _run_account(db_engine, account_in_group1["account_id"])
+        The second cycle re-fetches the same UID; ``ON CONFLICT DO NOTHING`` inserts
+        nothing, so nothing may be pushed again (a duplicate push would re-deliver a
+        message the CRM already stored).
+        """
+        _patch_fetch(monkeypatch, uid=220002)
+        first = await _run_account(db_engine, synced_account["account_id"])
+        assert first.new_count == 1
 
-        from shared.redis_client import get_redis
+        second = await _run_account(db_engine, synced_account["account_id"])
+        assert second.new_count == 0
+        assert second.conflict_count == 1
 
-        r = get_redis()
-        items = await r.lrange(_PUSH_QUEUE, 0, -1)
-        assert len(items) == 1
-        raw = items[0]
-        payload = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-        assert payload["source"] == "sync"
+        items = await cast(Any, redis_client.lrange(CRM_PUSH_QUEUE_KEY, 0, -1))
+        assert len(_payloads(items)) == 1  # still exactly ONE outbox item
 
 
-class TestPushEnqueueDisabled:
-    async def test_push_queue_untouched_when_disabled_main_still_enqueues(
+class TestCrmPushEnqueueDisabled:
+    async def test_queue_untouched_when_gate_off(
         self,
         db_engine: AsyncEngine,
-        disable_push: None,
-        account_in_group1: dict[str, Any],
+        disable_crm_push: None,
+        synced_account: dict[str, Any],
+        redis_client: Any,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        _patch_fetch_and_tags(monkeypatch, uid=220101)
+        _patch_fetch(monkeypatch, uid=220101)
 
-        result = await _run_account(db_engine, account_in_group1["account_id"])
+        result = await _run_account(db_engine, synced_account["account_id"])
+        assert result.new_count == 1
         assert result.outcome == "ok"
 
-        from shared.redis_client import get_redis
-
-        r = get_redis()
-        # push queue stays empty…
-        assert await r.llen(_PUSH_QUEUE) == 0
-        # …while the main TG queue is still enqueued (feature is independent).
-        assert await r.llen(_TG_QUEUE) == 1
+        # Gate off (pre-cut-over): the message is persisted but nothing is enqueued.
+        assert int(await cast(Any, redis_client.llen(CRM_PUSH_QUEUE_KEY))) == 0
 
 
-class TestPushEnqueueRedisError:
-    async def test_redis_error_on_push_enqueue_is_swallowed(
+class TestCrmPushEnqueueRedisError:
+    async def test_redis_error_on_enqueue_is_swallowed(
         self,
         db_engine: AsyncEngine,
-        enable_push: None,
-        account_in_group1: dict[str, Any],
+        enable_crm_push: None,
+        synced_account: dict[str, Any],
+        redis_client: Any,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A failing push LPUSH must NOT break the account sync or the main
-        enqueue (independent try/except, ADR-0027 §3.1)."""
-        _patch_fetch_and_tags(monkeypatch, uid=220201)
+        """A failing LPUSH must NOT abort the sync (independent try/except, ADR-0043 §2)."""
+        _patch_fetch(monkeypatch, uid=220201)
 
-        # Patch the redis client used by sync_cycle so ONLY lpush raises. We
-        # wrap the real client and explode on lpush (the push branch), while
-        # leaving every other method intact so the TG/webhook paths still work.
-        from shared.redis_client import get_redis as _real_get_redis
+        from backend.app.crm_push import service as crm_push_service
 
-        real = _real_get_redis()
+        real = crm_push_service.get_redis()
 
         class _PushBoomRedis:
             def __init__(self, inner: Any) -> None:
@@ -282,17 +258,13 @@ class TestPushEnqueueRedisError:
                 return getattr(self._inner, name)
 
             async def lpush(self, *_a: Any, **_k: Any) -> int:
-                raise RuntimeError("simulated push redis outage")
+                raise RuntimeError("simulated redis outage")
 
-        monkeypatch.setattr(sc, "get_redis", lambda: _PushBoomRedis(real))
+        monkeypatch.setattr(crm_push_service, "get_redis", lambda: _PushBoomRedis(real))
 
-        result = await _run_account(db_engine, account_in_group1["account_id"])
-        # The account sync still succeeds despite the push LPUSH failure.
+        result = await _run_account(db_engine, synced_account["account_id"])
+        # The account sync still succeeds despite the LPUSH failure…
         assert result.new_count == 1
         assert result.outcome == "ok"
-
-        # The push queue is empty (LPUSH raised) but the message WAS persisted
-        # and the main TG queue still got the id (separate code path).
-        r = real
-        assert await r.llen(_PUSH_QUEUE) == 0
-        assert await r.llen(_TG_QUEUE) == 1
+        # …and nothing landed on the queue (the LPUSH raised).
+        assert int(await cast(Any, redis_client.llen(CRM_PUSH_QUEUE_KEY))) == 0

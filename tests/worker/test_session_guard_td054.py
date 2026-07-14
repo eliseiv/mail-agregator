@@ -60,7 +60,6 @@ from shared.crypto import encrypt_mail_password
 from shared.db import make_session
 from shared.models import MailAccount, User
 from shared.redis_client import get_redis
-from tests.integration.conftest import login_as_admin
 
 pytestmark = pytest.mark.integration  # needs DB + Redis + MinIO (app lifespan)
 
@@ -315,7 +314,13 @@ class TestNoFalsePositives:
         client: httpx.AsyncClient,
         guard_warnings: list[dict[str, Any]],
     ) -> None:
-        """``PATCH /api/mail-accounts/{id}`` (flush at ``accounts/router.py:319``)."""
+        """Credential PATCH → H5 re-enable, with the router flushing after COMMIT.
+
+        ADR-0044 §5: the session route ``PATCH /api/mail-accounts/{id}`` is gone with
+        the cookie UI; the same ``MailAccountService.update`` call-site (and the same
+        ``flush_crm_status_events`` in the router, ``external/router.py``) is reached
+        through the surviving machine route.
+        """
         _, (account_id,) = await _seed(
             db_engine,
             suffix="c3a",
@@ -323,12 +328,11 @@ class TestNoFalsePositives:
             consecutive_failures=3,
             last_sync_error="auth_failed: bad password",
         )
-        csrf = await login_as_admin(client)
 
         resp = await client.patch(
-            f"/api/mail-accounts/{account_id}",
+            f"/api/external/mailboxes/{account_id}",
             json={"password": "new-app-password"},
-            headers={"X-CSRF-Token": csrf, "Content-Type": "application/json"},
+            headers=_key_headers(),
         )
 
         assert resp.status_code == 200, resp.text
@@ -373,12 +377,11 @@ class TestNoFalsePositives:
             consecutive_failures=3,
             last_sync_error="auth_failed: bad password",
         )
-        csrf = await login_as_admin(client)
 
         resp = await client.patch(
-            f"/api/mail-accounts/{account_id}",
+            f"/api/external/mailboxes/{account_id}",
             json={"password": "new-app-password", "smtp_ssl": True, "smtp_starttls": True},
-            headers={"X-CSRF-Token": csrf, "Content-Type": "application/json"},
+            headers=_key_headers(),
         )
 
         assert resp.status_code == 409, resp.text
@@ -598,14 +601,21 @@ class TestWorkerPathAndIdempotentFlush:
         crm_status_on: None,
         guard_warnings: list[dict[str, Any]],
     ) -> None:
-        """The worker/CLI session source (``shared/db.py:127``): a service that only
-        reads never enqueues anything → the detector must not fire."""
+        """The worker/CLI session source (``shared/db.py``): a session that only
+        READS never enqueues anything → the detector must not fire.
+
+        ADR-0044 §5: ``MailAccountService.get_for_scope`` served the HTML detail page
+        and went away with it; the read below goes through the surviving repository
+        (the same read the worker itself does) inside the same ``make_session()``
+        source the detector watches.
+        """
         owner_id, (account_id,) = await _seed(db_engine, suffix="c10")
 
         async with make_session() as db:
-            service = MailAccountService(db)
-            dto = await service.get_for_scope(_scope(owner_id), account_id)
-            assert dto.id == account_id
+            service = MailAccountService(db)  # instantiating must not enqueue anything
+            assert await service.visible_user_ids(_scope(owner_id)) is None
+            acc = await MailAccountsRepo(db).get_by_id(account_id)
+            assert acc is not None and acc.id == account_id
 
         assert guard_warnings == []
         assert await _status_events() == []

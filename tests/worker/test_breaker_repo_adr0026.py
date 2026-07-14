@@ -11,10 +11,19 @@ Key design:
   (pytest-asyncio gives each test a fresh loop; asyncpg connections can't cross
   loops).
 * ``sync_one_account`` is mocked at the seam (no IMAP / no network): each test
-  declares per-account outcomes; phase 2 (bump / disable / audit) runs for REAL
-  against PG so we assert true row state.
-* Each test seeds rows under unique names and deletes the accounts/users/audit it
+  declares per-account outcomes; phase 2 (bump / disable) runs for REAL against PG
+  so we assert true row state.
+* Each test seeds rows under unique names and deletes the accounts/users it
   created at teardown, so tests stay isolated and order-independent.
+
+ADR-0044 §4 (phase A3): ``admin_audit`` and its writers are decommissioned, so the
+breaker/disable decisions are asserted on the MAILBOX ROW STATE only
+(``is_active`` / ``consecutive_failures`` / ``last_sync_error``) — the very columns
+the CRM status channel mirrors (ADR-0046 §3 H3/H4). "Breaker tripped" is now proven
+by the ABSENCE of any disable/bump across the batch (with ``last_sync_error`` still
+written in phase 0), which is the observable contract of ADR-0026 §3; the
+``sync_mass_failure_suppressed`` / ``account_auto_disabled`` audit rows it used to
+assert on no longer exist anywhere in the product.
 """
 
 from __future__ import annotations
@@ -25,7 +34,7 @@ from collections.abc import AsyncIterator
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import delete, select
+from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -49,14 +58,9 @@ def _test_db_url() -> str:
 # Pin DATABASE_URL so the worker's make_session() binds to the test DB.
 os.environ["DATABASE_URL"] = _test_db_url()
 
-# NOTE: ``shared.models`` exports ``AdminAudit`` (table ``admin_audit``) — there is
-# no ``AuditLog``; the declarative base lives in ``shared.db``.
-from shared.models import AdminAudit, MailAccount, User
+from shared.models import MailAccount, User
 from worker.app import sync_cycle as sc
 from worker.app.sync_cycle import _AccountResult
-
-# Local alias so the assertions below read naturally against the audit table.
-AuditLog = AdminAudit
 
 
 @pytest_asyncio.fixture
@@ -109,14 +113,13 @@ async def session(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
 
 @pytest_asyncio.fixture
 async def cleanup(engine: AsyncEngine) -> AsyncIterator[list[int]]:
-    """Track created user ids; delete their accounts + audit rows at teardown."""
+    """Track created user ids; delete their accounts at teardown."""
     created_user_ids: list[int] = []
     yield created_user_ids
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     async with maker() as s, s.begin():
         if created_user_ids:
             await s.execute(delete(MailAccount).where(MailAccount.user_id.in_(created_user_ids)))
-            await s.execute(delete(AuditLog).where(AuditLog.target_user_id.in_(created_user_ids)))
             await s.execute(delete(User).where(User.id.in_(created_user_ids)))
 
 
@@ -127,9 +130,7 @@ async def _seed_user(
 
     * ``ck_users_role`` only allows super_admin / group_leader / group_member;
     * ``users_role_group_invariant`` requires a NON-NULL group_id for the two
-      group roles (we don't seed groups here);
-    * the audit writer resolves the actor via ``UsersRepo.get_admin()``
-      (role=super_admin), so disable/suppress audits attribute correctly.
+      group roles (groups are decommissioned — ADR-0044 §1 — so none are seeded).
     """
     suffix = uuid.uuid4().hex[:10]
     u = User(
@@ -202,22 +203,6 @@ async def _reload(session: AsyncSession, account_id: int) -> MailAccount:
         acc = await s.get(MailAccount, account_id)
     assert acc is not None
     return acc
-
-
-async def _audit_rows(session: AsyncSession, action: str) -> list[AdminAudit]:
-    # Fresh session on the worker's global engine (see _reload rationale).
-    from shared.db import make_session
-
-    async with make_session() as s:
-        rows = (await s.execute(select(AuditLog).where(AuditLog.action == action))).scalars().all()
-    return list(rows)
-
-
-def _details(row: AdminAudit) -> dict[str, object]:
-    """Typed accessor for the JSONB ``details`` payload (keeps mypy happy)."""
-    payload = row.details
-    assert payload is not None
-    return payload
 
 
 def _perm(
@@ -363,8 +348,10 @@ class TestCircuitBreaker:
         runs the same path under APScheduler's own loop.)
 
         Expect: 0 disabled, 0 bump, last_sync_error SET on every permanent
-        (phase 0), is_active stays True, ONE suppression audit row carrying the
-        real ratio/counts, NO per-account auto-disable audit."""
+        (phase 0), is_active stays True — i.e. the batch-wide suppression is
+        observable in the rows themselves (ADR-0044 §4: the
+        ``sync_mass_failure_suppressed`` audit row is gone; the suppression is
+        logged, not persisted)."""
         n_total, n_perm = 10, 9
         u = await _seed_user(session, cleanup)
         accounts = [await _seed_account(session, u) for _ in range(n_total)]
@@ -390,12 +377,10 @@ class TestCircuitBreaker:
         assert bumped == 0, "breaker must suppress ALL counter bumps"
         assert with_err == n_perm, "phase-0 last_sync_error must be written for all permanents"
 
-        rows = await _audit_rows(session, "sync_mass_failure_suppressed")
-        assert len(rows) == 1
-        details = _details(rows[0])
-        assert details["permanent_failures"] == n_perm
-        assert details["total"] == n_total
-        assert await _audit_rows(session, "account_auto_disabled") == []
+        # The OK account is untouched by the breaker (no error, still active).
+        healthy = await _reload(session, accounts[n_perm].id)
+        assert healthy.is_active is True
+        assert healthy.consecutive_failures == 0
 
     async def test_single_permanent_below_ratio_disables_normally(
         self, session: AsyncSession, cleanup: list[int], monkeypatch: pytest.MonkeyPatch
@@ -419,9 +404,14 @@ class TestCircuitBreaker:
         assert fresh.is_active is False  # disabled
         assert fresh.consecutive_failures == 1  # bumped
         assert fresh.last_sync_error is not None
+        # ADR-0033 stamp still written by ``disable_and_stamp_alert`` (ADR-0044 §4:
+        # only the Telegram alert enqueue + audit row were removed).
+        assert fresh.disabled_alert_sent_at is not None
 
-        assert await _audit_rows(session, "sync_mass_failure_suppressed") == []
-        assert len(await _audit_rows(session, "account_auto_disabled")) == 1
+        # The other 84 mailboxes are untouched (the breaker did not fire).
+        untouched = await _reload(session, accounts[1].id)
+        assert untouched.is_active is True
+        assert untouched.consecutive_failures == 0
 
     async def test_force_sync_single_account_below_min_disables(
         self, session: AsyncSession, cleanup: list[int], monkeypatch: pytest.MonkeyPatch
@@ -441,7 +431,6 @@ class TestCircuitBreaker:
         fresh = await _reload(session, acc.id)
         assert fresh.is_active is False
         assert fresh.consecutive_failures == 1
-        assert await _audit_rows(session, "sync_mass_failure_suppressed") == []
 
     async def test_threshold_permanent_non_explicit_disables_after_n(
         self, session: AsyncSession, cleanup: list[int], monkeypatch: pytest.MonkeyPatch
@@ -530,5 +519,3 @@ class TestCircuitBreaker:
             assert fresh.is_active is True
             assert fresh.consecutive_failures == 0
             assert fresh.last_sync_error is not None
-        assert await _audit_rows(session, "sync_mass_failure_suppressed") == []
-        assert await _audit_rows(session, "account_auto_disabled") == []

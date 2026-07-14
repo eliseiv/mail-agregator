@@ -36,15 +36,9 @@ class MailAccount(Base):
         ForeignKey("users.id", ondelete="CASCADE"),
         nullable=False,
     )
-    # FE-FIX round-10: group_id is the visibility key for non-super_admin
-    # callers. Set on insert from the owner's current ``users.group_id``;
-    # NULL means "personal" (visible to the owner + super_admin only).
-    # ON DELETE SET NULL keeps the account when its group is removed.
-    group_id: Mapped[int | None] = mapped_column(
-        BigInteger,
-        ForeignKey("groups.id", ondelete="SET NULL"),
-        nullable=True,
-    )
+    # ADR-0044 §3 (lock-step): ``group_id`` is removed from the ORM mapping
+    # BEFORE the DROP COLUMN (phase C). Mailbox-to-team ownership lives in the
+    # CRM only; every mailbox is owned by ``crm-service`` (ADR-0043 §4).
     email: Mapped[str] = mapped_column(Text, nullable=False)
     display_name: Mapped[str | None] = mapped_column(Text, nullable=True)
     # ADR-0025: ``encrypted_password`` is now NULLABLE — oauth_outlook

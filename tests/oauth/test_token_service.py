@@ -51,7 +51,6 @@ async def _seed_oauth_account(
         await repo.insert_oauth_account_with_id(
             account_id=acc_id,
             user_id=u.id,
-            group_id=None,
             email="box@outlook.com",
             oauth_provider="outlook",
             oauth_refresh_token_encrypted=refresh_enc,

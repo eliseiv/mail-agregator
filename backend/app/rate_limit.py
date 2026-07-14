@@ -13,18 +13,21 @@ listed in ``pyproject.toml`` as it is referenced from
 ``docs/02-tech-stack.md`` and ADR-0009; switching to slowapi decorators is
 out of scope for this rework. See backend rework round 2 reviewer note.
 
-Limits (``docs/04-api-contracts.md`` table sec. 8):
+Limits actually consumed after ADR-0044: the session/UI routes (``POST /login``,
+``/set-password``, the ``/api/mail-accounts*`` and ``/api/admin/*`` CRUD, the
+session ``send``) went away with the UI in phases A1/A3, and with them their
+``consume()`` calls. The connector's only surface is the machine API
+(``docs/04-api-contracts.md`` §4d/§4f), keyed per IP:
 
-- ``POST /login``                     30 / 15 min (per IP) — step-1 of two-step
-                                                 login (ADR-0016); username only.
-- ``POST /login/password``            5  / 15 min (username + IP) — step-2 of
-                                                 two-step login; password verify.
-- ``POST /set-password``              5  / 15 min (setup-session token, fallback IP)
-- ``POST /api/mail-accounts``         10 / hour   (user_id)
-- ``POST /api/mail-accounts/test``    10 / hour   (user_id)
-- ``POST /api/mail-accounts/{}/sync-now``  5 / hour   (account_id)
-- ``POST /api/messages/send``         30 / hour   (user_id)
-- ``POST /api/admin/users*``          50 / hour   (user_id)
+- ``GET  /api/external/messages`` / ``/mailboxes``  120 / min (``LIMIT_EXTERNAL_API``)
+- ``POST /api/external/messages/{id}/reply``         30 / min (``LIMIT_EXTERNAL_REPLY``
+                                                 — legacy, dropped in phase A2.2)
+- external WRITE: mailbox CRUD, OAuth, and the generic
+  ``POST /mailboxes/{id}/send``                      60 / min (``LIMIT_EXTERNAL_WRITE``)
+
+Each capacity is operator-tunable at consume-time from the matching
+``*_RATE_LIMIT_PER_MINUTE`` setting. The other ``Limit`` constants below are the
+pre-decommission table; they are pruned with the env sweep (phase G).
 """
 
 from __future__ import annotations

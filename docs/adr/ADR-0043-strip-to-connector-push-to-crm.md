@@ -2,7 +2,7 @@
 
 | | |
 | --- | --- |
-| Статус | accepted |
+| Статус | accepted (**§3 амендирован [ADR-0048](./ADR-0048-external-send-contract-and-reply-restore.md)** — ответ send сужен до `{smtp_message_id}`, `sent_id` снят) |
 | Дата | 2026-07-10 |
 
 **Отменяет курс** headless-прокси-интеграции: агрегатор перестаёт быть носителем тегов/Telegram/групп/webhooks/forwarding/UI и становится **тонким mail-connector'ом** (подключение ящиков, IMAP-поллинг, SMTP-отправка, **push нового письма в CRM**). Парный ADR в CRM — `ADR-044` (полный перенос модуля «Почты» в CRM). Решение владельца продукта (дословно — см. CRM `ADR-044` Context).
@@ -51,8 +51,10 @@
 
 ### §3. Обобщённый SMTP-send для reply/forward из CRM
 
+> **⚠️ Ответ эндпоинта амендирован [ADR-0048](./ADR-0048-external-send-contract-and-reply-restore.md) §1: `200 { smtp_message_id }` — `sent_id` в ответе агрегатора НЕТ.** Прежняя формулировка `{ sent_id, smtp_message_id }` (ниже, зачёркнута) была **невыполнима**: `sent_id` производился только `INSERT`'ом в `sent_messages` (`send/service.py:460`), а §4/`ADR-0044` §1 эту таблицу сносят. Идентификатор отправки выдаёт CRM из своей `mail_sent_messages` (парный CRM `ADR-057`). Прочее в этом §3 (путь, тело запроса, валидация, коды) — действует.
+
 Письма теперь в CRM; message-scoped reply `ADR-0035` (`POST /api/external/messages/{id}/reply`, требующий хранимого письма для threading/scope) заменяется на **обобщённый** эндпоинт:
-- **`POST /api/external/mailboxes/{id}/send`** (под `EXTERNAL_WRITE_ENABLED` + `LIMIT_EXTERNAL_WRITE`, auth-flow `ADR-0039` §1): тело `{ to: string[], cc?: string[], subject?, body_text, in_reply_to?, refs? }` → SMTP-отправка кредами ящика `{id}` (reuse SMTP-ядра `ADR-0034` §5/`ADR-0035`) → `200 { sent_id, smtp_message_id }`. **Нормы валидации переносятся из `ADR-0035` (не теряются):** каждый адрес `to+cc` — валидный e-mail, суммарно ≤100; `subject` ≤998; `body_text` непустой, ≤1 MiB → иначе `400/422`. Threading-заголовки формирует CRM. Коды `200/400/401/403/404 (mailbox not found)/409/422/502`. Применяется для reply и forward (CRM `ADR-044` §8).
+- **`POST /api/external/mailboxes/{id}/send`** (под `EXTERNAL_WRITE_ENABLED` + `LIMIT_EXTERNAL_WRITE`, auth-flow `ADR-0039` §1): тело `{ to: string[], cc?: string[], subject?, body_text, in_reply_to?, refs? }` → SMTP-отправка кредами ящика `{id}` (reuse SMTP-ядра `ADR-0034` §5/`ADR-0035`) → `200 { smtp_message_id }` (~~`{ sent_id, smtp_message_id }`~~ — отменено `ADR-0048` §1). **Нормы валидации переносятся из `ADR-0035` (не теряются):** каждый адрес `to+cc` — валидный e-mail, суммарно ≤100; `subject` ≤998; `body_text` непустой, ≤1 MiB → иначе `400/422`. Threading-заголовки формирует CRM. Коды `200/400/401/403/404 (mailbox not found)/409/422/502`. Применяется для reply и forward (CRM `ADR-044` §8).
 - `POST /api/external/messages/{id}/reply` (`ADR-0035`) — **снимается** (message-хранилище как источник threading уходит в CRM). `EXTERNAL_REPLY_ENABLED` → выводится из употребления. **Rate-limit:** прежний per-IP `EXTERNAL_REPLY_RATE_LIMIT` больше не нужен — reply инициирует CRM под JWT/RBAC пользователя (CRM `ADR-044` §8), апстрим-send идёт под `LIMIT_EXTERNAL_WRITE` как машинный; сдвиг границы осознан (аноним-IP → JWT-юзер).
 
 ### §4. Что агрегатор УБИРАЕТ

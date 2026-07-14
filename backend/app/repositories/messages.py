@@ -1,21 +1,31 @@
-"""Repository for ``messages`` and ``attachments``.
+"""Repository for ``messages`` (the connector's push-outbox, ADR-0043 §1).
 
-Cursor-based pagination per ``docs/04-api-contracts.md`` (keyset by
-``(internal_date DESC, id DESC)``). Cursor encoding is in
-:mod:`backend.app.messages.service`.
+ADR-0044 §4 (phase A3, KEEP-repository detach): the DROP-ORM imports
+(``Attachment`` / ``MessageTag`` / ``Tag`` / ``UserGroup``) and every method
+that used them are gone — tag filters (``list_for_user*``, ``is_tag_owned``,
+``is_tag_visible_to_scope``), the attachment methods (including the only raw
+SQL ``nextval('attachments_id_seq')``, §9 caveat B) and the HTML inbox helpers.
+
+What survives is what the connector actually runs:
+
+- ``get_for_user_ids`` — resolve the original message for the external reply
+  (ADR-0035);
+- ``list_since_id`` / ``list_before_id`` — the external PULL (ADR-0029/0036);
+- ``insert_message_idempotent`` — the sync insert (ADR-0008);
+- ``list_for_crm_push`` / ``mark_pushed`` / ``list_pending_push`` — the CRM
+  push-outbox (ADR-0043 §2);
+- ``select_expired`` / ``delete_messages`` — retention (ADR-0011).
 """
 
 from __future__ import annotations
 
-from collections.abc import Collection
 from datetime import datetime
-from typing import Any
 
-from sqlalchemy import and_, delete, exists, func, or_, select, text, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from shared.models import Attachment, MailAccount, Message, MessageTag, Tag, UserGroup
+from shared.models import MailAccount, Message
 
 
 class MessagesRepo:
@@ -24,28 +34,18 @@ class MessagesRepo:
 
     # --- Reads -------------------------------------------------------------
 
-    async def get_owned(self, *, message_id: int, user_id: int) -> Message | None:
-        """Return ``message_id`` only if it belongs to ``user_id``."""
-        stmt = (
-            select(Message)
-            .join(MailAccount, MailAccount.id == Message.mail_account_id)
-            .where(Message.id == message_id, MailAccount.user_id == user_id)
-        )
-        return (await self._s.execute(stmt)).scalar_one_or_none()
-
     async def get_for_user_ids(
         self,
         *,
         message_id: int,
         mail_account_ids: list[int] | None,
     ) -> Message | None:
-        """Visibility-aware get.
+        """Scope-aware get.
 
-        ``mail_account_ids=None`` = "no scope filter" (super-admin path).
-        ``mail_account_ids=[]`` = "no accounts visible" — returns ``None``.
-        FE-FIX round-10: filter shifted from ``MailAccount.user_id`` to
-        ``MailAccount.id`` so visibility follows ``mail_accounts.group_id``
-        instead of ``users.group_id``.
+        ``mail_account_ids=None`` = "no scope filter"; ``[]`` = nothing visible
+        (returns ``None``). The external reply passes the canonical mailbox set
+        (ADR-0029 §5), so a caller can only reply to a message it could have
+        pulled.
         """
         if mail_account_ids is None:
             return await self._s.get(Message, message_id)
@@ -56,133 +56,6 @@ class MessagesRepo:
             Message.mail_account_id.in_(mail_account_ids),
         )
         return (await self._s.execute(stmt)).scalar_one_or_none()
-
-    async def list_for_user(
-        self,
-        *,
-        user_id: int,
-        account_id: int | None,
-        tag_id: int | None = None,
-        unread: bool | None,
-        cursor_internal_date: datetime | None,
-        cursor_id: int | None,
-        limit: int,
-    ) -> list[tuple[Message, str]]:
-        """Single-user list (legacy path retained for tags-tagging logic).
-
-        See :meth:`list_for_user_ids` for the visibility-aware version
-        used by ``GET /api/messages``.
-        """
-        stmt = (
-            select(Message, MailAccount.email)
-            .join(MailAccount, MailAccount.id == Message.mail_account_id)
-            .where(MailAccount.user_id == user_id)
-        )
-        if account_id is not None:
-            stmt = stmt.where(Message.mail_account_id == account_id)
-        if tag_id is not None:
-            # Round-21 (bug #1): the cascade-dropdown collapses tags by
-            # (name, color) but the worker creates one ``tags`` row per
-            # team-member (auto-tagging applies team-wide). Filtering by a
-            # single ``tag.id`` would miss messages tagged via a sibling
-            # row of another team-member, leaving the Inbox empty. We
-            # therefore widen the filter to "any tag whose (name, color)
-            # equals the selected tag's (name, color)" — the cascade
-            # dropdown contract.
-            name_sub = select(Tag.name).where(Tag.id == tag_id).scalar_subquery()
-            color_sub = select(Tag.color).where(Tag.id == tag_id).scalar_subquery()
-            stmt = (
-                stmt.join(MessageTag, MessageTag.message_id == Message.id)
-                .join(Tag, Tag.id == MessageTag.tag_id)
-                .where(Tag.name == name_sub, Tag.color == color_sub)
-            )
-        if unread is True:
-            stmt = stmt.where(Message.is_read.is_(False))
-        elif unread is False:
-            stmt = stmt.where(Message.is_read.is_(True))
-        if cursor_internal_date is not None and cursor_id is not None:
-            # Strict keyset: rows strictly older OR same date but smaller id.
-            stmt = stmt.where(
-                or_(
-                    Message.internal_date < cursor_internal_date,
-                    and_(
-                        Message.internal_date == cursor_internal_date,
-                        Message.id < cursor_id,
-                    ),
-                )
-            )
-        # The (name, color) widening may join multiple message_tags rows per
-        # message (one per team-member's sibling tag); collapse via DISTINCT
-        # so the inbox keeps one item per ``messages.id``.
-        if tag_id is not None:
-            stmt = stmt.distinct()
-        stmt = stmt.order_by(Message.internal_date.desc(), Message.id.desc()).limit(limit)
-        rows = (await self._s.execute(stmt)).all()
-        return [(row[0], row[1]) for row in rows]
-
-    async def list_for_user_ids(
-        self,
-        *,
-        mail_account_ids: list[int] | None,
-        account_id: int | None,
-        tag_id: int | None = None,
-        unread: bool | None,
-        cursor_internal_date: datetime | None,
-        cursor_id: int | None,
-        limit: int,
-    ) -> list[tuple[Message, MailAccount]]:
-        """Visibility-aware listing.
-
-        ``mail_account_ids=None`` = no filter (super-admin);
-        ``mail_account_ids=[]`` = empty result. Returns
-        ``[(Message, MailAccount)]`` so the caller can build the per-row
-        ``mail_account_display_name`` / ``owner`` without an extra round-trip.
-        FE-FIX round-10.
-        """
-        stmt = select(Message, MailAccount).join(
-            MailAccount, MailAccount.id == Message.mail_account_id
-        )
-        if mail_account_ids is not None:
-            if not mail_account_ids:
-                return []
-            stmt = stmt.where(Message.mail_account_id.in_(mail_account_ids))
-        if account_id is not None:
-            stmt = stmt.where(Message.mail_account_id == account_id)
-        if tag_id is not None:
-            # Round-21 (bug #1): widen by (name, color) of ``tag_id`` so the
-            # filter catches the team-member sibling tags created by the
-            # team-wide auto-tagging. See :meth:`list_for_user` for the
-            # detailed rationale and the cascade-dropdown contract this
-            # mirrors.
-            name_sub = select(Tag.name).where(Tag.id == tag_id).scalar_subquery()
-            color_sub = select(Tag.color).where(Tag.id == tag_id).scalar_subquery()
-            stmt = (
-                stmt.join(MessageTag, MessageTag.message_id == Message.id)
-                .join(Tag, Tag.id == MessageTag.tag_id)
-                .where(Tag.name == name_sub, Tag.color == color_sub)
-            )
-        if unread is True:
-            stmt = stmt.where(Message.is_read.is_(False))
-        elif unread is False:
-            stmt = stmt.where(Message.is_read.is_(True))
-        if cursor_internal_date is not None and cursor_id is not None:
-            stmt = stmt.where(
-                or_(
-                    Message.internal_date < cursor_internal_date,
-                    and_(
-                        Message.internal_date == cursor_internal_date,
-                        Message.id < cursor_id,
-                    ),
-                )
-            )
-        # See :meth:`list_for_user`: the widened tag join can fan messages
-        # out across multiple sibling tag rows; DISTINCT keeps one row per
-        # ``messages.id``.
-        if tag_id is not None:
-            stmt = stmt.distinct()
-        stmt = stmt.order_by(Message.internal_date.desc(), Message.id.desc()).limit(limit)
-        rows = (await self._s.execute(stmt)).all()
-        return [(row[0], row[1]) for row in rows]
 
     async def list_since_id(
         self,
@@ -228,29 +101,22 @@ class MessagesRepo:
     ) -> list[tuple[Message, MailAccount]]:
         """Backward / newest-first keyset listing for the external API (ADR-0036 §2).
 
-        The mirror of :meth:`list_since_id`: same canonical-scope filter
-        (``mail_account_id IN (:mail_account_ids)`` — the deduped set from
-        :meth:`MailAccountsRepo.list_canonical_account_ids`) and the same
-        monotonic ``messages.id`` keyset, only reversed:
+        The mirror of :meth:`list_since_id`: same canonical-scope filter and the
+        same monotonic ``messages.id`` keyset, only reversed:
 
         - ``before_id is None`` → **latest** page: the freshest ``limit`` rows
           (``ORDER BY id DESC LIMIT limit``), no lower id bound.
-        - ``before_id`` set → **older** page: rows with ``id < before_id``
-          (``ORDER BY id DESC LIMIT limit``).
+        - ``before_id`` set → **older** page: rows with ``id < before_id``.
 
         Reverse-scan over the ``messages.id`` PK — no new index/migration
-        (ADR-0036 §2/Migration plan). ``mail_account_ids=[]`` (no mailboxes at
-        all) returns ``[]`` WITHOUT issuing a query; the ``IN`` and ``id <``
-        bounds are parameterised.
+        (ADR-0036 §2). ``mail_account_ids=[]`` returns ``[]`` WITHOUT issuing a
+        query; the ``IN`` and ``id <`` bounds are parameterised.
         """
         if not mail_account_ids:
             return []
         stmt = select(Message, MailAccount).join(
             MailAccount, MailAccount.id == Message.mail_account_id
         )
-        # ``before_id is None`` ⇒ latest page (no lower id bound); otherwise the
-        # older-page keyset ``id < before_id``. canonical-scope IN applies to
-        # both — identical profile to the forward ``list_since_id`` path.
         if before_id is not None:
             stmt = stmt.where(Message.id < before_id)
         stmt = (
@@ -260,145 +126,6 @@ class MessagesRepo:
         )
         rows = (await self._s.execute(stmt)).all()
         return [(row[0], row[1]) for row in rows]
-
-    async def count_unread_for_user_ids(self, mail_account_ids: list[int] | None) -> int:
-        stmt = select(func.count(Message.id)).where(Message.is_read.is_(False))
-        if mail_account_ids is not None:
-            if not mail_account_ids:
-                return 0
-            stmt = stmt.where(Message.mail_account_id.in_(mail_account_ids))
-        return int((await self._s.execute(stmt)).scalar_one())
-
-    async def is_tag_owned(self, *, tag_id: int, user_id: int) -> bool:
-        """Return True iff the tag exists and belongs to ``user_id``.
-
-        Kept for legacy callers (tag CRUD). For ``GET /api/messages?tag_id=X``
-        use :meth:`is_tag_visible_to_scope` — round-20 widens the gate so
-        the Inbox filter accepts team-member tags too.
-        """
-        stmt = select(exists().where(Tag.id == tag_id, Tag.user_id == user_id))
-        return bool((await self._s.execute(stmt)).scalar_one())
-
-    async def is_tag_visible_to_scope(
-        self,
-        *,
-        tag_id: int,
-        is_super_admin: bool,
-        user_id: int,
-        group_ids: Collection[int],
-    ) -> bool:
-        """Return True iff ``tag_id`` exists and is visible to the caller.
-
-        Visibility rules (round-20; ADR-0030 multi-group):
-        - super-admin: any tag in the system;
-        - non-super-admin: tag.user_id == self OR tag belongs to a user who
-          is a member of **any** of the caller's teams (``group_ids``,
-          resolved through ``user_groups`` — consistent with mail-account /
-          message visibility so the Inbox tag-filter is not narrower than
-          the messages it scopes; ADR-0030 §2).
-
-        Foreign / unknown tags still surface as 404 in the API layer.
-        """
-        if is_super_admin:
-            # Any tag visible.
-            stmt = select(exists().where(Tag.id == tag_id))
-        elif not group_ids:
-            # Caller has no team — only own tags.
-            stmt = select(exists().where(Tag.id == tag_id, Tag.user_id == user_id))
-        else:
-            # Own tags OR tags of any member of any of the caller's teams.
-            team_member_ids = select(UserGroup.user_id).where(
-                UserGroup.group_id.in_(list(group_ids))
-            )
-            stmt = select(
-                exists().where(
-                    Tag.id == tag_id,
-                    or_(
-                        Tag.user_id == user_id,
-                        Tag.user_id.in_(team_member_ids),
-                    ),
-                )
-            )
-        return bool((await self._s.execute(stmt)).scalar_one())
-
-    async def list_attachments_bulk(self, message_ids: list[int]) -> dict[int, list[Attachment]]:
-        if not message_ids:
-            return {}
-        stmt = (
-            select(Attachment)
-            .where(Attachment.message_id.in_(message_ids))
-            .order_by(Attachment.message_id, Attachment.id)
-        )
-        out: dict[int, list[Attachment]] = {mid: [] for mid in message_ids}
-        for att in (await self._s.execute(stmt)).scalars():
-            out[att.message_id].append(att)
-        return out
-
-    async def has_attachments_bulk(self, message_ids: list[int]) -> dict[int, bool]:
-        if not message_ids:
-            return {}
-        stmt = (
-            select(
-                Attachment.message_id,
-                func.count(Attachment.id),
-            )
-            .where(Attachment.message_id.in_(message_ids))
-            .group_by(Attachment.message_id)
-        )
-        present = {mid: False for mid in message_ids}
-        for mid, cnt in (await self._s.execute(stmt)).all():
-            present[mid] = cnt > 0
-        return present
-
-    async def get_attachment_owned(
-        self, *, attachment_id: int, message_id: int, user_id: int
-    ) -> Attachment | None:
-        stmt = (
-            select(Attachment)
-            .join(Message, Message.id == Attachment.message_id)
-            .join(MailAccount, MailAccount.id == Message.mail_account_id)
-            .where(
-                Attachment.id == attachment_id,
-                Attachment.message_id == message_id,
-                MailAccount.user_id == user_id,
-            )
-        )
-        return (await self._s.execute(stmt)).scalar_one_or_none()
-
-    async def get_attachment_for_user_ids(
-        self,
-        *,
-        attachment_id: int,
-        message_id: int,
-        mail_account_ids: list[int] | None,
-    ) -> Attachment | None:
-        """Visibility-aware get for ``GET /api/messages/{id}/attachments/{aid}``.
-
-        ``mail_account_ids=None`` = super-admin (no filter);
-        ``mail_account_ids=[]`` = empty result. FE-FIX round-10.
-        """
-        if mail_account_ids is None:
-            stmt = (
-                select(Attachment)
-                .join(Message, Message.id == Attachment.message_id)
-                .where(
-                    Attachment.id == attachment_id,
-                    Attachment.message_id == message_id,
-                )
-            )
-            return (await self._s.execute(stmt)).scalar_one_or_none()
-        if not mail_account_ids:
-            return None
-        stmt = (
-            select(Attachment)
-            .join(Message, Message.id == Attachment.message_id)
-            .where(
-                Attachment.id == attachment_id,
-                Attachment.message_id == message_id,
-                Message.mail_account_id.in_(mail_account_ids),
-            )
-        )
-        return (await self._s.execute(stmt)).scalar_one_or_none()
 
     # --- Writes ------------------------------------------------------------
 
@@ -424,9 +151,8 @@ class MessagesRepo:
     ) -> int | None:
         """``ON CONFLICT DO NOTHING`` insert. Returns the new id or None on conflict.
 
-        See ADR-0008 (idempotency invariant). Round-12 bug B: ``body_html``
-        is the sanitised HTML body (NULL when the email has no
-        ``text/html`` part).
+        See ADR-0008 (idempotency invariant). ``body_html`` is the sanitised
+        HTML body (NULL when the email has no ``text/html`` part).
         """
         stmt = (
             pg_insert(Message)
@@ -453,65 +179,6 @@ class MessagesRepo:
         )
         row = (await self._s.execute(stmt)).one_or_none()
         return int(row[0]) if row else None
-
-    async def insert_attachment(
-        self,
-        *,
-        message_id: int,
-        filename: str,
-        content_type: str | None,
-        size_bytes: int,
-        s3_key: str,
-        skipped_too_large: bool,
-    ) -> int:
-        att = Attachment(
-            message_id=message_id,
-            filename=filename,
-            content_type=content_type,
-            size_bytes=size_bytes,
-            s3_key=s3_key,
-            skipped_too_large=skipped_too_large,
-        )
-        self._s.add(att)
-        await self._s.flush()
-        return att.id
-
-    async def reserve_attachment_id(self) -> int:
-        """``SELECT nextval('attachments_id_seq')``.
-
-        Used to build the S3 key (which embeds ``attachment_id``) before the
-        actual INSERT — same pattern as :meth:`MailAccountsRepo.next_account_id`.
-        """
-        row = await self._s.execute(text("SELECT nextval('attachments_id_seq')"))
-        return int(row.scalar_one())
-
-    async def insert_attachment_with_id(
-        self,
-        *,
-        attachment_id: int,
-        message_id: int,
-        filename: str,
-        content_type: str | None,
-        size_bytes: int,
-        s3_key: str,
-        skipped_too_large: bool,
-    ) -> None:
-        att = Attachment(
-            id=attachment_id,
-            message_id=message_id,
-            filename=filename,
-            content_type=content_type,
-            size_bytes=size_bytes,
-            s3_key=s3_key,
-            skipped_too_large=skipped_too_large,
-        )
-        self._s.add(att)
-        await self._s.flush()
-
-    async def mark_read(self, *, message_id: int, is_read: bool) -> None:
-        await self._s.execute(
-            update(Message).where(Message.id == message_id).values(is_read=is_read)
-        )
 
     # --- CRM push-outbox (ADR-0043 §2, used by worker.crm_push_*) ----------
 
@@ -577,110 +244,9 @@ class MessagesRepo:
         rows = (await self._s.execute(stmt)).all()
         return [(int(r[0]), int(r[1]), int(r[2])) for r in rows]
 
-    async def select_attachment_keys_for_messages(self, message_ids: list[int]) -> list[str]:
-        if not message_ids:
-            return []
-        stmt = select(Attachment.s3_key).where(
-            Attachment.message_id.in_(message_ids),
-            Attachment.skipped_too_large.is_(False),
-        )
-        return [str(r[0]) for r in (await self._s.execute(stmt)).all()]
-
     async def delete_messages(self, message_ids: list[int]) -> int:
         if not message_ids:
             return 0
         stmt = delete(Message).where(Message.id.in_(message_ids))
         result = await self._s.execute(stmt)
         return int(result.rowcount or 0)
-
-    # --- Cleanup helpers for cascading user/account delete ----------------
-
-    async def select_attachment_keys_for_user(self, user_id: int) -> list[str]:
-        stmt = (
-            select(Attachment.s3_key)
-            .join(Message, Message.id == Attachment.message_id)
-            .join(MailAccount, MailAccount.id == Message.mail_account_id)
-            .where(
-                MailAccount.user_id == user_id,
-                Attachment.skipped_too_large.is_(False),
-            )
-        )
-        return [str(r[0]) for r in (await self._s.execute(stmt)).all()]
-
-    async def select_attachment_keys_for_account(self, account_id: int) -> list[str]:
-        stmt = (
-            select(Attachment.s3_key)
-            .join(Message, Message.id == Attachment.message_id)
-            .where(
-                Message.mail_account_id == account_id,
-                Attachment.skipped_too_large.is_(False),
-            )
-        )
-        return [str(r[0]) for r in (await self._s.execute(stmt)).all()]
-
-    # --- Stats for admin / delete-user response ---------------------------
-
-    async def stats_for_user(self, user_id: int) -> tuple[int, int, int]:
-        """Return ``(messages, attachments, mail_accounts)`` for ``user_id``."""
-        msgs = (
-            await self._s.execute(
-                select(func.count(Message.id))
-                .join(MailAccount, MailAccount.id == Message.mail_account_id)
-                .where(MailAccount.user_id == user_id)
-            )
-        ).scalar_one()
-        atts = (
-            await self._s.execute(
-                select(func.count(Attachment.id))
-                .join(Message, Message.id == Attachment.message_id)
-                .join(MailAccount, MailAccount.id == Message.mail_account_id)
-                .where(MailAccount.user_id == user_id)
-            )
-        ).scalar_one()
-        accs = (
-            await self._s.execute(
-                select(func.count(MailAccount.id)).where(MailAccount.user_id == user_id)
-            )
-        ).scalar_one()
-        return int(msgs), int(atts), int(accs)
-
-    async def has_any_attachments(self, message_id: int) -> bool:
-        stmt = select(exists().where(Attachment.message_id == message_id))
-        return bool((await self._s.execute(stmt)).scalar_one())
-
-    async def count_unread_for_user(self, user_id: int) -> int:
-        stmt = (
-            select(func.count(Message.id))
-            .join(MailAccount, MailAccount.id == Message.mail_account_id)
-            .where(MailAccount.user_id == user_id, Message.is_read.is_(False))
-        )
-        return int((await self._s.execute(stmt)).scalar_one())
-
-    async def list_for_user_html(
-        self,
-        *,
-        user_id: int,
-        account_id: int | None,
-        limit: int,
-        tag_id: int | None = None,
-    ) -> list[dict[str, Any]]:
-        """Convenience for HTML inbox: list with ``has_attachments`` precomputed."""
-        rows = await self.list_for_user(
-            user_id=user_id,
-            account_id=account_id,
-            tag_id=tag_id,
-            unread=None,
-            cursor_internal_date=None,
-            cursor_id=None,
-            limit=limit,
-        )
-        ids = [m.id for m, _ in rows]
-        att_map = await self.has_attachments_bulk(ids)
-        return [
-            {
-                "message": m,
-                "account_email": email,
-                "has_attachments": att_map.get(m.id, False),
-            }
-            for m, email in rows
-        ]

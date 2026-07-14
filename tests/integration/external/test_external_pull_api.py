@@ -337,14 +337,14 @@ class TestPagination:
         self,
         client: httpx.AsyncClient,
         api_key_on: str,
-        super_admin: Any,
+        owner: Any,
         make_mail_account: Callable[..., Any],
         make_message: Callable[..., Any],
     ) -> None:
         """A message inserted AFTER the cursor surfaces even when its
         ``internal_date`` is EARLIER than already-pulled rows (keyset is over
         ``id``, not date — late internal_date is not lost). ADR-0029 §1."""
-        acc = await make_mail_account(super_admin.id, "late@example.com")
+        acc = await make_mail_account(owner.id, "late@example.com")
         old = await make_message(acc.id, uid=1, internal_date=datetime.now(UTC), body_text="first")
         body = await self._get(client, api_key_on, since_id=0, limit=50)
         assert [m["id"] for m in body["messages"]] == [old.id]
@@ -431,18 +431,18 @@ class TestVisibilityAndCanonicalDedup:
         self,
         client: httpx.AsyncClient,
         api_key_on: str,
-        super_admin: Any,
+        owner: Any,
         make_mail_account: Callable[..., Any],
         make_message: Callable[..., Any],
-        make_secondary_team_mailbox: Callable[..., Any],
+        make_secondary_owner_mailbox: Callable[..., Any],
     ) -> None:
-        """External pull is super_admin-wide: messages of DIFFERENT teams /
+        """External pull is owner-wide: messages of DIFFERENT teams /
         owners / groups are ALL returned (no per-group filter). ADR-0029 §5."""
         # Team A: the super-admin's own mailbox.
-        acc_a = await make_mail_account(super_admin.id, "team-a@example.com")
+        acc_a = await make_mail_account(owner.id, "team-a@example.com")
         # Team B: a separate user + group + mailbox (one transaction).
-        acc_b = await make_secondary_team_mailbox(
-            username="teamb_user", group_name="Team B", email="team-b@example.com"
+        acc_b = await make_secondary_owner_mailbox(
+            username="teamb_user", email="team-b@example.com"
         )
         m_a = await make_message(acc_a.id, uid=1, subject="A")
         m_b = await make_message(acc_b.id, uid=1, subject="B")
@@ -456,21 +456,21 @@ class TestVisibilityAndCanonicalDedup:
         self,
         client: httpx.AsyncClient,
         api_key_on: str,
-        super_admin: Any,
+        owner: Any,
         make_mail_account: Callable[..., Any],
         make_message: Callable[..., Any],
-        make_secondary_team_mailbox: Callable[..., Any],
+        make_secondary_owner_mailbox: Callable[..., Any],
     ) -> None:
         """Two mail_accounts with the SAME ``LOWER(email)`` (one mailbox added
         by two teams), each holding a message — external pull returns ONE copy:
         the message of the canonical (``MIN(id)``) account; the duplicate is
-        absent. Consistent with the super_admin inbox. ADR-0029 §5 (CRITICAL).
+        absent. Consistent with the owner inbox. ADR-0029 §5 (CRITICAL).
         """
         # Same email, different case -> LOWER(email) collides. Canonical is the
         # smaller mail_accounts.id (the super-admin's, created first).
-        acc_canon = await make_mail_account(super_admin.id, "Shared@Example.com")
-        acc_dup = await make_secondary_team_mailbox(
-            username="dup_owner", group_name="Dup Team", email="shared@example.com"
+        acc_canon = await make_mail_account(owner.id, "Shared@Example.com")
+        acc_dup = await make_secondary_owner_mailbox(
+            username="dup_owner", email="shared@example.com"
         )
         assert acc_canon.id < acc_dup.id  # canonical = MIN(id)
 
@@ -507,11 +507,11 @@ class TestContent:
         self,
         client: httpx.AsyncClient,
         api_key_on: str,
-        super_admin: Any,
+        owner: Any,
         make_mail_account: Callable[..., Any],
         make_message: Callable[..., Any],
     ) -> None:
-        acc = await make_mail_account(super_admin.id, "big@example.com")
+        acc = await make_mail_account(owner.id, "big@example.com")
         big = "X" * 20_000  # > 16 KB
         m = await make_message(acc.id, uid=1, body_text=big)
         got = await self._one(client, api_key_on, m.id)
@@ -522,7 +522,7 @@ class TestContent:
         self,
         client: httpx.AsyncClient,
         api_key_on: str,
-        super_admin: Any,
+        owner: Any,
         make_mail_account: Callable[..., Any],
         make_message: Callable[..., Any],
     ) -> None:
@@ -532,7 +532,7 @@ class TestContent:
         from shared.html_sanitize import collapse_blank_lines_text
 
         raw = "para one\n\n\n\n\npara two"  # 4 blank lines between paragraphs
-        acc = await make_mail_account(super_admin.id, "blanks@example.com")
+        acc = await make_mail_account(owner.id, "blanks@example.com")
         m = await make_message(acc.id, uid=1, body_text=raw)
         got = await self._one(client, api_key_on, m.id)
         # External returns the verbatim stored body.
@@ -542,56 +542,15 @@ class TestContent:
         assert ui_view != raw, "test data should actually trigger collapse"
         assert got["body_text"] != ui_view
 
-    async def test_tags_id_name_color_with_name_color_dedup(
-        self,
-        client: httpx.AsyncClient,
-        api_key_on: str,
-        super_admin: Any,
-        make_mail_account: Callable[..., Any],
-        make_message: Callable[..., Any],
-        tag_message: Callable[..., Any],
-        add_sibling_tag: Callable[..., Any],
-    ) -> None:
-        acc = await make_mail_account(super_admin.id, "tagged@example.com")
-        m = await make_message(acc.id, uid=1)
-        t1 = await tag_message(super_admin.id, m.id, "Important", "#ff0000")
-
-        # A sibling tag with the SAME (name,color) owned by another team-member
-        # — team-wide auto-tagging creates these. External must dedup to ONE chip.
-        sib = await add_sibling_tag(
-            message_id=m.id, username="sibling_owner", name="Important", color="#ff0000"
-        )
-
-        got = await self._one(client, api_key_on, m.id)
-        tags = got["tags"]
-        assert len(tags) == 1, f"expected one deduped chip, got {tags}"
-        assert set(tags[0].keys()) == {"id", "name", "color"}
-        assert tags[0]["name"] == "Important"
-        assert tags[0]["color"] == "#ff0000"
-        assert tags[0]["id"] in (t1.id, sib.id)
-
-    async def test_message_without_tags_returns_empty_list(
-        self,
-        client: httpx.AsyncClient,
-        api_key_on: str,
-        super_admin: Any,
-        make_mail_account: Callable[..., Any],
-        make_message: Callable[..., Any],
-    ) -> None:
-        acc = await make_mail_account(super_admin.id, "notags@example.com")
-        m = await make_message(acc.id, uid=1)
-        got = await self._one(client, api_key_on, m.id)
-        assert got["tags"] == []
-
     async def test_body_present_false_empty_text_null_html(
         self,
         client: httpx.AsyncClient,
         api_key_on: str,
-        super_admin: Any,
+        owner: Any,
         make_mail_account: Callable[..., Any],
         make_message: Callable[..., Any],
     ) -> None:
-        acc = await make_mail_account(super_admin.id, "nobody@example.com")
+        acc = await make_mail_account(owner.id, "nobody@example.com")
         m = await make_message(acc.id, uid=1, body_present=False, body_text="", body_html=None)
         got = await self._one(client, api_key_on, m.id)
         assert got["body_present"] is False
@@ -602,11 +561,11 @@ class TestContent:
         self,
         client: httpx.AsyncClient,
         api_key_on: str,
-        super_admin: Any,
+        owner: Any,
         make_mail_account: Callable[..., Any],
         make_message: Callable[..., Any],
     ) -> None:
-        acc = await make_mail_account(super_admin.id, "nulls@example.com", display_name=None)
+        acc = await make_mail_account(owner.id, "nulls@example.com", display_name=None)
         m = await make_message(
             acc.id,
             uid=1,
@@ -624,11 +583,11 @@ class TestContent:
         self,
         client: httpx.AsyncClient,
         api_key_on: str,
-        super_admin: Any,
+        owner: Any,
         make_mail_account: Callable[..., Any],
         make_message: Callable[..., Any],
     ) -> None:
-        acc = await make_mail_account(super_admin.id, "toaddr@example.com")
+        acc = await make_mail_account(owner.id, "toaddr@example.com")
         m = await make_message(acc.id, uid=1, to_addrs="")
         got = await self._one(client, api_key_on, m.id)
         assert isinstance(got["to_addrs"], str)
@@ -638,15 +597,13 @@ class TestContent:
         self,
         client: httpx.AsyncClient,
         api_key_on: str,
-        super_admin: Any,
+        owner: Any,
         make_mail_account: Callable[..., Any],
         make_message: Callable[..., Any],
     ) -> None:
         """``mail_account`` exposes ONLY {id, email, display_name} — never
         passwords / oauth tokens / IMAP-UID / owner. ADR-0029 §2/§Security."""
-        acc = await make_mail_account(
-            super_admin.id, "secret@example.com", display_name="Public Name"
-        )
+        acc = await make_mail_account(owner.id, "secret@example.com", display_name="Public Name")
         m = await make_message(acc.id, uid=4242)
         got = await self._one(client, api_key_on, m.id)
         ma = got["mail_account"]
@@ -672,11 +629,11 @@ class TestContent:
         self,
         client: httpx.AsyncClient,
         api_key_on: str,
-        super_admin: Any,
+        owner: Any,
         make_mail_account: Callable[..., Any],
         make_message: Callable[..., Any],
     ) -> None:
-        acc = await make_mail_account(super_admin.id, "date@example.com")
+        acc = await make_mail_account(owner.id, "date@example.com")
         m = await make_message(
             acc.id, uid=1, internal_date=datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
         )

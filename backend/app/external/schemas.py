@@ -16,16 +16,12 @@ Field nullability mirrors the DB (``docs/03-data-model.md`` table ``messages``):
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from backend.app.send.schemas import _validate_addresses
-from backend.app.tags.schemas import (
-    MatchMode,
-    RuleType,
-    _normalise_color,
-)
 
 
 class ExternalMailAccountDTO(BaseModel):
@@ -40,46 +36,14 @@ class ExternalMailAccountDTO(BaseModel):
     display_name: str | None
 
 
-class ExternalTagDTO(BaseModel):
-    """A tag chip on a message (deduped by ``(name, color)`` upstream)."""
-
-    id: int
-    name: str
-    color: str
-
-
-class ExternalTeamDTO(BaseModel):
-    """One team in ``GET /api/external/teams`` (ADR-0037 §1).
-
-    A team == a ``groups`` row. Deliberately minimal: ``id``/``name`` ONLY —
-    NO ``leader_user_id`` / ``created_at`` / ``members_count`` (unlike the heavy
-    admin ``GET /api/admin/groups``). Team != tag (tags live in
-    ``ExternalMessageDTO.tags``, ADR-0017 — untouched here).
-    """
-
-    id: int
-    name: str
-
-
-class ExternalTeamsResponse(BaseModel):
-    """Envelope for ``GET /api/external/teams`` (ADR-0037 §1).
-
-    ``teams`` is the flat, unpaginated list of all system teams
-    (``GroupsRepo.list_all_groups()``, ``ORDER BY id``); empty system → ``[]``.
-    """
-
-    teams: list[ExternalTeamDTO]
-
-
 class ExternalMailboxDTO(BaseModel):
     """One mailbox in ``GET /api/external/mailboxes`` (ADR-0037 §2 / ADR-0039 §4).
 
     ``id`` == ``mail_accounts.id`` == ``ExternalMessageDTO.mail_account.id`` (the
-    CRM join key). ``group_id`` (mailbox→team mapping, ``null`` = personal) and
-    ``is_active`` (``false`` = worker auto-disabled, ADR-0033) are exposed
-    DELIBERATELY for the CRM (ADR-0037 §Security). NEVER any
+    CRM join key). ``is_active`` (``false`` = worker auto-disabled, ADR-0033) is
+    exposed DELIBERATELY for the CRM (ADR-0037 §Security). NEVER any
     ``encrypted_password`` / ``oauth_*`` / ``smtp_*`` / ``imap_*`` / ``user_id`` /
-    owner structures.
+    owner structures. ADR-0044 §4 (phase A1): ``group_id`` dropped (no teams).
 
     ADR-0039 §4: additionally carries the sync-status triplet
     (``last_synced_at`` / ``last_sync_error`` / ``consecutive_failures``) for the
@@ -89,7 +53,6 @@ class ExternalMailboxDTO(BaseModel):
     id: int
     email: str
     display_name: str | None
-    group_id: int | None
     is_active: bool
     last_synced_at: datetime | None
     last_sync_error: str | None
@@ -114,6 +77,9 @@ class ExternalMessageDTO(BaseModel):
     ``collapse_blank_lines_*`` render normalisation (ADR-0029 §3/§7). When
     ``body_present`` is false the email had no text/plain or text/html part —
     ``body_text=""`` and ``body_html=None`` (the fields are still present).
+
+    ADR-0044 §4 (phase A1): the ``tags`` field went away with tags (ADR-0043 §4
+    — the matching logic moved to the CRM).
     """
 
     id: int
@@ -128,7 +94,6 @@ class ExternalMessageDTO(BaseModel):
     body_html: str | None
     body_present: bool
     body_truncated: bool
-    tags: list[ExternalTagDTO]
 
 
 class ExternalMessagesResponse(BaseModel):
@@ -162,8 +127,8 @@ class ExternalMessagesResponseDesc(BaseModel):
     and NEVER ``next_before_id``; this ``desc`` response carries
     ``next_before_id`` and NEVER ``next_since_id``. A single model with two
     optional cursors would emit the other mode's key as ``null`` — the ADR
-    requires it **absent**, hence two models. ``ExternalMessageDTO`` /
-    ``ExternalTagDTO`` are shared and unchanged.
+    requires it **absent**, hence two models. ``ExternalMessageDTO`` is shared
+    and unchanged.
 
     - ``messages`` — ``ExternalMessageDTO`` ordered ``id DESC`` (newest-first).
     - ``next_before_id`` — ``min(id)`` of the batch (= the last element's ``id``
@@ -236,6 +201,151 @@ class ExternalReplyResponse(BaseModel):
     smtp_message_id: str
 
 
+# --- Generic send: POST /api/external/mailboxes/{id}/send ------------------
+# ADR-0048 §1 (phase A2.1, ``docs/04-api-contracts.md`` §4f-send). Replaces the
+# message-scoped reply above: messages live in the CRM, threading/defaults are
+# built there, the aggregator is a thin SMTP executor.
+
+
+# Defensive header bounds for the threading headers. The ADR fixes the ``subject``
+# ceiling (998, RFC 5322 unfolded line) and says the aggregator writes
+# ``In-Reply-To`` / ``References`` EXACTLY as passed (it never synthesises them),
+# but sets no size for them: ``In-Reply-To`` carries a single ``Message-ID``
+# (one unfolded line is the natural ceiling), while ``References`` is a
+# whitespace-separated chain that legitimately grows with a long thread — bounded
+# generously so a real chain is never rejected while an unbounded header can't be
+# pushed through.
+_MAX_IN_REPLY_TO_LEN = 998
+_MAX_REFS_LEN = 65_536
+
+
+# RFC 5322 §2.2.3 folding: a CRLF followed by at least one WSP (space/HTAB) is
+# NOT part of the value — it is line-wrapping inserted by the sending MUA. Real
+# ``References`` chains are folded almost always (they outgrow the 78-column
+# soft limit after two or three hops), and the CRM forwards the stored header
+# verbatim, folds included.
+_FWS_RE = re.compile(r"(?:\r\n|\r|\n)[ \t]+")
+
+
+def _clean_header(value: str | None) -> str | None:
+    """Unfold FWS, then reject any remaining control chars in a header value.
+
+    Two distinct things share the ASCII control range and must not be conflated:
+
+    1. **Folding whitespace** (``CRLF`` + space/HTAB — RFC 5322 §2.2.3). It is
+       transport-level line wrapping, semantically identical to a single space.
+       A real ``References`` chain arrives folded, so REJECTING it would fail
+       every reply in a thread longer than a couple of hops. It is therefore
+       UNFOLDED here (``CRLF WSP`` → one space) — that is not the aggregator
+       "synthesising" a header (ADR-0048 §1: written exactly as passed), it is
+       the same header in its canonical unfolded form; the MIME builder re-folds
+       it on the wire, and no ``Message-ID`` is lost or altered.
+    2. **A bare CR/LF (no continuation WSP) or any other C0/C1/DEL char** — that
+       is either a corrupt value or a header-injection attempt.
+       :class:`email.message.EmailMessage` raises ``ValueError`` on it, so it is
+       refused HERE as ``400 validation_error`` instead of blowing up as a 500
+       inside the MIME builder. Such a value is NOT silently sanitised: a
+       threading header that cannot be written as given is refused, not mangled.
+
+    HTAB inside the (unfolded) value is legal WSP and is left alone.
+    """
+    if value is None:
+        return None
+    unfolded = _FWS_RE.sub(" ", value)
+    if any(ch != "\t" and (ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F) for ch in unfolded):
+        raise ValueError("header value must not contain control characters")
+    return unfolded
+
+
+class ExternalSendRequest(BaseModel):
+    """Body of ``POST /api/external/mailboxes/{id}/send`` (ADR-0048 §1).
+
+    Exactly what the CRM already sends (`CRM backend/app/services/mail_service.py`
+    ``send_payload``): ``to`` / ``cc`` / ``subject`` / ``body_text`` plus the
+    OPTIONAL threading headers ``in_reply_to`` / ``refs`` (present only when the
+    CRM has them). The sender is the mailbox ``{id}`` from the path — never a
+    body field; there is no ``bcc`` (surface reduction, as in the reply).
+
+    Validation carried over from ADR-0035 (ADR-0048 §1, "не теряется"): every
+    ``to``+``cc`` address is a valid e-mail; ``to``+``cc`` ≤ 100 in total;
+    ``subject`` ≤ 998; ``body_text`` non-empty after ``strip`` and ≤ 1 MiB.
+
+    ``to`` may be an empty list as long as ``cc`` carries a recipient (the CRM
+    permits exactly that: `CRM mail_service.py::_prepare_reply` rejects only the
+    case where BOTH are empty) — the "≥ 1 recipient" rule is therefore enforced
+    over the UNION, not over ``to`` alone. A send with no recipient at all is a
+    ``400 validation_error``, not an SMTP round-trip.
+    """
+
+    to: list[str] = Field(..., max_length=100)
+    cc: list[str] | None = Field(default=None, max_length=100)
+    subject: str | None = Field(default=None, max_length=998)  # RFC 5322 line
+    body_text: str = Field(..., max_length=1_048_576)  # 1 MiB
+    in_reply_to: str | None = Field(default=None, max_length=_MAX_IN_REPLY_TO_LEN)
+    refs: str | None = Field(default=None, max_length=_MAX_REFS_LEN)
+
+    @field_validator("to", "cc")
+    @classmethod
+    def _check_addresses(cls, v: list[str] | None) -> list[str] | None:
+        # Same e-mail pattern as the reply / session send (``_validate_addresses``).
+        if v is None:
+            return None
+        return _validate_addresses(v)
+
+    @field_validator("body_text")
+    @classmethod
+    def _check_body_not_blank(cls, v: str) -> str:
+        # Non-empty after strip; the RAW (un-stripped) value is sent so the
+        # caller's intended formatting survives.
+        if not v.strip():
+            raise ValueError("body_text must not be empty")
+        return v
+
+    @field_validator("subject", "in_reply_to", "refs")
+    @classmethod
+    def _check_headers(cls, v: str | None) -> str | None:
+        # Every value that ends up in a MIME header goes through the SAME guard:
+        # folded (multi-line) values are unfolded, anything still carrying a bare
+        # CR/LF / control char is refused as ``400 validation_error``.
+        #
+        # ``subject`` is included DELIBERATELY (it is a header like the other
+        # two): inbound mail carries mis-folded / multi-line subjects (see
+        # ``send/mime.py::_sanitize_header``) and the CRM builds ``"Re: " +
+        # <stored subject>``, so without this the value reached
+        # ``build_mime`` (``send/mime.py:62``), where ``EmailMessage`` raises
+        # ``ValueError`` → an unhandled 500, while §4f-send mandates a ``400
+        # validation_error`` for a malformed body. Rejecting (rather than
+        # sanitising, as the forward path does) keeps the external contract
+        # honest: the aggregator never silently rewrites a header the caller
+        # gave it. The common real case — a *folded* subject — is not rejected,
+        # it is unfolded and sent.
+        return _clean_header(v)
+
+    @model_validator(mode="after")
+    def _check_recipients(self) -> ExternalSendRequest:
+        total = len(self.to) + len(self.cc or [])
+        if total == 0:
+            raise ValueError("at least one recipient is required (to or cc)")
+        # ADR-0048 §1: the 100-address ceiling is on the SUM of to+cc (the
+        # per-field ``max_length=100`` above alone would allow 200).
+        if total > 100:
+            raise ValueError("too many recipients (to + cc must be <= 100)")
+        return self
+
+
+class ExternalSendResponse(BaseModel):
+    """``200`` body of the generic send (ADR-0048 §1) — ``{smtp_message_id}``, nothing else.
+
+    ``sent_id`` is DELIBERATELY absent (ADR-0048 §1): the aggregator no longer
+    owns a durable record of what it sent (``sent_messages`` is under drop), so
+    any id it returned would be a surrogate pointing at no row. The durable
+    identifier is minted by the CRM from its own ``mail_sent_messages``.
+    ``appended_to_sent`` stays internal (as in the reply, ADR-0035 §5).
+    """
+
+    smtp_message_id: str
+
+
 # --- External write API: mailboxes (ADR-0039 §2, 04-api-contracts §4f) ------
 
 
@@ -276,22 +386,20 @@ class ExternalMailboxTestRequest(BaseModel):
 class ExternalMailboxCreateRequest(ExternalMailboxTestRequest):
     """Body of ``POST /api/external/mailboxes`` (ADR-0039 §2).
 
-    Test fields + an optional ``display_name`` and ``group_id`` (validated to
-    exist by the service, else ``404 group_not_found``; ``null`` = a box without
-    a team). Owner is the ``crm-service`` technical user (server-derived).
+    Test fields + an optional ``display_name``. Owner is the ``crm-service``
+    technical user (server-derived). ADR-0044 §4 (phase A1): ``group_id`` is
+    dropped — mailbox-to-team ownership lives in the CRM only.
     """
 
     display_name: str | None = Field(default=None, max_length=100)
-    group_id: int | None = Field(default=None, ge=1)
 
 
 class ExternalMailboxUpdateRequest(BaseModel):
     """Body of ``PATCH /api/external/mailboxes/{id}`` (ADR-0039 §2).
 
-    All fields optional. ``group_id`` uses presence-semantics via
-    ``set_group_id`` (the mere presence of the JSON key — even ``null`` — means
-    "change the team", mirroring the internal ``MailAccountUpdateRequest``);
-    ``is_active`` likewise via ``set_is_active`` (activate/deactivate).
+    All fields optional. ``is_active`` uses presence-semantics via
+    ``set_is_active`` (activate/deactivate). ADR-0044 §4 (phase A1):
+    ``group_id`` / ``set_group_id`` went away with teams.
     """
 
     email: str | None = Field(default=None, max_length=254)
@@ -306,19 +414,15 @@ class ExternalMailboxUpdateRequest(BaseModel):
     smtp_starttls: bool | None = None
     smtp_username: str | None = Field(default=None, max_length=254)
     smtp_password: str | None = Field(default=None, max_length=256)
-    group_id: int | None = Field(default=None, ge=1)
-    set_group_id: bool = False
     is_active: bool | None = None
     set_is_active: bool = False
 
     @model_validator(mode="before")
     @classmethod
     def _presence(cls, data: object) -> object:
-        """Infer ``set_group_id`` / ``set_is_active`` from JSON key presence."""
+        """Infer ``set_is_active`` from JSON key presence."""
         if isinstance(data, dict):
             d = dict(data)
-            if "group_id" in d and "set_group_id" not in d:
-                d["set_group_id"] = True
             if "is_active" in d and "set_is_active" not in d:
                 d["set_is_active"] = True
             return d
@@ -326,11 +430,11 @@ class ExternalMailboxUpdateRequest(BaseModel):
 
     @property
     def has_account_fields(self) -> bool:
-        """True when any credential / host / display_name / group change is set.
+        """True when any credential / host / display_name change is set.
 
         Drives whether the PATCH delegates to ``MailAccountService.update`` (the
-        credential/host/transfer path). A pure ``is_active`` toggle skips it and
-        goes straight to ``set_active`` to avoid a needless credential rewrite.
+        credential/host path). A pure ``is_active`` toggle skips it and goes
+        straight to ``set_active`` to avoid a needless credential rewrite.
         """
         return (
             self.email is not None
@@ -345,7 +449,6 @@ class ExternalMailboxUpdateRequest(BaseModel):
             or self.smtp_starttls is not None
             or self.smtp_username is not None
             or self.smtp_password is not None
-            or self.set_group_id
         )
 
 
@@ -360,114 +463,6 @@ class ExternalMailboxSyncResponse(BaseModel):
     """``202`` body of ``POST /api/external/mailboxes/{id}/sync``."""
 
     queued: bool
-
-
-# --- External write API: tags (ADR-0040 §4, 04-api-contracts §4f-tags) ------
-
-
-class ExternalTagRuleDTO(BaseModel):
-    """A persisted rule of a global tag (response side)."""
-
-    id: int
-    type: str
-    pattern: str
-    created_at: datetime
-
-
-class ExternalTagFullDTO(BaseModel):
-    """A global tag with its rules (ADR-0040 §4).
-
-    Shape mirrors the internal ``TagDTO`` but is a deliberately separate wire
-    type (ADR-0029 §6 stable-contract convention). Built from the service DTO.
-    """
-
-    id: int
-    name: str
-    color: str
-    match_mode: str
-    is_builtin: bool
-    rules: list[ExternalTagRuleDTO]
-    created_at: datetime
-    updated_at: datetime
-
-
-class ExternalTagsResponse(BaseModel):
-    """Envelope for ``GET /api/external/tags``. Empty catalogue → ``[]``."""
-
-    tags: list[ExternalTagFullDTO]
-
-
-class ExternalTagCreateRequest(BaseModel):
-    """Body of ``POST /api/external/tags`` (ADR-0040 §4).
-
-    ``color`` is validated against the fixed palette (``^#[0-9A-Fa-f]{6}$`` +
-    whitelist); ``match_mode`` defaults to ``any``.
-    """
-
-    name: str = Field(min_length=1, max_length=64)
-    color: str
-    # ``any`` (OR) by default — mirrors ``DEFAULT_MATCH_MODE`` / the internal
-    # tag create request (a literal so the ``MatchMode`` type is preserved).
-    match_mode: MatchMode = "any"
-
-    @field_validator("name")
-    @classmethod
-    def _normalise_name(cls, v: str) -> str:
-        stripped = v.strip()
-        if not stripped:
-            raise ValueError("name cannot be empty after stripping")
-        return stripped
-
-    @field_validator("color")
-    @classmethod
-    def _check_color(cls, v: str) -> str:
-        return _normalise_color(v)
-
-
-class ExternalTagUpdateRequest(BaseModel):
-    """Body of ``PATCH /api/external/tags/{id}`` — partial."""
-
-    name: str | None = Field(default=None, min_length=1, max_length=64)
-    color: str | None = None
-    match_mode: MatchMode | None = None
-
-    @field_validator("name")
-    @classmethod
-    def _normalise_name(cls, v: str | None) -> str | None:
-        if v is None:
-            return None
-        stripped = v.strip()
-        if not stripped:
-            raise ValueError("name cannot be empty after stripping")
-        return stripped
-
-    @field_validator("color")
-    @classmethod
-    def _check_color(cls, v: str | None) -> str | None:
-        if v is None:
-            return None
-        return _normalise_color(v)
-
-
-class ExternalTagRuleCreateRequest(BaseModel):
-    """Body of ``POST /api/external/tags/{id}/rules`` (ADR-0040 §4)."""
-
-    type: RuleType
-    pattern: str = Field(min_length=1, max_length=256)
-
-    @field_validator("pattern")
-    @classmethod
-    def _strip_pattern(cls, v: str) -> str:
-        stripped = v.strip()
-        if not stripped:
-            raise ValueError("pattern cannot be empty after stripping")
-        return stripped
-
-
-class ExternalTagApplyResponse(BaseModel):
-    """``200`` body of ``POST /api/external/tags/{id}/apply-to-existing``."""
-
-    applied_count: int
 
 
 # --- External Outlook OAuth (headless) (ADR-0045 §2, 04-api-contracts §4f-oauth) ---

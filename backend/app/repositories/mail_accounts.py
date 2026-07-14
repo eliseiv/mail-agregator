@@ -7,10 +7,9 @@ Special method :meth:`MailAccountsRepo.next_account_id` reserves the next
 
 from __future__ import annotations
 
-from collections.abc import Collection
 from datetime import UTC, datetime
 
-from sqlalchemy import and_, delete, func, or_, select, text, update
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.models import MailAccount
@@ -94,55 +93,12 @@ class MailAccountsRepo:
         stmt = select(MailAccount).order_by(MailAccount.user_id, MailAccount.id)
         return list((await self._s.execute(stmt)).scalars().all())
 
-    async def list_for_group_or_owner(
-        self, *, group_ids: Collection[int] | None, owner_user_id: int
-    ) -> list[MailAccount]:
-        """Visibility query for a non-super_admin caller (FE-FIX round-10;
-        ADR-0030 multi-group).
-
-        Returns accounts that satisfy ANY of the following:
-          - ``mail_accounts.group_id = ANY(group_ids)`` (accounts of any team
-            the caller is a member of — ADR-0030 replaced the single
-            ``users.group_id = mail_accounts.group_id`` predicate);
-          - ``mail_accounts.user_id == owner_user_id`` (the caller's personal
-            accounts — covers the case where the caller owns an account that
-            was created while they had no group, so its ``group_id`` is
-            still NULL or no longer matches any current membership).
-
-        Pass an empty / ``None`` ``group_ids`` for callers without any team:
-        only personal accounts are returned.
-        """
-        cond = MailAccount.user_id == owner_user_id
-        if group_ids:
-            cond = or_(cond, MailAccount.group_id.in_(list(group_ids)))
-        stmt = select(MailAccount).where(cond).order_by(MailAccount.user_id, MailAccount.id)
-        return list((await self._s.execute(stmt)).scalars().all())
-
-    async def get_for_group_or_owner(
-        self, *, group_ids: Collection[int] | None, owner_user_id: int, account_id: int
-    ) -> MailAccount | None:
-        owner_cond = MailAccount.user_id == owner_user_id
-        if group_ids:
-            visibility = or_(owner_cond, MailAccount.group_id.in_(list(group_ids)))
-        else:
-            visibility = owner_cond
-        stmt = select(MailAccount).where(and_(MailAccount.id == account_id, visibility))
-        return (await self._s.execute(stmt)).scalar_one_or_none()
-
-    async def list_account_ids_visible(
-        self, *, group_ids: Collection[int] | None, owner_user_id: int
-    ) -> list[int]:
-        """``mail_accounts.id`` visible to a non-super_admin caller (ADR-0030)."""
-        cond = MailAccount.user_id == owner_user_id
-        if group_ids:
-            cond = or_(cond, MailAccount.group_id.in_(list(group_ids)))
-        stmt = select(MailAccount.id).where(cond)
-        return [int(r[0]) for r in (await self._s.execute(stmt)).all()]
-
-    async def list_account_ids_in_group(self, group_id: int) -> list[int]:
-        """``mail_accounts.id`` belonging to a group (super-admin filter)."""
-        stmt = select(MailAccount.id).where(MailAccount.group_id == group_id)
-        return [int(r[0]) for r in (await self._s.execute(stmt)).all()]
+    # ADR-0044 §3 (lock-step): every reader of ``mail_accounts.group_id`` is
+    # removed BEFORE the DROP COLUMN (phase C) — ``list_for_group_or_owner`` /
+    # ``get_for_group_or_owner`` / ``list_account_ids_visible`` /
+    # ``list_account_ids_in_group`` / ``attach_orphans_to_group`` /
+    # ``update_group`` served the team-based visibility the connector no longer
+    # has (its single owner is the ``crm-service`` super_admin).
 
     async def list_canonical_account_ids(self) -> list[int]:
         """One canonical ``mail_accounts.id`` per ``LOWER(email)`` (round-18).
@@ -154,23 +110,6 @@ class MailAccountsRepo:
         """
         stmt = select(func.min(MailAccount.id)).group_by(func.lower(MailAccount.email))
         return [int(r[0]) for r in (await self._s.execute(stmt)).all()]
-
-    async def attach_orphans_to_group(self, *, user_id: int, group_id: int) -> None:
-        """Backfill ``mail_accounts.group_id`` for the user's orphan accounts.
-
-        Called by :meth:`AdminService.update_user` when a user is moved
-        from "no group" into a real group. Existing accounts that already
-        have a ``group_id`` are NOT touched — those stay with their
-        original group even when the owner changes group.
-        """
-        await self._s.execute(
-            update(MailAccount)
-            .where(
-                MailAccount.user_id == user_id,
-                MailAccount.group_id.is_(None),
-            )
-            .values(group_id=group_id, updated_at=datetime.now(UTC))
-        )
 
     async def list_for_users(self, user_ids: list[int]) -> dict[int, list[MailAccount]]:
         """Bulk-load mail accounts for many users to avoid N+1.
@@ -256,7 +195,6 @@ class MailAccountsRepo:
         *,
         account_id: int,
         user_id: int,
-        group_id: int | None,
         email: str,
         encrypted_password: bytes,
         imap_host: str,
@@ -273,7 +211,6 @@ class MailAccountsRepo:
         acc = MailAccount(
             id=account_id,
             user_id=user_id,
-            group_id=group_id,
             email=email,
             display_name=display_name,
             encrypted_password=encrypted_password,
@@ -299,7 +236,6 @@ class MailAccountsRepo:
         *,
         account_id: int,
         user_id: int,
-        group_id: int | None,
         email: str,
         oauth_provider: str,
         oauth_refresh_token_encrypted: bytes,
@@ -324,7 +260,6 @@ class MailAccountsRepo:
         acc = MailAccount(
             id=account_id,
             user_id=user_id,
-            group_id=group_id,
             email=email,
             display_name=display_name,
             encrypted_password=None,
@@ -437,19 +372,6 @@ class MailAccountsRepo:
         )
         row = (await self._s.execute(stmt)).one_or_none()
         return row is not None
-
-    async def update_group(self, account_id: int, group_id: int | None) -> None:
-        """Re-assign ``mail_accounts.group_id`` (ADR-0031 §3 team transfer).
-
-        ``group_id`` may be ``None`` to detach the box from any team
-        (super_admin personal box). Authorization + target-team validation
-        live in :class:`MailAccountService`; this is pure data access.
-        """
-        await self._s.execute(
-            update(MailAccount)
-            .where(MailAccount.id == account_id)
-            .values(group_id=group_id, updated_at=datetime.now(UTC))
-        )
 
     async def update_fields(self, account_id: int, **fields: object) -> None:
         if not fields:

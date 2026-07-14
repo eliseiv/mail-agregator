@@ -1,7 +1,9 @@
-"""OAuth2 Outlook module (ADR-0025, Sprint B).
+"""OAuth2 Outlook module (ADR-0025 / ADR-0045).
 
-Serves the consent flow (``/api/oauth/outlook/authorize`` +
-``/api/oauth/outlook/callback``) and the token-refresh helper used by the
-worker (before IMAP) and the send/test paths (before SMTP). A linked account
-is an ordinary ``mail_accounts`` row with ``auth_type='oauth_outlook'``.
+ADR-0044 §7: the session consent router went away with the UI; the headless
+consent flow lives in ``backend/app/external/router.py`` (ADR-0045). This module
+keeps ``OutlookOAuthService`` (authorize URL + code exchange) and
+``OutlookTokenService`` (refresh → access token for the worker sync and the SMTP
+send). A linked account is an ordinary ``mail_accounts`` row with
+``auth_type='oauth_outlook'``.
 """

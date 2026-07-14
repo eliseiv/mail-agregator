@@ -13,7 +13,7 @@ Source of truth: ``docs/adr/ADR-0036-external-backward-pagination.md`` +
 ``backend/app/repositories/messages.py``.
 
 The HTTP boundary is the only mocked seam — DB state is seeded directly against
-real Postgres so the reverse keyset, canonical-dedup and tag-dedup paths run
+real Postgres so the reverse keyset and canonical-dedup paths run
 against actual SQL (never a mock of our own code). ``seed_n_messages`` seeds
 ``internal_date`` DESCENDING against ``id`` ASCENDING, so a naive
 ``ORDER BY internal_date`` would order rows the OPPOSITE way to the id-keyset —
@@ -321,27 +321,27 @@ class TestValidationDeterministicField:
 
 
 # ===========================================================================
-# 5. Canonical-dedup + tags in desc (parity with forward — ADR-0036 §2/§4)
+# 5. Canonical-dedup in desc (parity with forward — ADR-0036 §2)
 # ===========================================================================
 
 
-class TestBackwardCanonicalDedupAndTags:
+class TestBackwardCanonicalDedup:
     async def test_desc_canonical_dedup_two_accounts_one_email_one_copy(
         self,
         client: httpx.AsyncClient,
         api_key_on: str,
-        super_admin: Any,
+        owner: Any,
         make_mail_account: Callable[..., Any],
         make_message: Callable[..., Any],
-        make_secondary_team_mailbox: Callable[..., Any],
+        make_secondary_owner_mailbox: Callable[..., Any],
     ) -> None:
         """Two mail_accounts sharing ``LOWER(email)`` (one mailbox, two teams):
         the ``desc`` mode applies the SAME canonical (``MIN(id)``) dedup as
         forward — only the canonical account's message is returned (ADR-0036 §2).
         """
-        acc_canon = await make_mail_account(super_admin.id, "Shared@Example.com")
-        acc_dup = await make_secondary_team_mailbox(
-            username="dup_owner_desc", group_name="Dup Team Desc", email="shared@example.com"
+        acc_canon = await make_mail_account(owner.id, "Shared@Example.com")
+        acc_dup = await make_secondary_owner_mailbox(
+            username="dup_owner_desc", email="shared@example.com"
         )
         assert acc_canon.id < acc_dup.id  # canonical = MIN(id)
         m_canon = await make_message(acc_canon.id, uid=1, subject="dup-mail")
@@ -353,49 +353,6 @@ class TestBackwardCanonicalDedupAndTags:
         assert m_dup.id not in ids, "non-canonical duplicate must NOT be returned in desc"
         account_ids = {m["mail_account"]["id"] for m in body["messages"]}
         assert acc_dup.id not in account_ids
-
-    async def test_desc_tags_returned_and_deduped_by_name_color(
-        self,
-        client: httpx.AsyncClient,
-        api_key_on: str,
-        super_admin: Any,
-        make_mail_account: Callable[..., Any],
-        make_message: Callable[..., Any],
-        tag_message: Callable[..., Any],
-        add_sibling_tag: Callable[..., Any],
-    ) -> None:
-        """Tags are returned in ``desc`` too and deduped by ``(name, color)`` —
-        a sibling tag (team-wide auto-tagging) collapses to ONE chip (ADR-0036 §4).
-        """
-        acc = await make_mail_account(super_admin.id, "tagged-desc@example.com")
-        m = await make_message(acc.id, uid=1)
-        t1 = await tag_message(super_admin.id, m.id, "Important", "#ff0000")
-        sib = await add_sibling_tag(
-            message_id=m.id, username="sibling_owner_desc", name="Important", color="#ff0000"
-        )
-
-        body = await _get(client, api_key_on, order="desc", limit=200)
-        got = next(mm for mm in body["messages"] if mm["id"] == m.id)
-        tags = got["tags"]
-        assert len(tags) == 1, f"expected one deduped chip, got {tags}"
-        assert set(tags[0].keys()) == {"id", "name", "color"}
-        assert tags[0]["name"] == "Important"
-        assert tags[0]["color"] == "#ff0000"
-        assert tags[0]["id"] in (t1.id, sib.id)
-
-    async def test_desc_message_without_tags_returns_empty_list(
-        self,
-        client: httpx.AsyncClient,
-        api_key_on: str,
-        super_admin: Any,
-        make_mail_account: Callable[..., Any],
-        make_message: Callable[..., Any],
-    ) -> None:
-        acc = await make_mail_account(super_admin.id, "notags-desc@example.com")
-        m = await make_message(acc.id, uid=1)
-        body = await _get(client, api_key_on, order="desc", limit=200)
-        got = next(mm for mm in body["messages"] if mm["id"] == m.id)
-        assert got["tags"] == []
 
 
 # ===========================================================================

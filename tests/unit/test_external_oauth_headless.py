@@ -3,10 +3,11 @@
 Covers the pure / logic-only surfaces of the headless flow:
 
 - ``OAuthState`` transition-safe payload (crm_state vs user_id, mutually exclusive).
-- Cross-flow isolation guards: ``exchange_code_headless`` rejects a state WITHOUT
-  ``crm_state`` (a session-minted state); ``exchange_code`` rejects a state WITHOUT
-  ``user_id`` (a headless-minted state). The adaptation must not let one flow consume the
-  other's state. ``_consume_state`` is stubbed so no Redis is touched.
+- Cross-flow isolation guard: ``exchange_code_headless`` rejects a state WITHOUT
+  ``crm_state`` (a session-minted state) — a leftover state from the old cookie flow must
+  never be consumable by the headless one. ``_consume_state`` is stubbed so no Redis is
+  touched. (The mirror-image guard lived on the SESSION ``OutlookOAuthService.exchange_code``,
+  which ADR-0044 §5 removed with the cookie UI — the session flow no longer exists.)
 - ``_require_outlook_oauth_enabled`` — 404 (``NotFoundError``) when the Azure creds are unset.
 - The callback HTML pages — no-store, self-contained, no request-derived interpolation.
 - ``ExternalOAuthAuthorize`` request/response schema bounds (crm_state 1..512).
@@ -92,16 +93,6 @@ async def test_headless_rejects_session_state_without_crm_state(
     svc = _service(monkeypatch, OAuthState(code_verifier="v", user_id=7))
     with pytest.raises(OAuthError) as exc:
         await svc.exchange_code_headless(code="c", state="s")
-    assert exc.value.code == "oauth_state_invalid"
-
-
-async def test_session_rejects_headless_state_without_user_id(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A headless-minted state (crm_state set, user_id None) must NOT feed the session flow."""
-    svc = _service(monkeypatch, OAuthState(code_verifier="v", crm_state="opaque"))
-    with pytest.raises(OAuthError) as exc:
-        await svc.exchange_code(code="c", state="s")
     assert exc.value.code == "oauth_state_invalid"
 
 

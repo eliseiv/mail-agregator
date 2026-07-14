@@ -71,9 +71,10 @@ class ForbiddenError(DomainError):
     code = "forbidden"
 
 
-class CSRFError(DomainError):
-    status_code = 403
-    code = "csrf_failed"
+# ADR-0044 §5 (phase A3): ``CSRFError`` (``csrf_failed``) went away with the
+# session/CSRF middleware and the HTML UI — the connector's only surface is the
+# machine API (``/api/external/*``), which is key-authenticated and CSRF-exempt
+# by construction. Nothing raised it any more.
 
 
 class NotFoundError(DomainError):

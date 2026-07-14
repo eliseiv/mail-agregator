@@ -1,64 +1,23 @@
-"""Unit tests for the multi-value address parser used by the send endpoint
-and the underlying RFC-light email regex.
+"""Unit tests for the e-mail address validation used by the outgoing-mail paths.
 
-Source of truth: ``backend/app/send/router.py`` (split helper) +
-``backend/app/send/schemas.py`` (regex + validator).
+Source of truth: ``backend/app/send/schemas.py`` (``_EMAIL_RE`` + ``_validate_addresses``)
+— the very validator the external send request re-uses for ``to`` / ``cc``
+(``backend/app/external/schemas.py::ExternalSendRequest._check_addresses``,
+ADR-0048 §1).
+
+ADR-0044 §5 (phase A1/A3): the session compose UI and its ``backend/app/send/router.py``
+multi-value splitter (``_split_addresses``) are decommissioned — the CRM sends a JSON
+``to``/``cc`` LIST, so there is nothing left to split. The splitter tests went with it;
+the regex/validator below stay because they still guard every outgoing address.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from backend.app.send.router import _split_addresses
 from backend.app.send.schemas import _EMAIL_RE, _validate_addresses
 
 pytestmark = pytest.mark.unit
-
-
-# ---------------------------------------------------------------------------
-# Splitter — comma / semicolon / whitespace handling
-# ---------------------------------------------------------------------------
-
-
-class TestSplit:
-    def test_csv(self) -> None:
-        assert _split_addresses("a@x.com,b@x.com,c@x.com") == [
-            "a@x.com",
-            "b@x.com",
-            "c@x.com",
-        ]
-
-    def test_semicolon(self) -> None:
-        assert _split_addresses("a@x.com;b@x.com;c@x.com") == [
-            "a@x.com",
-            "b@x.com",
-            "c@x.com",
-        ]
-
-    def test_mixed_separators(self) -> None:
-        assert _split_addresses("a@x.com, b@x.com; c@x.com") == [
-            "a@x.com",
-            "b@x.com",
-            "c@x.com",
-        ]
-
-    def test_strips_whitespace_around_each_entry(self) -> None:
-        assert _split_addresses("  a@x.com  ,   b@x.com  ") == ["a@x.com", "b@x.com"]
-
-    def test_empty_entries_dropped(self) -> None:
-        assert _split_addresses("a@x.com,,b@x.com,") == ["a@x.com", "b@x.com"]
-        assert _split_addresses(";;a@x.com;;b@x.com") == ["a@x.com", "b@x.com"]
-
-    def test_empty_input_returns_empty(self) -> None:
-        assert _split_addresses("") == []
-        assert _split_addresses(None) == []
-
-    def test_whitespace_inside_address_kept(self) -> None:
-        # Whitespace is NOT a separator (per the docstring).
-        # The whole string is treated as one entry.
-        # The address is malformed but the splitter doesn't care; validation
-        # happens later.
-        assert _split_addresses("a b@x.com") == ["a b@x.com"]
 
 
 # ---------------------------------------------------------------------------

@@ -296,12 +296,6 @@ class OutlookOAuthService:
         authorize_url = f"{self._settings.outlook_authorize_endpoint}?{urlencode(params)}"
         return authorize_url, state
 
-    async def build_authorize_url(self, user_id: int) -> tuple[str, str]:
-        """Session flow: mint state + PKCE bound to ``user_id`` (ADR-0025 §2)."""
-        authorize_url, state = await self._mint_state_and_url(user_id=user_id, crm_state=None)
-        log.info("oauth_authorize_url_built", user_id=user_id)
-        return authorize_url, state
-
     async def build_authorize_url_headless(self, crm_state: str) -> tuple[str, str]:
         """Headless flow: mint state + PKCE carrying the opaque ``crm_state`` (ADR-0045 §1/§2).
 
@@ -359,15 +353,14 @@ class OutlookOAuthService:
         return tokens, email.strip().lower()
 
     async def _create_or_relink(
-        self, *, owner_user_id: int, group_id: int | None, email: str, tokens: _TokenResponse
+        self, *, owner_user_id: int, email: str, tokens: _TokenResponse
     ) -> MailAccount:
         """Create a new oauth mailbox or refresh the tokens of an existing one.
 
-        Owner is ``owner_user_id`` (session user or ``crm-service``); ``group_id``
-        is the owner's home group for the session flow and ``None`` for the
-        headless flow (ADR-0045 §1 — transition-safe: the column is still
-        present pre-demontage, so we pass ``None`` rather than omit it).
-        Re-consent is keyed by ``(owner_user_id, email)``.
+        Owner is ``owner_user_id`` — after ADR-0044 always the ``crm-service``
+        technical user (the session consent flow is gone). Re-consent is keyed by
+        ``(owner_user_id, email)``. ADR-0044 §3 (lock-step): the ``group_id``
+        pass-through is removed together with ``mail_accounts.group_id``.
         """
         access_token = tokens.access_token
         refresh_token = tokens.refresh_token
@@ -400,7 +393,6 @@ class OutlookOAuthService:
         acc = await self._repo.insert_oauth_account_with_id(
             account_id=new_id,
             user_id=owner_user_id,
-            group_id=group_id,
             email=email,
             oauth_provider="outlook",
             oauth_refresh_token_encrypted=refresh_enc,
@@ -418,34 +410,13 @@ class OutlookOAuthService:
         log.info("oauth_account_linked", mail_account_id=acc.id, user_id=owner_user_id)
         return acc
 
-    async def exchange_code(self, *, code: str, state: str) -> MailAccount:
-        """Session flow: validate state, exchange the code, create/update the account.
-
-        Returns the persisted :class:`MailAccount`. Caller (router) writes the
-        ``oauth_account_linked`` audit row and commits the transaction.
-        """
-        st = await self._consume_state(state)
-        if st.user_id is None:
-            raise OAuthError("oauth_state_invalid", "Session state missing user")
-
-        tokens, email = await self._exchange_and_resolve(code, st.code_verifier)
-
-        owner = await self._users.get_by_id(st.user_id)
-        if owner is None:
-            raise OAuthError("oauth_state_invalid", "Initiating user no longer exists")
-
-        return await self._create_or_relink(
-            owner_user_id=st.user_id, group_id=owner.group_id, email=email, tokens=tokens
-        )
-
     async def exchange_code_headless(self, *, code: str, state: str) -> tuple[MailAccount, str]:
         """Headless flow: validate state, exchange the code, create/relink the box.
 
-        Owner is the ``crm-service`` technical user; ``group_id=None``
-        (transition-safe, ADR-0045 §1). Returns ``(mail_account, crm_state)`` —
-        the caller (external callback) writes the audit row, commits, then POSTs
-        the binding to the CRM ingest (§3). Raises :class:`OAuthError` on a bad
-        state / failed exchange (the callback maps it to the HTML error page).
+        Owner is the ``crm-service`` technical user (ADR-0045 §1). Returns
+        ``(mail_account, crm_state)`` — the caller (external callback) commits and
+        POSTs the binding to the CRM ingest (§3). Raises :class:`OAuthError` on a
+        bad state / failed exchange (the callback maps it to the HTML error page).
         """
         st = await self._consume_state(state)
         if st.crm_state is None:
@@ -459,9 +430,7 @@ class OutlookOAuthService:
             # post-boot state — surface as a recoverable OAuth error → HTML page.
             raise OAuthError("oauth_exchange_failed", "crm-service user is not provisioned")
 
-        acc = await self._create_or_relink(
-            owner_user_id=owner.id, group_id=None, email=email, tokens=tokens
-        )
+        acc = await self._create_or_relink(owner_user_id=owner.id, email=email, tokens=tokens)
         return acc, st.crm_state
 
 

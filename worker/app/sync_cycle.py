@@ -17,6 +17,13 @@ identical.
 
 Idempotency: ``ON CONFLICT DO NOTHING`` on
 ``(mail_account_id, uidvalidity, uid)``.
+
+ADR-0044 §4 (phase A3): every hook of the decommissioned subsystems is removed
+from the cycle — tag-apply, the ``tg_notify`` / ``webhook`` / ``push_notify`` /
+``forward`` enqueues, the MinIO attachment download, the ``admin_audit`` writers
+and the ``mailbox_alert`` queue. What stays: the message insert, the CRM
+push-outbox (``crm_push``, ADR-0043 §2), the mailbox status channel (ADR-0046)
+and the circuit-breaker / auto-disable logic (ADR-0026).
 """
 
 from __future__ import annotations
@@ -24,41 +31,31 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime as _dt
-import json
 import uuid
-from collections.abc import Awaitable
 from dataclasses import dataclass
-from typing import Literal, cast
+from typing import Literal
 
 import structlog
 from cryptography.exceptions import InvalidTag
 
-# NOTE: worker imports from ``backend.app.*`` (repositories + audit) — this
-# coupling is intentional and accepted by reviewers per the rework round 2
-# decision: keep `repositories/` in `backend/` to avoid moving 6 files
-# without architect sign-off. Both containers ship `backend/` + `worker/` +
-# `shared/` per ``deploy/Dockerfile``.
-from backend.app.audit import AuditWriter
+# NOTE: worker imports from ``backend.app.*`` (repositories + crm_push/oauth
+# services) — this coupling is intentional and accepted by reviewers per the
+# rework round 2 decision: keep `repositories/` in `backend/`. Both containers
+# ship `backend/` + `worker/` + `shared/` per ``deploy/Dockerfile``.
 from backend.app.crm_push.service import enqueue_crm_status_best_effort
 from backend.app.exceptions import InvalidHostError
 from backend.app.oauth.service import OAuthError, OAuthRefreshInvalidError, OutlookTokenService
 from backend.app.repositories.mail_accounts import MailAccountsRepo
 from backend.app.repositories.messages import MessagesRepo
-from backend.app.repositories.users import UsersRepo
 from backend.app.security import assert_public_host_async
-from backend.app.tags.service import TagsService
-from backend.app.telegram.notify_service import TelegramNotifyService
 from shared.config import get_settings
 from shared.crypto import decrypt_mail_password
 from shared.db import make_session
 from shared.logging import get_logger
 from shared.models import MailAccount
 from shared.redis_client import get_redis
-from shared.storage import get_storage
 from worker.app.error_classify import classify, error_prefix, is_explicit_permanent
-from worker.app.imap_fetcher import FetchedBox, FetchedMessage, fetch_blocking
-from worker.app.mailbox_alert_dispatch import MAILBOX_ALERT_QUEUE_KEY
-from worker.app.push_notify_dispatch import _QUEUE_KEY as _PUSH_NOTIFY_QUEUE_KEY
+from worker.app.imap_fetcher import FetchedBox, fetch_blocking
 
 log = get_logger(__name__)
 
@@ -66,18 +63,6 @@ log = get_logger(__name__)
 # ``_run_for_accounts`` to apply bump/disable AFTER the circuit-breaker
 # decision (so a mass infra outage cannot disable everything at once).
 AccountSyncOutcome = Literal["ok", "transient", "permanent"]
-
-# ADR-0034 §3.2: our own outbound forwards stamp ``X-Forwarded-By:
-# mail-aggregator``. A newly-fetched message already carrying this stamp is a
-# copy of one we forwarded (it landed back in one of our mailboxes) and must
-# NOT be re-enqueued for forwarding — loop-guard part 1.
-_FORWARD_STAMP = "mail-aggregator"
-
-
-def _carries_own_forward_stamp(fmsg: FetchedMessage) -> bool:
-    """True when the message already carries our ``X-Forwarded-By`` stamp."""
-    value = fmsg.x_forwarded_by
-    return value is not None and _FORWARD_STAMP in value.lower()
 
 
 @dataclass(slots=True)
@@ -97,30 +82,6 @@ class _AccountResult:
     error: str | None = None
     prefix: str | None = None
     explicit_permanent: bool = False
-
-
-@dataclass(slots=True)
-class _TagInputMessage:
-    """Minimal message-shaped tuple passed to ``TagsService.apply_tags_to_message``.
-
-    The service expects a ``Message``-shaped object with ``id``, ``subject``,
-    ``body_text``, ``body_html``, ``from_addr`` and ``from_name``.
-    Constructing a real ORM ``Message`` here would require extra round-trips
-    (we already have the values from ``FetchedMessage`` + ``inserted_id``); a
-    tiny dataclass keeps the call clean and avoids a SELECT round-trip.
-
-    round-29 (ADR-0017 §4.3): ``body_html`` is carried so the worker hook can
-    match ``body_contains`` against the tag-stripped HTML body the UI renders
-    (Apple ships different text in text/plain vs text/html). It is the same
-    raw HTML written to ``messages.body_html`` by ``insert_message_idempotent``.
-    """
-
-    id: int
-    subject: str | None
-    body_text: str
-    body_html: str | None
-    from_addr: str
-    from_name: str | None
 
 
 # ---------------------------------------------------------------------------
@@ -166,13 +127,9 @@ async def sync_one_account(
     returns the ``outcome`` so :func:`_run_for_accounts` can apply
     bump/disable after the circuit-breaker decision.
 
-    Side-effect: updates ``mail_accounts`` row + writes any new ``messages``
-    + ``attachments`` + uploads attachment blobs to MinIO.
+    Side-effect: updates the ``mail_accounts`` row + writes any new ``messages``
+    (the CRM push-outbox, ADR-0043 §2). Attachments are not fetched (ADR-0043 §4).
     """
-    storage = get_storage()
-    # ADR-0022 §2.1 (round-31): TG_NOTIFY_ALL_MESSAGES gates whether every
-    # inserted message is enqueued for Telegram notification or only tagged
-    # ones. lru-cached; one read per account-sync is cheap.
     settings = get_settings()
     cycle_log = log.bind(mail_account_id=account.id, user_id=account.user_id)
     cycle_log.info("sync_account_start")
@@ -237,27 +194,15 @@ async def sync_one_account(
         text = str(exc).replace("\r", " ").replace("\n", " ")
         return await _handle_sync_error(account, exc, detail=text, cycle_log=cycle_log)
 
-    # Save messages + attachments.
+    # Save messages.
     new_count = 0
     conflict_count = 0
-    tags_applied_total = 0
-    # ADR-0022 §2.1: collect message_ids that received at least one tag so
-    # we can LPUSH them onto ``tg_notify_queue`` after the transaction
-    # commits. Inserting from inside the transaction would risk pushing
-    # message_ids whose tags get rolled back on tag-apply failure.
-    notified_message_ids: list[int] = []
-    # ADR-0034 §3.2: separate accumulator for forwarding (NOT tag-gated — we
-    # forward ALL new incoming of a team). Only mailboxes bound to a team
-    # (group_id NOT NULL) and only messages that do not already carry our
-    # forward stamp (loop-guard part 1) are collected.
-    forward_ids: list[int] = []
     # ADR-0043 §2: CRM push-outbox — EVERY newly-inserted message is pushed to
-    # the CRM (not tag-gated, unlike the Telegram accumulator). Enqueued after
-    # COMMIT so the ``crm_push_dispatch`` job can load the committed rows.
+    # the CRM. Enqueued after COMMIT so the ``crm_push_dispatch`` job can load
+    # the committed rows.
     crm_push_ids: list[int] = []
     async with make_session() as s, s.begin():
         repo = MessagesRepo(s)
-        tags_service = TagsService(s)
         for fmsg in box.new_messages:
             inserted_id = await repo.insert_message_idempotent(
                 mail_account_id=account.id,
@@ -283,76 +228,6 @@ async def sync_one_account(
             new_count += 1
             # ADR-0043 §2: every inserted message is an outbox item for the CRM.
             crm_push_ids.append(inserted_id)
-            # ADR-0034 §3.2: collect for forwarding — team mailbox only,
-            # loop-guard part 1 (skip our own already-forwarded copies).
-            if account.group_id is not None and not _carries_own_forward_stamp(fmsg):
-                forward_ids.append(inserted_id)
-            for fatt in fmsg.attachments:
-                att_id = await repo.reserve_attachment_id()
-                key = storage.build_key(
-                    user_id=account.user_id,
-                    mail_account_id=account.id,
-                    message_uid=fmsg.uid,
-                    attachment_id=att_id,
-                    filename=fatt.filename,
-                )
-                skipped = fatt.size_bytes > max_att_bytes
-                if not skipped and fatt.payload:
-                    try:
-                        await storage.put_object(key, fatt.payload, fatt.content_type)
-                    except Exception as exc:
-                        # If MinIO write fails, mark as skipped so the row
-                        # in DB stays consistent. Log the error.
-                        cycle_log.warning(
-                            "sync_account_attachment_put_fail",
-                            detail=str(exc)[:200],
-                        )
-                        skipped = True
-                await repo.insert_attachment_with_id(
-                    attachment_id=att_id,
-                    message_id=inserted_id,
-                    filename=fatt.filename,
-                    content_type=fatt.content_type,
-                    size_bytes=fatt.size_bytes,
-                    s3_key=key,
-                    skipped_too_large=skipped,
-                )
-
-            # Apply tags (ADR-0017 §5). Best-effort within the same
-            # transaction: a SQL fault here would abort all messages in
-            # this batch, so we catch broadly and log a warning. The
-            # ``ON CONFLICT DO NOTHING`` in the underlying SQL keeps it
-            # idempotent against retries — no tag duplication risk.
-            try:
-                applied = await tags_service.apply_tags_to_message(
-                    message=_TagInputMessage(
-                        id=inserted_id,
-                        subject=fmsg.subject,
-                        body_text=fmsg.body_text,
-                        body_html=fmsg.body_html,
-                        from_addr=fmsg.from_addr,
-                        from_name=fmsg.from_name,
-                    ),
-                    mail_account_id=account.id,
-                )
-                tags_applied_total += applied
-                # ADR-0022 §2.1 (round-31): enqueue EVERY inserted message
-                # when TG_NOTIFY_ALL_MESSAGES is on (default); otherwise keep
-                # the historical "only tagged" behaviour (applied > 0).
-                if settings.TG_NOTIFY_ALL_MESSAGES or applied > 0:
-                    notified_message_ids.append(inserted_id)
-            except Exception as exc:
-                # Don't lose the message; just record that we couldn't
-                # tag it. Subsequent ingest of the same UID is impossible
-                # (UNIQUE constraint), so unlike the message itself the
-                # tag application has no automatic retry path. That's
-                # acceptable — operators can re-run apply-to-existing
-                # from /tags/{id}/edit if a rule was misconfigured.
-                cycle_log.warning(
-                    "apply_tags_failed",
-                    message_id=inserted_id,
-                    detail=str(exc)[:200],
-                )
 
     # Mark sync success.
     async with make_session() as s, s.begin():
@@ -391,103 +266,10 @@ async def sync_one_account(
                 count=len(crm_push_ids),
             )
 
-    # ADR-0022 §2.1 (round-31): enqueue Telegram-notifications for the
-    # collected message_ids — every inserted message when
-    # TG_NOTIFY_ALL_MESSAGES is on (default), else only those that got at
-    # least one tag. LPUSH after COMMIT so a recipient SQL inside the
-    # dispatcher can see the committed rows. We swallow any failure here
-    # — a Redis outage must NEVER abort the sync cycle.
-    if notified_message_ids:
-        try:
-            async with make_session() as s:
-                pushed = await TelegramNotifyService(s).enqueue_message_ids(notified_message_ids)
-            cycle_log.info(
-                "tg_notify_enqueued",
-                count=pushed,
-                mail_account_id=account.id,
-            )
-        except Exception as exc:
-            cycle_log.warning(
-                "tg_notify_enqueue_failed",
-                detail=str(exc)[:200],
-                count=len(notified_message_ids),
-            )
-
-        # ADR-0023 §3.1: enqueue outbound-webhook deliveries for the same
-        # message_ids. Independent try/except — a webhook-enqueue failure
-        # must not affect the TG channel and vice versa.
-        try:
-            from backend.app.webhooks.dispatch_service import WebhookDispatchService
-
-            async with make_session() as s:
-                pushed = await WebhookDispatchService(s).enqueue_message_ids(notified_message_ids)
-            cycle_log.info(
-                "webhook_enqueued",
-                count=pushed,
-                mail_account_id=account.id,
-            )
-        except Exception as exc:
-            cycle_log.warning(
-                "webhook_enqueue_failed",
-                detail=str(exc)[:200],
-                count=len(notified_message_ids),
-            )
-
-        # ADR-0027 §3.1: enqueue push-only per-team bot deliveries for the
-        # same message_ids onto the separate ``push_notify_queue``. Third
-        # independent try/except — a push-enqueue failure must not affect the
-        # main TG channel or webhooks (and vice versa). The actual bot is
-        # selected later (by account.group_id) in ``push_notify_dispatch``.
-        if settings.push_team_bots_enabled:
-            try:
-                from backend.app.telegram.notify_service import _QueuePayload
-
-                redis = get_redis()
-                items = [
-                    _QueuePayload(message_id=int(mid), source="sync").to_json()
-                    for mid in notified_message_ids
-                ]
-                await cast(Awaitable[int], redis.lpush(_PUSH_NOTIFY_QUEUE_KEY, *items))
-                cycle_log.info(
-                    "push_notify_enqueued",
-                    count=len(items),
-                    mail_account_id=account.id,
-                )
-            except Exception as exc:
-                cycle_log.warning(
-                    "push_notify_enqueue_error",
-                    detail=str(exc)[:200],
-                    count=len(notified_message_ids),
-                )
-
-    # ADR-0034 §3.2: enqueue forward deliveries. Independent of the TG/webhook
-    # channels — separate accumulator (all new team incoming, minus loop-guarded
-    # ones) and its own try/except so a Redis failure here never aborts the sync
-    # cycle nor the other notification channels. Consumer does the final config /
-    # temporal / loop / dedup checks (worker.forward_dispatch, §14.4).
-    if forward_ids:
-        try:
-            from backend.app.forwarding.dispatch_service import ForwardDispatchService
-
-            async with make_session() as s:
-                pushed = await ForwardDispatchService(s).enqueue_message_ids(forward_ids)
-            cycle_log.info(
-                "forward_enqueued",
-                count=pushed,
-                mail_account_id=account.id,
-            )
-        except Exception as exc:
-            cycle_log.warning(
-                "forward_enqueue_failed",
-                detail=str(exc)[:200],
-                count=len(forward_ids),
-            )
-
     cycle_log.info(
         "sync_account_finish",
         new_messages=new_count,
         conflicts=conflict_count,
-        tags_applied=tags_applied_total,
     )
     return _AccountResult(
         account_id=account.id,
@@ -746,108 +528,29 @@ async def _record_needs_consent_marker(account_id: int) -> None:
         await enqueue_crm_status_best_effort(account_id)
 
 
-async def _enqueue_mailbox_alert(account_id: int, *, reason: str) -> None:
-    """LPUSH one mailbox-down alert onto ``mailbox_alert_queue`` (ADR-0033 §4).
-
-    Called AFTER the disable transaction commits, only on a clean
-    ``NULL → now()`` stamp transition and only when
-    ``MAILBOX_DOWN_ALERT_ENABLED`` is on. Wrapped in ``try/except`` with a log —
-    a Redis outage must NEVER abort the sync cycle (same isolation as the
-    ``tg_notify`` enqueue). The stamp is already committed, so a lost enqueue is
-    not retried (fire-and-forget, TD-042).
-    """
-    try:
-        redis = get_redis()
-        payload = json.dumps(
-            {"v": 1, "mail_account_id": account_id, "reason": reason},
-            separators=(",", ":"),
-        )
-        await cast(Awaitable[int], redis.lpush(MAILBOX_ALERT_QUEUE_KEY, payload))
-        log.info("mailbox_alert_enqueued", mail_account_id=account_id, reason=reason)
-    except Exception as exc:
-        log.warning(
-            "mailbox_alert_enqueue_failed",
-            mail_account_id=account_id,
-            detail=str(exc)[:200],
-        )
-
-
 async def _disable_after_failures(account_id: int, *, user_id: int, reason: str) -> None:
-    """Disable the account and write an ``account_auto_disabled`` audit row.
+    """Disable the mailbox after repeated failures (ADR-0026 §3).
 
-    ``reason`` is a stable string for ``details.reason``:
-    ``"N_consecutive_failures"`` (threshold) or ``"auth_failed"`` /
-    ``"decrypt_fail"`` (explicit permanent, instant disable). ADR-0026 §3.
+    ``reason`` is a stable string: ``"N_consecutive_failures"`` (threshold) or
+    ``"auth_failed"`` / ``"decrypt_fail"`` (explicit permanent, instant disable).
 
-    ADR-0033: this is the ONLY worker auto-disable point and thus the only
-    mailbox-down alert trigger. In the same transaction as ``is_active=false`` +
-    audit, a guarded UPDATE stamps ``disabled_alert_sent_at=now()`` iff it was
-    ``NULL`` (idempotency "one alert per transition"). After COMMIT, if the
-    stamp really transitioned (``NULL → now()``) AND the feature is enabled, we
-    enqueue exactly one alert. Circuit-breaker suppression / transient / OAuth
-    needs-consent / manual disable never reach this function, so they never
-    alert.
+    ADR-0044 §4 (phase A3): the ``account_auto_disabled`` row in ``admin_audit``
+    and the Telegram alert enqueue (``mailbox_alert_queue``, ADR-0033) are
+    removed BEFORE the table/queue drops (§3 lock-step). ``disable_and_stamp_alert``
+    is KEPT: it writes ``is_active=false`` plus the idempotency stamp; the alert
+    itself is now sent by the CRM (ADR-0043 §2, ``down_alert_sent_at`` on its
+    side).
+
+    ADR-0046 §3 (H4): the mailbox status (``is_active`` true→false) is mirrored
+    to the CRM AFTER the COMMIT — the dispatcher reads the live DB snapshot.
     """
     async with make_session() as s, s.begin():
-        stamped = await MailAccountsRepo(s).disable_and_stamp_alert(account_id)
-        # The audit log requires ``actor_user_id``. For system actions we
-        # attribute to the super-admin (the one with role='super_admin').
-        # If for whatever reason there is no admin row (e.g. seed didn't
-        # run), we fall back to the affected user.
-        admin = await UsersRepo(s).get_admin()
-        actor_id = admin.id if admin else user_id
-        await AuditWriter(s).log(
-            actor_user_id=actor_id,
-            action="account_auto_disabled",
-            target_user_id=user_id,
-            details={
-                "mail_account_id": account_id,
-                "reason": reason,
-            },
-        )
+        await MailAccountsRepo(s).disable_and_stamp_alert(account_id)
 
-    # After COMMIT: enqueue exactly one alert on the clean NULL → now()
-    # transition. The stamp is written regardless of the flag; only the enqueue
-    # is gated by ``MAILBOX_DOWN_ALERT_ENABLED`` (ADR-0033 §8).
-    if stamped and get_settings().MAILBOX_DOWN_ALERT_ENABLED:
-        await _enqueue_mailbox_alert(account_id, reason=reason)
+    log.info("mailbox_auto_disabled", mail_account_id=account_id, user_id=user_id, reason=reason)
 
-    # ADR-0043 §2: mirror the mailbox status change (is_active true→false) to
-    # the CRM. Best-effort — the CRM dedups the down-alert on its side
-    # (``down_alert_sent_at``), so sending on every disable is safe. Gated by
-    # ``crm_status_enabled`` (URL + secret). Runs in parallel with the legacy
-    # Telegram ``mailbox_alert`` above until cut-over.
+    # After COMMIT — best-effort, gated (ADR-0046 §2).
     await enqueue_crm_status_best_effort(account_id)
-
-
-async def _audit_mass_failure_suppressed(
-    *,
-    total: int,
-    permanent_failures: int,
-    transient_failures: int,
-    ratio: float,
-    threshold_ratio: float,
-    threshold_min: int,
-    fallback_user_id: int,
-) -> None:
-    """Write the once-per-cycle ``sync_mass_failure_suppressed`` audit row when
-    the circuit-breaker trips (ADR-0026 §3). ``actor_user_id`` is the system
-    super-admin (falls back to an affected user if no admin row exists)."""
-    async with make_session() as s, s.begin():
-        admin = await UsersRepo(s).get_admin()
-        actor_id = admin.id if admin else fallback_user_id
-        await AuditWriter(s).log(
-            actor_user_id=actor_id,
-            action="sync_mass_failure_suppressed",
-            details={
-                "total": total,
-                "permanent_failures": permanent_failures,
-                "transient_failures": transient_failures,
-                "ratio": round(ratio, 4),
-                "threshold_ratio": threshold_ratio,
-                "threshold_min": threshold_min,
-            },
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -940,16 +643,10 @@ async def _run_for_accounts(accounts: list[MailAccount]) -> tuple[int, int, int]
             threshold_ratio=settings.SYNC_MASS_FAILURE_RATIO,
             threshold_min=settings.SYNC_MASS_FAILURE_MIN,
         )
-        if permanent:
-            await _audit_mass_failure_suppressed(
-                total=total,
-                permanent_failures=permanent_count,
-                transient_failures=transient_count,
-                ratio=ratio,
-                threshold_ratio=settings.SYNC_MASS_FAILURE_RATIO,
-                threshold_min=settings.SYNC_MASS_FAILURE_MIN,
-                fallback_user_id=permanent[0].user_id,
-            )
+        # ADR-0044 §4 (phase A3, MAJOR-4/MINOR-5): the audit row
+        # ``sync_mass_failure_suppressed`` went away with ``admin_audit`` — the
+        # breaker trip is still visible in the structured ``sync_breaker_tripped``
+        # log line above (that write was the function's only effect).
     else:
         # Normal path: bump each permanent; disable on threshold or explicit
         # auth/decrypt.

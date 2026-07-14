@@ -13,6 +13,13 @@ are distinguishable ONLY to a holder of the real key, so a prober cannot learn
 "the feature exists but is disabled" (config non-disclosure). The API key is
 never echoed in a response or an error body.
 
+ADR-0044 §4 (phase A1): the probe endpoint used to be ``POST /api/external/tags``
+(created a global tag). Tags are decommissioned, so the SAME ``_authorize_write``
+sequence is probed through a surviving write endpoint — ``POST /api/external/mailboxes``
+— with a well-formed create body. The gate is shared by every write route
+(``_authorize_write``), so the ordering contract is unchanged; the generic send
+(ADR-0048) pins the same order in ``tests/unit/adr0048/test_external_send_api.py``.
+
 Source of truth: ``backend/app/external/router.py`` (``_authorize_write`` +
 ``_parse_json_body``) + ``docs/04-api-contracts.md`` §4f.
 
@@ -31,11 +38,21 @@ import pytest
 
 pytestmark = pytest.mark.integration
 
-_TAGS = "/api/external/tags"
+_MAILBOXES = "/api/external/mailboxes"
 _MAILBOX_TEST = "/api/external/mailboxes/test"
-# A well-formed create-tag body so a 400 only ever comes from the body step
+# A well-formed create-mailbox body so a 400 only ever comes from the body step
 # being *reached*, never from a malformed payload we sent by accident.
-_GOOD_TAG_BODY = {"name": "auth-probe", "color": "#2563eb"}
+_GOOD_MAILBOX_BODY = {
+    "email": "auth-probe@example.com",
+    "password": "pw",
+    "imap_host": "imap.example.com",
+    "imap_port": 993,
+    "imap_ssl": True,
+    "smtp_host": "smtp.example.com",
+    "smtp_port": 465,
+    "smtp_ssl": True,
+    "smtp_starttls": False,
+}
 
 
 class TestRateLimitFirst:
@@ -55,9 +72,9 @@ class TestRateLimitFirst:
         set_external_write_enabled(True)
         set_external_write_rate_limit(1)
 
-        r1 = await client.post(_TAGS, json=_GOOD_TAG_BODY)  # no key
+        r1 = await client.post(_MAILBOXES, json=_GOOD_MAILBOX_BODY)  # no key
         assert r1.status_code == 401, r1.text
-        r2 = await client.post(_TAGS, json=_GOOD_TAG_BODY)  # no key, budget spent
+        r2 = await client.post(_MAILBOXES, json=_GOOD_MAILBOX_BODY)  # no key, budget spent
         assert r2.status_code == 429, r2.text
 
 
@@ -72,7 +89,9 @@ class TestAuthBeforeGate:
         the write-gate on and a well-formed body. The config is not disclosed."""
         set_external_api_key("")  # feature OFF
         set_external_write_enabled(True)
-        resp = await client.post(_TAGS, headers={"X-API-Key": "anything"}, json=_GOOD_TAG_BODY)
+        resp = await client.post(
+            _MAILBOXES, headers={"X-API-Key": "anything"}, json=_GOOD_MAILBOX_BODY
+        )
         assert resp.status_code == 401, resp.text
         assert resp.json()["error"]["code"] == "not_authenticated"
 
@@ -87,7 +106,7 @@ class TestAuthBeforeGate:
         set_external_api_key("correct-key-value-00000000000000000000")
         set_external_write_enabled(True)
         resp = await client.post(
-            _TAGS, headers={"X-API-Key": "wrong-key-value"}, json=_GOOD_TAG_BODY
+            _MAILBOXES, headers={"X-API-Key": "wrong-key-value"}, json=_GOOD_MAILBOX_BODY
         )
         assert resp.status_code == 401, resp.text
         assert resp.json()["error"]["code"] == "not_authenticated"
@@ -106,7 +125,7 @@ class TestGateNonDisclosure:
         key = "the-real-key-value-0000000000000000000000"
         set_external_api_key(key)
         set_external_write_enabled(False)  # write-gate OFF
-        resp = await client.post(_TAGS, headers={"X-API-Key": key}, json=_GOOD_TAG_BODY)
+        resp = await client.post(_MAILBOXES, headers={"X-API-Key": key}, json=_GOOD_MAILBOX_BODY)
         assert resp.status_code == 403, resp.text
         assert resp.json()["error"]["code"] == "forbidden"
 
@@ -119,7 +138,7 @@ class TestGateNonDisclosure:
         set_external_api_key("the-real-key-value-0000000000000000000000")
         set_external_write_enabled(False)  # write-gate OFF
         resp = await client.post(
-            _TAGS, headers={"X-API-Key": "not-the-real-key"}, json=_GOOD_TAG_BODY
+            _MAILBOXES, headers={"X-API-Key": "not-the-real-key"}, json=_GOOD_MAILBOX_BODY
         )
         assert resp.status_code == 401, resp.text
         assert resp.json()["error"]["code"] == "not_authenticated"
@@ -132,7 +151,7 @@ class TestBodyValidatedLast:
         """Auth + gate pass (valid key, write on) → the malformed body finally
         surfaces as 400 validation_error."""
         resp = await client.post(
-            _TAGS,
+            _MAILBOXES,
             headers={"X-API-Key": write_api_on, "Content-Type": "application/json"},
             content=b"{ this is not json",
         )
@@ -150,7 +169,7 @@ class TestBodyValidatedLast:
         set_external_api_key("real-key-000000000000000000000000000000")
         set_external_write_enabled(True)
         resp = await client.post(
-            _TAGS,
+            _MAILBOXES,
             headers={"X-API-Key": "wrong", "Content-Type": "application/json"},
             content=b"{ not json",
         )
@@ -166,7 +185,7 @@ class TestBodyValidatedLast:
         set_external_api_key(key)
         set_external_write_enabled(False)
         resp = await client.post(
-            _TAGS,
+            _MAILBOXES,
             headers={"X-API-Key": key, "Content-Type": "application/json"},
             content=b"{ not json",
         )
@@ -174,7 +193,7 @@ class TestBodyValidatedLast:
 
 
 class TestSecretNonDisclosure:
-    @pytest.mark.parametrize("path", [_TAGS, _MAILBOX_TEST])
+    @pytest.mark.parametrize("path", [_MAILBOXES, _MAILBOX_TEST])
     async def test_key_never_echoed_in_response(
         self, client: httpx.AsyncClient, write_api_on: str, path: str
     ) -> None:

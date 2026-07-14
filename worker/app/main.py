@@ -1,4 +1,11 @@
-"""Worker entrypoint: APScheduler with sync_cycle + retention_cleanup.
+"""Worker entrypoint: APScheduler (connector, ADR-0044 §4, phase A3).
+
+Jobs left: ``sync_cycle``, ``force_sync_dispatcher``, ``retention_cleanup``,
+``alive_touch``, ``crm_push_dispatch``, ``crm_push_recovery``,
+``crm_status_dispatch``. Removed with their subsystems (ADR-0043 §4):
+``tg_notify_dispatch`` / ``tg_notify_recovery`` / ``push_notify_dispatch`` /
+``mailbox_alert_dispatch`` / ``webhook_dispatch`` / ``webhook_recovery`` /
+``forward_dispatch`` and the ``ensure_bucket`` bootstrap (MinIO).
 
 Started by ``deploy/Dockerfile`` (target=worker): ``python -m worker.app.main``.
 
@@ -33,19 +40,11 @@ from shared.config import get_settings
 from shared.db import dispose_engine, init_engine
 from shared.logging import configure_logging, get_logger
 from shared.redis_client import close_redis
-from shared.storage import get_storage
 from worker.app.cleanup import retention_cleanup
 from worker.app.crm_push_dispatch import crm_push_dispatch
 from worker.app.crm_push_recovery import crm_push_recovery_scan
 from worker.app.crm_status_dispatch import crm_status_dispatch
-from worker.app.forward_dispatch import forward_dispatch
-from worker.app.mailbox_alert_dispatch import mailbox_alert_dispatch
-from worker.app.push_notify_dispatch import push_notify_dispatch
 from worker.app.sync_cycle import force_sync_dispatch, sync_cycle
-from worker.app.tg_notify_dispatch import tg_notify_dispatch
-from worker.app.tg_notify_recovery import tg_notify_recovery_scan
-from worker.app.webhook_dispatch import webhook_dispatch
-from worker.app.webhook_recovery import webhook_recovery_scan
 
 log = get_logger(__name__)
 
@@ -97,90 +96,6 @@ async def _safe_cleanup() -> None:
         )
 
 
-async def _safe_tg_notify_dispatch() -> None:
-    """Wrapper for the Telegram notification dispatcher (ADR-0022 §2.4)."""
-    try:
-        await tg_notify_dispatch()
-    except Exception as exc:
-        log.error(
-            "tg_notify_dispatch_unhandled",
-            detail=str(exc)[:300],
-            exc_info=True,
-        )
-
-
-async def _safe_tg_notify_recovery() -> None:
-    """Wrapper for the Telegram notification recovery scan (ADR-0022 §2.8)."""
-    try:
-        await tg_notify_recovery_scan()
-    except Exception as exc:
-        log.error(
-            "tg_notify_recovery_unhandled",
-            detail=str(exc)[:300],
-            exc_info=True,
-        )
-
-
-async def _safe_push_notify_dispatch() -> None:
-    """Wrapper for the push-only per-team bot dispatcher (ADR-0027 §3)."""
-    try:
-        await push_notify_dispatch()
-    except Exception as exc:
-        log.error(
-            "push_notify_dispatch_unhandled",
-            detail=str(exc)[:300],
-            exc_info=True,
-        )
-
-
-async def _safe_mailbox_alert_dispatch() -> None:
-    """Wrapper for the mailbox-down Telegram alert dispatcher (ADR-0033 §4)."""
-    try:
-        await mailbox_alert_dispatch()
-    except Exception as exc:
-        log.error(
-            "mailbox_alert_dispatch_unhandled",
-            detail=str(exc)[:300],
-            exc_info=True,
-        )
-
-
-async def _safe_webhook_dispatch() -> None:
-    """Wrapper for the outbound-webhook dispatcher (ADR-0023 §3.3)."""
-    try:
-        await webhook_dispatch()
-    except Exception as exc:
-        log.error(
-            "webhook_dispatch_unhandled",
-            detail=str(exc)[:300],
-            exc_info=True,
-        )
-
-
-async def _safe_webhook_recovery() -> None:
-    """Wrapper for the outbound-webhook recovery scan (ADR-0023 §3.5)."""
-    try:
-        await webhook_recovery_scan()
-    except Exception as exc:
-        log.error(
-            "webhook_recovery_unhandled",
-            detail=str(exc)[:300],
-            exc_info=True,
-        )
-
-
-async def _safe_forward_dispatch() -> None:
-    """Wrapper for the mail-forwarding dispatcher (ADR-0034 §3.3)."""
-    try:
-        await forward_dispatch()
-    except Exception as exc:
-        log.error(
-            "forward_dispatch_unhandled",
-            detail=str(exc)[:300],
-            exc_info=True,
-        )
-
-
 async def _safe_crm_push_dispatch() -> None:
     """Wrapper for the CRM ingest-push dispatcher (ADR-0043 §2)."""
     try:
@@ -217,21 +132,12 @@ async def _safe_crm_status_dispatch() -> None:
         )
 
 
-async def _bootstrap() -> None:
-    """One-time async startup: ensure bucket etc."""
-    try:
-        await get_storage().ensure_bucket()
-    except Exception as exc:
-        log.warning("worker_ensure_bucket_failed", detail=str(exc)[:200])
-
-
 async def main() -> None:
     settings = get_settings()
     configure_logging(level=settings.LOG_LEVEL, service="worker")
     log.info("worker_starting")
 
     init_engine(role="worker")
-    await _bootstrap()
 
     scheduler = AsyncIOScheduler(timezone="UTC")
     # IMPORTANT: do NOT pass ``next_run_time=None`` here. In APScheduler 3.x
@@ -270,79 +176,6 @@ async def main() -> None:
         coalesce=True,
         misfire_grace_time=10,
     )
-    # ADR-0022 §2.4: Telegram notification dispatcher (drains Redis queue).
-    scheduler.add_job(
-        _safe_tg_notify_dispatch,
-        trigger=IntervalTrigger(seconds=settings.TG_NOTIFY_DISPATCH_INTERVAL_SECONDS),
-        id="tg_notify_dispatch",
-        coalesce=True,
-        max_instances=1,
-        misfire_grace_time=30,
-    )
-    # ADR-0022 §2.8: recovery scan (re-enqueues lost notifications).
-    scheduler.add_job(
-        _safe_tg_notify_recovery,
-        trigger=IntervalTrigger(seconds=settings.TG_NOTIFY_RECOVERY_INTERVAL_SECONDS),
-        id="tg_notify_recovery",
-        coalesce=True,
-        max_instances=1,
-        misfire_grace_time=600,
-    )
-    # ADR-0027 §3.3: push-only per-team bot dispatcher (drains Redis queue).
-    # Registered ONLY when the feature is configured (>=1 push bot AND admin
-    # recipients) — no recovery job (fire-and-forget, ADR-0027 §5).
-    if settings.push_team_bots_enabled:
-        scheduler.add_job(
-            _safe_push_notify_dispatch,
-            trigger=IntervalTrigger(seconds=settings.PUSH_NOTIFY_DISPATCH_INTERVAL_SECONDS),
-            id="push_notify_dispatch",
-            coalesce=True,
-            max_instances=1,
-            misfire_grace_time=30,
-        )
-    # ADR-0033 §4: mailbox-down Telegram alert dispatcher (drains Redis queue).
-    # Registered ONLY when the feature is enabled; no recovery job
-    # (fire-and-forget, TD-042).
-    if settings.MAILBOX_DOWN_ALERT_ENABLED:
-        scheduler.add_job(
-            _safe_mailbox_alert_dispatch,
-            trigger=IntervalTrigger(seconds=settings.MAILBOX_ALERT_DISPATCH_INTERVAL_SECONDS),
-            id="mailbox_alert_dispatch",
-            coalesce=True,
-            max_instances=1,
-            misfire_grace_time=30,
-        )
-    # ADR-0023 §3.3: outbound-webhook dispatcher (drains Redis queue).
-    scheduler.add_job(
-        _safe_webhook_dispatch,
-        trigger=IntervalTrigger(seconds=settings.WEBHOOK_DISPATCH_INTERVAL_SECONDS),
-        id="webhook_dispatch",
-        coalesce=True,
-        max_instances=1,
-        misfire_grace_time=30,
-    )
-    # ADR-0023 §3.5: recovery scan (re-enqueues lost webhook deliveries).
-    scheduler.add_job(
-        _safe_webhook_recovery,
-        trigger=IntervalTrigger(seconds=settings.WEBHOOK_RECOVERY_INTERVAL_SECONDS),
-        id="webhook_recovery",
-        coalesce=True,
-        max_instances=1,
-        misfire_grace_time=600,
-    )
-    # ADR-0034 §3.5: mail-forwarding dispatcher (drains Redis queue). Registered
-    # ONLY when the feature is enabled; no recovery job (fire-and-forget,
-    # TD-043).
-    if settings.FORWARDING_ENABLED:
-        scheduler.add_job(
-            _safe_forward_dispatch,
-            trigger=IntervalTrigger(seconds=settings.FORWARD_DISPATCH_INTERVAL_SECONDS),
-            id="forward_dispatch",
-            coalesce=True,
-            max_instances=1,
-            misfire_grace_time=30,
-        )
-
     # ADR-0043 §2: CRM ingest-push dispatcher + recovery scan. Registered ONLY
     # when the CRM push is configured (``CRM_INGEST_URL`` + ``CRM_PUSH_SECRET``)
     # — a pre-cut-over deployment runs unchanged (jobs absent, sync_cycle does
@@ -387,16 +220,8 @@ async def main() -> None:
         sync_interval_minutes=settings.SYNC_INTERVAL_MINUTES,
         force_sync_dispatch_seconds=10,
         max_concurrent_imap=settings.MAX_CONCURRENT_IMAP,
-        tg_notify_dispatch_seconds=settings.TG_NOTIFY_DISPATCH_INTERVAL_SECONDS,
-        tg_notify_recovery_seconds=settings.TG_NOTIFY_RECOVERY_INTERVAL_SECONDS,
-        push_team_bots_enabled=settings.push_team_bots_enabled,
-        mailbox_down_alert_enabled=settings.MAILBOX_DOWN_ALERT_ENABLED,
-        webhook_dispatch_seconds=settings.WEBHOOK_DISPATCH_INTERVAL_SECONDS,
-        webhook_recovery_seconds=settings.WEBHOOK_RECOVERY_INTERVAL_SECONDS,
-        forwarding_enabled=settings.FORWARDING_ENABLED,
         crm_push_enabled=settings.crm_push_enabled,
         crm_status_enabled=settings.crm_status_enabled,
-        telegram_delivery_enabled=settings.TELEGRAM_DELIVERY_ENABLED,
     )
 
     # Optional: kick off one sync immediately on boot, so we don't wait the

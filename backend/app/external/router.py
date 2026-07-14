@@ -1,11 +1,28 @@
-"""External API router (ADR-0029 pull + ADR-0035 reply; ``docs/04-api-contracts.md`` §4d).
+"""External API router — the connector's only machine surface.
+
+ADR-0044 §4 (phase A1): the tags routes (``/api/external/tags*``), the teams
+routes (``/api/external/teams``) and the ``group_id`` filter of
+``GET /messages`` / ``GET /mailboxes`` went away with tags and teams
+(ADR-0043 §4).
+
+(ADR-0029 pull + ADR-0035 reply; ``docs/04-api-contracts.md`` §4d).
 
 ``GET /api/external/messages`` — a B2B partner incrementally pulls ALL system
 messages with a keyset cursor over ``messages.id`` (ADR-0029).
 
-``POST /api/external/messages/{id}/reply`` — the single WRITE endpoint (ADR-0035):
-reply to an existing message with the same key. Narrow surface — no CRUD, no
-arbitrary send, no ``from`` selection (sender = the original's mailbox).
+``POST /api/external/mailboxes/{id}/send`` — the generic send (ADR-0048 §1,
+phase A2.1, ``docs/04-api-contracts.md`` §4f-send): the CRM builds the reply
+(defaults + threading headers) and the aggregator only puts it on the wire from
+mailbox ``{id}``. Gated like the rest of the WRITE section
+(``EXTERNAL_WRITE_ENABLED`` + ``LIMIT_EXTERNAL_WRITE``). Answers
+``{smtp_message_id}`` — no ``sent_id``, and it writes NO ``sent_messages`` row.
+
+``POST /api/external/messages/{id}/reply`` — the LEGACY message-scoped write
+(ADR-0035): reply to an existing message with the same key; sender = the
+original's mailbox. Superseded by the send above and removed in phase A2.2
+(ADR-0048 §3) once the CRM is confirmed on it in production — A2.1 is additive,
+so it (and its ``sent_messages`` writer / ``EXTERNAL_REPLY_ENABLED`` gate) still
+stands.
 
 Auth flow (strict order, ADR-0029 §4 / ADR-0035 §3):
 
@@ -23,9 +40,9 @@ Auth flow (strict order, ADR-0029 §4 / ADR-0035 §3):
    §3 order + reviewer note).
 7. delegate to the service.
 
-Both routes are CSRF-exempt (``backend/app/csrf.py`` — the ``/api/external/``
-prefix) and need no cookie session. The key is NEVER logged (redacted:
-``EXTERNAL_API_KEY`` / ``X-API-Key`` / ``Authorization``).
+No cookie session is involved (ADR-0044 §5 removed the CSRF/session middlewares
+along with the UI — there is nothing left to be exempt from). The key is NEVER
+logged (redacted: ``EXTERNAL_API_KEY`` / ``X-API-Key`` / ``Authorization``).
 """
 
 from __future__ import annotations
@@ -39,7 +56,6 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from pydantic import ValidationError as PydanticValidationError
 
-from backend.app.audit import AuditWriter
 from backend.app.deps import DbSession
 from backend.app.exceptions import ForbiddenError, NotAuthenticatedError, NotFoundError
 from backend.app.external.schemas import (
@@ -56,20 +72,11 @@ from backend.app.external.schemas import (
     ExternalOAuthAuthorizeResponse,
     ExternalReplyRequest,
     ExternalReplyResponse,
-    ExternalTagApplyResponse,
-    ExternalTagCreateRequest,
-    ExternalTagFullDTO,
-    ExternalTagRuleCreateRequest,
-    ExternalTagRuleDTO,
-    ExternalTagsResponse,
-    ExternalTagUpdateRequest,
-    ExternalTeamsResponse,
+    ExternalSendRequest,
+    ExternalSendResponse,
 )
 from backend.app.external.service import ExternalMessagesService
-from backend.app.external.write_service import (
-    ExternalMailboxService,
-    ExternalTagsService,
-)
+from backend.app.external.write_service import ExternalMailboxService
 from backend.app.oauth.crm_ingest import notify_crm_oauth_ingest
 from backend.app.oauth.service import OAuthError, OutlookOAuthService
 from backend.app.rate_limit import (
@@ -167,15 +174,12 @@ async def list_external_messages(
     since_id: int = Query(default=0, ge=0),
     before_id: int | None = Query(default=None),
     limit: int = Query(default=_DEFAULT_LIMIT, ge=1, le=_MAX_LIMIT),
-    # ADR-0039 §3: optional server-side filters, now REPEATABLE and
-    # AND-combinable (the ADR-0037 mutual-exclusion is superseded). FastAPI
-    # parses ``?group_id=1&group_id=2`` into a list; a single value stays BC.
-    # No per-element ``ge`` bound — a missing/foreign/non-canonical id simply
-    # does not appear in the intersection (empty page, not 404 / not 400). The
-    # intersection semantics live in the service (after auth, before any DB
-    # call beyond the canonical resolve).
+    # ADR-0039 §3: optional server-side filter, REPEATABLE. FastAPI parses
+    # ``?mail_account_id=1&mail_account_id=2`` into a list; a single value stays
+    # BC. No per-element ``ge`` bound — a missing/foreign/non-canonical id simply
+    # does not appear in the intersection (empty page, not 404 / not 400).
+    # ADR-0044 §4 (phase A1): the ``group_id`` filter went away with teams.
     mail_account_id: list[int] | None = Query(default=None),
-    group_id: list[int] | None = Query(default=None),
 ) -> ExternalMessagesResponse | ExternalMessagesResponseDesc:
     """Incrementally pull system messages (ADR-0029 forward / ADR-0036 backward).
 
@@ -210,7 +214,6 @@ async def list_external_messages(
         before_id=before_id,
         limit=limit,
         mail_account_ids=mail_account_id,
-        group_ids=group_id,
     )
 
     log.info(
@@ -221,40 +224,8 @@ async def list_external_messages(
         before_id=before_id,
         limit=limit,
         mail_account_id=mail_account_id,
-        group_id=group_id,
         returned=len(result.messages),
     )
-    return result
-
-
-@router.get("/teams", response_model=ExternalTeamsResponse)
-async def list_external_teams(
-    request: Request,
-    db: DbSession,
-) -> ExternalTeamsResponse:
-    """List all system teams for the CRM (ADR-0037 §1).
-
-    Same auth flow as the pull GET (ADR-0029 §4): rate-limit FIRST (shared
-    ``LIMIT_EXTERNAL_API`` budget), then key extract + feature gate +
-    constant-time compare. Read-only, super_admin-visibility, minimal
-    ``id``/``name`` projection. CSRF-exempt via the ``/api/external/`` prefix.
-    """
-    ip = client_ip(request)
-    settings = get_settings()
-
-    # 1. Rate-limit FIRST — before any key work (same budget as the pull GET).
-    runtime_limit = Limit(
-        name=LIMIT_EXTERNAL_API.name,
-        capacity=settings.EXTERNAL_API_RATE_LIMIT_PER_MINUTE,
-        window_seconds=LIMIT_EXTERNAL_API.window_seconds,
-    )
-    await consume(runtime_limit, f"ip:{ip}")
-
-    # 2-4. Auth: key extract + feature gate + constant-time compare (401 opaque).
-    _authenticate(request, ip=ip, settings=settings)
-
-    result = await ExternalMessagesService(db).list_teams()
-    log.info("external_teams", client_ip=ip, returned=len(result.teams))
     return result
 
 
@@ -262,11 +233,9 @@ async def list_external_teams(
 async def list_external_mailboxes(
     request: Request,
     db: DbSession,
-    # ADR-0039 §4: optional filters over the canonical set. ``is_active`` (None =
-    # all) and a REPEATABLE ``group_id`` (union). No per-element ``ge`` — a
-    # foreign id simply narrows to nothing for that team.
+    # ADR-0039 §4: optional filter over the canonical set — ``is_active``
+    # (None = all). ADR-0044 §4 (phase A1): the ``group_id`` filter is gone.
     is_active: bool | None = Query(default=None),
-    group_id: list[int] | None = Query(default=None),
 ) -> ExternalMailboxesResponse:
     """List canonical mailboxes with status for the CRM (ADR-0037 §2 / ADR-0039 §4).
 
@@ -290,14 +259,11 @@ async def list_external_mailboxes(
     # 2-4. Auth: key extract + feature gate + constant-time compare (401 opaque).
     _authenticate(request, ip=ip, settings=settings)
 
-    result = await ExternalMessagesService(db).list_mailboxes(
-        is_active=is_active, group_ids=group_id
-    )
+    result = await ExternalMessagesService(db).list_mailboxes(is_active=is_active)
     log.info(
         "external_mailboxes",
         client_ip=ip,
         is_active=is_active,
-        group_id=group_id,
         returned=len(result.mailboxes),
     )
     return result
@@ -443,26 +409,6 @@ async def _parse_json_body(request: Request, model: type[_BodyT]) -> _BodyT:
         raise RequestValidationError(exc.errors()) from exc
 
 
-# --- Tags: read (under EXTERNAL_API_KEY, no write-gate) ---------------------
-
-
-@router.get("/tags", response_model=ExternalTagsResponse)
-async def list_external_tags(request: Request, db: DbSession) -> ExternalTagsResponse:
-    """List the global tag catalogue (ADR-0040 §4). Read — no write-gate."""
-    ip = client_ip(request)
-    settings = get_settings()
-    runtime_limit = Limit(
-        name=LIMIT_EXTERNAL_API.name,
-        capacity=settings.EXTERNAL_API_RATE_LIMIT_PER_MINUTE,
-        window_seconds=LIMIT_EXTERNAL_API.window_seconds,
-    )
-    await consume(runtime_limit, f"ip:{ip}")
-    _authenticate(request, ip=ip, settings=settings)
-    result = await ExternalTagsService(db).list()
-    log.info("external_tags_list", client_ip=ip, returned=len(result.tags))
-    return result
-
-
 # --- Mailboxes: write ------------------------------------------------------
 
 
@@ -495,7 +441,7 @@ async def external_mailbox_create(request: Request, db: DbSession) -> ExternalMa
 async def external_mailbox_update(
     request: Request, db: DbSession, account_id: int
 ) -> ExternalMailboxDTO:
-    """Update a mailbox: creds / hosts / display_name / group / is_active (ADR-0039 §2)."""
+    """Update a mailbox: creds / hosts / display_name / is_active (ADR-0039 §2)."""
     ip = client_ip(request)
     settings = get_settings()
     await _authorize_write(request, ip=ip, settings=settings)
@@ -515,7 +461,7 @@ async def external_mailbox_update(
 
 @router.delete("/mailboxes/{account_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def external_mailbox_delete(request: Request, db: DbSession, account_id: int) -> Response:
-    """Delete a mailbox (+attachment/MinIO cascade) (ADR-0039 §2)."""
+    """Delete a mailbox (ADR-0039 §2). Its messages go away via the FK CASCADE."""
     ip = client_ip(request)
     settings = get_settings()
     await _authorize_write(request, ip=ip, settings=settings)
@@ -542,93 +488,64 @@ async def external_mailbox_sync(
     return ExternalMailboxSyncResponse(queued=True)
 
 
-# --- Tags: write (global catalogue) ----------------------------------------
+@router.post("/mailboxes/{account_id}/send", response_model=ExternalSendResponse)
+async def external_mailbox_send(
+    request: Request, db: DbSession, account_id: int
+) -> ExternalSendResponse:
+    """Generic SMTP send from mailbox ``{id}`` (ADR-0048 §1, phase A2.1).
 
+    The endpoint the CRM calls to answer a message: the CRM owns the message
+    store, the reply defaults and the threading headers; the aggregator only
+    puts the MIME on the wire. Replaces the message-scoped reply above (removed
+    in phase A2.2, ADR-0048 §3).
 
-@router.post("/tags", response_model=ExternalTagFullDTO, status_code=status.HTTP_201_CREATED)
-async def external_tag_create(request: Request, db: DbSession) -> ExternalTagFullDTO:
-    """Create a global tag (ADR-0040 §4). ``409`` on name clash."""
-    ip = client_ip(request)
-    settings = get_settings()
-    await _authorize_write(request, ip=ip, settings=settings)
-    payload = await _parse_json_body(request, ExternalTagCreateRequest)
-    async with db.begin():
-        dto = await ExternalTagsService(db).create(payload)
-    log.info("external_tag_created", client_ip=ip, tag_id=dto.id)
-    return dto
+    Same auth flow / gate / budget as the rest of the external WRITE section
+    (``_authorize_write``: ``LIMIT_EXTERNAL_WRITE`` rate-limit → ``X-API-Key`` /
+    ``Bearer`` → ``EXTERNAL_WRITE_ENABLED`` → body). This matters more here than
+    for the mailbox CRUD: a generic send can mail ANY recipient from ANY mailbox
+    under the machine key (ADR-0048 §2 — the surface extension is deliberate and
+    is compensated by exactly this gate + the CRM's own JWT/RBAC in front).
 
+    ``account_id`` is a plain ``int`` path param (no ``ge``), so an id < 1
+    resolves to ``404 not_found`` in the service rather than a pre-auth 400 —
+    same precedent as the other write routes. Per ADR-0048 §4 a ``404`` here
+    means **the MAILBOX is unknown** (not "no such message" — there is no message
+    in this contract); the CRM maps it as a catalogue de-sync.
 
-@router.patch("/tags/{tag_id}", response_model=ExternalTagFullDTO)
-async def external_tag_update(request: Request, db: DbSession, tag_id: int) -> ExternalTagFullDTO:
-    """Update a global tag's name / color / match_mode (ADR-0040 §4)."""
-    ip = client_ip(request)
-    settings = get_settings()
-    await _authorize_write(request, ip=ip, settings=settings)
-    payload = await _parse_json_body(request, ExternalTagUpdateRequest)
-    async with db.begin():
-        dto = await ExternalTagsService(db).update(tag_id, payload)
-    log.info("external_tag_updated", client_ip=ip, tag_id=tag_id)
-    return dto
-
-
-@router.delete("/tags/{tag_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def external_tag_delete(request: Request, db: DbSession, tag_id: int) -> Response:
-    """Delete a global tag (ADR-0040 §4). Builtin → ``409 conflict``."""
-    ip = client_ip(request)
-    settings = get_settings()
-    await _authorize_write(request, ip=ip, settings=settings)
-    async with db.begin():
-        await ExternalTagsService(db).delete(tag_id)
-    log.info("external_tag_deleted", client_ip=ip, tag_id=tag_id)
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-
-@router.post(
-    "/tags/{tag_id}/rules",
-    response_model=ExternalTagRuleDTO,
-    status_code=status.HTTP_201_CREATED,
-)
-async def external_tag_add_rule(request: Request, db: DbSession, tag_id: int) -> ExternalTagRuleDTO:
-    """Add a rule to a global tag (ADR-0040 §4)."""
-    ip = client_ip(request)
-    settings = get_settings()
-    await _authorize_write(request, ip=ip, settings=settings)
-    payload = await _parse_json_body(request, ExternalTagRuleCreateRequest)
-    async with db.begin():
-        dto = await ExternalTagsService(db).add_rule(tag_id, payload)
-    log.info("external_tag_rule_added", client_ip=ip, tag_id=tag_id, rule_id=dto.id)
-    return dto
-
-
-@router.delete("/tags/{tag_id}/rules/{rule_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def external_tag_delete_rule(
-    request: Request, db: DbSession, tag_id: int, rule_id: int
-) -> Response:
-    """Delete a rule of a global tag (ADR-0040 §4)."""
-    ip = client_ip(request)
-    settings = get_settings()
-    await _authorize_write(request, ip=ip, settings=settings)
-    async with db.begin():
-        await ExternalTagsService(db).delete_rule(tag_id, rule_id)
-    log.info("external_tag_rule_deleted", client_ip=ip, tag_id=tag_id, rule_id=rule_id)
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-
-@router.post("/tags/{tag_id}/apply-to-existing", response_model=ExternalTagApplyResponse)
-async def external_tag_apply_to_existing(
-    request: Request, db: DbSession, tag_id: int
-) -> ExternalTagApplyResponse:
-    """Apply a global tag's rules to all existing messages (ADR-0040 §4).
-
-    ``422 tag_apply_too_many`` when the corpus exceeds ``APPLY_TO_EXISTING_LIMIT``.
+    Response is ``{smtp_message_id}`` only — no ``sent_id`` (ADR-0048 §1): the
+    aggregator writes NO ``sent_messages`` row on this path, so it has no durable
+    id to hand out; the CRM mints one from its own table.
     """
     ip = client_ip(request)
     settings = get_settings()
     await _authorize_write(request, ip=ip, settings=settings)
+    payload = await _parse_json_body(request, ExternalSendRequest)
+
+    # ``async with db.begin():`` even though nothing is persisted on this path:
+    # the OAuth branch REFRESHES the Outlook access/refresh token inside the send
+    # (``OutlookTokenService.get_valid_access_token`` → ``update_oauth_tokens``),
+    # and ``get_db`` does not commit on teardown — without an explicit
+    # transaction a rotated refresh-token would be rolled back at session close
+    # and the next send would present a spent token. Domain errors (404/409/502)
+    # propagate out of the block → rollback.
     async with db.begin():
-        result = await ExternalTagsService(db).apply_to_existing(tag_id)
-    log.info("external_tag_applied", client_ip=ip, tag_id=tag_id, applied=result.applied_count)
-    return result
+        smtp_message_id = await SendService(db).send_from_mailbox(
+            mail_account_id=account_id,
+            to=payload.to,
+            cc=payload.cc,
+            subject=payload.subject,
+            body_text=payload.body_text,
+            in_reply_to=payload.in_reply_to,
+            refs=payload.refs,
+        )
+
+    log.info(
+        "external_send",
+        client_ip=ip,
+        mailbox_id=account_id,
+        smtp_message_id=smtp_message_id,
+    )
+    return ExternalSendResponse(smtp_message_id=smtp_message_id)
 
 
 # ---------------------------------------------------------------------------
@@ -778,18 +695,10 @@ async def external_oauth_callback(
             email = account.email
             display_name = account.display_name
             is_active = bool(account.is_active)
-            await AuditWriter(db).log(
-                actor_user_id=account.user_id,
-                action="oauth_account_linked",
-                target_user_id=account.user_id,
-                details={
-                    "mail_account_id": mail_account_id,
-                    "email": email,
-                    "scopes": account.oauth_scopes,
-                },
-                ip=ip,
-                user_agent=request.headers.get("user-agent", "")[:256] or None,
-            )
+        # ADR-0044 §4 (phase A3): the ``admin_audit`` write is removed BEFORE the
+        # table drop (§3 lock-step) — the journal is not migrated to the CRM
+        # (ADR-0043 §4); the linkage is still visible in the structured
+        # ``external_oauth_connected`` log line below.
     except OAuthError as exc:
         log.info("external_oauth_exchange_failed", client_ip=ip, code=exc.code)
         return _oauth_error_page()

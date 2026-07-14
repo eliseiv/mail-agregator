@@ -1442,7 +1442,9 @@ DTO `ExternalMailboxDTO{id:int, email:str, display_name:str|null, group_id:int|n
 
 > **Консистентность:** `teams[].id` = `groups.id` = `mailboxes[].group_id`; `mailboxes[].id` = `messages[].mail_account.id`. Трёхуровневый джойн письмо → ящик → команда замыкается на стороне CRM. `ExternalMessageDTO`/`ExternalMailAccountDTO` **не меняются** — `group_id`/`is_active` доступны **только** через `mailboxes`, не в письме (стабильность контракта ADR-0029 §6).
 
-### 4d-reply. `POST /api/external/messages/{id}/reply` (ADR-0035)
+### 4d-reply. `POST /api/external/messages/{id}/reply` (ADR-0035) — ПОД СНЯТИЕ (Фаза A2.2)
+
+> **⚠️ Заменён обобщённым send (§4f-send).** Снимается в Фазе A2.2 ([ADR-0044](./adr/ADR-0044-decommission-runbook.md) §4 / [ADR-0048](./adr/ADR-0048-external-send-contract-and-reply-restore.md) §3), живёт до подтверждённого переключения CRM. **CRM его НЕ зовёт и звать не должна** даже временно: `id` писем CRM после cut-over не совпадают с `id` агрегатора (CRM вставляет своим `BIGSERIAL` через `ON CONFLICT DO NOTHING`) ⇒ риск ответа по чужому письму; плюс ретенция 30 дней и гейт `EXTERNAL_REPLY_ENABLED=false` (`ADR-0048` §5). Ниже — описание действующего (пока живого) эндпоинта.
 
 Источник истины — [ADR-0035](./adr/ADR-0035-external-reply-endpoint.md). **Единственный write** во внешнем API: ответ на **существующее** входящее письмо тем же `X-API-Key`. Не рушит read-only-модель ADR-0029 — узкая поверхность: отвечаем только на письмо, которое партнёр мог получить pull-каналом; отправитель **не выбирается** (= `mail_account` этого письма); нет CRUD/произвольной отправки/выбора `from`.
 
@@ -1533,6 +1535,26 @@ Content-Type: application/json
 Пароли (`password`/`smtp_password`) — только в запросе; в `ExternalMailboxDTO` не возвращаются; redact в логах.
 
 **Коды (все mailboxes-write):** `200`/`201`/`202`/`204` · `400 validation_error` (битое тело) · `401 not_authenticated` (нет/неверный ключ или `EXTERNAL_API_KEY` пуст) · `403 forbidden` (`EXTERNAL_WRITE_ENABLED=false`) · `404 not_found`/`group_not_found` · `409 conflict` (email) · `422 imap_login_failed`/`smtp_login_failed` (сбой IMAP/SMTP-логина или коннекта при `test`/create/update — переиспользуемый `MailAccountService.test`/`accounts/testers.py`) + `422 invalid_host` (SSRF-guard `assert_public_host`) · `429 rate_limited` (`LIMIT_EXTERNAL_WRITE`). **`502 smtp_failed` здесь не возникает** — это код фактической отправки (send-ядро, ADR-0035), не проверки соединения.
+
+### 4f-send. `POST /api/external/mailboxes/{id}/send` (обобщённая SMTP-отправка, ADR-0043 §3 + [ADR-0048](./adr/ADR-0048-external-send-contract-and-reply-restore.md))
+
+> **⚠️ Статус реализации (проверено по коду 2026-07-14): эндпоинт в коде ОТСУТСТВУЕТ** (в `backend/app/external/router.py` его нет), а CRM зовёт именно его (`CRM backend/app/infra/mail_client.py:225`) ⇒ **ответ на письмо из CRM на проде не работает** (`404`). Раздел описывает **нормативный целевой контракт** (реализация — Фаза A2.1, [ADR-0044](./adr/ADR-0044-decommission-runbook.md) §4); долг — [TD-059](./100-known-tech-debt.md).
+
+Заменяет message-scoped reply (§4d-reply, ADR-0035): письма живут в CRM, threading/дефолты формирует CRM, агрегатор — тонкий SMTP-исполнитель.
+
+| | |
+| --- | --- |
+| Метод / путь | `POST /api/external/mailboxes/{id}/send` (`{id}` — `mail_accounts.id`, `int ≥ 1`) |
+| Авторизация | `EXTERNAL_API_KEY` (`X-API-Key` \| `Bearer`) + **`EXTERNAL_WRITE_ENABLED`** (auth-flow ADR-0039 §1) |
+| Rate-limit | `LIMIT_EXTERNAL_WRITE` (60/min per IP) — общий машинный бюджет write-API |
+| Запрос | `{ to: string[], cc?: string[] \| null, subject?: string \| null, body_text: string, in_reply_to?: string, refs?: string }` |
+| **Ответ 200** | **`{ smtp_message_id: string }`** — **`sent_id` НЕТ** ([ADR-0048](./adr/ADR-0048-external-send-contract-and-reply-restore.md) §1: агрегатор не ведёт `sent_messages`; идентификатор отправки выдаёт CRM из своей `mail_sent_messages`) |
+| Семантика | `from` = ящик `{id}` (креды/OAuth-токен оттуда); MIME + SMTP + best-effort IMAP APPEND в «Sent» — реюз `send/service.py::_send_core`; заголовки `In-Reply-To`/`References` пишутся **ровно как переданы** (агрегатор их не сочиняет). **Локальная запись отправленного НЕ делается.** |
+| Валидация (из ADR-0035, не теряется) | каждый адрес `to`+`cc` — валидный e-mail; `to+cc` **≤ 100**; `subject` **≤ 998**; `body_text` непустой после `strip`, **≤ 1 MiB** |
+| Коды | `200` · `400 validation_error` (битое тело) · `401 not_authenticated` · `403 forbidden` (`EXTERNAL_WRITE_ENABLED=false`) · **`404 not_found` = ЯЩИКА `{id}` нет** (не «письма нет» — письма в контракте вовсе нет; CRM маппит это как рассинхрон каталога) · `409 conflict` · `422` (нарушение норм валидации) · **`502 smtp_failed`** (удалённый SMTP отклонил/не ответил) · `429 rate_limited` |
+| Бюджет времени | mail-server-путь: агрегатор идёт на удалённый SMTP; верхняя граница — send-инвариант (`send/service.py:41-52`), клиентский бюджет CRM — их `ADR-053` §1.1 (`MAIL_API_MAILSERVER_TIMEOUT_SEC = 75` / deadline `85`) |
+
+**Расширение поверхности (осознанно):** reply мог слать только с ящика хранимого оригинала, send — с любого ящика любому адресату под машинным ключом. Компенсация: ключ + `EXTERNAL_WRITE_ENABLED` (default `false`) + rate-limit; инициатор — CRM под JWT/RBAC пользователя.
 
 ### 4f-teams. `/api/external/teams` (write — create + guarded delete, ADR-0042)
 
@@ -1798,7 +1820,8 @@ FastAPI автогенерит OpenAPI 3.1. UI:
 | POST | `/api/external/teams` | `EXTERNAL_API_KEY` + `EXTERNAL_WRITE_ENABLED` | exempt | 60/min per IP (`LIMIT_EXTERNAL_WRITE`) | — | **ADR-0042:** создать leaderless-группу `{name}` → `201 {id,name}`; ленивый провижининг из CRM; НЕ идемпотентно, дубль имени НЕ конфликтит (`groups.name` не UNIQUE); owner=`crm-service` |
 | DELETE | `/api/external/teams/{id}` | `EXTERNAL_API_KEY` + `EXTERNAL_WRITE_ENABLED` | exempt | 60/min per IP (`LIMIT_EXTERNAL_WRITE`) | — | **ADR-0042:** guarded-реклейм **пустой** группы → `204`; непустая (ящики/участники/лидер) → `409 conflict`; нет id → `404 not_found` |
 | GET | `/api/external/mailboxes` | `EXTERNAL_API_KEY` (X-API-Key \| Bearer) | exempt | 120/min per IP (`LIMIT_EXTERNAL_API`) | — | **ADR-0037:** список ящиков `{mailboxes:[{id,email,display_name,group_id,is_active}]}` (canonical-дедуп), для дропдауна/счётчиков/маппинга ящик→команда CRM |
-| POST | `/api/external/messages/{id}/reply` | `EXTERNAL_API_KEY` (X-API-Key \| Bearer) + `EXTERNAL_REPLY_ENABLED` | exempt | 30/min per IP (`LIMIT_EXTERNAL_REPLY`) | — | **ADR-0035:** external reply — ответ на существующее письмо; `from`=ящик оригинала (не выбирается), threading по `{id}`; write opt-in (`EXTERNAL_REPLY_ENABLED`, default off) |
+| POST | `/api/external/messages/{id}/reply` | `EXTERNAL_API_KEY` (X-API-Key \| Bearer) + `EXTERNAL_REPLY_ENABLED` | exempt | 30/min per IP (`LIMIT_EXTERNAL_REPLY`) | — | **ADR-0035:** external reply — ответ на существующее письмо; `from`=ящик оригинала (не выбирается), threading по `{id}`; write opt-in (`EXTERNAL_REPLY_ENABLED`, default off). **⚠️ Заменяется обобщённым send (строка ниже) и СНИМАЕТСЯ в Фазе A2.2** ([ADR-0048](./adr/ADR-0048-external-send-contract-and-reply-restore.md) §3). CRM его **не зовёт и звать не должна** (id писем CRM ≠ id агрегатора после cut-over + ретенция 30 дней — `ADR-0048` §5) |
+| POST | `/api/external/mailboxes/{id}/send` | `EXTERNAL_API_KEY` (X-API-Key \| Bearer) + `EXTERNAL_WRITE_ENABLED` | exempt | 60/min per IP (`LIMIT_EXTERNAL_WRITE`) | — | **ADR-0043 §3 + [ADR-0048](./adr/ADR-0048-external-send-contract-and-reply-restore.md):** обобщённая SMTP-отправка от имени ящика `{id}` (reply/forward из CRM). Запрос `{to, cc?, subject?, body_text, in_reply_to?, refs?}` → **`200 {smtp_message_id}`** (без `sent_id`); `404` = ящик не найден; `502 smtp_failed` — SMTP отклонил. **В коде ЕЩЁ НЕ РЕАЛИЗОВАН** (Фаза A2.1) — reply из CRM на проде сломан, [TD-059](./100-known-tech-debt.md) |
 | GET | `/my/integrations` | group_leader \| super_admin | — | — | — | webhook config page (ADR-0023) |
 | GET | `/api/webhooks/me` | group_leader \| super_admin | — | — | — | get webhook config (no secret) |
 | POST | `/api/webhooks/me` | group_leader \| super_admin | yes | 10/h per group | yes | create webhook + one-shot secret reveal |

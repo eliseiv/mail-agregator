@@ -1,24 +1,30 @@
-"""User repository: CRUD + lockout / failed-attempts bookkeeping.
+"""User repository (ADR-0044: technical mailbox-owner table).
 
-Post-ADR-0019: ``is_admin`` is replaced with ``role`` and users gain a
-nullable ``group_id``. A ``display_name`` column is also stored. See
-``docs/03-data-model.md`` table ``users``.
+After the decommission (ADR-0043 §4) ``users`` carries only the ``crm-service``
+technical row: no interactive users, roles or groups. What survives is what the
+kept paths need:
+
+- ``get_by_id`` / ``get_by_username`` — mailbox-owner resolution (external
+  write, ``accounts/service.py``, ``oauth/service.py``);
+- ``get_many_by_ids`` — bulk owner resolution in ``accounts/service.py``;
+- ``create`` — the ``crm-service`` seed (``auth/service.py``).
+
+Removed with the UI / groups / audit: ``get_admin`` (the worker audit writer),
+``list_paged`` / ``list_in_group`` / ``list_user_ids_in_group`` (admin UI,
+``users.group_id``), ``upsert_admin`` (``seed_super_admin``) and the
+login/lockout bookkeeping (``set_password_hash`` / ``reset_password`` /
+``record_login_*``).
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
-from sqlalchemy import case, func, or_, select, text, update
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy import select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from shared.models import ROLE_GROUP_LEADER, ROLE_GROUP_MEMBER, ROLE_SUPER_ADMIN, User
-
-# Sentinel distinguishing "leave ``password_encrypted`` untouched" (e.g. the
-# argon2 re-hash path on login) from "explicitly set it" (including to NULL).
-_UNSET: object = object()
+from shared.models import ROLE_GROUP_MEMBER, User
 
 
 class UsersRepo:
@@ -34,72 +40,6 @@ class UsersRepo:
         stmt = select(User).where(User.username == username.lower())
         return (await self._s.execute(stmt)).scalar_one_or_none()
 
-    async def get_admin(self) -> User | None:
-        """Return the (single) super-admin row, or ``None``."""
-        stmt = select(User).where(User.role == ROLE_SUPER_ADMIN).limit(1)
-        return (await self._s.execute(stmt)).scalar_one_or_none()
-
-    async def list_paged(
-        self,
-        q: str | None,
-        page: int,
-        limit: int,
-        *,
-        group_id: int | None = None,
-        role: str | None = None,
-        in_group_ids: list[int] | None = None,
-    ) -> tuple[list[User], int]:
-        """List users with pagination and optional filters.
-
-        Filters:
-
-        - ``q`` — substring on ``username`` / ``email``.
-        - ``group_id`` — exact match on ``users.group_id``.
-        - ``role`` — exact match on ``users.role``.
-        - ``in_group_ids`` — restrict to users whose ``group_id`` is in
-          this list (used by group leaders to scope their visibility).
-        """
-        # Admin list ordering (FE-FIX round-3 #2):
-        #   1) ungrouped users first   (group_id IS NULL — NULLS FIRST)
-        #   2) within a group, leader before members
-        #   3) stable tiebreak by id
-        role_rank = case(
-            (User.role == ROLE_GROUP_LEADER, 0),
-            else_=1,
-        )
-        stmt = select(User).order_by(
-            User.group_id.asc().nullsfirst(),
-            role_rank,
-            User.id,
-        )
-        count_stmt = select(func.count()).select_from(User)
-        if q:
-            pattern = f"%{q.lower()}%"
-            cond = or_(
-                func.lower(User.username).like(pattern),
-                func.lower(func.coalesce(User.email, "")).like(pattern),
-            )
-            stmt = stmt.where(cond)
-            count_stmt = count_stmt.where(cond)
-        if group_id is not None:
-            stmt = stmt.where(User.group_id == group_id)
-            count_stmt = count_stmt.where(User.group_id == group_id)
-        if role is not None:
-            stmt = stmt.where(User.role == role)
-            count_stmt = count_stmt.where(User.role == role)
-        if in_group_ids is not None:
-            if not in_group_ids:
-                # Empty restriction == nothing visible.
-                return [], 0
-            stmt = stmt.where(User.group_id.in_(in_group_ids))
-            count_stmt = count_stmt.where(User.group_id.in_(in_group_ids))
-        total = (await self._s.execute(count_stmt)).scalar_one()
-        page = max(page, 1)
-        limit = max(min(limit, 200), 1)
-        stmt = stmt.offset((page - 1) * limit).limit(limit)
-        items = list((await self._s.execute(stmt)).scalars().all())
-        return items, int(total)
-
     async def get_many_by_ids(self, ids: list[int]) -> dict[int, User]:
         """Bulk-load users by id; missing ids are simply absent from the dict."""
         if not ids:
@@ -110,21 +50,6 @@ class UsersRepo:
             out[user.id] = user
         return out
 
-    async def list_user_ids_in_group(self, group_id: int) -> list[int]:
-        """All ``users.id`` values whose ``group_id`` matches.
-
-        Returns ``[]`` if no users belong to the group. Used by visibility
-        scope helpers in :class:`backend.app.accounts.service.MailAccountService`
-        and :class:`backend.app.messages.service.MessageService` to compute
-        the set of mail-accounts the caller is allowed to see.
-        """
-        stmt = select(User.id).where(User.group_id == group_id)
-        return [int(row[0]) for row in (await self._s.execute(stmt)).all()]
-
-    async def list_in_group(self, group_id: int) -> list[User]:
-        stmt = select(User).where(User.group_id == group_id).order_by(User.id)
-        return list((await self._s.execute(stmt)).scalars().all())
-
     # --- Writes ------------------------------------------------------------
 
     async def create(
@@ -133,7 +58,6 @@ class UsersRepo:
         username: str,
         email: str | None,
         role: str = ROLE_GROUP_MEMBER,
-        group_id: int | None = None,
         display_name: str | None = None,
         password_hash: str | None = None,
         password_reset_required: bool = True,
@@ -141,21 +65,14 @@ class UsersRepo:
     ) -> User:
         """Insert a new user. Raises :class:`IntegrityError` on username clash.
 
-        Caller is responsible for satisfying the ``users_role_group_invariant``
-        — pre-ADR-0019 callers (auth.seed_super_admin) pass ``role='super_admin'``
-        with ``group_id=None``; admin.create_user passes a concrete group.
-        For the auto-create-leader flow the caller wraps INSERT-user +
-        INSERT-groups + UPDATE-user.group_id in a single transaction with the
-        FK ``DEFERRABLE INITIALLY DEFERRED``, so this method may be called
-        with ``role='group_leader'`` and ``group_id=None``; the trigger
-        validates the invariant at COMMIT time.
+        The only caller after the decommission is ``seed_crm_service_user``
+        (``role='super_admin'``, no password).
         """
         user = User(
             username=username.lower(),
             email=email,
             display_name=display_name,
             role=role,
-            group_id=group_id,
             password_hash=password_hash,
             password_reset_required=password_reset_required,
             password_encrypted=password_encrypted,
@@ -168,86 +85,6 @@ class UsersRepo:
         await self._s.refresh(user)
         return user
 
-    async def upsert_admin(self, *, username: str, password_hash: str) -> tuple[User, str]:
-        """Idempotent super-admin seed.
-
-        Returns the row plus a status string: ``created`` / ``updated`` /
-        ``unchanged``. Used by ``seed_super_admin`` in :mod:`backend.app.auth.service`.
-        """
-        username = username.lower()
-        existing = await self.get_by_username(username)
-        if existing is None:
-            stmt = (
-                pg_insert(User)
-                .values(
-                    username=username,
-                    password_hash=password_hash,
-                    role=ROLE_SUPER_ADMIN,
-                    group_id=None,
-                    password_reset_required=False,
-                    failed_login_attempts=0,
-                    lockout_until=None,
-                )
-                .returning(User)
-            )
-            row = (await self._s.execute(stmt)).scalar_one()
-            return row, "created"
-
-        # Update — sync password & reset lockout state every boot.
-        existing.password_hash = password_hash
-        existing.role = ROLE_SUPER_ADMIN
-        existing.group_id = None
-        existing.password_reset_required = False
-        existing.failed_login_attempts = 0
-        existing.lockout_until = None
-        existing.updated_at = datetime.now(UTC)
-        await self._s.flush()
-        return existing, "updated"
-
-    async def set_password_hash(
-        self,
-        user_id: int,
-        password_hash: str,
-        *,
-        password_encrypted: bytes | None | object = _UNSET,
-    ) -> None:
-        """Persist a new argon2 hash and clear lockout / reset flags.
-
-        ``password_encrypted`` (ADR-0038): when ``_UNSET`` the reversible
-        copy column is left untouched (used by the login argon2 re-hash path,
-        which has no plaintext to re-encrypt). When a ``bytes`` value is
-        passed (admin-set / self-set flows, where the plaintext is known) the
-        reversible copy is written alongside the hash.
-        """
-        values: dict[str, object] = {
-            "password_hash": password_hash,
-            "password_reset_required": False,
-            "failed_login_attempts": 0,
-            "lockout_until": None,
-            "updated_at": datetime.now(UTC),
-        }
-        if password_encrypted is not _UNSET:
-            values["password_encrypted"] = password_encrypted
-        await self._s.execute(update(User).where(User.id == user_id).values(**values))
-
-    async def reset_password(self, user_id: int) -> None:
-        stmt = (
-            update(User)
-            .where(User.id == user_id)
-            .values(
-                password_hash=None,
-                # ADR-0038: a self-set reset drops the reversible copy too, so
-                # the "Password" column reverts to "—" until a password is set
-                # again (by the user or an admin-set reset with ``password``).
-                password_encrypted=None,
-                password_reset_required=True,
-                failed_login_attempts=0,
-                lockout_until=None,
-                updated_at=datetime.now(UTC),
-            )
-        )
-        await self._s.execute(stmt)
-
     async def update_fields(self, user_id: int, **fields: object) -> None:
         if not fields:
             return
@@ -257,49 +94,3 @@ class UsersRepo:
     async def delete(self, user_id: int) -> None:
         stmt = text("DELETE FROM users WHERE id = :id")
         await self._s.execute(stmt, {"id": user_id})
-
-    async def record_login_success(self, user_id: int) -> None:
-        stmt = (
-            update(User)
-            .where(User.id == user_id)
-            .values(
-                failed_login_attempts=0,
-                lockout_until=None,
-                last_login_at=datetime.now(UTC),
-                updated_at=datetime.now(UTC),
-            )
-        )
-        await self._s.execute(stmt)
-
-    async def record_login_failure(
-        self, user_id: int, *, threshold: int, lockout_minutes: int
-    ) -> tuple[int, datetime | None]:
-        """Increment ``failed_login_attempts``; set ``lockout_until`` if over.
-
-        Returns ``(new_attempts, lockout_until)``.
-        """
-        # Atomic increment with conditional lockout via expressions.
-        now = datetime.now(UTC)
-        lockout_at = now + timedelta(minutes=lockout_minutes)
-        stmt = (
-            update(User)
-            .where(User.id == user_id)
-            .values(
-                failed_login_attempts=User.failed_login_attempts + 1,
-                # Top-level ``case(...)`` is the SQL CASE expression; ``func.case``
-                # would call a SQL function literally named ``case`` which doesn't
-                # accept ``else_`` and raises TypeError at execute-time. Bug fix:
-                # without this lockout was never set on brute-force attempts.
-                lockout_until=case(
-                    (
-                        User.failed_login_attempts + 1 >= threshold,
-                        lockout_at,
-                    ),
-                    else_=User.lockout_until,
-                ),
-                updated_at=now,
-            )
-            .returning(User.failed_login_attempts, User.lockout_until)
-        )
-        row = (await self._s.execute(stmt)).one()
-        return int(row[0]), row[1]

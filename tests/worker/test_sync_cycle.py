@@ -1,12 +1,25 @@
-"""Worker tests for sync_cycle:
-- Initial sync (no last_synced_uidnext) calls fetch with the right window.
-- Per-account timeout -> recorded as failure (consecutive_failures += 1).
-- 3 consecutive fails -> auto-disable + admin_audit ``account_auto_disabled``.
-- SSRF guard: private host -> InvalidHostError -> disable.
-- Force_sync via Redis key prioritises account.
+"""Worker tests for sync_cycle (post-decommission, ADR-0044 §4 phase A3).
 
-Source of truth: ``worker/app/sync_cycle.py`` + ``docs/05-modules.md`` sec.14
-+ ADR-0008 + ADR-0013.
+Covered:
+
+- ``_drain_forced_account_ids`` — force-sync markers are drained + deleted.
+- Per-account timeout → TRANSIENT (ADR-0026): ``last_sync_error`` written, the
+  counter NOT bumped, the mailbox NOT disabled — no matter how often it repeats.
+- Decrypt failure → explicit PERMANENT (rule 9): instant disable.
+- Successful sync → idempotent insert (``ON CONFLICT DO NOTHING``): a re-run of
+  the same UID yields 0 new / 1 conflict.
+
+ADR-0044 §4 (phase A3) removed every hook of the dismantled subsystems from the
+cycle — tag-apply, the ``tg_notify`` / ``webhook`` / ``push_notify`` / ``forward``
+enqueues, the MinIO attachment download and the ``admin_audit`` writers. The
+assertions that rode on those (the ``TG_NOTIFY_ALL_MESSAGES`` enqueue gate, the
+``account_auto_disabled`` audit rows) went with them: the OBSERVABLE outcome of
+an auto-disable is now the mailbox state itself (``is_active`` /
+``consecutive_failures`` / ``last_sync_error``), which is exactly what the CRM
+reads over the status channel (ADR-0046 §3 H4). The surviving CRM push enqueue is
+covered by ``test_push_enqueue_sync_cycle.py``.
+
+Source of truth: ``worker/app/sync_cycle.py`` + ADR-0026 + ADR-0043 §2 + ADR-0044 §4.
 """
 
 from __future__ import annotations
@@ -15,11 +28,10 @@ import asyncio
 from typing import Any
 
 import pytest
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from shared.crypto import encrypt_mail_password
-from shared.models import AdminAudit, MailAccount, User
+from shared.models import MailAccount, User
 from worker.app import sync_cycle as sc
 
 pytestmark = pytest.mark.integration  # needs the DB + Redis to be live
@@ -29,7 +41,7 @@ pytestmark = pytest.mark.integration  # needs the DB + Redis to be live
 async def admin_user_with_account(
     db_engine: AsyncEngine,
 ) -> dict[str, Any]:
-    """Pre-seed an admin user + a mail_account row."""
+    """Pre-seed a user + a mail_account row."""
     factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
     async with factory() as ses, ses.begin():
         admin = User(
@@ -84,7 +96,7 @@ class TestSyncOneAccount:
         db_engine: AsyncEngine,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # Make ``asyncio.wait_for`` raise TimeoutError.
+        # Make the IMAP leg outlive the per-account timeout.
         async def _fake_to_thread(*_a: Any, **_k: Any) -> None:
             await asyncio.sleep(10)
 
@@ -126,10 +138,9 @@ class TestSyncOneAccount:
 
         Pre-ADR-0026 three consecutive timeouts auto-disabled the mailbox — exactly
         the over-eager disable the ADR removed. Run the FULL two-phase
-        ``_run_for_accounts`` three times; the account must stay active, the
-        counter must stay 0, and no ``account_auto_disabled`` audit may be written.
-        (Permanent-only threshold disable is covered in
-        test_breaker_repo_adr0026.py.)
+        ``_run_for_accounts`` three times; the account must stay active and the
+        counter must stay 0. (Permanent-only threshold disable is covered in
+        ``test_breaker_repo_adr0026.py``.)
         """
 
         # Deterministically surface a timeout the way a real IMAP stall does:
@@ -159,18 +170,6 @@ class TestSyncOneAccount:
         assert acc2.last_sync_error is not None
         assert "timeout" in acc2.last_sync_error.lower()
 
-        async with factory() as ses:
-            audits = (
-                (
-                    await ses.execute(
-                        select(AdminAudit).where(AdminAudit.action == "account_auto_disabled")
-                    )
-                )
-                .scalars()
-                .all()
-            )
-        assert audits == []  # no auto-disable for transient timeouts
-
     async def test_decrypt_failure_disables_account(
         self,
         admin_user_with_account: dict[str, Any],
@@ -196,23 +195,16 @@ class TestSyncOneAccount:
         async with factory() as ses:
             acc2 = await ses.get(MailAccount, admin_user_with_account["account_id"])
         assert acc2 is not None
+        # ADR-0044 §4: the ``account_auto_disabled`` audit row went away with
+        # ``admin_audit`` — the disable is now observable in the mailbox state
+        # alone, which is what the CRM mirrors (ADR-0046 §3 H4).
         assert acc2.is_active is False  # explicit-permanent => instant disable
         assert acc2.consecutive_failures == 1  # bumped once before disable
         assert acc2.last_sync_error is not None
         assert "decrypt" in acc2.last_sync_error.lower()
-
-        async with factory() as ses:
-            audits = (
-                (
-                    await ses.execute(
-                        select(AdminAudit).where(AdminAudit.action == "account_auto_disabled")
-                    )
-                )
-                .scalars()
-                .all()
-            )
-        assert len(audits) == 1
-        assert audits[0].details["reason"] == "decrypt_fail"
+        # ``disable_and_stamp_alert`` is KEPT (ADR-0044 §4): the idempotency stamp
+        # still lands, only the Telegram alert enqueue is gone (the CRM alerts now).
+        assert acc2.disabled_alert_sent_at is not None
 
     async def test_successful_sync_persists_messages_via_idempotent_insert(
         self,
@@ -220,15 +212,12 @@ class TestSyncOneAccount:
         db_engine: AsyncEngine,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # Build a fake FetchedBox with one message.
+        # Build a fake FetchedBox with one message. ADR-0044 §4: attachments are
+        # neither fetched nor stored any more — the box carries none.
         from datetime import UTC
         from datetime import datetime as _dt
 
-        from worker.app.imap_fetcher import (
-            FetchedAttachment,
-            FetchedBox,
-            FetchedMessage,
-        )
+        from worker.app.imap_fetcher import FetchedBox, FetchedMessage
 
         fetched_box = FetchedBox(
             uidvalidity=42,
@@ -250,14 +239,7 @@ class TestSyncOneAccount:
                     in_reply_to=None,
                     refs_header=None,
                     x_forwarded_by=None,
-                    attachments=[
-                        FetchedAttachment(
-                            filename="a.txt",
-                            content_type="text/plain",
-                            size_bytes=5,
-                            payload=b"abcde",
-                        )
-                    ],
+                    attachments=[],
                 )
             ],
         )
@@ -297,187 +279,3 @@ class TestSyncOneAccount:
         )
         assert res2.new_count == 0
         assert res2.conflict_count == 1
-
-
-def _single_message_box(uid: int) -> Any:
-    """Build a FetchedBox carrying exactly one message (no attachments)."""
-    from datetime import UTC
-    from datetime import datetime as _dt
-
-    from worker.app.imap_fetcher import FetchedBox, FetchedMessage
-
-    return FetchedBox(
-        uidvalidity=7,
-        uidnext=uid + 1,
-        new_messages=[
-            FetchedMessage(
-                uid=uid,
-                message_id_header=f"<{uid}@x>",
-                from_addr="x@y.com",
-                from_name="X",
-                to_addrs="sync@example.com",
-                cc_addrs=None,
-                subject="hello",
-                internal_date=_dt.now(UTC),
-                body_text="hi",
-                body_html=None,
-                body_truncated=False,
-                body_present=True,
-                in_reply_to=None,
-                refs_header=None,
-                x_forwarded_by=None,
-                attachments=[],
-            )
-        ],
-    )
-
-
-class TestNotifyAllMessagesGate:
-    """ADR-0022 §2.1 (round-31): TG_NOTIFY_ALL_MESSAGES gates enqueue.
-
-    - flag=true:  enqueue EVERY inserted message even if 0 tags applied.
-    - flag=false: enqueue only messages that received >=1 tag.
-
-    We mock ``TagsService.apply_tags_to_message`` to return a fixed count, and
-    capture the message_ids passed to
-    ``TelegramNotifyService.enqueue_message_ids``.
-    """
-
-    def _patch_common(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        *,
-        applied: int,
-        uid: int,
-    ) -> list[list[int]]:
-        """Patch fetch + tag-apply + enqueue capture. Returns the captured-arg list."""
-
-        async def _fake_to_thread(_func: Any, *_a: Any, **_k: Any) -> Any:
-            return _single_message_box(uid)
-
-        monkeypatch.setattr(asyncio, "to_thread", _fake_to_thread)
-
-        async def _fake_apply(self: Any, *, message: Any, mail_account_id: int) -> int:
-            return applied
-
-        from backend.app.tags.service import TagsService
-
-        monkeypatch.setattr(TagsService, "apply_tags_to_message", _fake_apply)
-
-        captured: list[list[int]] = []
-
-        async def _fake_enqueue(self: Any, message_ids: list[int]) -> int:
-            captured.append(list(message_ids))
-            return len(message_ids)
-
-        from backend.app.telegram.notify_service import TelegramNotifyService
-
-        monkeypatch.setattr(TelegramNotifyService, "enqueue_message_ids", _fake_enqueue)
-
-        # Also stub the webhook enqueue so it doesn't touch Redis / fail.
-        from backend.app.webhooks.dispatch_service import WebhookDispatchService
-
-        async def _fake_wh_enqueue(self: Any, message_ids: list[int]) -> int:
-            return len(message_ids)
-
-        monkeypatch.setattr(WebhookDispatchService, "enqueue_message_ids", _fake_wh_enqueue)
-
-        return captured
-
-    async def test_flag_on_enqueues_even_with_zero_tags_applied(
-        self,
-        admin_user_with_account: dict[str, Any],
-        db_engine: AsyncEngine,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        from shared.config import get_settings
-
-        monkeypatch.setenv("TG_NOTIFY_ALL_MESSAGES", "true")
-        get_settings.cache_clear()
-        assert get_settings().TG_NOTIFY_ALL_MESSAGES is True
-
-        captured = self._patch_common(monkeypatch, applied=0, uid=160001)
-
-        factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
-        async with factory() as ses:
-            acc = await ses.get(MailAccount, admin_user_with_account["account_id"])
-        assert acc is not None
-
-        # ADR-0026: sync_one_account returns an _AccountResult (not a tuple).
-        result = await sc.sync_one_account(
-            acc,
-            timeout_seconds=10,
-            initial_sync_days=30,
-            max_body_bytes=1024,
-            max_att_bytes=1024,
-        )
-        assert result.new_count == 1
-        # Even though 0 tags were applied, the message was enqueued.
-        assert captured, "enqueue_message_ids was never called"
-        flat = [mid for batch in captured for mid in batch]
-        assert len(flat) == 1
-        get_settings.cache_clear()
-
-    async def test_flag_off_skips_enqueue_when_zero_tags_applied(
-        self,
-        admin_user_with_account: dict[str, Any],
-        db_engine: AsyncEngine,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        from shared.config import get_settings
-
-        monkeypatch.setenv("TG_NOTIFY_ALL_MESSAGES", "false")
-        get_settings.cache_clear()
-        assert get_settings().TG_NOTIFY_ALL_MESSAGES is False
-
-        captured = self._patch_common(monkeypatch, applied=0, uid=160002)
-
-        factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
-        async with factory() as ses:
-            acc = await ses.get(MailAccount, admin_user_with_account["account_id"])
-        assert acc is not None
-
-        # ADR-0026: sync_one_account returns an _AccountResult (not a tuple).
-        result = await sc.sync_one_account(
-            acc,
-            timeout_seconds=10,
-            initial_sync_days=30,
-            max_body_bytes=1024,
-            max_att_bytes=1024,
-        )
-        assert result.new_count == 1
-        # 0 tags + flag off → no enqueue at all.
-        flat = [mid for batch in captured for mid in batch]
-        assert flat == [], f"flag-off must not enqueue untagged messages, got {flat}"
-        get_settings.cache_clear()
-
-    async def test_flag_off_enqueues_when_tags_applied(
-        self,
-        admin_user_with_account: dict[str, Any],
-        db_engine: AsyncEngine,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        from shared.config import get_settings
-
-        monkeypatch.setenv("TG_NOTIFY_ALL_MESSAGES", "false")
-        get_settings.cache_clear()
-
-        captured = self._patch_common(monkeypatch, applied=2, uid=160003)
-
-        factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
-        async with factory() as ses:
-            acc = await ses.get(MailAccount, admin_user_with_account["account_id"])
-        assert acc is not None
-
-        # ADR-0026: sync_one_account returns an _AccountResult (not a tuple).
-        result = await sc.sync_one_account(
-            acc,
-            timeout_seconds=10,
-            initial_sync_days=30,
-            max_body_bytes=1024,
-            max_att_bytes=1024,
-        )
-        assert result.new_count == 1
-        flat = [mid for batch in captured for mid in batch]
-        assert len(flat) == 1, "flag-off with applied>0 must enqueue the message"
-        get_settings.cache_clear()

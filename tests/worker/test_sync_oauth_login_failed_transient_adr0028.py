@@ -6,12 +6,12 @@ refresh, receives an IMAP ``LOGIN failed.`` flake. Asserts the end-to-end
 ADR-0028 contract:
 
 * oauth_outlook + IMAP "login failed" -> ``outcome == "transient"``;
-  ``consecutive_failures`` is NOT bumped; ``is_active`` stays ``True``; NO
-  ``account_auto_disabled`` audit row is written (instant-disable excluded by
-  construction — transient + ``explicit_permanent=False``).
+  ``consecutive_failures`` is NOT bumped; ``is_active`` stays ``True`` (the
+  instant-disable is excluded by construction — transient +
+  ``explicit_permanent=False``).
 * REGRESSION: a ``password`` account with the same IMAP "login failed" is an
-  explicit-permanent instant-disable (``is_active=False`` after one cycle, an
-  ``account_auto_disabled`` audit with ``reason='auth_failed'``).
+  explicit-permanent instant-disable (``is_active=False`` after one cycle, the
+  ``auth_failed:`` prefix in ``last_sync_error``).
 * Kill-switch: ``SYNC_OAUTH_LOGIN_FAILED_TRANSIENT=False`` reverts the oauth
   account to the legacy permanent instant-disable.
 * Suppress: an oauth flake with a FRESH ``last_synced_at`` (< suppress window)
@@ -22,6 +22,13 @@ The OAuth refresh (``OutlookTokenService.get_valid_access_token``) is mocked to
 return a token (simulating a SUCCESSFUL refresh — the ADR invariant: the token
 that reaches IMAP is valid). ``asyncio.to_thread`` is mocked so ``fetch_blocking``
 raises the IMAP ``LOGIN failed.`` flake. No real network.
+
+ADR-0044 §4 (phase A3): ``admin_audit`` is decommissioned, so the disable/no-disable
+verdict is asserted on the mailbox row itself (``is_active`` /
+``consecutive_failures`` / ``last_sync_error`` + the ADR-0033 ``disabled_alert_sent_at``
+stamp still written by ``disable_and_stamp_alert``) — the same columns the CRM status
+channel mirrors (ADR-0046 §3 H4). The ``reason`` that used to live in the audit row's
+JSONB is observable as the ``auth_failed:`` prefix of ``last_sync_error``.
 
 Needs a real Postgres (docker-compose.test.yml); reuses the worker package's
 autouse DB/Redis/MinIO truncation fixtures.
@@ -35,11 +42,10 @@ import imaplib
 from typing import Any
 
 import pytest
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from shared.crypto import encrypt_mail_password
-from shared.models import AdminAudit, MailAccount, User
+from shared.models import MailAccount, User
 from worker.app import sync_cycle as sc
 
 pytestmark = pytest.mark.integration  # needs the DB + Redis to be live
@@ -131,21 +137,6 @@ async def _reload(db_engine: AsyncEngine, account_id: int) -> MailAccount:
     return acc
 
 
-async def _auto_disabled_audits(db_engine: AsyncEngine) -> list[AdminAudit]:
-    factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
-    async with factory() as ses:
-        rows = (
-            (
-                await ses.execute(
-                    select(AdminAudit).where(AdminAudit.action == "account_auto_disabled")
-                )
-            )
-            .scalars()
-            .all()
-        )
-    return list(rows)
-
-
 def _patch_imap_login_failed(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make ``fetch_blocking`` (via ``asyncio.to_thread``) raise the IMAP flake.
 
@@ -182,7 +173,7 @@ def _patch_oauth_token_ok(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _force_kill_switch(monkeypatch: pytest.MonkeyPatch, *, enabled: bool) -> None:
     """Force SYNC_OAUTH_LOGIN_FAILED_TRANSIENT inside sync_cycle only (the rest
-    of settings — used by repos/audit — stays the real value)."""
+    of settings — used by the repos — stays the real value)."""
     real = sc.get_settings()
 
     class _S:
@@ -202,8 +193,8 @@ class TestOAuthLoginFailedTransient:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """oauth_outlook + IMAP login failed -> transient; counter untouched;
-        account stays active; NO auto-disable audit. Runs the FULL two-phase
-        cycle (single account, breaker not engaged)."""
+        account stays active (never disabled). Runs the FULL two-phase cycle
+        (single account, breaker not engaged)."""
         _patch_oauth_token_ok(monkeypatch)
         _patch_imap_login_failed(monkeypatch)
         account_id = oauth_account["account_id"]
@@ -227,7 +218,8 @@ class TestOAuthLoginFailedTransient:
         assert row.last_sync_error is not None
         # Calm ``network`` prefix, NOT the scary ``auth_failed`` (rule 7b).
         assert row.last_sync_error.startswith("network:")
-        assert await _auto_disabled_audits(db_engine) == []
+        # Never disabled => the ADR-0033 disable stamp was never written.
+        assert row.disabled_alert_sent_at is None
 
     async def test_oauth_login_failed_repeated_never_disables(
         self,
@@ -248,7 +240,7 @@ class TestOAuthLoginFailedTransient:
         row = await _reload(db_engine, account_id)
         assert row.is_active is True
         assert row.consecutive_failures == 0
-        assert await _auto_disabled_audits(db_engine) == []
+        assert row.disabled_alert_sent_at is None
 
     async def test_oauth_login_failed_suppressed_when_fresh(
         self,
@@ -303,10 +295,9 @@ class TestOAuthLoginFailedTransient:
         row = await _reload(db_engine, account_id)
         assert row.is_active is False  # legacy permanent instant-disable
         assert row.last_sync_error is not None
+        # The disable reason (ex-audit ``details.reason``) is the error prefix.
         assert row.last_sync_error.startswith("auth_failed:")
-        audits = await _auto_disabled_audits(db_engine)
-        assert len(audits) == 1
-        assert audits[0].details["reason"] == "auth_failed"
+        assert row.disabled_alert_sent_at is not None
 
 
 class TestPasswordLoginFailedRegression:
@@ -317,8 +308,8 @@ class TestPasswordLoginFailedRegression:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """REGRESSION: a password account with IMAP login failed is an explicit
-        permanent (rule 8) -> instant disable + ``auth_failed`` audit. ADR-0028
-        leaves the password path completely unchanged."""
+        permanent (rule 8) -> instant disable with the ``auth_failed:`` reason.
+        ADR-0028 leaves the password path completely unchanged."""
         _patch_imap_login_failed(monkeypatch)
         account_id = password_account["account_id"]
 
@@ -330,6 +321,4 @@ class TestPasswordLoginFailedRegression:
         assert row.consecutive_failures == 1  # bumped once before disable
         assert row.last_sync_error is not None
         assert row.last_sync_error.startswith("auth_failed:")
-        audits = await _auto_disabled_audits(db_engine)
-        assert len(audits) == 1
-        assert audits[0].details["reason"] == "auth_failed"
+        assert row.disabled_alert_sent_at is not None

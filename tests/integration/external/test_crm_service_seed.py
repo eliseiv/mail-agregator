@@ -1,33 +1,31 @@
 """``crm-service`` technical user seed (ADR-0039 §Q-0039-1).
 
-The owner of all externally-created mailboxes. Invariants asserted here against
-real Postgres:
+The owner of all mailboxes. Invariants asserted here against real Postgres:
 
 - ``seed_crm_service_user`` is idempotent (``created`` → ``unchanged``);
 - a concurrent double-seed (two workers booting together) is race-safe: the
   loser's ``IntegrityError`` is caught inside its SAVEPOINT and never breaks the
   shared lifespan transaction — exactly one row ends up present;
-- ``crm-service`` is a ``super_admin`` with ``group_id IS NULL`` and NO login
-  password;
-- it NEVER resolves as a notification recipient — it has no ``telegram_links``
-  row and the recipient SQL INNER-JOINs ``telegram_links`` (so a super_admin
-  with no link is filtered out), verified via ``list_recipients_for_message``.
+- ``crm-service`` is a ``super_admin`` with NO login password.
+
+ADR-0044 §1/§4: ``users`` survives as a TECHNICAL table carrying exactly this one row
+(``mail_accounts.user_id`` is a NOT NULL FK with ``ON DELETE CASCADE``, so it cannot be
+dropped). The "never a Telegram notification recipient" case went away with Telegram
+(``telegram_links`` / ``telegram_notifications`` are decommissioned — there is nothing
+left to be a recipient of), and ``users.group_id`` left the ORM mapping ahead of its
+DDL drop (ADR-0044 §3 lock-step).
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
-from typing import Any
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from backend.app.auth.service import CRM_SERVICE_USERNAME, seed_crm_service_user
-from backend.app.repositories.telegram_notifications import TelegramNotificationsRepo
-from shared.models import TelegramLink, User
+from shared.models import User
 
 pytestmark = pytest.mark.integration
 
@@ -66,7 +64,6 @@ class TestSeedIdempotency:
                 await ses.execute(select(User).where(User.username == CRM_SERVICE_USERNAME))
             ).scalar_one()
         assert u.role == "super_admin"
-        assert u.group_id is None
         assert u.password_hash is None, "crm-service has no interactive login password"
 
 
@@ -82,52 +79,3 @@ class TestConcurrentSeed:
         assert all(not isinstance(r, BaseException) for r in results), results
         assert "created" in results
         assert await _count_crm(db_engine) == 1
-
-
-class TestNotARecipient:
-    async def test_crm_service_never_a_notification_recipient(
-        self,
-        client: Any,  # app lifespan seeds super_admin + crm-service
-        db_engine: AsyncEngine,
-        super_admin: User,
-        crm_service_user: User,
-        make_mail_account: Callable[..., Any],
-        make_message: Callable[..., Any],
-    ) -> None:
-        """A message visible to both super_admins: only the one with a live
-        ``telegram_links`` row (the real super_admin) resolves; ``crm-service``
-        (no link) is filtered out by the recipient SQL's INNER JOIN."""
-        # Real super_admin gets a live Telegram link created in the past so the
-        # ``m.internal_date >= tl.created_at`` guard admits the message.
-        past = datetime.now(UTC) - timedelta(hours=1)
-        factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
-        async with factory() as ses, ses.begin():
-            ses.add(
-                TelegramLink(
-                    telegram_user_id=555001,
-                    user_id=super_admin.id,
-                    created_at=past,
-                    dead_at=None,
-                )
-            )
-
-        acc = await make_mail_account(super_admin.id, "crm-recip@example.com")
-        msg = await make_message(acc.id, uid=1, internal_date=datetime.now(UTC))
-
-        factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
-        async with factory() as ses:
-            recipients = await TelegramNotificationsRepo(ses).list_recipients_for_message(
-                message_id=msg.id
-            )
-        recipient_ids = {r.user_id for r in recipients}
-        assert super_admin.id in recipient_ids, "the linked super_admin must resolve"
-        assert crm_service_user.id not in recipient_ids, "crm-service must never be a recipient"
-        # Confirm crm-service genuinely has no telegram_links row.
-        async with factory() as ses:
-            n = (
-                await ses.execute(
-                    text("SELECT count(*) FROM telegram_links WHERE user_id = :u"),
-                    {"u": crm_service_user.id},
-                )
-            ).scalar_one()
-        assert n == 0

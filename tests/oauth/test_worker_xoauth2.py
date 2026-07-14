@@ -113,7 +113,6 @@ class TestSyncOneAccountOAuth:
             await repo.insert_oauth_account_with_id(
                 account_id=acc_id,
                 user_id=u.id,
-                group_id=None,
                 email="box@outlook.com",
                 oauth_provider="outlook",
                 oauth_refresh_token_encrypted=cipher.encrypt("RT", acc_id),
@@ -155,14 +154,15 @@ class TestSyncOneAccountOAuth:
             "backend.app.oauth.service.OutlookTokenService.get_valid_access_token", _tok
         )
 
-        new, conflicts = await sc.sync_one_account(
+        # ADR-0026: ``sync_one_account`` returns an ``_AccountResult`` (not a tuple).
+        result = await sc.sync_one_account(
             acc,
             timeout_seconds=30,
             initial_sync_days=30,
             max_body_bytes=1_000_000,
             max_att_bytes=1_000_000,
         )
-        assert (new, conflicts) == (0, 0)
+        assert (result.new_count, result.conflict_count) == (0, 0)
         assert captured["access_token"] == "AT-worker"
         assert captured["password"] is None
 
@@ -182,14 +182,14 @@ class TestSyncOneAccountOAuth:
 
         monkeypatch.setattr(sc, "fetch_blocking", _fake_fetch)
 
-        new, conflicts = await sc.sync_one_account(
+        result = await sc.sync_one_account(
             acc,
             timeout_seconds=30,
             initial_sync_days=30,
             max_body_bytes=1_000_000,
             max_att_bytes=1_000_000,
         )
-        assert (new, conflicts) == (0, 0)
+        assert (result.new_count, result.conflict_count) == (0, 0)
         assert called["fetch"] == 0  # never connected
         async with make_session() as s:
             after = await MailAccountsRepo(s).get_by_id(acc_id)

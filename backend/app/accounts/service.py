@@ -1,9 +1,10 @@
 """MailAccountService — CRUD + test-login + force-sync marker.
 
-Post-ADR-0019: visibility is governed by :class:`VisibilityScope`. The
-caller's user_id is no longer the only key — group leaders / members
-share the same view of every member's mailboxes (ADR-0019 §7.1) and a
-super-admin sees all.
+Reused by the external write API (``backend/app/external/write_service.py``)
+— the ONLY caller left after the decommission (ADR-0044 §4, phase A3). The
+scope is always the synthetic ``crm-service`` super_admin; team-based
+visibility, the ``admin_audit`` writer and the MinIO attachment cascade went
+away with ``groups`` / ``admin_audit`` / MinIO (ADR-0043 §4).
 """
 
 from __future__ import annotations
@@ -31,13 +32,11 @@ from backend.app.accounts.testers import (
     smtp_test_login,
     smtp_test_oauth,
 )
-from backend.app.audit import AuditWriter
 from backend.app.crm_push.service import enqueue_crm_status_best_effort
 from backend.app.deps import VisibilityScope
 from backend.app.exceptions import (
     ConflictError,
     ForbiddenError,
-    GroupNotFoundError,
     IMAPLoginFailedError,
     NotFoundError,
     OAuthReconsentRequiredError,
@@ -45,9 +44,7 @@ from backend.app.exceptions import (
     ValidationError,
 )
 from backend.app.oauth.service import OAuthRefreshInvalidError, OutlookTokenService
-from backend.app.repositories.groups import GroupsRepo
 from backend.app.repositories.mail_accounts import MailAccountsRepo
-from backend.app.repositories.messages import MessagesRepo
 from backend.app.repositories.users import UsersRepo
 from shared.config import get_settings
 from shared.crypto import decrypt_mail_password, encrypt_mail_password
@@ -55,7 +52,6 @@ from shared.logging import get_logger
 from shared.models import MailAccount, User
 from shared.redis_client import get_redis
 from shared.session_guards import SessionGuard, register_session_guard
-from shared.storage import get_storage
 
 log = get_logger(__name__)
 
@@ -150,11 +146,7 @@ class MailAccountService:
     def __init__(self, session: AsyncSession) -> None:
         self._db = session
         self._repo = MailAccountsRepo(session)
-        self._messages = MessagesRepo(session)
         self._users = UsersRepo(session)
-        self._groups = GroupsRepo(session)
-        self._audit = AuditWriter(session)
-        self._storage = get_storage()
         # ADR-0046 §2 — mailbox-status hooks (H5 creds re-enable / H6 set_active)
         # are DEFERRED here and fired by the router AFTER the request
         # transaction commits (see :meth:`flush_crm_status_events`). This
@@ -262,85 +254,24 @@ class MailAccountService:
     # --- Visibility helpers ------------------------------------------------
 
     async def visible_user_ids(self, scope: VisibilityScope) -> list[int] | None:
-        """Compute the set of ``mail_accounts.id`` visible to the caller.
+        """Set of ``mail_accounts.id`` visible to the caller.
 
-        FE-FIX round-10: the filter shifted from per-user to per-account
-        — visibility is determined by ``mail_accounts.group_id`` (with a
-        personal exception for the owner). The legacy method name is
-        preserved to avoid renaming every caller.
+        ADR-0044 §4 (phase A3): team-based visibility went away with
+        ``mail_accounts.group_id``. The only caller left is the synthetic
+        ``crm-service`` super_admin scope (``external/write_service.py``),
+        which sees every mailbox.
 
-        ``None`` = "no scope filter" (super-admin path).
-        ``[]``   = nothing visible.
-        ``[id…]`` = the explicit list of visible ``mail_accounts.id``.
+        ``None`` = "no scope filter" (super-admin path). A non-super_admin scope
+        cannot even be built in the headless connector (there are no sessions),
+        so it is rejected with an explicit 403 instead of silently returning an
+        empty list.
         """
-        if scope.is_super_admin:
-            return None
-        return await self._repo.list_account_ids_visible(
-            group_ids=scope.group_ids, owner_user_id=scope.user_id
-        )
+        if not scope.is_super_admin:
+            raise ForbiddenError("Only the crm-service scope may manage mailboxes")
+        return None
 
     async def _visible_user_ids(self, scope: VisibilityScope) -> list[int] | None:
         return await self.visible_user_ids(scope)
-
-    # --- Reads -------------------------------------------------------------
-
-    async def list_for_scope(
-        self,
-        scope: VisibilityScope,
-        *,
-        status: Literal["all", "active", "inactive"] = "all",
-    ) -> list[MailAccountDTO]:
-        # FE-FIX round-10: visibility now keys off ``mail_accounts.group_id``
-        # (set on insert from the owner's then-current group, never moved
-        # automatically when the owner changes group). Personal accounts
-        # remain visible to their owner via the user_id condition.
-        if scope.is_super_admin:
-            rows = await self._repo.list_all()
-            # Round-18: collapse duplicates by lower(email). Two teams may
-            # add the same mailbox independently — super-admin sees ONE row
-            # per email (canonical = lowest mail_account.id). Team views
-            # are naturally scoped by group_id, so they only see their own.
-            seen: set[str] = set()
-            deduped: list[MailAccount] = []
-            for a in sorted(rows, key=lambda r: r.id):
-                key = a.email.lower()
-                if key in seen:
-                    continue
-                seen.add(key)
-                deduped.append(a)
-            rows = deduped
-        else:
-            rows = await self._repo.list_for_group_or_owner(
-                group_ids=scope.group_ids, owner_user_id=scope.user_id
-            )
-        owner_ids = sorted({a.user_id for a in rows})
-        owner_map = await self._users.get_many_by_ids(owner_ids)
-        dtos = [_to_dto(a, owner_map[a.user_id]) for a in rows if a.user_id in owner_map]
-        # Status filter applied in Python (the visible set is small and
-        # unpaginated). ``all`` → no filter. This mirrors the ``is_active``
-        # indicator already rendered per row.
-        if status == "active":
-            return [d for d in dtos if d.is_active]
-        if status == "inactive":
-            return [d for d in dtos if not d.is_active]
-        return dtos
-
-    async def get_for_scope(self, scope: VisibilityScope, account_id: int) -> MailAccountDTO:
-        if scope.is_super_admin:
-            acc = await self._repo.get_by_id(account_id)
-        else:
-            acc = await self._repo.get_for_group_or_owner(
-                group_ids=scope.group_ids,
-                owner_user_id=scope.user_id,
-                account_id=account_id,
-            )
-        if acc is None:
-            raise NotFoundError()
-        owner = await self._users.get_by_id(acc.user_id)
-        if owner is None:
-            # FK should prevent this; surface 404 to avoid 500.
-            raise NotFoundError()
-        return _to_dto(acc, owner)
 
     # --- Test login --------------------------------------------------------
 
@@ -557,96 +488,22 @@ class MailAccountService:
         scope: VisibilityScope,
         target_user_id: int | None,
     ) -> int:
-        """Apply ADR-0019 §8 rules and return the row's owner user_id."""
-        # group_member: cannot create on someone else.
-        if scope.is_group_member:
-            if target_user_id is not None and target_user_id != scope.user_id:
-                raise ValidationError(
-                    "target_user_id must equal own user_id for group_member",
-                    field="target_user_id",
-                )
-            return scope.user_id
+        """Resolve the row's owner ``user_id``.
 
-        # group_leader: target must be in the same group; default = self.
-        if scope.is_group_leader:
-            if target_user_id is None:
-                return scope.user_id
-            target = await self._users.get_by_id(target_user_id)
-            if target is None:
-                raise NotFoundError()
-            if target.group_id != scope.group_id:
-                raise ForbiddenError("user_not_in_group_scope")
-            return target_user_id
-
-        # super_admin: target must exist (default = self).
-        if scope.is_super_admin:
-            if target_user_id is None:
-                return scope.user_id
-            target = await self._users.get_by_id(target_user_id)
-            if target is None:
-                raise NotFoundError()
-            return target_user_id
-
-        # Defensive — unknown role.
-        raise ForbiddenError()
-
-    async def _validate_target_group(
-        self,
-        scope: VisibilityScope,
-        target_user_id: int,
-        group_id: int | None,
-    ) -> int | None:
-        """Validate the target team for a mailbox (ADR-0031 §4).
-
-        Single source of truth for both create (§2) and transfer (§3). The
-        ``target_user_id`` is the resolved *owner* of the box (already vetted
-        by :meth:`_resolve_target_user_id`); ``group_id`` is the requested
-        team. Returns the validated ``group_id`` (possibly ``None``) on
-        success.
-
-        Raises (never 500):
-
-        - ``ForbiddenError("user_not_in_group_scope")`` — the role may not put
-          a box in this team (or may not detach it to ``NULL``).
-        - ``GroupNotFoundError`` (``code="group_not_found"``) — ``group_id``
-          does not exist.
+        ADR-0044 §4 (phase A3): the role branches (group_leader / group_member)
+        and the target-team validation (``_validate_target_group``, ADR-0031)
+        went away with ``groups`` / ``mail_accounts.group_id``. One live path
+        remains: the synthetic ``crm-service`` super_admin — the default owner
+        is itself; an explicit ``target_user_id`` must exist.
         """
-        # NULL target — personal box. Only super_admin may have one.
-        if group_id is None:
-            if scope.is_super_admin:
-                return None
-            raise ForbiddenError("user_not_in_group_scope")
-
-        # The team must exist before any role-specific authorisation.
-        group = await self._groups.get_by_id(group_id)
-        if group is None:
-            raise GroupNotFoundError()
-
-        if scope.is_super_admin:
-            return group_id
-
-        if scope.is_group_member:
-            # Own teams only, and only on self (defence-in-depth — the owner
-            # resolution already pins ``target_user_id`` to self for members).
-            if target_user_id != scope.user_id or group_id not in scope.group_ids:
-                raise ForbiddenError("user_not_in_group_scope")
-            return group_id
-
-        if scope.is_group_leader:
-            if target_user_id == scope.user_id:
-                # Leader acting on self: any of their own memberships.
-                if group_id not in scope.group_ids:
-                    raise ForbiddenError("user_not_in_group_scope")
-                return group_id
-            # Leader acting on a member of their team: only the team the
-            # leader runs (their home group). Cannot file a member's box into
-            # any other team.
-            if scope.group_id is None or group_id != scope.group_id:
-                raise ForbiddenError("user_not_in_group_scope")
-            return group_id
-
-        # Defensive — unknown role.
-        raise ForbiddenError()
+        if not scope.is_super_admin:
+            raise ForbiddenError("Only the crm-service scope may manage mailboxes")
+        if target_user_id is None:
+            return scope.user_id
+        target = await self._users.get_by_id(target_user_id)
+        if target is None:
+            raise NotFoundError()
+        return target_user_id
 
     async def create(
         self,
@@ -656,39 +513,16 @@ class MailAccountService:
     ) -> MailAccountDTO:
         target_user_id = await self._resolve_target_user_id(scope, payload.target_user_id)
 
-        # Round-18: revert the global guard. Two teams MAY add the same
-        # mailbox independently — each gets its own credentials and its own
-        # ``mail_account.id``. Duplicates are hidden later at read-time by
-        # ``list_for_scope`` / message visibility (super-admin sees the
-        # canonical row per email; teams see only their own).
+        # With a single ``crm-service`` owner ``UNIQUE(user_id, email)`` is
+        # effectively a GLOBAL uniqueness of the address (ADR-0043 §4).
         existing = await self._repo.find_by_user_email(target_user_id, payload.email)
         if existing is not None:
             raise ConflictError("Email already added", field="email")
         await self.test(payload.as_test_request())
 
-        # FE-FIX round-10: bind the new account to a group at insert time.
-        # Subsequent owner-group changes do NOT move the account (see
-        # ``MailAccountsRepo.attach_orphans_to_group`` for the orphan-attach
-        # exception when going from "no group" to a real group via
-        # PATCH /api/admin/users).
         owner = await self._users.get_by_id(target_user_id)
         if owner is None:
             raise NotFoundError()
-
-        # ADR-0031 §2: team selection. ``group_id`` omitted (None) keeps the
-        # pre-ADR-0031 behaviour — the box lands in the owner's home group,
-        # or NULL for a super_admin creating a personal box on themselves.
-        # When supplied, the target team is validated against the initiator's
-        # role via the shared ``_validate_target_group`` (ADR-0031 §4).
-        if payload.group_id is None:
-            if scope.is_super_admin and target_user_id == scope.user_id:
-                owner_group_id: int | None = None
-            else:
-                owner_group_id = owner.group_id
-        else:
-            owner_group_id = await self._validate_target_group(
-                scope, target_user_id, payload.group_id
-            )
 
         new_id = await self._repo.next_account_id()
         encrypted = encrypt_mail_password(payload.password, new_id)
@@ -700,7 +534,6 @@ class MailAccountService:
             acc = await self._repo.insert_with_id(
                 account_id=new_id,
                 user_id=target_user_id,
-                group_id=owner_group_id,
                 email=payload.email,
                 encrypted_password=encrypted,
                 imap_host=payload.imap_host,
@@ -721,49 +554,6 @@ class MailAccountService:
 
     # --- Update ------------------------------------------------------------
 
-    async def _transfer_group(
-        self,
-        scope: VisibilityScope,
-        acc: MailAccount,
-        requested_group_id: int | None,
-    ) -> None:
-        """Move a visible mailbox to another team (ADR-0031 §3/§4).
-
-        ``acc`` is already confirmed visible to the initiator. ``group_member``
-        may never transfer an existing box — even one they can see — so the
-        attempt is rejected before any team lookup. For ``group_leader`` /
-        ``super_admin`` the target team is validated against the box *owner*
-        (``acc.user_id``) by the shared :meth:`_validate_target_group`. The
-        UPDATE + ``mail_account_group_change`` audit row are written only when
-        the team actually changes (a no-op resubmit stays silent).
-        """
-        if scope.is_group_member:
-            # Transfer of an existing box is administratively significant and
-            # off-limits to members (ADR-0031 §4) — they may only pick a team
-            # at create time.
-            raise ForbiddenError("forbidden")
-
-        target_group_id = await self._validate_target_group(scope, acc.user_id, requested_group_id)
-        if target_group_id == acc.group_id:
-            # No-op resubmit (e.g. the form pre-selected the current team):
-            # neither write nor audit.
-            return
-
-        from_group_id = acc.group_id
-        await self._repo.update_group(acc.id, target_group_id)
-        # Keep the in-memory row consistent for any later reads in this call.
-        acc.group_id = target_group_id
-        await self._audit.log(
-            actor_user_id=scope.user_id,
-            action="mail_account_group_change",
-            target_user_id=acc.user_id,
-            details={
-                "mail_account_id": acc.id,
-                "from_group_id": from_group_id,
-                "to_group_id": target_group_id,
-            },
-        )
-
     async def update(
         self,
         *,
@@ -775,14 +565,6 @@ class MailAccountService:
         acc = await self._repo.get_for_user_ids(visible, account_id)
         if acc is None:
             raise NotFoundError()
-
-        # ADR-0031 §3/§4: team transfer is orthogonal to credentials and
-        # applies to password *and* oauth accounts (it never touches hosts /
-        # secrets, so no IMAP/SMTP re-test is required). Handle it up-front so
-        # the early-return oauth branch below also benefits. ``set_group_id``
-        # is the presence sentinel — only act when the field was sent.
-        if payload.set_group_id:
-            await self._transfer_group(scope, acc, payload.group_id)
 
         # ADR-0025 §4c: oauth_outlook accounts have fixed Microsoft host/port
         # and token-based auth — only ``display_name`` may be edited. Any
@@ -985,12 +767,10 @@ class MailAccountService:
         acc = await self._repo.get_for_user_ids(visible, account_id)
         if acc is None:
             raise NotFoundError()
-        keys = await self._messages.select_attachment_keys_for_account(account_id)
+        # ADR-0044 §4 (phase A3 → G): the MinIO attachment-delete cascade is
+        # gone — attachments are neither fetched nor stored (ADR-0043 §4). The
+        # ``messages`` rows go away via the FK CASCADE.
         await self._repo.delete(account_id)
-        if keys:
-            await self._storage.delete_objects(keys)
-        prefix = f"{acc.user_id}/{account_id}/"
-        await self._storage.delete_prefix(prefix)
 
     # --- Force sync marker -------------------------------------------------
 

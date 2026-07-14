@@ -1,6 +1,10 @@
-"""Authentication module: login, logout, set-password, super-admin seed."""
+"""Auth module (ADR-0044 §4, phase A3).
 
-from backend.app.auth.router import router
-from backend.app.auth.service import AuthService, seed_super_admin
+The session ``AuthService`` and the HTML router went away with the cookie UI;
+what is left is the ``crm-service`` technical-user seed used by the API lifespan
+and by the external write path.
+"""
 
-__all__ = ["AuthService", "router", "seed_super_admin"]
+from backend.app.auth.service import CRM_SERVICE_USERNAME, seed_crm_service_user
+
+__all__ = ["CRM_SERVICE_USERNAME", "seed_crm_service_user"]

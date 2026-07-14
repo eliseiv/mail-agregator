@@ -1,7 +1,21 @@
-"""SendService — compose / reply via SMTP, persist, best-effort IMAP append.
+"""SendService — SMTP send, best-effort IMAP append (+ legacy reply persist).
 
-Algorithm follows ``docs/01-architecture.md`` sequence S4 and
-``docs/05-modules.md`` sec. 11.
+ADR-0044 §4 (phase A3): the session ``send`` (HTML form, visibility scope) and
+the forward relay (``smtp_send_via_relay``, ADR-0034) went away with the UI and
+forwarding.
+
+Two send paths co-exist (ADR-0048 §3 — phase A2.1 is ADDITIVE):
+
+- :meth:`SendService.send_from_mailbox` — the generic send behind
+  ``POST /api/external/mailboxes/{id}/send`` (ADR-0048 §1): transport only, **no**
+  ``sent_messages`` write (the durable record lives in the CRM).
+- :meth:`SendService.send_external_reply` — the legacy message-scoped reply
+  (ADR-0035), still persisting ``sent_messages``. It is removed together with
+  that writer in phase A2.2, once the CRM is confirmed on the generic send in
+  production.
+
+Both share one transport (:meth:`SendService._send_transport`) — MIME/SMTP/append
+are not duplicated.
 """
 
 from __future__ import annotations
@@ -9,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import ssl
+from dataclasses import dataclass
 from email.message import EmailMessage
 
 import aiosmtplib
@@ -17,7 +32,6 @@ from imap_tools import MailBoxUnencrypted
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.accounts.testers import build_xoauth2_string
-from backend.app.deps import VisibilityScope
 from backend.app.exceptions import (
     NotFoundError,
     OAuthReconsentRequiredError,
@@ -27,11 +41,9 @@ from backend.app.oauth.service import OutlookTokenService
 from backend.app.repositories.mail_accounts import MailAccountsRepo
 from backend.app.repositories.messages import MessagesRepo
 from backend.app.repositories.sent_messages import SentMessagesRepo
-from backend.app.repositories.users import UsersRepo
 from backend.app.security import assert_public_host_async
 from backend.app.send.mime import build_mime, generate_message_id
-from backend.app.send.schemas import SendMessageRequest, SendMessageResponse
-from shared.config import get_settings
+from backend.app.send.schemas import SendMessageResponse
 from shared.crypto import decrypt_mail_password
 from shared.logging import get_logger
 from shared.models import MailAccount, Message
@@ -49,6 +61,21 @@ log = get_logger(__name__)
 # subclasses) within 20s → mapped to ``SMTPSendFailedError`` below.
 _SMTP_TIMEOUT = 20
 _IMAP_APPEND_TIMEOUT = 30
+
+
+@dataclass(frozen=True, slots=True)
+class _TransportResult:
+    """What the transport leg produced: the wire ``Message-ID`` + append outcome.
+
+    Returned by :meth:`SendService._send_transport` (MIME → SMTP → best-effort
+    IMAP "Sent" append). The generic send (ADR-0048 §1) consumes only
+    ``smtp_message_id``; the legacy reply additionally persists ``appended`` /
+    ``appended_error`` into ``sent_messages``.
+    """
+
+    smtp_message_id: str
+    appended: bool
+    appended_error: str | None
 
 
 def _ssl_context() -> ssl.SSLContext:
@@ -275,77 +302,20 @@ async def smtp_send_message(
         ) from exc
 
 
-async def smtp_send_via_relay(msg: EmailMessage, recipients: list[str]) -> None:
-    """Send a built forward MIME through the service SMTP relay (ADR-0034 §5).
-
-    Used by the forward dispatcher when ``settings.forward_relay_enabled`` —
-    the forward leaves through the operator's relay (``FORWARD_SMTP_*``) instead
-    of the receiving mailbox's own credentials, because many monitoring
-    mailboxes cannot send (Gmail app-password revoked → BadCredentials, AOL
-    drops the connection, Outlook OAuth lacks ``SMTP.Send``). The ``From`` is
-    the relay's ``FORWARD_SMTP_FROM`` and ``Reply-To`` carries the original
-    sender — both already set on ``msg`` by :func:`build_forward_mime`.
-
-    Mirrors the password branch of :func:`smtp_send_message`: SSRF re-check
-    (:func:`assert_public_host_async` on the relay host, off-loop — TD-056),
-    shared TLS context,
-    fail-fast ``_SMTP_TIMEOUT``, and the same error matrix
-    (``SMTPException`` / ``TimeoutError`` / ``OSError`` →
-    :class:`SMTPSendFailedError` with host detail stripped). No Sent-append
-    (forwards never append, ADR-0034 §5).
-    """
-    settings = get_settings()
-    await assert_public_host_async(settings.FORWARD_SMTP_HOST, port=settings.FORWARD_SMTP_PORT)
-    try:
-        await aiosmtplib.send(
-            msg,
-            hostname=settings.FORWARD_SMTP_HOST,
-            port=settings.FORWARD_SMTP_PORT,
-            username=settings.FORWARD_SMTP_USERNAME,
-            password=settings.FORWARD_SMTP_PASSWORD,
-            use_tls=settings.FORWARD_SMTP_SSL,
-            start_tls=settings.FORWARD_SMTP_STARTTLS,
-            tls_context=_ssl_context(),
-            recipients=recipients,
-            timeout=_SMTP_TIMEOUT,
-        )
-    except aiosmtplib.SMTPException as exc:
-        raise SMTPSendFailedError(
-            "SMTP send failed",
-            details={"detail": _safe_error_text(exc)},
-        ) from exc
-    except (TimeoutError, OSError) as exc:
-        raise SMTPSendFailedError(
-            "SMTP send failed",
-            details={"detail": _safe_error_text(exc)},
-        ) from exc
-
-
 class SendService:
     def __init__(self, session: AsyncSession) -> None:
         self._db = session
         self._accounts = MailAccountsRepo(session)
         self._messages = MessagesRepo(session)
         self._sent = SentMessagesRepo(session)
-        self._users = UsersRepo(session)
-
-    async def _visible_user_ids(self, scope: VisibilityScope) -> list[int] | None:
-        """FE-FIX round-10: returns visible ``mail_accounts.id`` (semantic
-        change kept under the legacy method name to avoid renaming callers).
-        """
-        if scope.is_super_admin:
-            return None
-        return await self._accounts.list_account_ids_visible(
-            group_ids=scope.group_ids, owner_user_id=scope.user_id
-        )
 
     @staticmethod
     def _resolve_threading(original: Message) -> tuple[str | None, str | None]:
         """Build ``In-Reply-To`` / ``References`` headers from ``original``.
 
-        Shared by the session ``send`` (in-reply-to path) and the external
-        reply (ADR-0035): both thread a new outgoing message onto an existing
-        one. Returns ``(in_reply_to_header, references_header)`` — both ``None``
+        Used by the external reply (ADR-0035): a new outgoing message is
+        threaded onto an existing one. Returns ``(in_reply_to_header,
+        references_header)`` — both ``None``
         when the original carries no ``Message-ID`` header (nothing to thread
         onto). ``References`` = original ``References`` + original ``Message-ID``
         per RFC 5322.
@@ -358,45 +328,6 @@ class SendService:
         else:
             refs_header = original.message_id_header
         return in_reply_header, refs_header
-
-    async def send(
-        self, *, scope: VisibilityScope, payload: SendMessageRequest
-    ) -> SendMessageResponse:
-        # 1. Visibility: from_account must be reachable by the caller's
-        #    scope (super-admin sees all; group_leader/group_member see
-        #    every member's mailboxes — ADR-0019 §7.1, §8).
-        visible = await self._visible_user_ids(scope)
-        acc = await self._accounts.get_for_user_ids(visible, payload.from_account_id)
-        if acc is None:
-            raise NotFoundError("Mail account not found")
-
-        # 2. Resolve in-reply-to headers if requested (visibility-scoped).
-        in_reply_header: str | None = None
-        refs_header: str | None = None
-        if payload.in_reply_to_message_id is not None:
-            original = await self._messages.get_for_user_ids(
-                message_id=payload.in_reply_to_message_id,
-                mail_account_ids=visible,
-            )
-            if original is None:
-                raise NotFoundError("Original message not found")
-            in_reply_header, refs_header = self._resolve_threading(original)
-
-        # 3-7. Shared send core (MIME → SMTP → IMAP-append → persist). The
-        #      author is the caller (``scope.user_id``) — distinct from the
-        #      mailbox owner so a leader sending from a member's mailbox is
-        #      correctly attributed (ADR-0019 §7.3).
-        return await self._send_core(
-            account=acc,
-            to=payload.to,
-            cc=payload.cc,
-            bcc=payload.bcc,
-            subject=payload.subject,
-            body=payload.body,
-            in_reply_header=in_reply_header,
-            refs_header=refs_header,
-            author_user_id=scope.user_id,
-        )
 
     async def send_external_reply(
         self,
@@ -458,7 +389,63 @@ class SendService:
             author_user_id=from_account.user_id,
         )
 
-    async def _send_core(
+    async def send_from_mailbox(
+        self,
+        *,
+        mail_account_id: int,
+        to: list[str],
+        cc: list[str] | None,
+        subject: str | None,
+        body_text: str,
+        in_reply_to: str | None,
+        refs: str | None,
+    ) -> str:
+        """Generic send from mailbox ``{id}`` (ADR-0048 §1, phase A2.1).
+
+        The CRM owns the message store, the reply defaults and the threading
+        headers; the aggregator is a thin SMTP executor: resolve the mailbox →
+        reuse the transport (MIME → SMTP → best-effort IMAP "Sent" append) →
+        return the ``Message-ID`` it put on the wire.
+
+        **No ``sent_messages`` write** (ADR-0048 §1/§3 A2.1): the durable record
+        of the send lives in the CRM (``mail_sent_messages``), so this path never
+        touches :class:`SentMessagesRepo` — the writer used by
+        :meth:`send_external_reply` is untouched and still in place (A2.1 is
+        additive; the old path is removed in A2.2).
+
+        Threading headers are written **exactly as passed** — the aggregator does
+        not synthesise them (ADR-0048 §1).
+
+        Raises :class:`NotFoundError` (404) when mailbox ``{id}`` does not exist
+        (ADR-0048 §4: a 404 here means "no such MAILBOX" — there is no message in
+        this contract at all). :class:`OAuthReconsentRequiredError` (409) and
+        :class:`SMTPSendFailedError` (502) propagate from the transport.
+        """
+        # Resolve by id across all mailboxes — the same reach the rest of the
+        # external WRITE section already has (PATCH / DELETE / sync resolve an
+        # arbitrary ``mail_accounts.id`` under the synthetic ``crm-service``
+        # super_admin scope, ``external/write_service.py``). The canonical-dedup
+        # of the READ/reply paths is a disclosure guard for the message scope and
+        # has no counterpart here: the mailbox id comes from the CRM's own
+        # catalogue, and the aggregator must be able to send from any mailbox it
+        # holds credentials for.
+        account = await self._accounts.get_by_id(mail_account_id)
+        if account is None:
+            raise NotFoundError("Mailbox not found")
+
+        result = await self._send_transport(
+            account=account,
+            to=to,
+            cc=cc,
+            bcc=None,
+            subject=subject,
+            body=body_text,
+            in_reply_header=in_reply_to,
+            refs_header=refs,
+        )
+        return result.smtp_message_id
+
+    async def _send_transport(
         self,
         *,
         account: MailAccount,
@@ -469,15 +456,15 @@ class SendService:
         body: str,
         in_reply_header: str | None,
         refs_header: str | None,
-        author_user_id: int,
-    ) -> SendMessageResponse:
-        """Shared post-visibility send pipeline (ADR-0035 §Migration step 6).
+    ) -> _TransportResult:
+        """Transport-only send core: OAuth resolve → MIME → SMTP → IMAP append.
 
-        Steps: OAuth token resolve → MIME build → SMTP send → best-effort IMAP
-        "Sent" append → persist ``sent_messages``. Reused verbatim by the
-        session ``send`` and the external reply so MIME/SMTP/append/persist are
-        NEVER duplicated. Callers own visibility + threading resolution and pass
-        the resolved ``account`` / headers / ``author_user_id`` in.
+        Everything :meth:`_send_core` used to do EXCEPT the ``sent_messages``
+        persist — extracted so the generic send (ADR-0048 §1) can reuse the exact
+        same MIME/SMTP/append pipeline **without** a local write, while the
+        surviving reply path (:meth:`send_external_reply`) keeps persisting via
+        :meth:`_send_core` (ADR-0048 §3: A2.1 is additive — the old writer stays
+        until A2.2).
         """
         # OAuth access token (consumed by the best-effort IMAP append below;
         # ``smtp_send_message`` resolves its own token for the SMTP leg).
@@ -552,6 +539,45 @@ class SendService:
                 mail_account_id=account.id,
                 detail=appended_error,
             )
+
+        return _TransportResult(
+            smtp_message_id=message_id,
+            appended=appended,
+            appended_error=appended_error,
+        )
+
+    async def _send_core(
+        self,
+        *,
+        account: MailAccount,
+        to: list[str],
+        cc: list[str] | None,
+        bcc: list[str] | None,
+        subject: str | None,
+        body: str,
+        in_reply_header: str | None,
+        refs_header: str | None,
+        author_user_id: int,
+    ) -> SendMessageResponse:
+        """Transport + ``sent_messages`` persist (ADR-0035 §Migration step 6).
+
+        The path of the surviving external reply. Untouched by ADR-0048 §3 (A2.1
+        is additive): the ``INSERT`` below is still the reply's durable record;
+        the generic send does NOT come through here.
+        """
+        transport = await self._send_transport(
+            account=account,
+            to=to,
+            cc=cc,
+            bcc=bcc,
+            subject=subject,
+            body=body,
+            in_reply_header=in_reply_header,
+            refs_header=refs_header,
+        )
+        message_id = transport.smtp_message_id
+        appended = transport.appended
+        appended_error = transport.appended_error
 
         sent = await self._sent.insert(
             user_id=author_user_id,

@@ -1,5 +1,5 @@
-"""Mail send module: compose / reply, SMTP send, IMAP append best-effort."""
+"""Mail send module: SMTP send core + best-effort IMAP append.
 
-from backend.app.send.router import router
-
-__all__ = ["router"]
+ADR-0044 §4 (phase A3): the HTML/form router went away with the UI; the module
+now only exposes the send core reused by the external reply (ADR-0035).
+"""

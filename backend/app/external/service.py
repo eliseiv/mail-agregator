@@ -31,30 +31,27 @@ from backend.app.external.schemas import (
     ExternalMessageDTO,
     ExternalMessagesResponse,
     ExternalMessagesResponseDesc,
-    ExternalTagDTO,
-    ExternalTeamDTO,
-    ExternalTeamsResponse,
 )
-from backend.app.repositories.groups import GroupsRepo
 from backend.app.repositories.mail_accounts import MailAccountsRepo
 from backend.app.repositories.messages import MessagesRepo
-from backend.app.repositories.tags import MessageTagsRepo
-from shared.models import MailAccount, Message, Tag
+from shared.models import MailAccount, Message
 
 
 def to_external_mailbox_dto(acc: MailAccount) -> ExternalMailboxDTO:
     """Project a ``mail_accounts`` row onto the public external mailbox DTO.
 
-    ADR-0037 §2 + ADR-0039 §4: id/email/display_name/group_id/is_active plus the
+    ADR-0037 §2 + ADR-0039 §4: id/email/display_name/is_active plus the
     sync-status triplet (``last_synced_at`` / ``last_sync_error`` /
     ``consecutive_failures``). NEVER any credentials / owner / oauth / smtp / imap
     internals. Shared by the read list and the write create/update responses.
+
+    ADR-0044 §4 (phase A1): the ``group_id`` field is dropped from the DTO — the
+    aggregator has no teams (``mail_accounts.group_id`` is dropped in phase C).
     """
     return ExternalMailboxDTO(
         id=acc.id,
         email=acc.email,
         display_name=acc.display_name,
-        group_id=acc.group_id,
         is_active=acc.is_active,
         last_synced_at=acc.last_synced_at,
         last_sync_error=acc.last_sync_error,
@@ -68,48 +65,27 @@ class ExternalMessagesService:
     def __init__(self, db: AsyncSession) -> None:
         self._db = db
 
-    async def list_teams(self) -> ExternalTeamsResponse:
-        """All system teams for the CRM (ADR-0037 §1).
-
-        super_admin-visibility (the trusted key sees everything): the flat,
-        unpaginated ``GroupsRepo.list_all_groups()`` (``ORDER BY id``). Minimal
-        projection — ``id``/``name`` only (no leader/counts/timestamps). Empty
-        system → ``{"teams": []}``.
-        """
-        groups = await GroupsRepo(self._db).list_all_groups()
-        return ExternalTeamsResponse(teams=[ExternalTeamDTO(id=g.id, name=g.name) for g in groups])
-
     async def list_mailboxes(
         self,
         *,
         is_active: bool | None = None,
-        group_ids: list[int] | None = None,
     ) -> ExternalMailboxesResponse:
         """Canonical mailboxes with status for the CRM (ADR-0037 §2 / ADR-0039 §4).
 
         Canonical-dedup (ADR-0029 §5): ``list_by_ids(list_canonical_account_ids())``
         — one ``MIN(id)`` mailbox per ``LOWER(email)``, so the set matches the
         mailboxes whose messages ``GET /api/external/messages`` returns. Exposes
-        ``group_id`` (mailbox→team), ``is_active`` (worker auto-disable) and the
-        sync-status triplet; never any credentials/owner structures.
+        ``is_active`` (worker auto-disable) and the sync-status triplet; never any
+        credentials/owner structures.
 
-        ADR-0039 §4 filters (both optional, applied over the canonical set):
-
-        - ``group_id`` (repeatable → ``group_ids``): union of the given teams'
-          accounts; empty/None = no team filter.
-        - ``is_active``: ``None`` = all; ``True``/``False`` filter on the flag.
+        ADR-0044 §4 (phase A1): the ``group_id`` filter is gone (no teams). Only
+        ``is_active`` remains: ``None`` = all; ``True``/``False`` filters the flag.
 
         No mailboxes → ``{"mailboxes": []}``.
         """
         repo = MailAccountsRepo(self._db)
         canonical_ids = await repo.list_canonical_account_ids()
-        effective: set[int] = set(canonical_ids)
-        if group_ids:
-            in_groups: set[int] = set()
-            for gid in set(group_ids):
-                in_groups.update(await repo.list_account_ids_in_group(gid))
-            effective &= in_groups
-        accounts = await repo.list_by_ids(list(effective))
+        accounts = await repo.list_by_ids(canonical_ids)
         if is_active is not None:
             accounts = [a for a in accounts if a.is_active == is_active]
         return ExternalMailboxesResponse(mailboxes=[to_external_mailbox_dto(a) for a in accounts])
@@ -122,7 +98,6 @@ class ExternalMessagesService:
         before_id: int | None,
         limit: int,
         mail_account_ids: list[int] | None = None,
-        group_ids: list[int] | None = None,
     ) -> ExternalMessagesResponse | ExternalMessagesResponseDesc:
         """Return one page in the requested direction (ADR-0029 / ADR-0036 / ADR-0039 §3).
 
@@ -133,16 +108,12 @@ class ExternalMessagesService:
         envelopes so each mode's cursor field is present only in its own mode
         (ADR-0036 §3).
 
-        ADR-0039 §3: ``mail_account_id`` and ``group_id`` are repeatable AND
-        **AND-combinable** (the ADR-0037 mutual-exclusion is superseded). The
-        effective set is the intersection ``canonical ∩ groups ∩ mailboxes``
-        (see :meth:`_resolve_account_ids`); an empty intersection yields an empty
-        page (not 404). BC: a single value of either filter behaves as before.
+        ADR-0039 §3: ``mail_account_id`` is a repeatable filter over the
+        canonical set; an empty intersection yields an empty page (not a 404).
+        The ``group_id`` filter is gone (ADR-0044 §4, phase A1 — no teams).
         """
         self._validate_mode(order=order, since_id=since_id, before_id=before_id)
-        account_ids = await self._resolve_account_ids(
-            mail_account_ids=mail_account_ids, group_ids=group_ids
-        )
+        account_ids = await self._resolve_account_ids(mail_account_ids=mail_account_ids)
         if order == "asc":
             return await self._list_forward(
                 mail_account_ids=account_ids, since_id=since_id, limit=limit
@@ -151,14 +122,10 @@ class ExternalMessagesService:
             mail_account_ids=account_ids, before_id=before_id, limit=limit
         )
 
-    async def _resolve_account_ids(
-        self, *, mail_account_ids: list[int] | None, group_ids: list[int] | None
-    ) -> list[int]:
-        """Effective mailbox set = canonical ∩ groups ∩ mailboxes (ADR-0039 §3).
+    async def _resolve_account_ids(self, *, mail_account_ids: list[int] | None) -> list[int]:
+        """Effective mailbox set = canonical ∩ mailboxes (ADR-0039 §3).
 
         - ``base`` = ``list_canonical_account_ids()`` (canonical-dedup, ADR-0029 §5).
-        - ``group_ids`` (if non-empty) → intersect with the UNION of each team's
-          accounts. An empty / ``None`` list imposes no team constraint.
         - ``mail_account_ids`` (if non-empty) → intersect with that id set. An
           empty / ``None`` list imposes no mailbox constraint.
 
@@ -169,11 +136,6 @@ class ExternalMessagesService:
         """
         repo = MailAccountsRepo(self._db)
         effective: set[int] = set(await repo.list_canonical_account_ids())
-        if group_ids:
-            in_groups: set[int] = set()
-            for gid in set(group_ids):
-                in_groups.update(await repo.list_account_ids_in_group(gid))
-            effective &= in_groups
         if mail_account_ids:
             effective &= set(mail_account_ids)
         return list(effective)
@@ -270,53 +232,36 @@ class ExternalMessagesService:
     async def _build_dtos(
         self, rows: list[tuple[Message, MailAccount]]
     ) -> list[ExternalMessageDTO]:
-        """Shared DTO assembly for both directions (ADR-0036 §4: tags in both).
+        """Shared DTO assembly for both directions (ADR-0036 §4).
 
-        Bulk-loads tags for the page and dedups them by ``(name, color)`` (the
-        same team-wide auto-tagging sibling-collapse as the UI inbox), then
-        builds one :class:`ExternalMessageDTO` per row with **raw** bodies (no
+        Builds one :class:`ExternalMessageDTO` per row with **raw** bodies (no
         ``collapse_blank_lines_*`` — ADR-0029 §3/§7). Direction only affects row
         order and the cursor field, never the per-message shape (ADR-0036 §4).
+
+        ADR-0044 §4 (phase A1): the tag assembly
+        (``MessageTagsRepo.list_for_messages_bulk``) and the ``tags`` field are
+        gone — the pull no longer JOINs ``message_tags`` / ``tags``, so dropping
+        them (phase D) does not break it.
         """
-        message_ids = [m.id for (m, _ma) in rows]
-        tags_map = await MessageTagsRepo(self._db).list_for_messages_bulk(message_ids)
-
-        messages: list[ExternalMessageDTO] = []
-        for message, account in rows:
-            # Dedup tag chips by (name, color): team-wide auto-tagging creates a
-            # sibling ``tags`` row per team-member, so the raw bulk result can
-            # list the same logical tag several times (mirrors messages/service).
-            seen_keys: set[tuple[str, str]] = set()
-            unique_tags: list[Tag] = []
-            for tag in tags_map.get(message.id, []):
-                key = (tag.name, tag.color)
-                if key in seen_keys:
-                    continue
-                seen_keys.add(key)
-                unique_tags.append(tag)
-
-            messages.append(
-                ExternalMessageDTO(
-                    id=message.id,
-                    subject=message.subject,
-                    internal_date=message.internal_date,
-                    from_addr=message.from_addr,
-                    from_name=message.from_name,
-                    to_addrs=message.to_addrs,
-                    cc_addrs=message.cc_addrs,
-                    mail_account=ExternalMailAccountDTO(
-                        id=account.id,
-                        email=account.email,
-                        display_name=account.display_name,
-                    ),
-                    # Raw stored bodies — NO collapse-normalisation (ADR-0029 §3/§7).
-                    # ``body_present=false`` ⇒ body_text="" / body_html=None already
-                    # hold in the DB (worker writes them so), surfaced verbatim.
-                    body_text=message.body_text,
-                    body_html=message.body_html,
-                    body_present=message.body_present,
-                    body_truncated=message.body_truncated,
-                    tags=[ExternalTagDTO(id=t.id, name=t.name, color=t.color) for t in unique_tags],
-                )
+        return [
+            ExternalMessageDTO(
+                id=message.id,
+                subject=message.subject,
+                internal_date=message.internal_date,
+                from_addr=message.from_addr,
+                from_name=message.from_name,
+                to_addrs=message.to_addrs,
+                cc_addrs=message.cc_addrs,
+                mail_account=ExternalMailAccountDTO(
+                    id=account.id,
+                    email=account.email,
+                    display_name=account.display_name,
+                ),
+                # Raw stored bodies — NO collapse-normalisation (ADR-0029 §3/§7).
+                body_text=message.body_text,
+                body_html=message.body_html,
+                body_present=message.body_present,
+                body_truncated=message.body_truncated,
             )
-        return messages
+            for message, account in rows
+        ]

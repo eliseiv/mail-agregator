@@ -5,9 +5,14 @@ at request time, so flipping the feature on/off for a test means setting the
 env var and clearing the ``lru_cache`` on :func:`shared.config.get_settings`
 (mirrors the ``set_tg_notify_all`` pattern in the telegram package conftest).
 
-Seeding helpers build ``users`` / ``mail_accounts`` / ``messages`` / ``tags``
-directly via the DB so the keyset / canonical-dedup paths are exercised against
-real Postgres — never a mock of our own code (only the API boundary uses HTTP).
+Seeding helpers build ``users`` / ``mail_accounts`` / ``messages`` directly via the
+DB so the keyset / canonical-dedup paths are exercised against real Postgres — never
+a mock of our own code (only the API boundary uses HTTP).
+
+ADR-0044 §4 (phase A1/A3): tags, teams/groups and the session super-admin seed are
+decommissioned. The tag/group seeding helpers went with them, and the mailbox OWNER
+is now the technical ``crm-service`` user (the only user the app seeds — ADR-0039)
+— hence ``owner`` below replaces the old ``super_admin`` fixture.
 """
 
 from __future__ import annotations
@@ -23,7 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from shared.config import get_settings
 from shared.crypto import encrypt_mail_password
-from shared.models import MailAccount, Message, MessageTag, Tag, User
+from shared.models import MailAccount, Message, User
 
 # A deterministic 256-bit-ish test key (the contract only needs a constant-time
 # match; value is arbitrary). Never a real secret.
@@ -141,31 +146,20 @@ async def write_api_on(
     return TEST_API_KEY
 
 
-@pytest_asyncio.fixture
-async def make_group(db_engine: AsyncEngine) -> Callable[..., Any]:
-    """Create a bare ``groups`` row (no mailboxes); return its id."""
-    from shared.models import Group
+async def _get_owner(db_engine: AsyncEngine) -> User:
+    """The ``crm-service`` technical user — the owner of every mailbox (ADR-0039).
 
-    async def _create(name: str) -> int:
-        factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
-        async with factory() as ses, ses.begin():
-            g = Group(name=name, leader_user_id=None)
-            ses.add(g)
-            await ses.flush()
-            await ses.refresh(g)
-            return int(g.id)
+    ADR-0044 §5: ``seed_super_admin`` went away with the cookie UI, so ``crm-service``
+    is the only user the app lifespan seeds.
+    """
+    from backend.app.auth.service import CRM_SERVICE_USERNAME
 
-    return _create
-
-
-async def _get_super_admin(db_engine: AsyncEngine) -> User:
     factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
-    s = get_settings()
     async with factory() as ses:
         u = (
-            await ses.execute(select(User).where(User.username == s.ADMIN_LOGIN))
+            await ses.execute(select(User).where(User.username == CRM_SERVICE_USERNAME))
         ).scalar_one_or_none()
-        assert u is not None, "super-admin must be seeded by app startup"
+        assert u is not None, "crm-service must be seeded by app startup"
         return u
 
 
@@ -175,7 +169,6 @@ async def _make_mail_account(
     user_id: int,
     email: str,
     display_name: str | None = None,
-    group_id: int | None = None,
 ) -> MailAccount:
     factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
     async with factory() as ses, ses.begin():
@@ -186,7 +179,6 @@ async def _make_mail_account(
         acc = MailAccount(
             id=new_id,
             user_id=user_id,
-            group_id=group_id,
             email=email,
             display_name=display_name,
             encrypted_password=blob,
@@ -243,59 +235,36 @@ async def _make_message(
         return m
 
 
-async def _tag_message(
-    db_engine: AsyncEngine,
-    *,
-    user_id: int,
-    message_id: int,
-    name: str,
-    color: str = "#aabbcc",
-) -> Tag:
-    factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
-    async with factory() as ses, ses.begin():
-        tag = Tag(user_id=user_id, name=name, color=color)
-        ses.add(tag)
-        await ses.flush()
-        ses.add(MessageTag(message_id=message_id, tag_id=tag.id))
-        await ses.flush()
-        await ses.refresh(tag)
-        return tag
-
-
-async def _make_secondary_team_mailbox(
+async def _make_secondary_owner_mailbox(
     db_engine: AsyncEngine,
     *,
     username: str,
-    group_name: str,
     email: str,
     display_name: str | None = None,
 ) -> MailAccount:
-    """Create user + group + mailbox for a SECOND team in ONE transaction.
+    """Create a SECOND user + a mailbox of theirs in ONE transaction.
 
-    Consolidating into a single ``ses.begin()`` (instead of three separate
-    short-lived sessions) avoids inter-transaction lock contention with the
-    app-lifespan seed / autouse TRUNCATE, which was an intermittent source of
-    Postgres deadlocks — the test must be deterministic, not flaky.
+    Feeds the canonical-dedup cases (two mailboxes with the same ``LOWER(email)``
+    under different owners → the external API returns only ``MIN(id)``), which is
+    still live after the decommission. ADR-0044 §1: there are no groups any more, so
+    the "second team" of the old helper is just a second owner row.
+
+    One ``ses.begin()`` (instead of several short-lived sessions) avoids lock
+    contention with the app-lifespan seed / autouse TRUNCATE — the test must be
+    deterministic, not flaky.
     """
     from backend.app.repositories.mail_accounts import MailAccountsRepo
-    from shared.models import Group
 
     factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
     async with factory() as ses, ses.begin():
-        u = User(username=username, display_name=display_name or username, role="group_member")
+        u = User(username=username, display_name=display_name or username, role="super_admin")
         ses.add(u)
-        await ses.flush()
-        g = Group(name=group_name, leader_user_id=None)
-        ses.add(g)
-        await ses.flush()
-        u.group_id = g.id
         await ses.flush()
 
         new_id = await MailAccountsRepo(ses).next_account_id()
         acc = MailAccount(
             id=new_id,
             user_id=u.id,
-            group_id=g.id,
             email=email,
             display_name=display_name,
             encrypted_password=encrypt_mail_password("p", new_id),
@@ -314,65 +283,19 @@ async def _make_secondary_team_mailbox(
 
 
 @pytest_asyncio.fixture
-def make_secondary_team_mailbox(db_engine: AsyncEngine) -> Callable[..., Any]:
-    async def _create(
-        *,
-        username: str,
-        group_name: str,
-        email: str,
-        display_name: str | None = None,
-    ) -> MailAccount:
-        return await _make_secondary_team_mailbox(
-            db_engine,
-            username=username,
-            group_name=group_name,
-            email=email,
-            display_name=display_name,
+def make_secondary_owner_mailbox(db_engine: AsyncEngine) -> Callable[..., Any]:
+    async def _create(*, username: str, email: str, display_name: str | None = None) -> MailAccount:
+        return await _make_secondary_owner_mailbox(
+            db_engine, username=username, email=email, display_name=display_name
         )
 
     return _create
 
 
-async def _add_sibling_tag(
-    db_engine: AsyncEngine,
-    *,
-    message_id: int,
-    username: str,
-    name: str,
-    color: str,
-) -> Tag:
-    """Add a second-owner tag with the SAME (name,color) linked to ``message_id``.
-
-    Models the team-wide auto-tagging duplicate (one ``tags`` row per
-    team-member). Single transaction — see ``_make_secondary_team_mailbox``.
-    """
-    factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
-    async with factory() as ses, ses.begin():
-        u = User(username=username, display_name=username, role="group_member")
-        ses.add(u)
-        await ses.flush()
-        sib = Tag(user_id=u.id, name=name, color=color)
-        ses.add(sib)
-        await ses.flush()
-        ses.add(MessageTag(message_id=message_id, tag_id=sib.id))
-        await ses.flush()
-        await ses.refresh(sib)
-        return sib
-
-
 @pytest_asyncio.fixture
-def add_sibling_tag(db_engine: AsyncEngine) -> Callable[..., Any]:
-    async def _add(*, message_id: int, username: str, name: str, color: str) -> Tag:
-        return await _add_sibling_tag(
-            db_engine, message_id=message_id, username=username, name=name, color=color
-        )
-
-    return _add
-
-
-@pytest_asyncio.fixture
-async def super_admin(db_engine: AsyncEngine) -> User:
-    return await _get_super_admin(db_engine)
+async def owner(db_engine: AsyncEngine) -> User:
+    """Owner of the seeded mailboxes = the ``crm-service`` technical user."""
+    return await _get_owner(db_engine)
 
 
 @pytest_asyncio.fixture
@@ -414,14 +337,12 @@ def make_mail_account(db_engine: AsyncEngine) -> Callable[..., Any]:
         email: str,
         *,
         display_name: str | None = None,
-        group_id: int | None = None,
     ) -> MailAccount:
         return await _make_mail_account(
             db_engine,
             user_id=user_id,
             email=email,
             display_name=display_name,
-            group_id=group_id,
         )
 
     return _create
@@ -436,19 +357,9 @@ def make_message(db_engine: AsyncEngine) -> Callable[..., Any]:
 
 
 @pytest_asyncio.fixture
-def tag_message(db_engine: AsyncEngine) -> Callable[..., Any]:
-    async def _link(user_id: int, message_id: int, name: str, color: str = "#aabbcc") -> Tag:
-        return await _tag_message(
-            db_engine, user_id=user_id, message_id=message_id, name=name, color=color
-        )
-
-    return _link
-
-
-@pytest_asyncio.fixture
 def seed_n_messages(
     db_engine: AsyncEngine,
-    super_admin: User,
+    owner: User,
     make_mail_account: Callable[..., Any],
     make_message: Callable[..., Any],
 ) -> Callable[..., Any]:
@@ -460,7 +371,7 @@ def seed_n_messages(
     """
 
     async def _seed(n: int, *, email: str = "seed@example.com") -> list[int]:
-        acc = await make_mail_account(super_admin.id, email)
+        acc = await make_mail_account(owner.id, email)
         base = datetime.now(UTC)
         ids: list[int] = []
         for i in range(n):
