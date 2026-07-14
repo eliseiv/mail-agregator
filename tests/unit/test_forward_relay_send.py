@@ -24,6 +24,18 @@ from backend.app.send import service as snd_svc
 pytestmark = pytest.mark.unit
 
 
+async def _noop_host_guard(host: str, *, port: int) -> None:
+    """Stand-in for the SSRF guard.
+
+    TD-056 / ADR-0047 §4 turned this call-site into the OFF-LOOP
+    ``assert_public_host_async`` (``send/service.py:298``): the blocking
+    ``getaddrinfo`` of the sync variant used to run in the event-loop thread.
+    The sync name is no longer imported by the module, so patching it here was
+    a dead mock (``monkeypatch.setattr`` raised ``AttributeError``); the guard
+    is now stubbed under its real, awaitable name.
+    """
+
+
 def _stub_relay_settings() -> SimpleNamespace:
     return SimpleNamespace(
         FORWARD_SMTP_HOST="relay.service.example",
@@ -37,7 +49,7 @@ def _stub_relay_settings() -> SimpleNamespace:
 
 async def test_relay_send_forwards_relay_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(snd_svc, "get_settings", _stub_relay_settings)
-    monkeypatch.setattr(snd_svc, "assert_public_host", lambda host, *, port: None)
+    monkeypatch.setattr(snd_svc, "assert_public_host_async", _noop_host_guard)
 
     calls: list[dict[str, Any]] = []
 
@@ -72,7 +84,7 @@ async def test_relay_send_wraps_transport_errors(
     monkeypatch: pytest.MonkeyPatch, exc: Exception
 ) -> None:
     monkeypatch.setattr(snd_svc, "get_settings", _stub_relay_settings)
-    monkeypatch.setattr(snd_svc, "assert_public_host", lambda host, *, port: None)
+    monkeypatch.setattr(snd_svc, "assert_public_host_async", _noop_host_guard)
 
     async def _bad(msg: Any, **kwargs: Any) -> None:
         raise exc

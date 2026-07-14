@@ -202,7 +202,8 @@ Server-блок отвечает `200 ok\n` на `/_health_nginx` (HTTP, не HT
 | `WORKER_THREAD_POOL_SIZE` | `14` | no | Размер default ThreadPoolExecutor (= `MAX_CONCURRENT_IMAP + 4`). |
 | `SYNC_INTERVAL_MINUTES` | `5` | no | Интервал sync_cycle. Не рекомендуется снижать ниже 3. |
 | `RETENTION_DAYS` | `30` | no | TTL писем (см. ADR-0011). |
-| `IMAP_TIMEOUT_SECONDS` | `60` | no | Per-account timeout (см. ADR-0013). |
+| `IMAP_TIMEOUT_SECONDS` | `60` | no | Per-account timeout воркера при синхронизации (см. ADR-0013). **Не** относится к connection-test — там `MAILBOX_TEST_DEADLINE_SECONDS`. |
+| `MAILBOX_TEST_DEADLINE_SECONDS` | `45` | no | **ADR-0047:** hard-deadline на **весь** connection-test ящика (host-assert + IMAP-логин + SMTP-логин), общий для `POST /mailboxes/test`, `POST /mailboxes` и `PATCH /mailboxes/{id}` при смене кредов. Это **единственная** верхняя граница **probe**. Исчерпание → доменная `422` (`imap_login_failed`/`smtp_login_failed`, `details.detail="timeout"`), НЕ `504` и НЕ зависание. Границы `ge=10, le=45` (`shared/config.py:169` — норма **применена в коде**): `le` **машинно** охраняет инвариант `deadline + teardown (≤ 5 с, ADR-0047 §2.3) + внепробная часть запроса (≤ 5 с) < proxy_read_timeout (60s)`; значение > 45 **не проходит** валидацию на старте. (Отменённые `le=50`/`le=55` были over-claim: `50 + 5 + 5 = 60` = ровно `proxy_read_timeout` → `504`.) **При изменении `proxy_read_timeout` пересчитать `le`** (формула — §6 / ADR-0047 §5). |
 | `INITIAL_SYNC_DAYS` | `30` | no | Окно при первом подключении. |
 | `MAX_ATTACHMENT_BYTES` | `26214400` | no | 25 MiB. |
 | `SYNC_MAX_CONSECUTIVE_FAILURES` | `3` | no | ADR-0026: порог PERMANENT-ошибок подряд → auto-disable (`ge=1, le=20`). Заменяет хардкод `_DISABLE_AFTER_FAILS`. |
@@ -364,6 +365,17 @@ TLS терминируется на контейнере `nginx`. Сертифи
 - gzip on для text/css, application/json, application/javascript, application/xml+rss, atom, image/svg+xml. text/html включается gzip-модулем по умолчанию — добавлять его в `gzip_types` нельзя (warning duplicate MIME type).
 - `client_max_body_size 30m` (под MAX_ATTACHMENT_BYTES=25 MiB + MIME overhead).
 - `proxy_read_timeout 60s` / `proxy_send_timeout 60s` / `proxy_connect_timeout 5s` — выровнено с gunicorn `--timeout=60` в api Dockerfile.
+
+> **Инвариант цепочки бюджетов (ADR-0047 §2.1 + ADR-0032 follow-up) — `proxy_read_timeout` менять только вместе с ним.**
+> Каждый долгий HTTP-путь агрегатора обязан вернуть **доменную ошибку JSON раньше**, чем nginx превратит ожидание в `504` **HTML** (иначе причина отказа теряется у клиента — прод-баг проверки ящика):
+> ```
+> connection-test:  MAILBOX_TEST_DEADLINE_SECONDS 45  +  teardown ≤ 5  +  внепробная ≤ 5  = 55  <  60
+> send (reply):     SMTP 20 + IMAP APPEND 30 + 5 = 55                                            <  60
+>                                                    proxy_read_timeout = gunicorn --timeout
+> ```
+> У connection-test верхнюю границу **probe** задаёт **только** hard-deadline (`MAILBOX_TEST_DEADLINE_SECONDS`), но граница **ответа** = дедлайн + **два** нормированных слагаемых: **teardown после отмены** (`asyncio.wait_for` дожидается `finally` отменённой пробы — вежливый `QUIT` под `_SMTP_QUIT_TIMEOUT = 5`, `accounts/testers.py:65`; `ADR-0047` §2.3) и **внепробная часть запроса** (auth / SELECT / decrypt / INSERT / сериализация DTO — ≤ 5 с, `ADR-0047` §5). Сумма сокет-таймаутов `_IMAP_TIMEOUT + _SMTP_TIMEOUT` (20+20) в инвариант **не входит**: это эвристика fail-fast, а не bound (`ADR-0047` §2.2). У send — наоборот: там сокет-таймаут `aiosmtplib` покрывает всю последовательность, поэтому сумма констант и есть граница.
+> Наружу цепочка продолжается на стороне CRM (`ADR-053` §1.1/§1.2/§1.2.1/§6): `60 < MAIL_API_MAILSERVER_TIMEOUT_SEC (75, read-фаза одного вызова) < MAIL_API_MAILSERVER_DEADLINE_SEC (85, overall ОДНОГО вызова)`, а наружное звено CRM нормировано **по бюджету ЗАПРОСА, а не вызова** (`ADR-053` §1.2.1): `Σ overall всех вызовов запроса + внепробная работа CRM (≤5) < proxy_read_timeout nginx CRM (120)`; худший путь CRM (`create` + компенсирующее удаление сироты) = `85 + 15 + 5 = 105 < 120` (`ADR-053` §6). Прежнее звено «nginx CRM **90**» **отменено**: оно нормировалось против одного вызова и не выдерживало пути с двумя (85 + компенсация → 115 > 90). Цепочка строго возрастает, поэтому любой ответ агрегатора доходит до CRM. Числа CRM-стороны сверять по `ADR-053`, агрегатор их не задаёт.
+> Бюджет connection-test страхуется машинно: `MAILBOX_TEST_DEADLINE_SECONDS` объявлен как `Field(default=45, ge=10, le=45)` (`shared/config.py:169` — норма амендмента **в коде**, TD-058 закрыт) → при худшем допустимом значении `45 + 5 + 5 = 55 < 60` (формула `le ≤ 60 − teardown 5 − внепробная 5 − резерв 5`, `ADR-0047` §5). Прежнее `le=50` **отменено**: оно пропускало значение `50`, дающее ровно `50 + 5 + 5 = 60` = `proxy_read_timeout` → `504` HTML; сегодня такое значение падает на валидации при старте. Бюджет send — константы модуля `send/service.py:50-51`. **Снижение `proxy_read_timeout` ниже 60s ломает оба** и требует ADR; **подъём** `MAILBOX_TEST_DEADLINE_SECONDS` выше 45 требует одновременного подъёма `proxy_read_timeout` + gunicorn `--timeout` и пересчёта `le` по формуле.
 
 ### Установка certbot на хост (одноразово)
 

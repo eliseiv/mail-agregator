@@ -338,6 +338,7 @@ email=user%40gmail.com&password=secret&imap_host=imap.gmail.com&imap_port=993&im
 | Rate-limit | 10 / час per user. |
 | 200 | `{imap_ok: true, smtp_ok: true}`. |
 | 422 | первый fail возвращает соответствующий код. |
+| **Верхняя граница (ADR-0047)** | Весь тест (host-assert + IMAP + SMTP) выполняется под hard-deadline `MAILBOX_TEST_DEADLINE_SECONDS` (45 с). Исчерпание → **`422`** `imap_login_failed` / `smtp_login_failed` с `details.detail="timeout"` (стадия — в `details.stage`). Новых кодов ошибок нет; `504` / зависание на этом пути — дефект. Тот же дедлайн наследуют `POST /api/mail-accounts` и `PATCH /api/mail-accounts/{id}` при смене кредов/хостов (оба идут через `MailAccountService.test()`). См. `05-modules.md` §9.2. |
 
 #### `GET /api/mail-accounts/{id}`
 | 200 | объект (как в list). |
@@ -1523,9 +1524,9 @@ Content-Type: application/json
 
 | Метод / путь | Семантика | Ответ |
 | --- | --- | --- |
-| `POST /api/external/mailboxes/test` | Проверка IMAP/SMTP-соединения без сохранения. Тело `ExternalMailboxTestRequest{email, imap_host, imap_port, imap_ssl, smtp_host, smtp_port, smtp_ssl, smtp_starttls, smtp_username?, password, smtp_password?}`. | `200 {imap_ok:true, smtp_ok:true}`; иначе `422` (`imap_login_failed`/`smtp_login_failed` — сбой логина/коннекта, `invalid_host` — SSRF-guard) или `400 validation_error` (битое тело). **`502` путь `test` не отдаёт** (см. «Коды»). |
-| `POST /api/external/mailboxes` | Создание. Тело = поля `test` + `display_name?`, `group_id?` (валидируется на существование, иначе `404 group_not_found`; `null` — без команды). Owner=`crm-service`. | `201 ExternalMailboxDTO` (расширенный). `409 conflict field=email` при дубле. |
-| `PATCH /api/external/mailboxes/{id}` | Правка (креды/`is_active`/`group_id`/хосты; presence-семантика полей). | `200 ExternalMailboxDTO`; `404 not_found`. |
+| `POST /api/external/mailboxes/test` | Проверка IMAP/SMTP-соединения без сохранения. Тело `ExternalMailboxTestRequest{email, imap_host, imap_port, imap_ssl, smtp_host, smtp_port, smtp_ssl, smtp_starttls, smtp_username?, password, smtp_password?}`. **Медленный путь** — ходит на удалённый почтовый сервер (ADR-0047). | `200 {imap_ok:true, smtp_ok:true}`; иначе `422` (`imap_login_failed`/`smtp_login_failed` — сбой логина/коннекта **или исчерпание дедлайна** (`details.detail="timeout"`), `invalid_host` — SSRF-guard) или `400 validation_error` (битое тело). **`502` путь `test` не отдаёт** (см. «Коды»). **Верхняя граница — `MAILBOX_TEST_DEADLINE_SECONDS` (45 с, ADR-0047 §1/§2):** ответ гарантированно доменный, `504` от прокси на этом пути недостижим. Клиент (CRM) обязан дать бюджет ≥ 60 с — `ADR-053` §1 (`MAIL_API_MAILSERVER_TIMEOUT_SEC = 75`). |
+| `POST /api/external/mailboxes` | Создание. Тело = поля `test` + `display_name?`, `group_id?` (валидируется на существование, иначе `404 group_not_found`; `null` — без команды). Owner=`crm-service`. **Медленный путь:** до вставки прогоняется тот же connection-test (`accounts/service.py:667`) под дедлайном ADR-0047 — коды таймаута те же, что у `test`. | `201 ExternalMailboxDTO` (расширенный). `409 conflict field=email` при дубле. |
+| `PATCH /api/external/mailboxes/{id}` | Правка (креды/`is_active`/`group_id`/хосты; presence-семантика полей). **Медленный путь при смене кредов/хостов:** прогоняется connection-test (`accounts/service.py:891`) под дедлайном ADR-0047 (перенос `group_id` / `is_active` теста не требуют). | `200 ExternalMailboxDTO`; `404 not_found`. |
 | `DELETE /api/external/mailboxes/{id}` | Удаление (+каскад вложений/MinIO). | `204`; `404`. |
 | `POST /api/external/mailboxes/{id}/sync` | Форс-синк: Redis-маркер `force_sync:{id}` (ex=60). | `202 {queued:true}`; `404`. |
 

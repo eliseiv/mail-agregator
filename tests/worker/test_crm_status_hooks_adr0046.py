@@ -202,9 +202,19 @@ def _spy_hook(monkeypatch: pytest.MonkeyPatch, module: Any) -> list[dict[str, An
 
 
 def _patch_fetch(monkeypatch: pytest.MonkeyPatch, result: Callable[[], Any]) -> None:
-    """Replace the blocking IMAP fetch (``asyncio.to_thread``) with ``result()``."""
+    """Replace the blocking IMAP fetch (``asyncio.to_thread``) with ``result()``.
+
+    Only ``fetch_blocking`` is faked. Since TD-056 the SSRF guard also runs
+    through ``asyncio.to_thread`` (``assert_public_host_async`` — ADR-0047 §4),
+    so a blanket fake would hijack the resolve leg as well and feed it
+    ``result()`` (or raise the fetch's error) before the cycle ever reaches IMAP.
+    Everything that is not the blocking fetch goes to the REAL ``to_thread``.
+    """
+    real_to_thread = asyncio.to_thread
 
     async def _fake_to_thread(_func: Any, *_a: Any, **_k: Any) -> Any:
+        if getattr(_func, "__name__", "") != "fetch_blocking":
+            return await real_to_thread(_func, *_a, **_k)
         return result()
 
     monkeypatch.setattr(asyncio, "to_thread", _fake_to_thread)

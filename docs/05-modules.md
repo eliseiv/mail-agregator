@@ -1033,11 +1033,13 @@ stateDiagram-v2
 - Один и тот же email уже добавлен — 409.
 - Пользователь меняет только пароль — нужно повторно прогнать IMAP+SMTP тест (иначе можно сохранить битый пароль).
 - Удаление: сначала собираем s3_key всех вложений, удаляем из MinIO, затем DELETE FROM mail_accounts (CASCADE).
+- **Почтовый сервер не отвечает / отвечает медленнее дедлайна (ADR-0047)** — `imap_login_failed` / `smtp_login_failed` (422) с `details.detail="timeout"`, НЕ зависание и НЕ `504` от nginx. См. §9.2.
 
 ### Инварианты
 - Ни один INSERT/UPDATE без успешного теста IMAP+SMTP.
 - Шифрование пароля выполняется в той же транзакции, в которой INSERT.
 - Удаление аккаунта удаляет все его сообщения и вложения (БД + MinIO).
+- **Connection-test завершается ≤ `MAILBOX_TEST_DEADLINE_SECONDS` (45 с) доменным ответом, НЕ зависанием и НЕ `504`** — hard-deadline поверх обоих probe-путей (`test` / `create` / `patch` при смене кредов). **Верхняя граница probe — сам дедлайн; верхняя граница ОТВЕТА — три слагаемых:** `MAILBOX_TEST_DEADLINE_SECONDS` (45) + teardown после отмены (≤ 5 с, `_SMTP_QUIT_TIMEOUT`) + внепробная часть (≤ 5 с) = 55 < nginx `proxy_read_timeout` (60). Сумма `_IMAP_TIMEOUT + _SMTP_TIMEOUT` (20+20) — **эвристика fail-fast, не bound** (см. §9.2 п.2). ADR-0047, детали — §9.2.
 
 ### Content negotiation (no-JS fallback)
 
@@ -1073,6 +1075,70 @@ Redirect targets и flash-тексты — из таблицы в ADR-0015 (serv
 - **`update`**: для `auth_type='oauth_outlook'` запрещено менять креды/host/port (`400 validation_error`); допускается только `display_name`.
 - **Безопасность**: см. `06-security.md` §1.11 + §2.2. Токены не логируются (redact-list).
 - **Зависимости**: repositories.mail_accounts, crypto, redis (state + refresh-lock), httpx (token endpoint), imap-tools/aiosmtplib (XOAUTH2-коннект для теста).
+
+### 9.2 Hard-deadline connection-test (ADR-0047)
+
+> **Статус кода:** норма ADR-0047 **реализована полностью** (2026-07-14; TD-055 и TD-058 закрыты): дедлайн внутри обоих probe-методов (`accounts/service.py:414-430`, `:517-520`), константы `20`/`20` (`accounts/testers.py:57-58`), `wait_for`-guard у обеих SMTP-проб (`testers.py:240-250`, `:374-383`), off-loop SSRF-guard (`security.py:104-121`), env с границей амендмента — `shared/config.py:169`: `Field(default=45, ge=10, le=45)` (§5, teardown-плечо — п. 2.1 ниже).
+
+**Проблема.** Проверка соединения ходит на **удалённый** почтовый сервер, поэтому её длительность задаёт не агрегатор, а чужой хост. Без верхней границы она упирается в `proxy_read_timeout 60s` nginx (`deploy/nginx/templates/default.conf.template:121-122,150-151`) / gunicorn `--timeout 60` (`deploy/Dockerfile:154`), и клиент получает **`504` HTML вместо доменного `422` JSON** — причина отказа теряется. Прод-баг: агрегатор ответил `422` через ~31 с, CRM уже оборвала запрос.
+
+**Норма (ADR-0047 §1–§4):**
+
+1. **Единый `asyncio.wait_for(..., timeout=settings.MAILBOX_TEST_DEADLINE_SECONDS)`** поверх **обоих** probe-путей (закрытый перечень — других probe-путей из `test()` нет):
+   - **P1** `MailAccountService._test_credentials` (`service.py:385-432`, `wait_for` — `:414-430`; тело — `_test_credentials_inner`, `:434-472`) — password-путь;
+   - **P2** `MailAccountService._test_oauth_account` (`service.py:504-522`, `wait_for` — `:517-520`; тело — `_test_oauth_account_inner`, `:524`) — oauth-путь (включая refresh access-token).
+
+   **`wait_for` живёт ВНУТРИ probe-метода** (тело целиком уходит под дедлайн через внутренний `_test_credentials_inner`), **а не на call-site**. У `_test_credentials` **два** вызывающих — `service.py:371` (`test()`, ad-hoc креды) и `service.py:490` (`_test_existing_account`, re-probe сохранённого ящика, достижим из `POST /test` с `account_id`); обёртка на одном call-site оставила бы второй без дедлайна.
+
+   Этим покрыты **все** входы, без дополнительных обёрток: `test()` (`service.py:347`, в т.ч. ветка `_test_existing_account`, `:474-502`), `create()` (`service.py:651` → `await self.test(...)` `:667`, до вставки) и `update()` при смене кредов/хостов (`service.py:767` → `:891`).
+
+   **Запрещён второй ДЕДЛАЙН, а не всякий `wait_for`.** Обёртки-дедлайны на уровне **вызывающих** (`test()` / `create()` / `update()` / роутеров) запрещены — второй дедлайн замаскировал бы первый. Per-probe `wait_for`-**guards внутри `testers.py`** (п. 2) — **разрешены и предписаны**: формально они вложены во внешний дедлайн, и это штатно. Guard — не бюджет, а **маркер атрибуции стадии** (п. 3). Существующий IMAP-guard (`testers.py:140-143`) снимать **не требуется и запрещено**.
+
+2. **Числа: один инвариант и эвристика.** `_IMAP_TIMEOUT` / `_SMTP_TIMEOUT` (`testers.py:57-58`) = **20** каждый (было 30). SMTP-пробы имеют `wait_for(_SMTP_TIMEOUT + 5)`-guard (`testers.py:240-250`, `:374-383`) — симметрично IMAP (`:140-143`, `:300-303`).
+
+   **2.1. Инвариант (верхняя граница HTTP-ответа = ТРИ слагаемых, ADR-0047 §2.1/§2.3):**
+
+   ```
+   MAILBOX_TEST_DEADLINE_SECONDS 45  +  teardown после отмены ≤ 5  +  внепробная часть ≤ 5   <   60
+                                                                      (nginx агрегатора = gunicorn --timeout)
+   ```
+
+   Верхнюю границу **probe** задаёт только дедлайн; но **время ответа ≠ дедлайн**: `asyncio.wait_for` при истечении таймаута отменяет внутреннюю задачу и **дожидается её `finally`**, а там у SMTP-пробы — `await _close_smtp_client(client)` (`testers.py:210-211`, `:355-356`) с вежливым `QUIT` под `_SMTP_QUIT_TIMEOUT = 5` (`:65`, `:163-168`). Это **teardown-плечо ≤ 5 с**, и оно входит в инвариант явной строкой. У IMAP-проб teardown ≈ 0 (проба живёт в `asyncio.to_thread`, отменённый future завершается сразу — тред доживает вне запроса).
+
+   `_SMTP_QUIT_TIMEOUT` **необходим**: без него `QUIT` против молчащего сервера тянулся бы до `_SMTP_TIMEOUT = 20` → `45 + 20 = 65 > 60` → гарантированный `504`.
+
+   Тот же класс инварианта, что у send (§11 «Инварианты»): доменная ошибка обязана всплыть **раньше**, чем прокси превратит ожидание в `504`. Машинная защита — **`le=45`** на env (норма, **применена в коде**: `shared/config.py:169`, см. «Конфигурация»).
+
+   **Правило для будущих правок:** любой новый `await` в `finally`/`__aexit__` под дедлайном обязан быть time-boxed **и** учтён в этом инварианте; вырастет teardown — `le` пересчитывается в том же изменении (формула — ADR-0047 §5).
+
+   Внешняя цепочка (звенья за пределами агрегатора нормативны в `ADR-053` §1.1/§1.2/§1.2.1/§6; агрегатор их не задаёт, а обязан в них укладываться):
+
+   ```
+   45  <  nginx агрегатора 60  <  CRM read 75  <  CRM overall-deadline ОДНОГО вызова 85
+
+   наружное звено CRM — бюджет ЗАПРОСА, а не вызова (ADR-053 §1.2.1):
+     Σ overall всех вызовов запроса + внепробная работа CRM (≤5)  <  proxy_read_timeout nginx CRM 120
+     худший путь CRM (create + компенсирующее удаление): 85 + 15 + 5 = 105 < 120
+   ```
+
+   Прежнее звено «nginx CRM **90**» **отменено** (`ADR-053` §6): оно нормировалось против одного вызова и не выдерживало пути с двумя (85 + компенсация → 115 > 90). Числа CRM-стороны сверять по `ADR-053`.
+
+   > **`20 + 20 = 40 ≤ 45` — бюджетная ЭВРИСТИКА fail-fast, а НЕ верхняя граница.** `_IMAP_TIMEOUT` уходит в `imap_tools.MailBox(..., timeout=...)` (`testers.py:104,106,274`) как **сокет-таймаут на операцию**, а `_SMTP_TIMEOUT` — в `aiosmtplib.SMTP(..., timeout=...)` (`testers.py:186,320`), где применяется к **отдельным фазам** (`connect`/`starttls`/`login`), а не к их сумме. Ни то, ни другое не ограничивает логин целиком — **именно поэтому** у IMAP и понадобился guard `+5`. Композиция guards = `25 + 25 = 50 > 45`. Смысл чисел — быстрый отказ по стадии **внутри** бюджета и запас `45 − 40 = 5 с` на DNS/TLS/тред-пул. Опираться на `40` как на bound (в т.ч. ассертить арифметику констант в тестах) **запрещено** — гарантию даёт только `wait_for` п. 1.
+
+3. **Исчерпание дедлайна → доменная `422`**, НЕ `5xx` и НЕ зависание. Разрешены **только существующие** коды (`exceptions.py:94-101`): `imap_login_failed` / `smtp_login_failed`, `details.detail="timeout"`. **Новый код заводить запрещено** — у CRM он попал бы в fallback `422 unprocessable` («Агрегатор отклонил запрос», `ADR-053` §2), т.е. причина отказа снова потерялась бы. Атрибуция — по маркеру стадии, не угадыванием:
+
+   | Стадия в момент истечения | Ошибка | `details` |
+   | --- | --- | --- |
+   | host-assert IMAP / IMAP-логин; refresh access-token (P2) | `IMAPLoginFailedError` | `{"detail":"timeout","stage":"imap"\|"oauth_token"}` |
+   | host-assert SMTP / SMTP-логин | `SMTPLoginFailedError` | `{"detail":"timeout","stage":"smtp"}` |
+
+4. **SSRF-guard уходит off-loop — иначе дедлайн декоративен.** `assert_public_host` (`security.py:77`) внутри делает блокирующий `socket.getaddrinfo` (`security.py:45-54`); вызванный **синхронно из корутины**, он крутится **в потоке event loop**, а `asyncio.wait_for` отменяет только `await`-точки → зависший резолвер стопорит весь loop и никакой дедлайн не срабатывает. Норма (**реализована**): `security.py:104-121` — `async def assert_public_host_async(host, *, port)` = `await asyncio.to_thread(assert_public_host, host, port=port)`; все **четыре** вызова в `testers.py` (`:138`, `:232`, `:298`, `:372`) идут через неё.
+
+   **Остальные четыре call-site (вне connection-test) тоже переведены — TD-056 закрыт:** `send/service.py:228` (`smtp_send_message`), `:298` (`smtp_send_via_relay`), `:519` (IMAP APPEND в Sent), **`worker/app/sync_cycle.py:212`** (`sync_one_account`; в воркере зависший резолвер стопорил **весь** sync-цикл — все ящики). Прямых вызовов синхронного `assert_public_host` из корутин не осталось. ⚠️ `send/service.py:31` — строка **импорта**, а не вызов.
+
+   > **Класс дефекта закрыт НЕ полностью — долг TD-057.** Тот же паттерн живёт во **втором** резолвере: `shared/url_safety.py:87` (`socket.getaddrinfo` в `_resolve_addresses`, вызов из `validate_outbound_url` `:192`), который зовут синхронно из корутин webhook-подсистемы — `webhooks/dispatch_service.py:304` (в `dispatch_one_payload` `:138`, исполняется **в воркере**) и `webhooks/service.py:86` (sync-хелпер `_validate_url_or_raise` `:82`) из async `:175`/`:248`, а также `:429`. Вне scope ADR-0047; закрывать класс до TD-057 нельзя.
+
+**Конфигурация.** `MAILBOX_TEST_DEADLINE_SECONDS` (`shared/config.py:169` — `Field(default=45, ge=10, le=45)`: и default, и граница нормы **в коде**) — `07-deployment.md` §4. Дедлайн ограничивает **probe**, а не весь HTTP-запрос: teardown-плечо (≤ 5 с, п. 2.1) и внепробная часть (auth; для `POST /test` с `account_id` — SELECT ящика + `decrypt_mail_password`, `service.py:474-502`; у `create`/`update` — INSERT/UPDATE + сериализация DTO) нормированы **отдельно, по ≤ 5 с каждая**. `le=45` **машинно** охраняет инвариант `deadline + teardown + внепробная ≤ 55 < 60`; формула — `le ≤ 60 − 5 − 5 − 5` (резерв на гранулярность таймеров). `le=50` был **over-claim**: при значении `50` худший случай = ровно `60` = `proxy_read_timeout` → `504`. `_IMAP_TIMEOUT`/`_SMTP_TIMEOUT`/`_SMTP_QUIT_TIMEOUT` остаются константами модуля `testers.py` (не env) — они подчинены дедлайну; ср. §11, где бюджет send тоже задан константами.
 
 ---
 
@@ -1217,6 +1283,7 @@ async def smtp_send_via_relay(msg: EmailMessage, recipients: list[str]) -> None
 - `INSERT INTO sent_messages` происходит ТОЛЬКО после успешной SMTP-отправки.
 - IMAP APPEND — best-effort, не влияет на успех endpoint'а.
 - **SMTP send timeout < nginx `proxy_read_timeout` (ADR-0032 follow-up).** Инвариант отказоустойчивости: суммарный worst-case времени SMTP-пути на одном запросе `POST /api/messages/send` должен быть **строго меньше** nginx `proxy_read_timeout` (60s, `deploy/nginx/templates/default.conf.template`), чтобы клиент всегда получал доменный 502/JSON, а не сырой **504** от nginx на зависшем upstream. Составная граница: `_SMTP_TIMEOUT` (20s) + best-effort IMAP APPEND (`_IMAP_APPEND_TIMEOUT + 5` = 35s, выполняется **после** успешной отправки) = 55s < 60s (запас ~5s). `_SMTP_TIMEOUT` держать `≤ 25` при неизменном nginx-60s. Значение — константа модуля `send/service.py`, не env.
+  > ⚠️ **Однофамильцы:** `_SMTP_TIMEOUT` определён в **двух** модулях. Здесь речь о `send/service.py:50` (**отправка**, `20`). Константы **connection-test** — `_IMAP_TIMEOUT`/`_SMTP_TIMEOUT` в `accounts/testers.py:57-58` (`20`/`20` по ADR-0047, см. §9.2) плюс `_SMTP_QUIT_TIMEOUT` (`:65`): это **другой** бюджет под **другим** дедлайном (`MAILBOX_TEST_DEADLINE_SECONDS`). Правя один, не трогай другой.
 
 ### Content negotiation (no-JS fallback)
 
@@ -3420,6 +3487,8 @@ class ExternalMessagesPage(BaseModel):
 - telegram (ADR-0018): `POST /api/telegram/webhook/<wrong>` → 403; правильный secret + `/start` → 200 и Bot API получил `sendMessage` с inline-keyboard и web_app.url; правильный secret + `/help` или произвольный текст или body без `message` → 200 без вызова Bot API; `TELEGRAM_BOT_TOKEN` отсутствует во всех логах (redact-test).
 - webhooks (ADR-0023): `encrypt_webhook_secret`/`decrypt_webhook_secret` round-trip с `webhook_id` AAD; decrypt с другим `webhook_id` → `InvalidTag`; URL validation (https only, lexical localhost reject, SSRF DNS-резолв с приватными CIDR → 400); idempotency `try_reserve` (повторный вызов → None); `find_active_for_message` отсеивает inactive/dead/history-filter; `secret` plaintext отсутствует во всех логах (redact-test); FSM transitions (4xx×10 → dead, 410 → dead, 5xx → rollback, 2xx → success); `POST /test` не пишет `webhook_deliveries`.
 - send SMTP timeout (ADR-0032 follow-up): `_SMTP_TIMEOUT` ≤ 25 и `_SMTP_TIMEOUT + _IMAP_APPEND_TIMEOUT + 5 < 60` (nginx `proxy_read_timeout`); зависший/заблокированный SMTP-connect (mock-сервер не отвечает на 465) → `SMTPSendFailedError` (502/доменная ошибка) в пределах `_SMTP_TIMEOUT`, НЕ зависание до 60s; `TimeoutError`/`OSError`/`SMTPException` на send-пути → 502 JSON, не 500/504.
+- **connection-test hard-deadline (ADR-0047):** норму доказывает **поведенческий** кейс, а не арифметика констант. **Обязателен:** probe висит дольше дедлайна (мок-сервер молчит) → ответ **`422` В ПРЕДЕЛАХ `MAILBOX_TEST_DEADLINE_SECONDS` + teardown (≤ `_SMTP_QUIT_TIMEOUT` = 5 с)** (замерить фактическое время ответа), НЕ зависание, НЕ `500`, НЕ `504`. Атрибуция стадии: молчит IMAP-баннер → `IMAPLoginFailedError` (`422`, `details.detail="timeout"`, `stage="imap"`); молчит SMTP-баннер (IMAP успешен) → `SMTPLoginFailedError` (`422`, `detail="timeout"`, `stage="smtp"`); истёк refresh-обмен (P2) → `IMAPLoginFailedError`, `stage="oauth_token"`. **Teardown-плечо (§9.2 п.2.1):** молчащий SMTP-сервер, который не отвечает и на `QUIT`, → ответ приходит **не позже** `дедлайн + 5 с` (а не `дедлайн + _SMTP_TIMEOUT`) — кейс обязателен, именно он охраняет инвариант `55 < 60`. Дедлайн покрывает **все три** входа: `POST /mailboxes/test` (включая ветку с `account_id` — re-probe сохранённого ящика, `service.py:490`), `POST /mailboxes` (тест до вставки — ящик **не создан**), `PATCH /mailboxes/{id}` со сменой кредов (креды **не изменены**). **Env-границы (после амендмента §5; граница в коде — `shared/config.py:169`, `ge=10, le=45`):** `MAILBOX_TEST_DEADLINE_SECONDS=46` и `=9` → настройки **не** валидируются; `=45` и `=10` — валидируются. Кейс `=46` **обязателен** (TD-058 закрыт — граница приведена к норме; прежнее `le=50` отменено, значение `50` валидацию больше не проходит). SSRF-guard off-loop (§9.2 п.4): при заведомо зависшем DNS-резолве event loop **не блокируется** (конкурентный запрос к `/healthz` отвечает, пока тест висит) и дедлайн срабатывает.
+  > ⚠️ **Assert арифметики констант (`_IMAP_TIMEOUT + _SMTP_TIMEOUT ≤ MAILBOX_TEST_DEADLINE_SECONDS`) заводить ЗАПРЕЩЕНО** — в отличие от send (строка выше), где сокет-таймаут `aiosmtplib` покрывает всю последовательность. Здесь `20 + 20 = 40` — **эвристика fail-fast, а не верхняя граница** (§9.2 п.2): сокет-таймауты применяются к отдельным операциям/фазам, композиция guards = `25 + 25 = 50 > 45`. Такой assert закрепил бы свойство, которое ничего не гарантирует. Верхнюю границу доказывает **только** поведенческий кейс выше.
 - mailbox-down alert (ADR-0033): `list_recipients_for_mailbox` отдаёт тех же получателей, что `list_recipients_for_message` для письма в том же ящике **минус** per-message-фильтры (сравнить наборы; получатель с `internal_date < tl.created_at` попадает в mailbox-алерт, но не в message-нотификацию); opt-out (`tg_notifications_enabled=false`) и dead-link (`dead_at`) исключают получателя; вне scope (не super_admin, не член команды ящика, не владелец) — не в наборе. Идемпотентность: `_disable_after_failures` ставит `disabled_alert_sent_at` guarded (`WHERE ... IS NULL`) → повторный вызов в том же disabled-состоянии не enqueue'ит второй раз; re-enable (`creds_changed`) сбрасывает штамп в NULL → следующий disable снова enqueue'ит. Триггер строго в worker-auto-disable: ручное `is_active=false` и circuit-breaker-подавление алерт НЕ enqueue'ят. Текст: `reason` маппится в RU-фразу; сырой `last_sync_error` в тексте отсутствует; `acc_label` экранируется. Диспатчер: per-chat dedup (один чат — один send в пределах алерта); `send_notification` вызван с `message_id=None`; сбой Bot API 403 → `mark_link_dead`, 429/5xx → дроп без re-enqueue.
 - external pull-API (ADR-0029): auth-флоу — нет ключа → 401; неверный ключ → 401 (`compare_digest`); `EXTERNAL_API_KEY` пуст (фича выключена) → 401 (неотличимо от неверного ключа); `X-API-Key` и `Authorization: Bearer` оба принимаются, `X-API-Key` приоритетнее; rate-limit consume **до** auth (исчерпание → 429 `Retry-After`, ключ не сравнивается); query validation (`since_id<0` → 400, `limit=0`/`limit=201` → 400, defaults `since_id=0`/`limit=50`); ключ/заголовок отсутствуют во всех логах (redact-test); `body_text`/`body_html` отдаются **сырыми** (без `collapse_blank_lines_*` — сравнить с UI-DTO на письме с пустыми строками); **canonical-дедуп** — `ExternalMessagesRepo.list_since_id` вызывается с `mail_account_ids` из `list_canonical_account_ids()` (mock возвращает только canonical id), не-канонические `mail_account_id` отсутствуют в SQL-фильтре; пустой `mail_account_ids` → пустой результат без SQL-запроса.
 

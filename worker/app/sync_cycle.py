@@ -45,7 +45,7 @@ from backend.app.oauth.service import OAuthError, OAuthRefreshInvalidError, Outl
 from backend.app.repositories.mail_accounts import MailAccountsRepo
 from backend.app.repositories.messages import MessagesRepo
 from backend.app.repositories.users import UsersRepo
-from backend.app.security import assert_public_host
+from backend.app.security import assert_public_host_async
 from backend.app.tags.service import TagsService
 from backend.app.telegram.notify_service import TelegramNotifyService
 from shared.config import get_settings
@@ -203,8 +203,13 @@ async def sync_one_account(
     # ``InvalidHostError("Could not resolve host", ...)``. That used to disable
     # the account immediately. Now it is classified like any other error — the
     # "could not resolve" substring makes it TRANSIENT (no disable, retries).
+    #
+    # TD-056: resolve OFF the event loop (``assert_public_host_async`` →
+    # ``asyncio.to_thread``). The blocking ``socket.getaddrinfo`` used to run in
+    # the worker's loop thread, so a hung resolver on ONE mailbox stalled the
+    # ENTIRE sync cycle (all accounts), not just this one.
     try:
-        assert_public_host(account.imap_host, port=account.imap_port)
+        await assert_public_host_async(account.imap_host, port=account.imap_port)
     except InvalidHostError as exc:
         detail = str(exc.message) if hasattr(exc, "message") else str(exc)
         return await _handle_sync_error(account, exc, detail=detail, cycle_log=cycle_log)

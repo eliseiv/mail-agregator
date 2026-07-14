@@ -8,9 +8,18 @@ Both perform the absolute minimum needed to validate credentials:
 
 Errors are translated to the appropriate :class:`backend.app.exceptions.DomainError`.
 
-SSRF guard: :func:`backend.app.security.assert_public_host` is called for
-each host before any TCP connect, so we never leak ourselves as an internal
-port scanner (``docs/06-security.md`` sec. 4).
+SSRF guard: :func:`backend.app.security.assert_public_host_async` is called
+for each host before any TCP connect, so we never leak ourselves as an internal
+port scanner (``docs/06-security.md`` sec. 4). It resolves OFF the event loop
+(``asyncio.to_thread``) — a blocking ``getaddrinfo`` in the loop thread would
+make the hard-deadline of ADR-0047 §1 decorative (ADR-0047 §4).
+
+Timeouts (ADR-0047 §2): the per-probe ``wait_for`` guards below are NOT the
+budget of the operation — the single upper bound is the hard-deadline
+``MAILBOX_TEST_DEADLINE_SECONDS`` applied inside the probe methods of
+``accounts/service.py`` (ADR-0047 §1/§1.1). The guards exist so that a hung
+IMAP/SMTP login surfaces as a STAGE-attributed domain error
+(``details.detail="timeout"``) before that deadline fires.
 """
 
 from __future__ import annotations
@@ -29,13 +38,31 @@ from backend.app.exceptions import (
     IMAPLoginFailedError,
     SMTPLoginFailedError,
 )
-from backend.app.security import assert_public_host
+from backend.app.security import assert_public_host_async
 from shared.logging import get_logger
 
 log = get_logger(__name__)
 
-_IMAP_TIMEOUT = 30
-_SMTP_TIMEOUT = 30
+# ADR-0047 §2/§2.2 — fail-fast INSIDE the deadline, NOT an upper bound.
+# ``_IMAP_TIMEOUT`` goes to ``imap_tools.MailBox(..., timeout=...)`` (a socket
+# timeout PER OPERATION, not per login) and ``_SMTP_TIMEOUT`` to
+# ``aiosmtplib.SMTP(..., timeout=...)`` (applied to each PHASE — connect /
+# starttls / login — not to their sum). Neither bounds a whole login, which is
+# exactly why each probe also carries a ``wait_for`` guard (+5). The composition
+# of the guards (25 + 25 = 50) is NOT a bound either: the only upper bound of
+# the operation is ``MAILBOX_TEST_DEADLINE_SECONDS`` (ADR-0047 §1/§2.1).
+# Do not assert arithmetic over these constants in tests (ADR-0047 §2.2).
+# NB: ``send/service.py`` defines its OWN ``_SMTP_TIMEOUT`` under a different
+# budget (05-modules.md §11) — the two are unrelated.
+_IMAP_TIMEOUT = 20
+_SMTP_TIMEOUT = 20
+
+# Bounded teardown. When the outer deadline (ADR-0047 §1) cancels the probe, an
+# ``await client.quit()`` in a ``finally`` against a SILENT server would keep the
+# response hanging for up to another ``_SMTP_TIMEOUT`` — i.e. past the deadline
+# and into nginx's ``proxy_read_timeout`` (60s → 504 HTML), defeating §2.1. QUIT
+# stays polite but time-boxed; the transport is then closed synchronously.
+_SMTP_QUIT_TIMEOUT = 5
 
 
 def build_xoauth2_string(email: str, access_token: str) -> str:
@@ -108,7 +135,7 @@ async def imap_test_login(
     password: str,
 ) -> None:
     """Test IMAP login. Raises :class:`IMAPLoginFailedError` on any failure."""
-    assert_public_host(host, port=port)
+    await assert_public_host_async(host, port=port)
     try:
         await asyncio.wait_for(
             asyncio.to_thread(_imap_login_blocking, host, port, ssl_on, username, password),
@@ -133,7 +160,15 @@ def _ssl_context() -> ssl.SSLContext:
     return ctx
 
 
-async def smtp_test_login(
+async def _close_smtp_client(client: aiosmtplib.SMTP) -> None:
+    """Time-boxed, cancellation-safe SMTP teardown (see ``_SMTP_QUIT_TIMEOUT``)."""
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(client.quit(), timeout=_SMTP_QUIT_TIMEOUT)
+    with contextlib.suppress(Exception):
+        client.close()
+
+
+async def _smtp_login_probe(
     *,
     host: str,
     port: int,
@@ -142,14 +177,7 @@ async def smtp_test_login(
     username: str,
     password: str,
 ) -> None:
-    """Test SMTP login. Raises :class:`SMTPLoginFailedError` on any failure."""
-    assert_public_host(host, port=port)
-    if ssl_on and starttls:
-        raise SMTPLoginFailedError(
-            "smtp_ssl and smtp_starttls are mutually exclusive",
-            details={"detail": "ssl_and_starttls_set"},
-        )
-
+    """Connect + (STARTTLS) + LOGIN. Body of :func:`smtp_test_login`."""
     client = aiosmtplib.SMTP(
         hostname=host,
         port=port,
@@ -180,8 +208,51 @@ async def smtp_test_login(
             details={"detail": _safe_error_text(exc)},
         ) from exc
     finally:
-        with contextlib.suppress(Exception):
-            await client.quit()
+        await _close_smtp_client(client)
+
+
+async def smtp_test_login(
+    *,
+    host: str,
+    port: int,
+    ssl_on: bool,
+    starttls: bool,
+    username: str,
+    password: str,
+) -> None:
+    """Test SMTP login. Raises :class:`SMTPLoginFailedError` on any failure.
+
+    Guarded by ``wait_for(_SMTP_TIMEOUT + 5)`` symmetrically to
+    :func:`imap_test_login` (ADR-0047 §2): ``aiosmtplib``'s own timeout applies
+    to each PHASE (connect / starttls / login), never to their sum, so without
+    this guard the probe had NO upper bound of its own. The guard attributes the
+    STAGE (``smtp``) — the budget of the whole test is the hard-deadline in
+    ``MailAccountService`` (ADR-0047 §1.1).
+    """
+    await assert_public_host_async(host, port=port)
+    if ssl_on and starttls:
+        raise SMTPLoginFailedError(
+            "smtp_ssl and smtp_starttls are mutually exclusive",
+            details={"detail": "ssl_and_starttls_set"},
+        )
+
+    try:
+        await asyncio.wait_for(
+            _smtp_login_probe(
+                host=host,
+                port=port,
+                ssl_on=ssl_on,
+                starttls=starttls,
+                username=username,
+                password=password,
+            ),
+            timeout=_SMTP_TIMEOUT + 5,
+        )
+    except TimeoutError as exc:
+        raise SMTPLoginFailedError(
+            "SMTP login timed out",
+            details={"detail": "timeout"},
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +295,7 @@ def _imap_oauth_login_blocking(host: str, port: int, email: str, access_token: s
 
 async def imap_test_oauth(*, host: str, port: int, email: str, access_token: str) -> None:
     """Test an IMAP XOAUTH2 connection. Raises :class:`IMAPLoginFailedError`."""
-    assert_public_host(host, port=port)
+    await assert_public_host_async(host, port=port)
     try:
         await asyncio.wait_for(
             asyncio.to_thread(_imap_oauth_login_blocking, host, port, email, access_token),
@@ -237,17 +308,10 @@ async def imap_test_oauth(*, host: str, port: int, email: str, access_token: str
         ) from exc
 
 
-async def smtp_test_oauth(
+async def _smtp_oauth_probe(
     *, host: str, port: int, starttls: bool, email: str, access_token: str
 ) -> None:
-    """Test an SMTP XOAUTH2 connection (ADR-0025 §4).
-
-    ``aiosmtplib`` 3.0.2 has no built-in XOAUTH2 mechanism, so we drive the
-    raw ``AUTH XOAUTH2 <base64>`` command via :meth:`SMTP.execute_command`
-    after STARTTLS (TD-030). Personal Outlook SMTP is ``smtp-mail.outlook.com``
-    :587 STARTTLS.
-    """
-    assert_public_host(host, port=port)
+    """Connect + (STARTTLS) + ``AUTH XOAUTH2``. Body of :func:`smtp_test_oauth`."""
     client = aiosmtplib.SMTP(
         hostname=host,
         port=port,
@@ -289,5 +353,36 @@ async def smtp_test_oauth(
             details={"detail": _safe_error_text(exc)},
         ) from exc
     finally:
-        with contextlib.suppress(Exception):
-            await client.quit()
+        await _close_smtp_client(client)
+
+
+async def smtp_test_oauth(
+    *, host: str, port: int, starttls: bool, email: str, access_token: str
+) -> None:
+    """Test an SMTP XOAUTH2 connection (ADR-0025 §4).
+
+    ``aiosmtplib`` 3.0.2 has no built-in XOAUTH2 mechanism, so we drive the
+    raw ``AUTH XOAUTH2 <base64>`` command via :meth:`SMTP.execute_command`
+    after STARTTLS (TD-030). Personal Outlook SMTP is ``smtp-mail.outlook.com``
+    :587 STARTTLS.
+
+    Guarded by ``wait_for(_SMTP_TIMEOUT + 5)`` — same stage-attribution guard as
+    :func:`smtp_test_login` (ADR-0047 §2/§1.1).
+    """
+    await assert_public_host_async(host, port=port)
+    try:
+        await asyncio.wait_for(
+            _smtp_oauth_probe(
+                host=host,
+                port=port,
+                starttls=starttls,
+                email=email,
+                access_token=access_token,
+            ),
+            timeout=_SMTP_TIMEOUT + 5,
+        )
+    except TimeoutError as exc:
+        raise SMTPLoginFailedError(
+            "SMTP XOAUTH2 login timed out",
+            details={"detail": "timeout"},
+        ) from exc

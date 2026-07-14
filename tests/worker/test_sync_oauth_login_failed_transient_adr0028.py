@@ -152,9 +152,18 @@ def _patch_imap_login_failed(monkeypatch: pytest.MonkeyPatch) -> None:
     The flake is raised AFTER ``_resolve_oauth_access_token`` has already
     succeeded (token mocked below) — exactly the ADR-0028 sequence: refresh OK,
     then a spurious IMAP login failure.
+
+    Only ``fetch_blocking`` is faked: since TD-056 the SSRF guard also goes
+    through ``asyncio.to_thread`` (``assert_public_host_async``, ADR-0047 §4), so
+    a blanket fake would hijack the resolve leg too and raise the IMAP flake
+    before the cycle ever reaches IMAP. Everything that is not the blocking fetch
+    is delegated to the REAL ``asyncio.to_thread``.
     """
+    real_to_thread = asyncio.to_thread
 
     async def _fake_to_thread(_func: Any, *_a: Any, **_k: Any) -> Any:
+        if getattr(_func, "__name__", "") != "fetch_blocking":
+            return await real_to_thread(_func, *_a, **_k)
         raise _IMAP_LOGIN_FAILED
 
     monkeypatch.setattr(asyncio, "to_thread", _fake_to_thread)

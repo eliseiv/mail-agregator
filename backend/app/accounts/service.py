@@ -8,6 +8,7 @@ super-admin sees all.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Literal
 
 from sqlalchemy import event as sa_event
@@ -37,8 +38,10 @@ from backend.app.exceptions import (
     ConflictError,
     ForbiddenError,
     GroupNotFoundError,
+    IMAPLoginFailedError,
     NotFoundError,
     OAuthReconsentRequiredError,
+    SMTPLoginFailedError,
     ValidationError,
 )
 from backend.app.oauth.service import OAuthRefreshInvalidError, OutlookTokenService
@@ -46,6 +49,7 @@ from backend.app.repositories.groups import GroupsRepo
 from backend.app.repositories.mail_accounts import MailAccountsRepo
 from backend.app.repositories.messages import MessagesRepo
 from backend.app.repositories.users import UsersRepo
+from shared.config import get_settings
 from shared.crypto import decrypt_mail_password, encrypt_mail_password
 from shared.logging import get_logger
 from shared.models import MailAccount, User
@@ -71,6 +75,46 @@ def _require(value: str | None, field: str) -> str:
     if not value:
         raise ValidationError(f"{field} is required", field=field)
     return value
+
+
+#: Stage of a connection-test probe, used to attribute a hard-deadline
+#: expiry to a domain error (ADR-0047 §3).
+ProbeStageName = Literal["imap", "smtp", "oauth_token"]
+
+
+class _ProbeStage:
+    """Mutable marker of the stage a probe is currently in (ADR-0047 §3).
+
+    The probe body updates it as it advances; the deadline handler reads it to
+    pick the domain error DETERMINISTICALLY instead of guessing.
+    """
+
+    __slots__ = ("value",)
+
+    def __init__(self, initial: ProbeStageName) -> None:
+        self.value: ProbeStageName = initial
+
+
+def _deadline_error(stage: ProbeStageName) -> IMAPLoginFailedError | SMTPLoginFailedError:
+    """Translate a hard-deadline expiry into an EXISTING domain error (ADR-0047 §3).
+
+    Only ``imap_login_failed`` / ``smtp_login_failed`` (both 422) are allowed: a
+    NEW error code would land in the CRM's ``422 unprocessable`` fallback and the
+    reason of the failure — the whole point of the deadline — would be lost again
+    (ADR-0047 §3, CRM ``ADR-053`` §2). ``oauth_token`` (the refresh exchange with
+    Microsoft ran out) precedes IMAP and means "no connection to the mailbox", so
+    it is attributed to ``imap_login_failed``. ``details`` is a free-form field
+    (the CRM reads only ``error.code``), so ``stage`` does not widen the contract.
+    """
+    if stage == "smtp":
+        return SMTPLoginFailedError(
+            "SMTP connection test timed out",
+            details={"detail": "timeout", "stage": stage},
+        )
+    return IMAPLoginFailedError(
+        "IMAP connection test timed out",
+        details={"detail": "timeout", "stage": stage},
+    )
 
 
 def _to_dto(acc: MailAccount, owner: User) -> MailAccountDTO:
@@ -353,6 +397,62 @@ class MailAccountService:
         smtp_username: str | None,
         smtp_password: str | None,
     ) -> TestResult:
+        """Password probe (P1) under the hard-deadline (ADR-0047 §1).
+
+        The ``wait_for`` lives HERE, inside the probe method, and NOT at the call
+        site: ``_test_credentials`` has TWO callers — :meth:`test` (ad-hoc creds)
+        and :meth:`_test_existing_account` (re-probe of a stored mailbox, also
+        reachable from ``POST /test`` with ``account_id``) — so a call-site
+        wrapper would leave one of them unbounded. Bound to the method, every
+        future caller (``create`` / ``update`` already among them) inherits the
+        deadline for free. A SECOND deadline around this method (in ``test`` /
+        ``create`` / ``update`` / a router) is forbidden — it would mask this one
+        (ADR-0047 §1.1).
+        """
+        stage = _ProbeStage("imap")
+        try:
+            return await asyncio.wait_for(
+                self._test_credentials_inner(
+                    stage=stage,
+                    email=email,
+                    password=password,
+                    imap_host=imap_host,
+                    imap_port=imap_port,
+                    imap_ssl=imap_ssl,
+                    smtp_host=smtp_host,
+                    smtp_port=smtp_port,
+                    smtp_ssl=smtp_ssl,
+                    smtp_starttls=smtp_starttls,
+                    smtp_username=smtp_username,
+                    smtp_password=smtp_password,
+                ),
+                timeout=get_settings().MAILBOX_TEST_DEADLINE_SECONDS,
+            )
+        except TimeoutError as exc:
+            raise _deadline_error(stage.value) from exc
+
+    async def _test_credentials_inner(
+        self,
+        *,
+        stage: _ProbeStage,
+        email: str,
+        password: str,
+        imap_host: str,
+        imap_port: int,
+        imap_ssl: bool,
+        smtp_host: str,
+        smtp_port: int,
+        smtp_ssl: bool,
+        smtp_starttls: bool,
+        smtp_username: str | None,
+        smtp_password: str | None,
+    ) -> TestResult:
+        """Body of P1: host-assert + IMAP login, then host-assert + SMTP login.
+
+        Both host-asserts resolve OFF the event loop (ADR-0047 §4) — otherwise
+        the deadline above could not fire while ``getaddrinfo`` blocks the loop.
+        """
+        stage.value = "imap"
         await imap_test_login(
             host=imap_host,
             port=imap_port,
@@ -360,6 +460,7 @@ class MailAccountService:
             username=email,
             password=password,
         )
+        stage.value = "smtp"
         await smtp_test_login(
             host=smtp_host,
             port=smtp_port,
@@ -401,13 +502,30 @@ class MailAccountService:
         )
 
     async def _test_oauth_account(self, acc: MailAccount) -> TestResult:
-        """XOAUTH2 connectivity probe for an oauth_outlook account (ADR-0025 §4).
+        """XOAUTH2 connectivity probe (P2) under the hard-deadline (ADR-0047 §1).
 
         Mirrors the send path: a needs-consent account is rejected with the
-        documented 409 before any token refresh / network connect.
+        documented 409 before any token refresh / network connect. Like P1, the
+        ``wait_for`` sits inside the probe method, never at the call site
+        (ADR-0047 §1/§1.1). The token refresh (a network call to Microsoft) is
+        INSIDE the deadline — it is part of the probe.
         """
         if acc.oauth_needs_consent:
             raise OAuthReconsentRequiredError("Reconnect Outlook to test this account")
+        stage = _ProbeStage("oauth_token")
+        try:
+            return await asyncio.wait_for(
+                self._test_oauth_account_inner(acc, stage=stage),
+                timeout=get_settings().MAILBOX_TEST_DEADLINE_SECONDS,
+            )
+        except TimeoutError as exc:
+            raise _deadline_error(stage.value) from exc
+
+    async def _test_oauth_account_inner(
+        self, acc: MailAccount, *, stage: _ProbeStage
+    ) -> TestResult:
+        """Body of P2: refresh→access-token, then IMAP-XOAUTH2, then SMTP-XOAUTH2."""
+        stage.value = "oauth_token"
         try:
             access_token = await OutlookTokenService(self._db).get_valid_access_token(acc)
         except OAuthRefreshInvalidError as exc:
@@ -415,12 +533,14 @@ class MailAccountService:
             # service has already flagged ``oauth_needs_consent``; surface the
             # documented 409 so the UI prompts a reconnect (ADR-0025 §9.1).
             raise OAuthReconsentRequiredError("Reconnect Outlook to test this account") from exc
+        stage.value = "imap"
         await imap_test_oauth(
             host=acc.imap_host,
             port=acc.imap_port,
             email=acc.email,
             access_token=access_token,
         )
+        stage.value = "smtp"
         await smtp_test_oauth(
             host=acc.smtp_host,
             port=acc.smtp_port,

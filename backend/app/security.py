@@ -9,6 +9,7 @@ with :class:`backend.app.exceptions.InvalidHostError`.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import socket
 from collections.abc import Iterable
@@ -98,3 +99,23 @@ def assert_public_host(host: str, *, port: int) -> None:
                 "Host resolves to a private/internal address",
                 details={"host": host},
             )
+
+
+async def assert_public_host_async(host: str, *, port: int) -> None:
+    """Off-loop variant of :func:`assert_public_host` (ADR-0047 §4).
+
+    :func:`assert_public_host` calls the BLOCKING ``socket.getaddrinfo``
+    (:func:`_resolve`). Called straight from a coroutine it runs *in the event
+    loop thread*: a hung resolver stalls the whole loop, and since
+    :func:`asyncio.wait_for` can only cancel at ``await`` points, any deadline
+    around such a call is DECORATIVE (ADR-0047 «Дефект 4»). Every async caller
+    (connection-test — ADR-0047 §4; send + worker sync — TD-056) therefore
+    resolves in a worker thread.
+
+    Semantics are unchanged: :class:`InvalidHostError` raised inside the thread
+    propagates to the caller as before. When an outer deadline expires the
+    thread may outlive the cancelled ``await`` and finish on its own — the same
+    accepted trade-off as the existing ``wait_for``-over-``to_thread`` IMAP
+    pattern (``accounts/testers.py``).
+    """
+    await asyncio.to_thread(assert_public_host, host, port=port)

@@ -137,6 +137,37 @@ class Settings(BaseSettings):
     # without a code redeploy. Password accounts are unaffected either way.
     SYNC_OAUTH_LOGIN_FAILED_TRANSIENT: bool = Field(default=True)
 
+    # --- Mailbox connection-test hard-deadline (ADR-0047 §5) --------------
+    # Upper bound of the PROBE part of a connection test (host-assert + IMAP
+    # login + SMTP login, or the OAuth equivalent). Applied as
+    # ``asyncio.wait_for`` INSIDE ``MailAccountService._test_credentials`` /
+    # ``._test_oauth_account``, so ``POST /mailboxes/test``, ``POST /mailboxes``
+    # and ``PATCH /mailboxes/{id}`` (creds change) all inherit it. Exhaustion →
+    # domain 422 (``imap_login_failed`` / ``smtp_login_failed``,
+    # ``details.detail="timeout"``), never a hang and never a 504.
+    #
+    # ``le=45`` machine-guards the THREE-TERM invariant (ADR-0047 §2.1/§2.3/§5).
+    # The deadline bounds the PROBE, not the response: ``asyncio.wait_for`` AWAITS
+    # the cancelled task, including the ``finally: await _close_smtp_client(...)``
+    # of the SMTP probe (``accounts/testers.py:210-211``, ``:355-356``) — a polite
+    # QUIT time-boxed by ``_SMTP_QUIT_TIMEOUT = 5`` (``testers.py:65``, ``:163-168``).
+    # Hence the response time has three terms, and all three are budgeted:
+    #   deadline (≤45) + teardown after cancellation (≤5, ADR-0047 §2.3)
+    #                  + non-probe part of the request (≤5: auth, one SELECT by
+    #                    PK, AES-decrypt, INSERT/UPDATE, DTO serialisation)
+    #   = ≤55 < 60 = nginx ``proxy_read_timeout`` = gunicorn ``--timeout``
+    # i.e. the domain 422 JSON always reaches the client BEFORE our own proxy
+    # would turn the wait into a 504 HTML page. ``le`` formula (recompute on any
+    # change of a term): ``le <= 60 - teardown(5) - non-probe(5) - reserve(5) = 45``.
+    # ``le=50`` (the previous bound) and ``le=55`` are both over-claims: at 50 the
+    # worst case is exactly ``50 + 5 + 5 = 60`` — the very 504 HTML this ADR exists
+    # to prevent. env rather than a module constant because the correct value
+    # follows ``proxy_read_timeout``, which devops retunes without a code release.
+    # The fail-fast constants ``_IMAP_TIMEOUT``/``_SMTP_TIMEOUT``
+    # (``accounts/testers.py``) stay module constants — they are subordinate to
+    # this deadline, not the other way round.
+    MAILBOX_TEST_DEADLINE_SECONDS: int = Field(default=45, ge=10, le=45)
+
     # --- Sessions / auth ---
     SESSION_TTL_SECONDS: int = Field(default=43_200, ge=60)
     SESSION_ABSOLUTE_TTL_SECONDS: int = Field(default=604_800, ge=60)

@@ -28,7 +28,7 @@ from backend.app.repositories.mail_accounts import MailAccountsRepo
 from backend.app.repositories.messages import MessagesRepo
 from backend.app.repositories.sent_messages import SentMessagesRepo
 from backend.app.repositories.users import UsersRepo
-from backend.app.security import assert_public_host
+from backend.app.security import assert_public_host_async
 from backend.app.send.mime import build_mime, generate_message_id
 from backend.app.send.schemas import SendMessageRequest, SendMessageResponse
 from shared.config import get_settings
@@ -211,14 +211,21 @@ async def smtp_send_message(
     - **oauth_outlook:** fetch a fresh XOAUTH2 access token
       (:class:`OutlookTokenService`) and drive ``AUTH XOAUTH2``.
 
-    Plus ``assert_public_host`` (SSRF re-check at send time), the shared TLS
-    context and the fail-fast ``_SMTP_TIMEOUT``. Does **not** append to the
+    Plus ``assert_public_host_async`` (SSRF re-check at send time), the shared
+    TLS context and the fail-fast ``_SMTP_TIMEOUT``. Does **not** append to the
     "Sent" folder — the caller decides (``send`` does a best-effort append;
     ``forward`` does not, ADR-0034 §5). Raises :class:`SMTPSendFailedError`
     on any SMTP/transport failure and :class:`OAuthReconsentRequiredError`
     when an oauth account needs re-consent.
+
+    TD-056: the SSRF guard resolves OFF the event loop. Its blocking
+    ``getaddrinfo`` used to run in the loop thread — a hung resolver stalled the
+    WHOLE api container (and, via the forward dispatcher, the worker loop), and
+    the phase timeouts of ``aiosmtplib`` never covered the resolve leg, so the
+    declared send budget (``_SMTP_TIMEOUT + _IMAP_APPEND_TIMEOUT + 5 = 55 < 60``)
+    was not guaranteed for it.
     """
-    assert_public_host(account.smtp_host, port=account.smtp_port)
+    await assert_public_host_async(account.smtp_host, port=account.smtp_port)
 
     if account.auth_type == "oauth_outlook":
         if account.oauth_needs_consent:
@@ -280,14 +287,15 @@ async def smtp_send_via_relay(msg: EmailMessage, recipients: list[str]) -> None:
     sender — both already set on ``msg`` by :func:`build_forward_mime`.
 
     Mirrors the password branch of :func:`smtp_send_message`: SSRF re-check
-    (:func:`assert_public_host` on the relay host), shared TLS context,
+    (:func:`assert_public_host_async` on the relay host, off-loop — TD-056),
+    shared TLS context,
     fail-fast ``_SMTP_TIMEOUT``, and the same error matrix
     (``SMTPException`` / ``TimeoutError`` / ``OSError`` →
     :class:`SMTPSendFailedError` with host detail stripped). No Sent-append
     (forwards never append, ADR-0034 §5).
     """
     settings = get_settings()
-    assert_public_host(settings.FORWARD_SMTP_HOST, port=settings.FORWARD_SMTP_PORT)
+    await assert_public_host_async(settings.FORWARD_SMTP_HOST, port=settings.FORWARD_SMTP_PORT)
     try:
         await aiosmtplib.send(
             msg,
@@ -507,7 +515,8 @@ class SendService:
         appended = False
         appended_error: str | None = None
         try:
-            assert_public_host(account.imap_host, port=account.imap_port)
+            # TD-056: off-loop SSRF re-check before the IMAP APPEND.
+            await assert_public_host_async(account.imap_host, port=account.imap_port)
             if is_oauth:
                 assert access_token is not None
                 await asyncio.wait_for(
