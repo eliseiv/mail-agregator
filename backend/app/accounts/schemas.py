@@ -17,6 +17,36 @@ from typing import Annotated
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from shared.credentials import normalize_optional_login, normalize_optional_secret
+
+
+class OptionalSmtpCredsMixin(BaseModel):
+    """Input hardening for the OPTIONAL SMTP credentials (``smtp_username`` /
+    ``smtp_password``).
+
+    A blank string and the serialisation sentinels ``'None'`` / ``'null'`` mean
+    "no value" — they are coerced to ``None`` at the schema boundary, so such a
+    value can never reach ``mail_accounts`` again (prod: 41 rows with the literal
+    text ``'None'`` in ``smtp_username``, every send → 535 BadCredentials). This
+    keeps the documented form-encoded semantics ("пустая строка → ``null``",
+    ``docs/05-modules.md`` §9) and extends it to JSON callers of the external
+    write API.
+
+    ``None`` (not the empty string) also remains the "field not submitted"
+    marker of the PATCH schemas, so scrubbing a garbage value degrades to "field
+    not submitted" — never to a silent write of nonsense.
+    """
+
+    @field_validator("smtp_username", check_fields=False)
+    @classmethod
+    def _scrub_smtp_username(cls, v: str | None) -> str | None:
+        return normalize_optional_login(v)
+
+    @field_validator("smtp_password", check_fields=False)
+    @classmethod
+    def _scrub_smtp_password(cls, v: str | None) -> str | None:
+        return normalize_optional_secret(v)
+
 
 class OwnerBriefDTO(BaseModel):
     """Mailbox owner brief — used in account list / message rows."""
@@ -26,7 +56,7 @@ class OwnerBriefDTO(BaseModel):
     display_name: str | None = None
 
 
-class MailAccountTestRequest(BaseModel):
+class MailAccountTestRequest(OptionalSmtpCredsMixin):
     """Body of ``POST /api/mail-accounts/test``.
 
     Two modes (ADR-0025 §4c, docs/04-api-contracts §4c):
@@ -85,7 +115,7 @@ class MailAccountTestRequest(BaseModel):
         return self
 
 
-class MailAccountCreateRequest(BaseModel):
+class MailAccountCreateRequest(OptionalSmtpCredsMixin):
     """``POST /api/mail-accounts`` — full password-account credential set plus
     optional ``display_name`` (ADR-0020) and ``target_user_id`` (ADR-0019 §8).
 
@@ -146,7 +176,7 @@ class MailAccountCreateRequest(BaseModel):
         )
 
 
-class MailAccountUpdateRequest(BaseModel):
+class MailAccountUpdateRequest(OptionalSmtpCredsMixin):
     """``PATCH /api/mail-accounts/{id}`` — partial."""
 
     email: str | None = Field(default=None, max_length=254)

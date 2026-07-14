@@ -44,6 +44,7 @@ from backend.app.repositories.sent_messages import SentMessagesRepo
 from backend.app.security import assert_public_host_async
 from backend.app.send.mime import build_mime, generate_message_id
 from backend.app.send.schemas import SendMessageResponse
+from shared.credentials import normalize_optional_login, normalize_optional_secret
 from shared.crypto import decrypt_mail_password
 from shared.logging import get_logger
 from shared.models import MailAccount, Message
@@ -271,12 +272,22 @@ async def smtp_send_message(
 
     # Password path — prefer the dedicated SMTP password, fall back to the
     # IMAP password (same precedence as the pre-ADR-0034 inline send).
+    #
+    # Both optional SMTP credentials are normalised at the point of USE: a stored
+    # ``'None'`` / ``''`` / blank is the ABSENCE of the value, not the value
+    # (``shared/credentials.py`` — prod: 41 rows with the literal text ``'None'``
+    # in ``smtp_username`` made every send fail with 535 BadCredentials, while a
+    # truthy garbage string silently shadowed the documented fallback to
+    # ``email`` / ``encrypted_password``).
+    smtp_pwd: str | None = None
     if account.smtp_encrypted_password is not None:
-        smtp_pwd = decrypt_mail_password(account.smtp_encrypted_password, account.id)
-    else:
+        smtp_pwd = normalize_optional_secret(
+            decrypt_mail_password(account.smtp_encrypted_password, account.id)
+        )
+    if smtp_pwd is None:
         assert account.encrypted_password is not None
         smtp_pwd = decrypt_mail_password(account.encrypted_password, account.id)
-    smtp_user = account.smtp_username or account.email
+    smtp_user = normalize_optional_login(account.smtp_username) or account.email
     try:
         await aiosmtplib.send(
             msg,

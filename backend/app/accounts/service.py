@@ -47,6 +47,7 @@ from backend.app.oauth.service import OAuthRefreshInvalidError, OutlookTokenServ
 from backend.app.repositories.mail_accounts import MailAccountsRepo
 from backend.app.repositories.users import UsersRepo
 from shared.config import get_settings
+from shared.credentials import normalize_optional_login, normalize_optional_secret
 from shared.crypto import decrypt_mail_password, encrypt_mail_password
 from shared.logging import get_logger
 from shared.models import MailAccount, User
@@ -133,7 +134,9 @@ def _to_dto(acc: MailAccount, owner: User) -> MailAccountDTO:
         smtp_port=acc.smtp_port,
         smtp_ssl=acc.smtp_ssl,
         smtp_starttls=acc.smtp_starttls,
-        smtp_username=acc.smtp_username,
+        # Garbage-in-DB guard: a stored ``'None'`` / blank means "no SMTP login"
+        # (shared/credentials.py) — never echo it back as if it were a login.
+        smtp_username=normalize_optional_login(acc.smtp_username),
         is_active=acc.is_active,
         last_synced_at=acc.last_synced_at,
         last_sync_error=acc.last_sync_error,
@@ -392,13 +395,17 @@ class MailAccountService:
             password=password,
         )
         stage.value = "smtp"
+        # The SMTP probe must resolve the login/secret EXACTLY like the send path
+        # (``send/service.smtp_send_message``): absence sentinels (``'None'`` /
+        # blank) fall back to ``email`` / the IMAP password. Otherwise a probe
+        # could pass while the real send fails (or vice versa).
         await smtp_test_login(
             host=smtp_host,
             port=smtp_port,
             ssl_on=smtp_ssl,
             starttls=smtp_starttls,
-            username=smtp_username or email,
-            password=smtp_password or password,
+            username=normalize_optional_login(smtp_username) or email,
+            password=normalize_optional_secret(smtp_password) or password,
         )
         return TestResult(imap_ok=True, smtp_ok=True)
 
@@ -411,13 +418,16 @@ class MailAccountService:
         if acc.auth_type == "oauth_outlook":
             return await self._test_oauth_account(acc)
 
-        # Password account: re-probe with the stored credentials.
+        # Password account: re-probe with the stored credentials (same absence
+        # semantics as the send path — see shared/credentials.py).
         assert acc.encrypted_password is not None
         imap_pwd = decrypt_mail_password(acc.encrypted_password, acc.id)
+        stored_smtp_pwd: str | None = None
         if acc.smtp_encrypted_password is not None:
-            smtp_pwd: str = decrypt_mail_password(acc.smtp_encrypted_password, acc.id)
-        else:
-            smtp_pwd = imap_pwd
+            stored_smtp_pwd = normalize_optional_secret(
+                decrypt_mail_password(acc.smtp_encrypted_password, acc.id)
+            )
+        smtp_pwd: str = stored_smtp_pwd if stored_smtp_pwd is not None else imap_pwd
         return await self._test_credentials(
             email=acc.email,
             password=imap_pwd,
@@ -623,8 +633,14 @@ class MailAccountService:
         new_smtp_starttls = (
             payload.smtp_starttls if payload.smtp_starttls is not None else acc.smtp_starttls
         )
+        # Both sides are normalised: the payload value (defence in depth — the
+        # schema already scrubs it) and the STORED value, so a PATCH on a row
+        # poisoned by a past import rewrites ``smtp_username`` as SQL NULL
+        # instead of carrying the ``'None'`` text forward.
         new_smtp_username = (
-            payload.smtp_username if payload.smtp_username is not None else acc.smtp_username
+            normalize_optional_login(payload.smtp_username)
+            if payload.smtp_username is not None
+            else normalize_optional_login(acc.smtp_username)
         )
 
         if new_smtp_ssl and new_smtp_starttls:

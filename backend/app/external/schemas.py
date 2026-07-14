@@ -21,6 +21,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from backend.app.accounts.schemas import OptionalSmtpCredsMixin
 from backend.app.send.schemas import _validate_addresses
 
 
@@ -349,7 +350,7 @@ class ExternalSendResponse(BaseModel):
 # --- External write API: mailboxes (ADR-0039 §2, 04-api-contracts §4f) ------
 
 
-class ExternalMailboxTestRequest(BaseModel):
+class ExternalMailboxTestRequest(OptionalSmtpCredsMixin):
     """Body of ``POST /api/external/mailboxes/test`` (ADR-0039 §2).
 
     A full IMAP/SMTP credential set for a connectivity probe (no persistence).
@@ -394,7 +395,7 @@ class ExternalMailboxCreateRequest(ExternalMailboxTestRequest):
     display_name: str | None = Field(default=None, max_length=100)
 
 
-class ExternalMailboxUpdateRequest(BaseModel):
+class ExternalMailboxUpdateRequest(OptionalSmtpCredsMixin):
     """Body of ``PATCH /api/external/mailboxes/{id}`` (ADR-0039 §2).
 
     All fields optional. ``is_active`` uses presence-semantics via
