@@ -78,7 +78,7 @@
 
 **Изменение схемы `mail_accounts`** (отдельная alembic-ревизия, `down_revision = 20260710_024`, Фаза C):
 1. **Данные:** `UPDATE mail_accounts SET user_id = <crm-service.id> WHERE user_id <> <crm-service.id>` (`crm-service` по `username='crm-service'`, `seed_crm_service_user`, ADR-0039).
-2. **Схема:** `ALTER TABLE mail_accounts DROP COLUMN group_id`. Индекса по `group_id` нет (`mail_account.py` __table_args__: только `ix_mail_accounts_user_id`, `ix_mail_accounts_active_partial`).
+2. **Схема:** `ALTER TABLE mail_accounts DROP COLUMN group_id`. Индекс `ix_mail_accounts_group_id` в живой схеме **существует** (создан миграцией `20260509_009`; редуцированный ORM `__table_args__` в `mail_account.py` его больше не перечисляет — оставлены только `ix_mail_accounts_user_id`, `ix_mail_accounts_active_partial`, поэтому чтение ORM вводит в заблуждение). Он снимается в этой же Фазе C: PostgreSQL снимает индекс автоматически при `DROP COLUMN group_id`, миграция дополнительно делает явный `DROP INDEX IF EXISTS ix_mail_accounts_group_id`.
 3. `user_id` (NOT NULL, FK CASCADE, `uq_mail_accounts_user_email`) — **без изменений**; `UNIQUE(user_id,email)` при едином owner = глобальная уникальность email (ADR-0043 §4).
 
 `downgrade()` восстанавливает `group_id` nullable + FK (данные не восстановимы — необратимо by design).
@@ -141,7 +141,7 @@ Pull `GET /api/external/messages` и `GET /api/external/mailboxes` (обесте
 1. `sent_attachments` 2. `sent_messages` 3. `attachments` 4. `message_tags` 5. `tag_rules` 6. `tags` 7. `telegram_notifications` 8. `telegram_links` 9. `webhook_deliveries` 10. `webhooks` 11. `message_forwards` 12. `group_forwarding` 13. `user_groups` 14. `users_settings` 15. `admin_audit` (**после** дампа Фазы B; audit-writer'ы уже сняты в A3).
 
 #### Фаза E — Развязка `users`↔`groups` и DROP `groups`
-- `ALTER TABLE users DROP COLUMN group_id` — снимает FK `users.group_id → groups`, partial-index `ix_users_group_id_partial`, CHECK `users_role_group_invariant`. Мэппинг `User.group_id`/`User.group` уже снят (A3). `crm-service` (super_admin, group_id NULL) инвариант не нарушает.
+- `ALTER TABLE users DROP COLUMN group_id` — снимает зависящие от колонки объекты: FK `users_group_id_fkey` (`users.group_id → groups`, SET NULL) и partial-index `ix_users_group_id_partial` (`WHERE group_id IS NOT NULL`). CHECK `users_role_group_invariant` в живой схеме **отсутствует** — снят исторически миграцией `20260508_005` (auto-create-leader flow требовал его отмены); снимать при drop нечего. Мэппинг `User.group_id`/`User.group` уже снят (A3). `crm-service` (super_admin, group_id NULL) инвариант не нарушает.
 - `DROP TABLE groups` — на неё уже не ссылается никто (`mail_accounts.group_id` снят в C, `users.group_id` — выше, `user_groups`/`group_forwarding`/`message_forwards`/`webhooks` дропнуты в D; `groups.leader_user_id RESTRICT → users` уходит с таблицей). Класс `Group`/`relationship` сняты в A3.
 
 #### Фаза F — Редукция `users` до `crm-service`
