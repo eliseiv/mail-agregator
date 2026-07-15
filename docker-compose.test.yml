@@ -1,7 +1,7 @@
-# Test override: expose postgres/redis/minio on host so QA can run pytest
+# Test override: expose postgres/redis on host so QA can run pytest
 # directly on Windows without docker-in-docker shenanigans.
 #
-# Usage: docker compose -f docker-compose.yml -f docker-compose.test.yml up -d postgres redis minio minio-bootstrap
+# Usage: docker compose -f docker-compose.yml -f docker-compose.test.yml up -d postgres redis
 name: mail-aggregator
 
 services:
@@ -23,8 +23,3 @@ services:
       - DAC_OVERRIDE
       - CHOWN
       - FOWNER
-
-  minio:
-    ports:
-      - "127.0.0.1:59000:9000"
-      - "127.0.0.1:59001:9001"

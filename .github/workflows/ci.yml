@@ -4,7 +4,7 @@
 # Stages (per docs/07-deployment.md sec.9):
 #   1. lint         ruff check + ruff format --check
 #   2. type-check   mypy backend worker shared
-#   3. test         pytest with postgres+redis+minio service containers,
+#   3. test         pytest with postgres+redis service containers,
 #                   coverage gate >= 75% on backend/worker/shared
 #   4. build        docker buildx build for both targets;
 #                   on push to main also push to GHCR (ghcr.io/<owner>/<repo>).
@@ -99,7 +99,7 @@ jobs:
         run: uv run mypy backend worker shared
 
   # -------------------------------------------------------------------------
-  # 3. Test — pytest with real postgres / redis / minio service containers.
+  # 3. Test — pytest with real postgres / redis service containers.
   #    Coverage gate enforced via --cov-fail-under in pytest itself.
   # -------------------------------------------------------------------------
   test:
@@ -133,9 +133,6 @@ jobs:
           --health-timeout 3s
           --health-retries 10
 
-      # MinIO is started via `docker run` below — GH Actions services don't
-      # let us override `command:` and the official image needs `server /data`.
-
     env:
       # Test config — local-host endpoints because services map to the runner host.
       APP_ENV: dev
@@ -143,11 +140,6 @@ jobs:
       LOG_LEVEL: WARNING
       DATABASE_URL: postgresql+asyncpg://mas:mas_test_password@localhost:5432/mail_aggregator_test
       REDIS_URL: redis://localhost:6379/0
-      S3_ENDPOINT_URL: http://localhost:9000
-      S3_ACCESS_KEY: ci_root_user
-      S3_SECRET_KEY: ci_root_password_change_in_real_envs
-      S3_BUCKET_NAME: mail-attachments-ci
-      S3_REGION: us-east-1
       # 32-byte test-only key. Regenerate with: python -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"
       MAIL_ENCRYPTION_KEY: HSoYMcwRZLguwQpz+kHPwifN9LvO/H86royMLyRgclo=
       ADMIN_LOGIN: admin
@@ -169,32 +161,6 @@ jobs:
 
       - name: Sync deps
         run: uv sync --frozen --all-extras --dev
-
-      - name: Start MinIO server
-        run: |
-          docker run -d --name minio --network host \
-            -e MINIO_ROOT_USER=ci_root_user \
-            -e MINIO_ROOT_PASSWORD=ci_root_password_change_in_real_envs \
-            minio/minio:RELEASE.2024-08-29T01-40-52Z \
-            server /data
-          # Wait up to 60s for the service to become healthy.
-          for i in $(seq 1 30); do
-            if curl -fsS http://localhost:9000/minio/health/live > /dev/null 2>&1; then
-              echo "MinIO ready"
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "MinIO failed to start"
-          docker logs minio
-          exit 1
-
-      - name: Bootstrap MinIO bucket for tests
-        run: |
-          docker run --rm --network host \
-            -e MC_HOST_local=http://ci_root_user:ci_root_password_change_in_real_envs@localhost:9000 \
-            minio/mc:latest \
-            mb --ignore-existing local/mail-attachments-ci
 
       - name: Apply migrations
         run: uv run alembic upgrade head

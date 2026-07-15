@@ -22,7 +22,7 @@ from httpx import ASGITransport
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from tests.conftest import _pg_available, _redis_available, _s3_available
+from tests.conftest import _pg_available, _redis_available
 
 # The post-decommission schema (ADR-0044 phases C-F, revisions 025-028) keeps
 # exactly three domain tables — everything else (tags/attachments/telegram/
@@ -74,7 +74,7 @@ async def _redis_flush() -> AsyncIterator[None]:
 @pytest_asyncio.fixture
 async def app() -> AsyncIterator[Any]:
     """Build the FastAPI app for one test (full lifespan)."""
-    if not (_pg_available() and _redis_available() and _s3_available()):
+    if not (_pg_available() and _redis_available()):
         pytest.skip("integration deps missing")
     # Ensure the global engine is fresh — older lifespans may have disposed it.
     from shared.db import dispose_engine

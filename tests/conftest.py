@@ -96,7 +96,6 @@ def _parse_host_port(url: str, default_host: str, default_port: int) -> tuple[st
 # most once per pytest session.
 _PG_AVAILABLE: bool | None = None
 _REDIS_AVAILABLE: bool | None = None
-_S3_AVAILABLE: bool | None = None
 
 
 def _pg_available() -> bool:
@@ -120,15 +119,6 @@ def _redis_available() -> bool:
     return _REDIS_AVAILABLE
 
 
-def _s3_available() -> bool:
-    global _S3_AVAILABLE
-    if _S3_AVAILABLE is None:
-        url = os.environ.get("S3_ENDPOINT_URL", "http://127.0.0.1:59000")
-        host, port = _parse_host_port(url, "127.0.0.1", 9000)
-        _S3_AVAILABLE = _can_connect(host, port)
-    return _S3_AVAILABLE
-
-
 # Expose as fixtures so individual tests can opt-in to their own skip logic.
 @pytest.fixture
 def pg_available() -> bool:
@@ -138,11 +128,6 @@ def pg_available() -> bool:
 @pytest.fixture
 def redis_available() -> bool:
     return _redis_available()
-
-
-@pytest.fixture
-def s3_available() -> bool:
-    return _s3_available()
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +225,8 @@ async def _close_singletons_after_each_test() -> AsyncIterator[None]:
 # Storage (MinIO) — the ``storage`` fixture was removed together with
 # ``shared/storage.py`` in the decommission (ADR-0044 phase G). Attachments /
 # MinIO are gone from the domain, so no test handle to the bucket remains.
-# The ``_s3_available`` probe above is kept only because the integration
-# ``app`` / ``oauth_app`` fixtures still gate on the (CI-provisioned) MinIO
-# service being reachable.
+# The ``_s3_available`` probe and the MinIO gate on the integration ``app`` /
+# ``oauth_app`` fixtures were removed in phase G too: with ``shared.storage``
+# gone those fixtures no longer touch S3, and gating on a decommissioned
+# service only silently skipped the worker/frontend/adr0048 suites in CI.
 # ---------------------------------------------------------------------------

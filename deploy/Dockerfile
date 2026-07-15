@@ -93,8 +93,8 @@ ENV PYTHONUNBUFFERED=1 \
 
 # tini  -> proper PID 1, forwards signals to gunicorn/python so SIGTERM
 #          triggers graceful shutdown instead of being eaten.
-# curl  -> used by minio healthcheck pattern; api healthcheck uses python
-#          stdlib (urllib) so no extra deps for the api image.
+# The api/worker healthchecks use python stdlib (urllib / os.stat) so the
+# runtime image needs no extra HTTP-client deps.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         tini \

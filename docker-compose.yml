@@ -2,16 +2,13 @@
 # Mail Aggregator — docker-compose stack
 #
 # Source of truth: docs/07-deployment.md (services, env, healthchecks,
-# bootstrap order) and docs/06-security.md sec.12 (MinIO least-privilege).
+# bootstrap order).
 #
 # Layout:
 #   - api       : FastAPI (HTTP, internal :8080, fronted by nginx in prod)
 #   - worker    : APScheduler sync_cycle + cleanup
 #   - postgres  : metadata + audit
 #   - redis     : sessions, rate-limit, force_sync flags
-#   - minio     : object storage for attachments
-#   - minio-bootstrap : one-shot init container (creates bucket, policy,
-#                      service account from MINIO_APP_*). Idempotent.
 #   - nginx     : TLS + reverse proxy (only in prod profile, see profiles)
 #   TLS/certs   : handled at HOST level — host `certbot` + systemd `certbot.timer`
 #                 (webroot /var/www/certbot), certs in host /etc/letsencrypt
@@ -19,8 +16,8 @@
 #                 and NO mas_certbot_* volumes (see ADR-0032 / docs/07-deployment.md §6).
 #
 # All services live on a single user-defined bridge network so DNS resolves
-# by service name (postgres / redis / minio / api). No host-port mapping
-# for postgres/redis/minio — only nginx publishes 80/443.
+# by service name (postgres / redis / api). No host-port mapping
+# for postgres/redis — only nginx publishes 80/443.
 #
 # Local dev:  docker compose up -d
 # Prod:       docker compose --profile prod up -d
@@ -125,64 +122,6 @@ services:
       - FOWNER
 
   # -------------------------------------------------------------------------
-  # MinIO — object storage. Boots with ROOT credentials only used by
-  # itself and the bootstrap init container; api/worker NEVER see them.
-  # -------------------------------------------------------------------------
-  minio:
-    image: minio/minio:RELEASE.2024-08-29T01-40-52Z
-    container_name: mas-minio
-    <<: [*restart_default, *logging_default]
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER:     ${MINIO_ROOT_USER:?MINIO_ROOT_USER must be set}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set}
-      # Disable telemetry / update checks.
-      MINIO_UPDATE: "off"
-      MINIO_BROWSER: "on"
-    volumes:
-      - mas_minio_data:/data
-    networks:
-      - mas-net
-    # Console port :9001 is published ONLY in dev (override via profile).
-    # In prod the console must stay behind VPN — comment out or remove.
-    ports:
-      - "127.0.0.1:9001:9001"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    security_opt:
-      - no-new-privileges:true
-
-  # -------------------------------------------------------------------------
-  # MinIO bootstrap — one-shot init container. Creates bucket + policy +
-  # service account from MINIO_APP_*. Idempotent (safe to re-run).
-  # See docs/07-deployment.md sec.12 + docs/06-security.md sec.12.
-  # -------------------------------------------------------------------------
-  minio-bootstrap:
-    # mc is a static Go binary (no glibc dependency); digest-pinned for reproducibility.
-    image: minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
-    container_name: mas-minio-bootstrap
-    depends_on:
-      minio:
-        condition: service_healthy
-    environment:
-      MINIO_ROOT_USER:      ${MINIO_ROOT_USER:?}
-      MINIO_ROOT_PASSWORD:  ${MINIO_ROOT_PASSWORD:?}
-      MINIO_APP_ACCESS_KEY: ${MINIO_APP_ACCESS_KEY:?MINIO_APP_ACCESS_KEY must be set}
-      MINIO_APP_SECRET_KEY: ${MINIO_APP_SECRET_KEY:?MINIO_APP_SECRET_KEY must be set}
-      S3_BUCKET_NAME:       ${S3_BUCKET_NAME:-mail-attachments}
-    volumes:
-      - ./deploy/minio-bootstrap.sh:/usr/local/bin/bootstrap.sh:ro
-    entrypoint: ["/bin/sh", "/usr/local/bin/bootstrap.sh"]
-    networks:
-      - mas-net
-    restart: "no"
-    <<: *logging_default
-
-  # -------------------------------------------------------------------------
   # Migrations — one-shot init container. Runs `alembic upgrade head` and
   # exits. Both api and worker depend on its successful completion, so
   # neither boots against a schema-less database (race-free).
@@ -241,24 +180,14 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      minio:
-        condition: service_healthy
-      minio-bootstrap:
-        condition: service_completed_successfully
       mas-migrations:
         condition: service_completed_successfully
     env_file:
       - .env
     environment:
-      # Override / pin a few values that must NEVER come from .env
-      # ambiguity. S3_* are explicitly mapped to APP keys (least-privilege).
+      # Override / pin a few values that must NEVER come from .env ambiguity.
       DATABASE_URL:    ${DATABASE_URL:-postgresql+asyncpg://mas:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-mail_aggregator}}
       REDIS_URL:       ${REDIS_URL:-redis://redis:6379/0}
-      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://minio:9000}
-      S3_ACCESS_KEY:   ${MINIO_APP_ACCESS_KEY}
-      S3_SECRET_KEY:   ${MINIO_APP_SECRET_KEY}
-      S3_BUCKET_NAME:  ${S3_BUCKET_NAME:-mail-attachments}
-      S3_REGION:       ${S3_REGION:-us-east-1}
     networks:
       - mas-net
     # Per docs/07-deployment.md sec.5: try read-only rootfs.
@@ -303,10 +232,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      minio:
-        condition: service_healthy
-      minio-bootstrap:
-        condition: service_completed_successfully
       # Worker waits for mas-migrations to finish so the schema is in
       # place before any DB calls. No coupling to api lifecycle — worker
       # can start in parallel with api once migrations are done.
@@ -317,11 +242,6 @@ services:
     environment:
       DATABASE_URL:    ${DATABASE_URL:-postgresql+asyncpg://mas:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-mail_aggregator}}
       REDIS_URL:       ${REDIS_URL:-redis://redis:6379/0}
-      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://minio:9000}
-      S3_ACCESS_KEY:   ${MINIO_APP_ACCESS_KEY}
-      S3_SECRET_KEY:   ${MINIO_APP_SECRET_KEY}
-      S3_BUCKET_NAME:  ${S3_BUCKET_NAME:-mail-attachments}
-      S3_REGION:       ${S3_REGION:-us-east-1}
     networks:
       - mas-net
     read_only: true
@@ -405,8 +325,6 @@ volumes:
     name: mas_pg_data
   mas_redis_data:
     name: mas_redis_data
-  mas_minio_data:
-    name: mas_minio_data
 
 # ---------------------------------------------------------------------------
 # Network — single user-defined bridge. Service-to-service traffic stays

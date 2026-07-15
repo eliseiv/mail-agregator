@@ -9,7 +9,6 @@ README is operational — what to run, in what order, with what flags.
 | Path | Purpose |
 | --- | --- |
 | `Dockerfile` | Multi-stage build, two final targets: `api` and `worker`. |
-| `minio-bootstrap.sh` | Idempotent script run by the `minio-bootstrap` init container — creates the bucket, the `mas-app` policy, and the `MINIO_APP_*` service account. |
 | `nginx/nginx.conf` | Main nginx config (mounted read-only at `/etc/nginx/nginx.conf`). |
 | `nginx/templates/default.conf.template` | Per-host server block; rendered at container start by the alpine entrypoint, which `envsubst`'s `${SERVER_DOMAIN}`. |
 
@@ -46,9 +45,6 @@ makes builds deterministic.
 cp .env.example .env
 # Edit .env — at minimum set:
 #   POSTGRES_PASSWORD
-#   MINIO_ROOT_USER / MINIO_ROOT_PASSWORD
-#   MINIO_APP_ACCESS_KEY / MINIO_APP_SECRET_KEY (and copy app keys
-#     into S3_ACCESS_KEY / S3_SECRET_KEY in the same file)
 #   MAIL_ENCRYPTION_KEY  (python -c "import os, base64; print(base64.b64encode(os.urandom(32)).decode())")
 #   ADMIN_PASSWORD
 
@@ -72,15 +68,12 @@ either:
 - or temporarily add `ports: ["8080:8080"]` under `services.api` in a
   `docker-compose.override.yml` (gitignored — your local convenience).
 
-The MinIO console **is** published on `127.0.0.1:9001` for dev convenience
-(loopback-only, never `0.0.0.0`). Remove that mapping for prod.
-
 ## Upgrade
 
 ```bash
 git pull
 docker compose build api worker
-docker compose up -d api worker     # postgres / redis / minio untouched
+docker compose up -d api worker     # postgres / redis untouched
 ```
 
 Migrations run via a dedicated **`mas-migrations`** init container
@@ -110,43 +103,16 @@ forward-fix migration; do not `downgrade`.
 # Postgres — daily 02:00, retain 14 days
 docker exec mas-postgres pg_dump -U mas -d mail_aggregator -F c \
   | gzip > /backups/pg/$(date +%F).dump.gz
-
-# MinIO — daily 03:00, retain 14 days
-docker run --rm -v mas_minio_data:/data:ro -v /backups/minio:/out alpine \
-  tar czf /out/$(date +%F).tar.gz -C /data .
 ```
 
 Both must be encrypted (gpg) before going off-site.
 **`MAIL_ENCRYPTION_KEY` lives in a separate vault** — without it the
 postgres dump is useless (mail-account passwords un-decryptable).
 
-## MinIO console access (prod)
-
-The console (`:9001`) must be unreachable from the public internet.
-
-**On the prod host: comment out the entire `ports:` block under
-`services.minio` in `docker-compose.yml`** (the dev-default
-`127.0.0.1:9001:9001` mapping). The console is then only reachable from
-inside the docker network or via SSH tunnel:
-
-```bash
-# After commenting out the mapping you can still tunnel to it via
-# `docker compose exec minio` -> a sidecar curl/mc, or expose temporarily.
-# Recommended: re-add the loopback mapping only when you need it, then
-# tunnel from your laptop:
-ssh -L 9001:127.0.0.1:9001 user@server
-# then open http://localhost:9001 in a browser
-```
-
-A future hardening item (see TD backlog): move the `ports:` mapping into
-a gitignored `docker-compose.override.yml` so dev convenience stays out
-of the prod-shipped file entirely.
-
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
-| `minio-bootstrap` exits non-zero | ROOT credentials wrong | Re-check `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` in `.env`. |
 | `api` stuck "starting" forever | DB migrations failing | `docker compose logs api` — look for alembic stack trace. |
 | `worker` healthcheck flaps | `/tmp/worker_alive` not written | Check worker process logs — APScheduler keep-alive job may have crashed. |
 | 503 from any endpoint | postgres or redis unhealthy | `docker compose ps`; restart the unhealthy service. |

@@ -87,9 +87,9 @@ def disable_outlook_oauth(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 @pytest_asyncio.fixture
 async def oauth_app() -> AsyncIterator[Any]:
     """FastAPI app built after the OUTLOOK_* env was (maybe) set."""
-    from tests.conftest import _pg_available, _redis_available, _s3_available
+    from tests.conftest import _pg_available, _redis_available
 
-    if not (_pg_available() and _redis_available() and _s3_available()):
+    if not (_pg_available() and _redis_available()):
         pytest.skip("integration deps missing")
     from shared.db import dispose_engine
 

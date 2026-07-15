@@ -39,8 +39,6 @@ dependencies = [
   # round-12 bug B: HTML body sanitiser for ``messages.body_html`` and
   # the Telegram callback path. Whitelist-based, drops <script> etc.
   "bleach==6.1.0",
-  # --- MinIO / S3 ---
-  "aioboto3==13.2.0",
   # --- Scheduler ---
   "APScheduler==3.10.4",
 ]
@@ -143,7 +141,6 @@ exclude = [
 [[tool.mypy.overrides]]
 module = [
   "imap_tools.*",
-  "aioboto3.*",
   "aiosmtplib.*",
   "slowapi.*",
   "html2text.*",
@@ -158,7 +155,7 @@ asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 markers = [
   "unit: pure unit tests, no I/O, no docker dependencies",
-  "integration: requires postgres + redis + minio (docker compose up)",
+  "integration: requires postgres + redis (docker compose up)",
   "worker: tests for worker.app.* (with mocked imap-tools)",
   "contract: validate API response shapes against docs/04-api-contracts.md",
   "frontend: render Jinja2 templates and inspect HTML",
