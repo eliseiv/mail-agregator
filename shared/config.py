@@ -77,13 +77,6 @@ class Settings(BaseSettings):
     # --- Redis ---
     REDIS_URL: str = "redis://redis:6379/0"
 
-    # --- MinIO / S3 ---
-    S3_ENDPOINT_URL: str = "http://minio:9000"
-    S3_ACCESS_KEY: str = ""
-    S3_SECRET_KEY: str = ""
-    S3_BUCKET_NAME: str = "mail-attachments"
-    S3_REGION: str = "us-east-1"
-
     # --- Crypto (mail account passwords, AES-256-GCM, ADR-0005) ---
     MAIL_ENCRYPTION_KEY: str = ""  # base64 of exactly 32 raw bytes
     MAIL_ENCRYPTION_KEY_PREV: str | None = None  # only during rotation
@@ -508,10 +501,6 @@ class Settings(BaseSettings):
             missing.append("MAIL_ENCRYPTION_KEY")
         if not self.ADMIN_PASSWORD:
             missing.append("ADMIN_PASSWORD")
-        if not self.S3_ACCESS_KEY:
-            missing.append("S3_ACCESS_KEY")
-        if not self.S3_SECRET_KEY:
-            missing.append("S3_SECRET_KEY")
         if missing:
             raise ValueError("Missing required env: " + ", ".join(missing))
 

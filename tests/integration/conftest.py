@@ -5,8 +5,9 @@
   before each test so requests that open their own sessions don't bleed
   state between tests.
 - ``_redis_flush`` — autouse, FLUSHDB before each test.
-- ``_minio_clean`` — autouse, deletes every object under the test prefix
-  so attachment uploads from previous tests don't bleed.
+
+MinIO isolation is gone: attachments / ``shared.storage`` were removed in the
+decommission (ADR-0044 phase G), so there is nothing to clean between tests.
 """
 
 from __future__ import annotations
@@ -63,29 +64,6 @@ async def _redis_flush() -> AsyncIterator[None]:
     await r.flushdb()
     yield
     await r.flushdb()
-
-
-@pytest_asyncio.fixture(autouse=True)
-async def _minio_clean() -> AsyncIterator[None]:
-    """Clear the bucket before each test.
-
-    MinIO is shared across tests; without cleanup, previous attachments
-    pile up under ``user_id/account_id/...`` prefixes. We run delete-all
-    by paginating list+delete (handled by ``Storage.delete_prefix``).
-    """
-    if not _s3_available():
-        pytest.skip("minio not reachable")
-    from shared.storage import get_storage
-
-    st = get_storage()
-    # Ensure bucket on first request — cheap idempotent.
-    await st.ensure_bucket()
-    # Empty bucket is just an empty pagination list; this is a no-op.
-    # We use a single-character prefix that sweeps the whole namespace.
-    # (delete_prefix rejects empty prefix.)
-    for prefix in "0123456789":
-        await st.delete_prefix(prefix)
-    yield
 
 
 # ---------------------------------------------------------------------------

@@ -2,7 +2,7 @@
 
 These tests need:
 
-* The integration autouse fixtures (truncate DB, flush Redis, clean MinIO) so
+* The integration autouse fixtures (truncate DB, flush Redis) so
   each test starts from a clean state — re-exported from the integration
   package conftest (same approach as ``tests/worker/conftest.py``).
 * A way to flip ``OUTLOOK_OAUTH_ENABLED`` on/off. The flag is *derived* from
@@ -31,10 +31,9 @@ from httpx import ASGITransport
 from shared.config import get_settings
 
 # Re-export the integration autouse fixtures so this package gets the same
-# clean-state guarantees (DB truncate / Redis flush / MinIO clean).
+# clean-state guarantees (DB truncate / Redis flush).
 from tests.integration.conftest import (  # noqa: F401
     _db_truncate_all,
-    _minio_clean,
     _redis_flush,
     login_as_admin,
     two_step_login,

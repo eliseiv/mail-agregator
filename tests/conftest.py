@@ -237,21 +237,10 @@ async def _close_singletons_after_each_test() -> AsyncIterator[None]:
 
 
 # ---------------------------------------------------------------------------
-# Storage (MinIO) — ensure bucket exists once
+# Storage (MinIO) — the ``storage`` fixture was removed together with
+# ``shared/storage.py`` in the decommission (ADR-0044 phase G). Attachments /
+# MinIO are gone from the domain, so no test handle to the bucket remains.
+# The ``_s3_available`` probe above is kept only because the integration
+# ``app`` / ``oauth_app`` fixtures still gate on the (CI-provisioned) MinIO
+# service being reachable.
 # ---------------------------------------------------------------------------
-
-
-@pytest_asyncio.fixture
-async def storage() -> AsyncIterator[Any]:
-    """Storage handle for the test bucket; ensures bucket exists.
-
-    Function-scoped to keep behaviour consistent with the engine/Redis
-    fixtures (asyncio loop swap).
-    """
-    if not _s3_available():
-        pytest.skip("minio not reachable on test endpoint")
-    from shared.storage import Storage, get_storage
-
-    st: Storage = get_storage()
-    await st.ensure_bucket()
-    yield st

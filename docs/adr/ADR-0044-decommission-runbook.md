@@ -9,6 +9,25 @@
 
 **Контекст готовности.** Cut-over на CRM выполнен 10.07.2026: push-outbox (`messages.pushed_at`, миграция `20260710_024`), `crm_push_dispatch`/`crm_push_recovery`/`crm_status_dispatch` — **уже в коде и на проде** (2874 письма, 7 реальных уведомлений через CRM). Настоящий демонтаж — **последний шаг** (decommission), после подтверждённой end-to-end доставки; до drop-миграций откат бесплатен (ADR-0043 §5).
 
+## Статус реализации (по состоянию на 2026-07-15)
+
+Демонтаж задеплоен на прод коммитом **`8cb3099`** (образы `mas-api`/`mas-worker` = `8cb3099`, Deploy job = **success**); code-детач фаз A1/A2/A3 и DDL фаз C→F применены. Проверено на живой прод-БД (read-only) и по логам коннектора.
+
+| Фаза | Содержание | Статус | Подтверждение (прод, 2026-07-15) |
+| --- | --- | --- | --- |
+| A1 | Детач external-API от tags/groups | **DONE** (в `8cb3099`) | `create_app()` поднимается; pull-DTO без тегов. |
+| A2.1 | Обобщённый send `POST /api/external/mailboxes/{id}/send` (аддитивно, ADR-0048) | **DONE** | Reply из CRM работает (CRM-коммит `ac0df07`). |
+| A2.2 | Снятие reply/`sent_messages`-writer'а | **DONE** (в `8cb3099`) | — |
+| A3 | Детач worker/backend читателей + снятие ORM-мэппинга + снос фронта | **DONE** (в `8cb3099`) | Все HTML-URL → 404; `/healthz`+`/readyz` = **200**; коннектор синкает. |
+| B | Бэкап перед необратимым (§6) | **DONE** (предусловие C) | DDL применён (см. C–F). |
+| **C** | Миграция схемы `mail_accounts` (`20260715_025`): self-seed `crm-service` → дедуп 4 дублей → repoint `user_id` → `SET CONSTRAINTS ALL IMMEDIATE` → DROP COLUMN `group_id` | **DONE / applied** | `mail_accounts` = **117 строк, ВСЕ на `crm-service` (id 24)**, колонки `group_id` **НЕТ**, **0 дублей** по `LOWER(email)`. Merge отработал: 4 легаси-дубля схлопнуты (survivor'ы 18/126/28/71 остались, проигравшие 73/140/85/145 удалены). |
+| **D** | Drop 15 таблиц (`20260715_026`) | **DONE / applied** | В БД осталось **4 таблицы**: `alembic_version`, `mail_accounts`, `messages`, `users`. |
+| **E** | Развязка `users`↔`groups` + DROP `groups` (`20260715_027`) | **DONE / applied** | `groups` отсутствует; `users` без `group_id`. |
+| **F** | Редукция `users` до `crm-service` (`20260715_028`) | **DONE / applied** | `users` = **1 ряд** (`crm-service`/`super_admin`). |
+| **G** | Снос MinIO/S3 + env-чистка | **НЕ ВЫПОЛНЕНА** — план ниже (см. Фаза G) | MinIO/bucket/S3-env/`shared/storage.py` ещё на месте; коннектор от них **не зависит** рантайм-путём (доказано ниже). |
+
+Текущая ревизия схемы прод-БД — **`alembic_version = 20260715_028`**. Коннектор жив на редуцированной схеме: полный sync-цикл (112 пар `sync_account_start`/`sync_account_finish`, есть `new_messages`, `user_id:24`), **112 `crm_status_delivered` 200**, `crm_push_delivered` 200; `/healthz`+`/readyz` = **200**. Точка невозврата пройдена для C–F; остаётся необратимая Фаза G (удаление bucket).
+
 ## Context
 
 Агрегатор всё ещё несёт полную функциональность headless-прокси (теги, Telegram, webhooks, forwarding, группы/роли/пользователи, Jinja-UI/static, MinIO-вложения) — код, таблицы, worker-jobs, env, docs-разделы. CRM теперь durable system of record. Всё лишнее нужно снести необратимо, а фронт — снять так, чтобы сервис нельзя было открыть (владелец: «убери фронт, чтобы сервис нельзя было открыть»).
@@ -117,12 +136,12 @@ ON CONFLICT (username) DO NOTHING;
 | `<email-C>` | 28 (grp1) | 85 (grp2) | 15 / 15 | различны |
 | `<email-D>` | 71 (grp2) | 145 (grp1) | 6 / 6 | различны |
 
-Это **легитимный легаси-паттерн**, не порча: один и тот же ящик заведён в двух командах (agg-группы 1 и 2), у каждой строки свои письма и свои креды. Глобальный `UNIQUE(LOWER(email))` был установлен `20260514_012` и **намеренно снят** `20260514_013` (round-17: «две команды ВПРАВЕ добавить один email независимо»); с тех пор дубли гасятся только на READ-пути (`MailAccountsRepo.list_canonical_account_ids` = `MIN(id)` per `LOWER(email)`, `backend/app/external/service.py:87-88`), а не уникальностью в БД. Перевод всех рядов на единый `crm-service` разрушает read-time-схему: `(user_id, email)` становится де-факто глобально-уникальным и сталкивает пары.
+Это **легитимный легаси-паттерн**, не порча: один и тот же ящик заведён в двух командах (agg-группы 1 и 2), у каждой строки свои письма и свои креды. Глобальный `UNIQUE(LOWER(email))` (индекс `ux_mail_accounts_email_lower`) был **установлен** миграцией `20260514_012` (round-16 dedup-миграция, `CREATE UNIQUE INDEX … LOWER(email)` — `20260514_012:83-87`) и **намеренно снят** миграцией `20260514_013` (round-17, `DROP INDEX ux_mail_accounts_email_lower` — `20260514_013:26`; мотив: «две команды ВПРАВЕ добавить один email независимо»); с тех пор дубли гасятся только на READ-пути (`MailAccountsRepo.list_canonical_account_ids` = `MIN(id)` per `LOWER(email)` — определение `backend/app/repositories/mail_accounts.py:111`, call-site `backend/app/external/service.py:87-88`), а не уникальностью в БД. Перевод всех рядов на единый `crm-service` разрушает read-time-схему: `(user_id, email)` становится де-факто глобально-уникальным и сталкивает пары.
 
 **Политика merge (детерминированная, воспроизводимая на `scratch_dedup`).** Перед repoint'ом миграция 025 схлопывает дубли по `LOWER(email)` — тот же ключ, что read-path canonical и precedent `20260514_012`:
 
 1. **Survivor = `MIN(id)` per `LOWER(email)`.** Совпадает с (а) canonical-рядом, который агрегатор УЖЕ отдаёт CRM на pull-пути (`GET /api/external/messages|mailboxes`), и (б) выжившим рядом precedent-миграции `20260514_012:56-79`. Детерминизм → воспроизводимо на scratch-данных.
-2. **Письма проигравшего — `DELETE`, НЕ repoint.** Repoint писем (`UPDATE messages SET mail_account_id = <survivor>`) **невозможен**: `uq_messages_account_uidv_uid (mail_account_id, uidvalidity, uid)` (`shared/models/message.py:69-75`) — обе строки поллят один IMAP-folder → совпадающий `uidvalidity` и пересекающиеся `uid` (счётчики почти равны: 13/13, 114/113, …) → repoint дал бы `duplicate key` уже на `messages`. Письма — **пересинкабельный 30-дневный буфер** (retention; source of truth — IMAP; уже доставленные копии лежат в CRM), их удаление безопасно и уже применялось в `20260514_012:47-66`. Явный `DELETE FROM messages WHERE mail_account_id = <loser>` перед удалением ряда (audit-ясность; каскад снял бы их и так).
+2. **Письма проигравшего — `DELETE`, НЕ repoint.** Repoint писем (`UPDATE messages SET mail_account_id = <survivor>`) **невозможен**: `uq_messages_account_uidv_uid (mail_account_id, uidvalidity, uid)` (`shared/models/message.py:69-75`) — обе строки поллят один IMAP-folder → совпадающий `uidvalidity` и пересекающиеся `uid` (счётчики почти равны: 13/13, 114/113, …) → repoint дал бы `duplicate key` уже на `messages`. Письма — **пересинкабельный 30-дневный буфер** (retention; source of truth — IMAP; уже доставленные копии лежат в CRM), их удаление безопасно и уже применялось в `20260514_012:47-66`. Явный `DELETE FROM messages WHERE mail_account_id = <loser>` перед удалением ряда (audit-ясность; каскад снял бы их и так). **Краевой случай — письмо проигравшего ещё НЕ запушено в CRM (`pushed_at IS NULL`) И уже удалено на IMAP-сервере** (пересинк его не вернёт): такая строка не восстановима ни из CRM, ни из IMAP — но она **покрыта §6-бэкапом `messages` целиком ДО Фазы C** (полный `pg_dump` `mail_accounts`+`messages`, обязателен перед merge), поэтому потеря не молчаливая и обратима из дампа.
 3. **Проигравший ряд — `DELETE`.** На момент Фазы C дочерние таблицы ещё существуют (дропаются в 026/Фаза D), FK `ON DELETE CASCADE` (`messages`, `sent_messages.from_account_id`, `attachments`, `message_tags`, `telegram_notifications`) снимают детей чисто.
 4. **Порядок в `upgrade()` 025:** self-seed §3.1 → **merge §3.2 (delete loser messages → delete loser rows)** → repoint `user_id` (§3.1 шаг 1) → `SET CONSTRAINTS ALL IMMEDIATE` (§3.1 шаг 2) → `DROP COLUMN group_id`. После merge — ≤1 ряд на `LOWER(email)`, поэтому repoint на единый owner больше не сталкивает `uq_mail_accounts_user_email`. Merge идемпотентен (повторный прогон дублей не находит) → корректен на проде, в CI (0 рядов) и при restore.
 
@@ -192,23 +211,48 @@ Pull `GET /api/external/messages` и `GET /api/external/mailboxes` (обесте
 
 #### Фаза B — БЭКАП перед необратимым (devops, см. §6)
 
-#### Фаза C — Миграция схемы `mail_accounts` (§3): self-seed `crm-service` (§3.1) → **дедуп 4 легаси-дублей email (§3.2)** → repoint `user_id`→`crm-service` → **`SET CONSTRAINTS ALL IMMEDIATE`** (флаш отложенного FK, §3.1) → DROP COLUMN `group_id`
+#### Фаза C — Миграция схемы `mail_accounts` (§3): self-seed `crm-service` (§3.1) → **дедуп 4 легаси-дублей email (§3.2)** → repoint `user_id`→`crm-service` → **`SET CONSTRAINTS ALL IMMEDIATE`** (флаш отложенного FK, §3.1) → DROP COLUMN `group_id` — **✅ DONE / applied на проде 2026-07-15 (`20260715_025`, коммит `8cb3099`)**
 Миграция **самодостаточна** (§3.1): идемпотентно сидит `crm-service` ПЕРЕД repoint'ом, поэтому проходит на пустой БД в CI (`alembic upgrade head` до старта app) и при restore — без зависимости от того, что приложение когда-то засидило ряд. НЕ бросает `RuntimeError` при отсутствии owner'а. **Между self-seed и repoint выполняется дедуп §3.2** (delete loser messages → delete loser rows, survivor = `MIN(id)` per `LOWER(email)`): иначе repoint на единый owner падает на `uq_mail_accounts_user_email` (уронило деплой `62442e5`). **ГЕЙТ ВЛАДЕЛЬЦА:** deploy Фазы C на прод не выполняется, пока не получена санкция владельца по семантическому риску merge (§3.2.4, `Q-0044-1`) — merge осиротит по одному CRM-ряду на каждый дубль-email и может лишить команду доступа к инбоксу. До Фазы C бэкапится `mail_accounts` + `messages` целиком (§6). **После repoint и ДО `DROP COLUMN` миграция форсирует `SET CONSTRAINTS ALL IMMEDIATE`** (§3.1 шаг 2): self-seed ставит отложенное событие FK `users_group_id_fkey` (`DEFERRABLE INITIALLY DEFERRED`, `20260508_004:124-128`), а single-transaction alembic-цепочка (`migrations/env.py:55-62`) донесла бы его до Фазы E и уронила бы `DROP COLUMN users.group_id` с `pending trigger events` — форсированная проверка снимает очередь здесь.
 
-#### Фаза D — Drop 15 из 16 таблиц (backend, alembic), порядок «referencing → referenced»
+#### Фаза D — Drop 15 из 16 таблиц (backend, alembic), порядок «referencing → referenced» — **✅ DONE / applied на проде 2026-07-15 (`20260715_026`)**
 `groups` — 16-я, отдельно в Фазе E (нужно предварительно снять входящие FK-колонки):
 1. `sent_attachments` 2. `sent_messages` 3. `attachments` 4. `message_tags` 5. `tag_rules` 6. `tags` 7. `telegram_notifications` 8. `telegram_links` 9. `webhook_deliveries` 10. `webhooks` 11. `message_forwards` 12. `group_forwarding` 13. `user_groups` 14. `users_settings` 15. `admin_audit` (**после** дампа Фазы B; audit-writer'ы уже сняты в A3).
 
-#### Фаза E — Развязка `users`↔`groups` и DROP `groups`
+#### Фаза E — Развязка `users`↔`groups` и DROP `groups` — **✅ DONE / applied на проде 2026-07-15 (`20260715_027`)**
 - `ALTER TABLE users DROP COLUMN group_id` — снимает зависящие от колонки объекты: FK `users_group_id_fkey` (`users.group_id → groups`, SET NULL) и partial-index `ix_users_group_id_partial` (`WHERE group_id IS NOT NULL`). CHECK `users_role_group_invariant` в живой схеме **отсутствует** — снят исторически миграцией `20260508_005` (auto-create-leader flow требовал его отмены); снимать при drop нечего. Мэппинг `User.group_id`/`User.group` уже снят (A3). `crm-service` (super_admin, group_id NULL) инвариант не нарушает. **Предпосылка:** отложенное событие FK `users_group_id_fkey`, поставленное self-seed'ом `crm-service` в Фазе C, уже снято там же через `SET CONSTRAINTS ALL IMMEDIATE` (§3.1 шаг 2); иначе single-transaction alembic-цепочка (`migrations/env.py:55-62`) донесла бы `pending trigger events` до этого `DROP COLUMN` и уронила бы Фазу E.
 - `DROP TABLE groups` — на неё уже не ссылается никто (`mail_accounts.group_id` снят в C, `users.group_id` — выше, `user_groups`/`group_forwarding`/`message_forwards`/`webhooks` дропнуты в D; `groups.leader_user_id RESTRICT → users` уходит с таблицей). Класс `Group`/`relationship` сняты в A3.
 
-#### Фаза F — Редукция `users` до `crm-service`
+#### Фаза F — Редукция `users` до `crm-service` — **✅ DONE / applied на проде 2026-07-15 (`20260715_028`; прод `users` = 1 ряд `crm-service`)**
 `DELETE FROM users WHERE username <> 'crm-service'`. Безопасно: ящики repointed (C) → CASCADE `mail_accounts.user_id` не трогает `mail_accounts`; прочие CASCADE-таблицы дропнуты (D); `groups.leader_user_id RESTRICT` снят (E). `crm-service` НЕ удаляется никогда.
 
-#### Фаза G — MinIO/S3 + env-чистка (devops)
-- Удалить bucket `mail-attachments` (646 объектов) после бэкапа (§6); убрать MinIO + `minio-bootstrap` из compose, S3-env, `shared/storage.py`; `ensure_bucket` из lifespan (§5).
-- Env-чистка: Telegram (`TELEGRAM_BOT_TOKEN`, `BOT_*_TOKEN`/`_GROUP_ID`/`_WEBHOOK_SECRET`, `TELEGRAM_DELIVERY_ENABLED`, `TG_*`), `MAILBOX_DOWN_ALERT_ENABLED`, webhooks (`WEBHOOK_*`), forwarding (`FORWARDING_ENABLED`, `FORWARD_*`), `EXTERNAL_REPLY_ENABLED`/`EXTERNAL_REPLY_RATE_LIMIT_*`, MinIO/S3 (`MINIO_*`, `S3_*`). **Оставить:** `CRM_INGEST_URL`/`CRM_MAILBOX_STATUS_URL`/`CRM_PUSH_SECRET`/`CRM_PUSH_*`, `EXTERNAL_API_KEY`/`EXTERNAL_WRITE_ENABLED`/`LIMIT_EXTERNAL_*`, `MAIL_ENCRYPTION_KEY`, sync/IMAP-параметры. **Outlook-OAuth env (амендмент ADR-0045 §4 — НЕ удалять):** `OUTLOOK_CLIENT_ID`, `OUTLOOK_CLIENT_SECRET`, `OUTLOOK_REDIRECT_URI` (обновить на `{APP_BASE_URL}/api/external/mailboxes/oauth/callback`), `OUTLOOK_TENANT`, `OUTLOOK_OAUTH_STATE_TTL_SECONDS`; **добавить** `CRM_OAUTH_INGEST_URL`. Точный список — за devops (grep по `shared/config.py`), сверяясь с ADR-0045 §4.
+#### Фаза G — MinIO/S3 + env-чистка — **⛔ НЕ ВЫПОЛНЕНА (план, 2026-07-15)**
+
+**Проверка безопасности коннектора (claims-from-code, HEAD `8cb3099`) — коннектор рантайм-путём от MinIO/S3 НЕ зависит.** После A3-детача ни один живой (не-тестовый) модуль не читает/пишет MinIO:
+- **Единственный прод-импортёр `get_storage`/`shared.storage` — сам `shared/storage.py:273`.** Repo-wide grep по `backend/`+`worker/`+`shared/` не нашёл иных прод-импортёров (только тест-фикстуры — см. ниже). Код-читатели A3 сняты: в `worker/app/sync_cycle.py` (`:23`,`:131`), `worker/app/main.py:8`, `worker/app/cleanup.py:3`, `backend/app/accounts/service.py` (`:6-7`,`:786`), `backend/app/health/router.py:6`, `backend/app/main.py` (`:56-57`) остались **только docstring-комментарии** «MinIO removed» — вызовов нет.
+- **Скачивание вложений в MinIO из синка удалено.** `sync_cycle.py` тянет `settings.MAX_ATTACHMENT_BYTES` (`:594`→`imap_fetcher.py:205`), но это **только in-memory size-cap**: `imap_fetcher.py:247` пропускает payload больше лимита (`payload=b""`), в S3 ничего не пишется. `worker/app/cleanup.py` — ретенция только `messages`, S3-каскада нет.
+- **`/readyz` больше не проверяет S3.** Вызов `get_storage().health_check()` снят из `health/router.py` (A3); проверяются только db/redis.
+
+⇒ Удаление bucket/сервиса MinIO во время работы **НЕ ломает** sync/send/push/`healthz`/`readyz`.
+
+**⚠️ Единственная жёсткая связность — СТАРТОВЫЙ конфиг-гейт (делает Фазу G code-first).** `shared/config.py::_enforce_required` (`:503-516`) **всё ещё требует** `S3_ACCESS_KEY`/`S3_SECRET_KEY` (`:511-514`), а поля `S3_ENDPOINT_URL/S3_ACCESS_KEY/S3_SECRET_KEY/S3_BUCKET_NAME/S3_REGION` объявлены в `Settings` (`:81-85`). **Если devops снимет S3-env из compose ДО того как backend уберёт эти поля + required-проверку — worker/api упадут на старте** `ValueError: Missing required env: S3_ACCESS_KEY, S3_SECRET_KEY`. Поэтому порядок строгий: **сначала backend-код (G-code), потом devops-инфра (G-infra).**
+
+**G-code — снять код-зависимость от S3 (владелец: `backend`; ПЕРВЫМ, отдельным релизом ДО G-infra):**
+1. `shared/config.py`: удалить S3-поля `Settings` (`:81-85`) и снять `S3_ACCESS_KEY`/`S3_SECRET_KEY` из `_enforce_required` (`:511-514`). Без этого удаление env роняет старт.
+2. Удалить `shared/storage.py` целиком (единственный прод-импортёр — он сам; код-читатели сняты в A3). Снять `ensure_bucket` из lifespan, если ещё остался (§5; на HEAD в `main.py:56-57` уже только комментарий).
+3. **§9-гейт:** `python -c "import backend.app.main"` + `python -c "import worker.app.main"` + mypy + CI-scope тесты — зелёные. Orphaned-тесты, импортящие `shared.storage` (`tests/conftest.py:253`, `tests/integration/conftest.py:78`, `tests/worker/test_worker_main.py:130-140`), ожидаемо падают — это **штатный хендофф `qa`** (`blame: test`), перечислить в `follow_up_for_qa`, НЕ править исполнителем.
+
+**G-tests — переписать/снять orphaned-тесты на `shared.storage` (владелец: `qa`; синхронно с G-code):** `tests/conftest.py`, `tests/integration/conftest.py`, `tests/worker/test_worker_main.py` (+ греп `shared.storage`/`get_storage`/`S3_` по `tests/`). После — §9.4 зелёный.
+
+**G-infra — снять инфраструктуру MinIO/S3 (владелец: `devops`; ПОСЛЕ бэкапа §6 и ПОСЛЕ деплоя G-code):**
+1. **Снапшот** bucket `mail-attachments` (646 объектов) — `mc mirror`/`mc cp --recursive` (§6), ДО удаления.
+2. Удалить bucket `mail-attachments`.
+3. `docker-compose.yml`: удалить сервисы `minio` (`:131`), `minio-bootstrap` (`:164`) и volume `mas_minio_data` (`:408-409`); снять `depends_on: minio`/`minio-bootstrap` у **mas-api** (`:244-247`) и **mas-worker** (`:306-308`); снять инъекцию S3-env (`S3_ENDPOINT_URL/S3_ACCESS_KEY/S3_SECRET_KEY/S3_BUCKET_NAME/S3_REGION`) у обоих сервисов (`:257-261` и `:320-324`).
+4. Удалить `deploy/minio-bootstrap.sh`.
+5. Env-чистка `.env.example`: снять `MINIO_*` (`:67-74`) и `S3_*` (`:78-82`). Прогнать grep S3/MinIO-env по CI (`.github/workflows/ci.yml`) — снять там же.
+
+**Env-чистка (владелец: `devops`; в G-infra) — что снять и что ОСТАВИТЬ.** Снять: Telegram (`TELEGRAM_BOT_TOKEN`, `BOT_*_TOKEN`/`_GROUP_ID`/`_WEBHOOK_SECRET`, `TELEGRAM_DELIVERY_ENABLED`, `TG_*`), `MAILBOX_DOWN_ALERT_ENABLED`, webhooks (`WEBHOOK_*`), forwarding (`FORWARDING_ENABLED`, `FORWARD_*`), `EXTERNAL_REPLY_ENABLED`/`EXTERNAL_REPLY_RATE_LIMIT_*`, MinIO/S3 (`MINIO_*`, `S3_*`). **Оставить:** `CRM_INGEST_URL`/`CRM_MAILBOX_STATUS_URL`/`CRM_PUSH_SECRET`/`CRM_PUSH_*`, `EXTERNAL_API_KEY`/`EXTERNAL_WRITE_ENABLED`/`LIMIT_EXTERNAL_*`, `MAIL_ENCRYPTION_KEY`, sync/IMAP-параметры. **Outlook-OAuth env (амендмент ADR-0045 §4 — НЕ удалять):** `OUTLOOK_CLIENT_ID`, `OUTLOOK_CLIENT_SECRET`, `OUTLOOK_REDIRECT_URI` (обновить на `{APP_BASE_URL}/api/external/mailboxes/oauth/callback`), `OUTLOOK_TENANT`, `OUTLOOK_OAUTH_STATE_TTL_SECONDS`; **добавить** `CRM_OAUTH_INGEST_URL`. Точный список env-чистки — за devops (grep по `shared/config.py`), сверяясь с ADR-0045 §4. Снятие Telegram/webhooks/forwarding-env из кода (сами поля `Settings`) — часть тех же подсистем; если поля ещё в `shared/config.py`, их удаление — `backend`, синхронно с G-code.
+
+**Итоговый порядок Фазы G:** G-code (`backend`, деплой) → [G-tests `qa` синхронно] → бэкап §6 → G-infra (`devops`). Обратный порядок (env/bucket раньше кода) роняет старт коннектора конфиг-гейтом.
 
 **Точка невозврата** — Фазы C–G (drop-миграции + удаление MinIO). До них откат = reverse `setWebhook` + откат CRM.
 
