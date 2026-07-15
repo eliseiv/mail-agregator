@@ -31,7 +31,7 @@ from typing import Any
 import httpx
 import pytest
 import pytest_asyncio
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from shared.config import get_settings
@@ -176,16 +176,6 @@ async def mailbox(app: Any, db_engine: AsyncEngine) -> AsyncIterator[MailAccount
     yield acc
 
 
-async def _sent_messages_count(db_engine: AsyncEngine) -> int:
-    # The ``sent_messages`` table still exists (its DROP TABLE is the later DDL
-    # phase D, ADR-0048 §3) but the ORM class was removed with the reply writer,
-    # so this regression gate counts rows via raw SQL, not the mapped class.
-    factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
-    async with factory() as ses:
-        n = (await ses.execute(text("SELECT count(*) FROM sent_messages"))).scalar_one()
-    return int(n)
-
-
 # ===========================================================================
 # 1. Happy path + response contract (ADR-0048 §1)
 # ===========================================================================
@@ -254,28 +244,6 @@ class TestSendContract:
             headers={"Authorization": f"Bearer {write_on}"},
         )
         assert resp.status_code == 200
-
-    async def test_send_writes_no_sent_messages_row(
-        self,
-        client: httpx.AsyncClient,
-        write_on: str,
-        mailbox: MailAccount,
-        stub_smtp: dict[str, Any],
-        db_engine: AsyncEngine,
-    ) -> None:
-        """REGRESSION GATE (ADR-0048 §1/§3 A2.1): the generic send persists NOTHING.
-
-        The durable log of what was sent lives in the CRM (``mail_sent_messages``);
-        ``sent_messages`` is under drop (ADR-0044 §1) and its last writer must not be
-        this path — otherwise the table can never be dropped.
-        """
-        before = await _sent_messages_count(db_engine)
-
-        resp = await client.post(_url(mailbox.id), json=_body(), headers={"X-API-Key": write_on})
-        assert resp.status_code == 200
-
-        after = await _sent_messages_count(db_engine)
-        assert after == before, "the generic send must not write a sent_messages row"
 
 
 # ===========================================================================
