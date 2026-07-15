@@ -19,12 +19,36 @@ technical ``crm-service`` user, ADR-0043 §4):
    (username) DO NOTHING`` — idempotent raw SQL (NOT the ORM/``seed_crm_service_user``,
    the migration does not raise the app graph). On prod the row already exists
    (no-op); on an empty DB it is created so the repoint below can resolve it.
-1. **Data — repoint owners.** ``UPDATE mail_accounts SET user_id =
-   <crm-service.id>`` for every account still owned by a human user. After the
-   human ``users`` rows are deleted (Phase F) the ``mail_accounts.user_id NOT
-   NULL CASCADE`` FK must NOT cascade-delete any mailbox — repointing them onto
-   the surviving ``crm-service`` row guarantees that.
-2. **Schema — drop ``mail_accounts.group_id``.** Mailbox-to-team ownership
+1. **Merge legacy email duplicates (§3.2).** BEFORE the repoint, collapse the
+   4 legacy prod duplicates (8 rows) where the same mailbox was added by two
+   teams under two ``user_id``\\ s. Without this, repointing every row onto the
+   single ``crm-service`` owner collides on ``uq_mail_accounts_user_email
+   (user_id, email)`` — exactly the ``duplicate key`` that crashed deploy
+   ``62442e5``. Policy (deterministic, matches the read-path canonical
+   ``MIN(id) per LOWER(email)`` and precedent migration ``20260514_012``):
+     - **Survivor = ``MIN(id)`` per ``LOWER(email)``.**
+     - **Loser messages — ``DELETE``, NOT repoint.** Repointing messages onto
+       the survivor is impossible: ``uq_messages_account_uidv_uid
+       (mail_account_id, uidvalidity, uid)`` — both rows poll the same IMAP
+       folder → colliding ``(uidvalidity, uid)`` → duplicate key. Messages are
+       a re-syncable 30-day buffer (source of truth is IMAP; delivered copies
+       already sit in the CRM), so dropping them is safe.
+     - **Loser rows — ``DELETE``.** Child tables still exist at Phase C
+       (dropped in Phase D / rev 026), so their ``ON DELETE CASCADE`` FKs clear
+       cleanly; loser messages are deleted explicitly first for audit clarity.
+   Idempotent: a re-run (prod dedup, restore) finds no duplicates and on an
+   empty DB (CI) touches 0 rows. **Owner sanction obtained** — merge is
+   authorised across the 4 emails (§3.2.4 / ``Q-0044-1``); the CRM-side orphan
+   remediation is a separate cross-repo follow-up (§3.2.4).
+2. **Data — repoint owners.** ``UPDATE mail_accounts SET user_id =
+   <crm-service.id>`` for every account still owned by a human user. Runs AFTER
+   the §3.2 merge, so at most one row per ``LOWER(email)`` survives and the
+   repoint onto the single owner no longer collides on
+   ``uq_mail_accounts_user_email``. After the human ``users`` rows are deleted
+   (Phase F) the ``mail_accounts.user_id NOT NULL CASCADE`` FK must NOT
+   cascade-delete any mailbox — repointing them onto the surviving
+   ``crm-service`` row guarantees that.
+3. **Schema — drop ``mail_accounts.group_id``.** Mailbox-to-team ownership
    lives in the CRM only. ``DROP COLUMN`` automatically removes the dependent
    FK ``mail_accounts_group_id_fkey`` (→ ``groups`` ON DELETE SET NULL) and the
    physical index ``ix_mail_accounts_group_id``; the index is dropped
@@ -82,6 +106,41 @@ _SEED_CRM_SERVICE_SQL = sa.text(
     """
 )
 
+# ADR-0044 §3.2 — merge legacy email duplicates BEFORE the repoint.
+# Survivor = MIN(id) per LOWER(email) (matches the read-path canonical id and
+# precedent migration 20260514_012). Losers = every non-survivor row sharing a
+# LOWER(email). We DELETE the losers' messages first (explicit, for audit
+# clarity — CASCADE would remove them anyway when the row goes) and then DELETE
+# the loser rows. ``email`` is NOT NULL (shared/models/mail_account.py), so
+# GROUP/PARTITION BY LOWER(email) has no NULL-grouping hazard. Both statements
+# are idempotent: after the first run each LOWER(email) has exactly one row, so
+# ``id <> survivor_id`` selects nothing (prod re-run / restore); on an empty DB
+# (CI) they touch 0 rows.
+_MERGE_DELETE_LOSER_MESSAGES_SQL = sa.text(
+    """
+    WITH dupes AS (
+        SELECT id,
+               MIN(id) OVER (PARTITION BY LOWER(email)) AS survivor_id
+        FROM mail_accounts
+    )
+    DELETE FROM messages
+    WHERE mail_account_id IN (
+        SELECT id FROM dupes WHERE id <> survivor_id
+    )
+    """
+)
+_MERGE_DELETE_LOSER_ACCOUNTS_SQL = sa.text(
+    """
+    WITH dupes AS (
+        SELECT id,
+               MIN(id) OVER (PARTITION BY LOWER(email)) AS survivor_id
+        FROM mail_accounts
+    )
+    DELETE FROM mail_accounts
+    WHERE id IN (SELECT id FROM dupes WHERE id <> survivor_id)
+    """
+)
+
 
 def _crm_service_id() -> int:
     """Resolve the technical mailbox-owner id, self-seeding it if missing.
@@ -113,14 +172,28 @@ def upgrade() -> None:
     #    depend on the app-lifespan seed having run.
     crm_id = _crm_service_id()
 
-    # 1) Repoint every mailbox still owned by a human user onto crm-service.
+    # 1) Merge legacy email duplicates BEFORE the repoint (ADR-0044 §3.2).
+    #    On prod 4 emails exist twice (8 of 121 rows, legacy two-team flow); the
+    #    repoint onto a single crm-service owner would otherwise collide on
+    #    uq_mail_accounts_user_email (user_id, email) — the duplicate-key that
+    #    crashed deploy 62442e5. Survivor = MIN(id) per LOWER(email). Delete the
+    #    losers' messages first (repointing them is impossible:
+    #    uq_messages_account_uidv_uid collides — both rows poll the same IMAP
+    #    folder; messages are a re-syncable buffer), then delete the loser rows
+    #    (child tables still exist at Phase C, CASCADE FKs clear them). Owner
+    #    sanction for the merge is obtained (§3.2.4 / Q-0044-1). Idempotent:
+    #    no-op on prod re-run / restore and on an empty DB (CI, 0 rows).
+    op.execute(_MERGE_DELETE_LOSER_MESSAGES_SQL)
+    op.execute(_MERGE_DELETE_LOSER_ACCOUNTS_SQL)
+
+    # 2) Repoint every mailbox still owned by a human user onto crm-service.
     op.execute(
         sa.text("UPDATE mail_accounts SET user_id = :crm_id WHERE user_id <> :crm_id").bindparams(
             crm_id=crm_id
         )
     )
 
-    # 1b) Flush deferred FK trigger events queued by the self-seed INSERT / repoint
+    # 2b) Flush deferred FK trigger events queued by the self-seed INSERT / repoint
     #     above. ``users_group_id_fkey`` (users.group_id → groups) is DEFERRABLE
     #     INITIALLY DEFERRED, so inserting the crm-service row queues an un-fired
     #     deferred check on ``users``. alembic runs the whole decommission chain in
@@ -133,7 +206,7 @@ def upgrade() -> None:
     #     and clears the queue for the later DDL migrations.
     op.execute("SET CONSTRAINTS ALL IMMEDIATE")
 
-    # 2) Drop group_id (FK + index go with the column; index dropped explicitly
+    # 3) Drop group_id (FK + index go with the column; index dropped explicitly
     #    for symmetry with downgrade()).
     op.execute("DROP INDEX IF EXISTS ix_mail_accounts_group_id")
     op.execute("ALTER TABLE mail_accounts DROP COLUMN group_id")
