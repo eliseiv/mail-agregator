@@ -280,13 +280,3 @@ class TestBackwardCompatibility:
         assert set(body.keys()) == _DESC_KEYS
         assert [m["id"] for m in body["messages"]] == sorted(ids, reverse=True)
         assert body["has_more"] is False
-
-    async def test_reply_endpoint_still_guarded_not_affected_by_filters(
-        self, client: httpx.AsyncClient, api_key_on: str
-    ) -> None:
-        """The ADR-0035 reply route is untouched by the ADR-0037 GET filters:
-        it still requires the key (401 without one) — a smoke check that adding
-        query filters to ``GET /messages`` did not regress the reply POST."""
-        resp = await client.post("/api/external/messages/1/reply", json={"body": "hi"})
-        assert resp.status_code == 401
-        assert resp.json()["error"]["code"] == "not_authenticated"

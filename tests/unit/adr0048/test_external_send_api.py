@@ -25,19 +25,18 @@ long conversation breaks again.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable, Iterator
-from datetime import UTC, datetime
 from email.message import EmailMessage
 from typing import Any
 
 import httpx
 import pytest
 import pytest_asyncio
-from sqlalchemy import func, select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from shared.config import get_settings
 from shared.crypto import encrypt_mail_password
-from shared.models import MailAccount, Message, SentMessage, User
+from shared.models import MailAccount, User
 
 pytestmark = pytest.mark.integration
 
@@ -178,9 +177,12 @@ async def mailbox(app: Any, db_engine: AsyncEngine) -> AsyncIterator[MailAccount
 
 
 async def _sent_messages_count(db_engine: AsyncEngine) -> int:
+    # The ``sent_messages`` table still exists (its DROP TABLE is the later DDL
+    # phase D, ADR-0048 §3) but the ORM class was removed with the reply writer,
+    # so this regression gate counts rows via raw SQL, not the mapped class.
     factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
     async with factory() as ses:
-        n = (await ses.execute(select(func.count()).select_from(SentMessage))).scalar_one()
+        n = (await ses.execute(text("SELECT count(*) FROM sent_messages"))).scalar_one()
     return int(n)
 
 
@@ -646,62 +648,3 @@ class TestSmtpFailure:
         resp = await client.post(_url(mailbox.id), json=_body(), headers={"X-API-Key": write_on})
         assert resp.status_code == 502
         assert resp.json()["error"]["code"] == "smtp_failed"
-
-
-# ===========================================================================
-# 7. A2.1 is ADDITIVE — the legacy reply path is NOT broken (ADR-0048 §3)
-# ===========================================================================
-
-
-class TestLegacyReplyStillWorks:
-    async def test_reply_endpoint_still_sends_and_still_persists(
-        self,
-        client: httpx.AsyncClient,
-        external_env: Callable[..., Any],
-        mailbox: MailAccount,
-        stub_smtp: dict[str, Any],
-        db_engine: AsyncEngine,
-    ) -> None:
-        """``POST /api/external/messages/{id}/reply`` survives A2.1 untouched.
-
-        A2.1 only ADDS the generic send; the old message-scoped reply (and its
-        ``sent_messages`` writer) stays until A2.2 — the rollback of A2.1 is "drop
-        the new route", which is only true while the old one still works.
-        """
-        external_env(key=TEST_API_KEY, write_enabled=True, reply_enabled=True)
-
-        # Seed the original message the reply resolves.
-        factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
-        async with factory() as ses, ses.begin():
-            m = Message(
-                mail_account_id=mailbox.id,
-                uid=1,
-                uidvalidity=1,
-                from_addr="sender@x.com",
-                from_name="Sender",
-                to_addrs=mailbox.email,
-                subject="Original",
-                internal_date=datetime.now(UTC),
-                body_text="original body",
-                body_present=True,
-                body_truncated=False,
-            )
-            ses.add(m)
-            await ses.flush()
-            message_id = int(m.id)
-
-        before = await _sent_messages_count(db_engine)
-
-        resp = await client.post(
-            f"/api/external/messages/{message_id}/reply",
-            json={"body": "Спасибо, приняли в работу."},
-            headers={"X-API-Key": TEST_API_KEY},
-        )
-        assert resp.status_code == 200, resp.text
-        payload = resp.json()
-        # The LEGACY contract still carries ``sent_id`` (it still writes the row).
-        assert set(payload.keys()) == {"sent_id", "smtp_message_id"}
-
-        after = await _sent_messages_count(db_engine)
-        assert after == before + 1, "the legacy reply must still persist sent_messages"
-        assert stub_smtp["smtp_calls"] == 1

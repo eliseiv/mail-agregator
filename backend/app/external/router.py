@@ -11,33 +11,28 @@ routes (``/api/external/teams``) and the ``group_id`` filter of
 messages with a keyset cursor over ``messages.id`` (ADR-0029).
 
 ``POST /api/external/mailboxes/{id}/send`` — the generic send (ADR-0048 §1,
-phase A2.1, ``docs/04-api-contracts.md`` §4f-send): the CRM builds the reply
-(defaults + threading headers) and the aggregator only puts it on the wire from
-mailbox ``{id}``. Gated like the rest of the WRITE section
-(``EXTERNAL_WRITE_ENABLED`` + ``LIMIT_EXTERNAL_WRITE``). Answers
-``{smtp_message_id}`` — no ``sent_id``, and it writes NO ``sent_messages`` row.
+``docs/04-api-contracts.md`` §4f-send): the CRM builds the reply (defaults +
+threading headers) and the aggregator only puts it on the wire from mailbox
+``{id}``. Gated like the rest of the WRITE section (``EXTERNAL_WRITE_ENABLED`` +
+``LIMIT_EXTERNAL_WRITE``). Answers ``{smtp_message_id}`` — no ``sent_id``, and it
+writes NO ``sent_messages`` row. ADR-0048 §3 (phase A2.2): the legacy
+message-scoped ``POST /api/external/messages/{id}/reply`` (ADR-0035) it superseded
+— together with its ``sent_messages`` writer and the ``EXTERNAL_REPLY_ENABLED``
+gate — was removed once the CRM was confirmed on this send in production.
 
-``POST /api/external/messages/{id}/reply`` — the LEGACY message-scoped write
-(ADR-0035): reply to an existing message with the same key; sender = the
-original's mailbox. Superseded by the send above and removed in phase A2.2
-(ADR-0048 §3) once the CRM is confirmed on it in production — A2.1 is additive,
-so it (and its ``sent_messages`` writer / ``EXTERNAL_REPLY_ENABLED`` gate) still
-stands.
-
-Auth flow (strict order, ADR-0029 §4 / ADR-0035 §3):
+Auth flow (strict order, ADR-0029 §4):
 
 1. ``consume(<limit>, ip)`` FIRST — anti-flood before any work with the key (a
-   failed-auth flood is rate-limited too). 429 on exhaustion. The read and the
-   reply endpoints use SEPARATE budgets (``LIMIT_EXTERNAL_API`` vs
-   ``LIMIT_EXTERNAL_REPLY``) so neither can evict the other (ADR-0035 §4).
+   failed-auth flood is rate-limited too). 429 on exhaustion. Read and WRITE use
+   SEPARATE budgets (``LIMIT_EXTERNAL_API`` vs ``LIMIT_EXTERNAL_WRITE``) so
+   neither can evict the other.
 2. extract the key: ``X-API-Key`` (priority) or ``Authorization: Bearer <key>``.
 3. feature off (``EXTERNAL_API_KEY`` empty) → 401 ``not_authenticated`` —
    unenumerable, the config is not disclosed.
 4. missing / wrong key → 401 ``not_authenticated`` (constant-time compare).
-5. (reply only) write off (``EXTERNAL_REPLY_ENABLED`` false) → 403 ``forbidden``.
-6. validate the request payload (query for pull; body for reply — parsed AFTER
-   steps 1-5 so a malformed/invalid body cannot pre-empt 401/403/429, ADR-0035
-   §3 order + reviewer note).
+5. (write only) write off (``EXTERNAL_WRITE_ENABLED`` false) → 403 ``forbidden``.
+6. validate the request payload (query for pull; body for write — parsed AFTER
+   steps 1-5 so a malformed/invalid body cannot pre-empt 401/403/429).
 7. delegate to the service.
 
 No cookie session is involved (ADR-0044 §5 removed the CSRF/session middlewares
@@ -70,8 +65,6 @@ from backend.app.external.schemas import (
     ExternalMessagesResponseDesc,
     ExternalOAuthAuthorizeRequest,
     ExternalOAuthAuthorizeResponse,
-    ExternalReplyRequest,
-    ExternalReplyResponse,
     ExternalSendRequest,
     ExternalSendResponse,
 )
@@ -81,7 +74,6 @@ from backend.app.oauth.crm_ingest import notify_crm_oauth_ingest
 from backend.app.oauth.service import OAuthError, OutlookOAuthService
 from backend.app.rate_limit import (
     LIMIT_EXTERNAL_API,
-    LIMIT_EXTERNAL_REPLY,
     LIMIT_EXTERNAL_WRITE,
     Limit,
     client_ip,
@@ -269,100 +261,6 @@ async def list_external_mailboxes(
     return result
 
 
-async def _parse_reply_body(request: Request) -> ExternalReplyRequest:
-    """Read + validate the reply body AFTER rate-limit/auth/gate (ADR-0035 §3).
-
-    FastAPI validates an auto-injected Pydantic body parameter during dependency
-    resolution — BEFORE the handler runs — so a 400 could pre-empt 401/403/429
-    and violate the ADR-0035 §3 order. We therefore read the raw body and parse
-    it here, at the correct point in the sequence (reviewer note). A malformed
-    JSON body or a schema violation both surface as ``400 validation_error``
-    with ``details.errors[]`` via the app's :class:`RequestValidationError`
-    handler (identical envelope to auto-validated routes).
-    """
-    raw = await request.body()
-    try:
-        # ``model_validate_json`` raises ``pydantic.ValidationError`` for BOTH a
-        # syntactically invalid JSON body and a schema violation — one path.
-        return ExternalReplyRequest.model_validate_json(raw)
-    except PydanticValidationError as exc:
-        raise RequestValidationError(exc.errors()) from exc
-
-
-@router.post("/messages/{message_id}/reply", response_model=ExternalReplyResponse)
-async def reply_external_message(
-    request: Request,
-    db: DbSession,
-    message_id: int,
-) -> ExternalReplyResponse:
-    """Reply to an existing message (ADR-0035). See module docstring.
-
-    ``message_id`` is a plain ``int`` path param: a non-numeric segment fails
-    routing, and ``id < 1`` (no such message) resolves to ``404 not_found`` in
-    the service — NOT a pre-auth 400 — keeping the ADR-0035 §3 check order
-    (rate-limit → auth → gate → resolve) intact.
-    """
-    ip = client_ip(request)
-    settings = get_settings()
-
-    # 1. Rate-limit FIRST — SEPARATE, stricter budget than the read endpoint
-    #    (ADR-0035 §4). Capacity is operator-tunable at consume-time from
-    #    ``settings.EXTERNAL_REPLY_RATE_LIMIT_PER_MINUTE``.
-    runtime_limit = Limit(
-        name=LIMIT_EXTERNAL_REPLY.name,
-        capacity=settings.EXTERNAL_REPLY_RATE_LIMIT_PER_MINUTE,
-        window_seconds=LIMIT_EXTERNAL_REPLY.window_seconds,
-    )
-    await consume(runtime_limit, f"ip:{ip}")
-
-    # 2-4. Auth (shared with the pull endpoint) — 401 opaque.
-    _authenticate(request, ip=ip, settings=settings)
-
-    # 5. Write gate — valid key but write disabled → 403 (ADR-0035 §1/§3).
-    if not settings.EXTERNAL_REPLY_ENABLED:
-        log.info("external_reply_forbidden", client_ip=ip, message_id=message_id)
-        raise ForbiddenError("External reply is disabled")
-
-    # 6. Body validation — AFTER rate-limit + auth + gate (ADR-0035 §3 order).
-    payload = await _parse_reply_body(request)
-
-    # 7. Delegate: canonical-scope resolve → from = original mailbox → send
-    #    core (MIME/SMTP/append/persist reused). 404/409/502 propagate from
-    #    the send core as domain errors.
-    #
-    #    ``get_db`` does NOT commit on teardown and ``SentMessagesRepo.insert``
-    #    only add+flushes, so without an explicit transaction the persisted
-    #    ``sent_messages`` row is rolled back at session close — the 200 would
-    #    return a ``sent_id`` of a non-durable row (ADR-0035 §5/§7 violation).
-    #    Mirror the session send (``backend/app/send/router.py``): wrap the
-    #    send core in ``async with db.begin():`` so a successful send COMMITS
-    #    the row (durable ``sent_id``) and any domain error (404/409/502) rolls
-    #    back partial state as it propagates out. The best-effort IMAP append
-    #    failure is swallowed inside ``_send_core`` (not raised), so an append
-    #    error still commits ``sent_messages`` and yields 200. No form-fallback
-    #    here, so domain errors simply propagate out of the block (→ rollback).
-    async with db.begin():
-        result = await SendService(db).send_external_reply(
-            message_id=message_id,
-            to=payload.to,
-            cc=payload.cc,
-            subject=payload.subject,
-            body=payload.body,
-        )
-
-    log.info(
-        "external_reply",
-        client_ip=ip,
-        message_id=message_id,
-        sent_id=result.sent_id,
-        smtp_message_id=result.smtp_message_id,
-    )
-    return ExternalReplyResponse(
-        sent_id=result.sent_id,
-        smtp_message_id=result.smtp_message_id,
-    )
-
-
 # ---------------------------------------------------------------------------
 # External WRITE section — mailboxes + global tags CRUD (ADR-0039 / ADR-0040).
 #
@@ -396,7 +294,12 @@ async def _authorize_write(request: Request, *, ip: str, settings: Settings) -> 
 
 
 async def _parse_json_body(request: Request, model: type[_BodyT]) -> _BodyT:
-    """Parse + validate a JSON body AFTER auth/gate (mirrors ``_parse_reply_body``).
+    """Parse + validate a JSON body AFTER rate-limit/auth/gate (ADR-0035 §3 order).
+
+    Reading the raw body and parsing it HERE (rather than via an auto-injected
+    FastAPI body parameter, which validates during dependency resolution BEFORE
+    the handler runs) keeps a malformed/invalid body from pre-empting the
+    401/403/429 that must fire first.
 
     A malformed JSON body and a schema violation both surface as
     ``400 validation_error`` via the app's :class:`RequestValidationError`

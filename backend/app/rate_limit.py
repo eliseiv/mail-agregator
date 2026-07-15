@@ -20,10 +20,12 @@ session ``send``) went away with the UI in phases A1/A3, and with them their
 (``docs/04-api-contracts.md`` §4d/§4f), keyed per IP:
 
 - ``GET  /api/external/messages`` / ``/mailboxes``  120 / min (``LIMIT_EXTERNAL_API``)
-- ``POST /api/external/messages/{id}/reply``         30 / min (``LIMIT_EXTERNAL_REPLY``
-                                                 — legacy, dropped in phase A2.2)
 - external WRITE: mailbox CRUD, OAuth, and the generic
   ``POST /mailboxes/{id}/send``                      60 / min (``LIMIT_EXTERNAL_WRITE``)
+
+ADR-0048 §3 (phase A2.2): the legacy reply endpoint and its
+``LIMIT_EXTERNAL_REPLY`` (30 / min) were removed once the CRM moved to the
+generic send.
 
 Each capacity is operator-tunable at consume-time from the matching
 ``*_RATE_LIMIT_PER_MINUTE`` setting. The other ``Limit`` constants below are the
@@ -138,22 +140,13 @@ LIMIT_TG_SEND_PER_CHAT = Limit(name="tg_send", capacity=20, window_seconds=60)
 # ``LIMIT_WEBHOOK_TEST`` / ``LIMIT_TG_SEND_PER_CHAT``) so operators can tune the
 # cap without a code redeploy. The static value here is the default fallback.
 LIMIT_EXTERNAL_API = Limit(name="external_api", capacity=120, window_seconds=60)
-# External reply-endpoint (ADR-0035 §4): 30 req / 60 s per client IP — a
-# SEPARATE, stricter budget than ``LIMIT_EXTERNAL_API`` (read, 120/min). A
-# reply sends a real SMTP message (cost + spam/abuse risk), so its write budget
-# is independent (no mutual eviction between pull and reply) and strictly
-# smaller. Consumed FIRST in the router — before any key work — like the read
-# limit. ``capacity`` is overridden at consume-time from
-# ``settings.EXTERNAL_REPLY_RATE_LIMIT_PER_MINUTE`` (same override pattern as
-# ``LIMIT_EXTERNAL_API``); the static value here is the default fallback.
-LIMIT_EXTERNAL_REPLY = Limit(name="external_reply", capacity=30, window_seconds=60)
-# External write API — mailboxes + tags CRUD (ADR-0039 §1): 60 req / 60 s per
-# client IP — a SEPARATE budget from read (``LIMIT_EXTERNAL_API`` 120/min) and
-# reply (``LIMIT_EXTERNAL_REPLY`` 30/min) so a write flood cannot evict read /
-# reply and vice-versa. Consumed FIRST in the router — before any key work —
-# like the read/reply limits. ``capacity`` is overridden at consume-time from
-# ``settings.EXTERNAL_WRITE_RATE_LIMIT_PER_MINUTE`` (same override pattern as
-# ``LIMIT_EXTERNAL_API``); the static value here is the default fallback.
+# External write API — mailboxes CRUD + OAuth + generic send (ADR-0039 §1): 60
+# req / 60 s per client IP — a SEPARATE budget from read (``LIMIT_EXTERNAL_API``
+# 120/min) so a write flood cannot evict read and vice-versa. Consumed FIRST in
+# the router — before any key work — like the read limit. ``capacity`` is
+# overridden at consume-time from ``settings.EXTERNAL_WRITE_RATE_LIMIT_PER_MINUTE``
+# (same override pattern as ``LIMIT_EXTERNAL_API``); the static value here is the
+# default fallback.
 LIMIT_EXTERNAL_WRITE = Limit(name="external_write", capacity=60, window_seconds=60)
 
 
