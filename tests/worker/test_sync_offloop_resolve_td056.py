@@ -72,7 +72,6 @@ async def test_hung_dns_on_one_mailbox_does_not_stall_the_cycle(
             timeout_seconds=30,
             initial_sync_days=7,
             max_body_bytes=1_000_000,
-            max_att_bytes=10_000_000,
         )
 
     await assert_loop_responsive_while(_call)

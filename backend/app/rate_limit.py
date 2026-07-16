@@ -28,8 +28,8 @@ ADR-0048 §3 (phase A2.2): the legacy reply endpoint and its
 generic send.
 
 Each capacity is operator-tunable at consume-time from the matching
-``*_RATE_LIMIT_PER_MINUTE`` setting. The other ``Limit`` constants below are the
-pre-decommission table; they are pruned with the env sweep (phase G).
+``*_RATE_LIMIT_PER_MINUTE`` setting. The pre-decommission ``Limit`` table was
+pruned with the env sweep (phase G, TD-060) — only the two limits above remain.
 """
 
 from __future__ import annotations
@@ -69,75 +69,16 @@ class Limit:
     window_seconds: int
 
 
-# Predeclared limits matching the docs table.
-# ``LIMIT_LOGIN_USERNAME`` guards step-1 of the two-step login (ADR-0016).
-# It is intentionally looser than ``LIMIT_LOGIN`` because the step-1 endpoint
-# does not verify any secret and is only weakly enumerable (set-password vs
-# password redirect).
-LIMIT_LOGIN_USERNAME = Limit(name="login_user", capacity=30, window_seconds=15 * 60)
-LIMIT_LOGIN = Limit(name="login", capacity=5, window_seconds=15 * 60)
-LIMIT_SET_PASSWORD = Limit(name="setpwd", capacity=5, window_seconds=15 * 60)
-LIMIT_ACCOUNT_TEST = Limit(name="acc_test", capacity=50, window_seconds=60 * 60)
-LIMIT_ACCOUNT_WRITE = Limit(name="acc_write", capacity=50, window_seconds=60 * 60)
-LIMIT_ACCOUNT_SYNC = Limit(name="acc_sync", capacity=5, window_seconds=60 * 60)
-LIMIT_MESSAGE_SEND = Limit(name="msg_send", capacity=30, window_seconds=60 * 60)
-LIMIT_ADMIN_WRITE = Limit(name="admin_write", capacity=50, window_seconds=60 * 60)
-# Admin login-password reveal (ADR-0038 §4). Keyed PER super_admin actor
-# (``user_id``), not per IP — anti-bulk-exfiltration of login passwords +
-# protection against flooding the ``user_password_revealed`` audit. ``capacity``
-# is overridden at consume-time from
-# ``settings.ADMIN_PASSWORD_REVEAL_RATE_LIMIT_PER_MINUTE`` (same pattern as
-# ``LIMIT_EXTERNAL_API``); the static value here is the default fallback.
-LIMIT_ADMIN_PASSWORD_REVEAL = Limit(name="admin_pw_reveal", capacity=30, window_seconds=60)
-# Tags (ADR-0017): writes (create/edit/delete tag, add/remove rule) — 30/h.
-# ``apply_to_existing`` is a heavier path and gets its own 50/h limit per user.
-# Raised 5/h -> 50/h: bulk onboarding and repeated re-applies (debug / re-tagging)
-# need headroom; the runaway-guard (>100k messages -> 422, ADR-0017 §7) still
-# protects against expensive full-table scans regardless of this cap.
-LIMIT_TAGS_WRITE = Limit(name="tags_write", capacity=30, window_seconds=60 * 60)
-LIMIT_TAGS_APPLY = Limit(name="tags_apply", capacity=50, window_seconds=60 * 60)
-# Telegram persistent SSO (ADR-0022 §1.2):
-# - per IP:           30 / min  (front line — covers HMAC-fail flooding).
-# - per tg_user_id:   10 / min  (post-HMAC — covers replay of valid init_data).
-LIMIT_TG_AUTH_IP = Limit(name="tg_auth_ip", capacity=30, window_seconds=60)
-LIMIT_TG_AUTH_USER = Limit(name="tg_auth_user", capacity=10, window_seconds=60)
-# Multi-link management (ADR-0024 §4, docs/04-api-contracts.md §4b):
-# add (POST) / unlink (DELETE) a TG link while authenticated — 10/h per user.
-LIMIT_TG_LINKS_WRITE = Limit(name="tg_links_write", capacity=10, window_seconds=60 * 60)
-# Outbound webhooks (ADR-0023 §5). All four limits are keyed per
-# ``webhook_id`` except ``LIMIT_WEBHOOK_CREATE`` which is keyed per
-# ``group_id`` (anti-spam for accidentally re-creating after delete).
-LIMIT_WEBHOOK_CREATE = Limit(name="webhook_create", capacity=10, window_seconds=60 * 60)
-LIMIT_WEBHOOK_UPDATE = Limit(name="webhook_update", capacity=30, window_seconds=60 * 60)
-LIMIT_WEBHOOK_DELETE = Limit(name="webhook_delete", capacity=10, window_seconds=60 * 60)
-LIMIT_WEBHOOK_ROTATE = Limit(name="webhook_rotate", capacity=5, window_seconds=60 * 60)
-# ``LIMIT_WEBHOOK_TEST.capacity`` is overridden at consume-time by
-# ``settings.WEBHOOK_TEST_LIMIT`` so operators can tune the cap without a
-# redeploy of the codebase. The static value here is a sensible fallback
-# only if the settings lookup is unavailable for some reason.
-LIMIT_WEBHOOK_TEST = Limit(name="webhook_test", capacity=10, window_seconds=60 * 60)
-# Mail forwarding (ADR-0034 §2). Keyed per ``group_id`` (like webhooks):
-# ``PUT`` (upsert) 30/h, ``DELETE`` 10/h.
-LIMIT_FORWARDING_UPDATE = Limit(name="forwarding_update", capacity=30, window_seconds=60 * 60)
-LIMIT_FORWARDING_DELETE = Limit(name="forwarding_delete", capacity=10, window_seconds=60 * 60)
-# Per-account forward throttle (ADR-0034 §6, docs/06-security.md §1.14 threat D).
-# Consumed via the non-raising :func:`try_consume` in the worker dispatcher;
-# ``capacity`` is overridden at consume-time from
-# ``settings.FORWARD_PER_ACCOUNT_PER_MINUTE`` (same pattern as
-# ``LIMIT_WEBHOOK_TEST``). Key: ``rl:forward_acct:<mail_account_id>``.
-LIMIT_FORWARD_PER_ACCOUNT = Limit(name="forward_acct", capacity=30, window_seconds=60)
-# Telegram per-chat send throttle (ADR-0022 §2.9). ``capacity`` is overridden
-# at consume-time from ``settings.TG_SEND_PER_CHAT_PER_MINUTE`` (same pattern as
-# ``LIMIT_WEBHOOK_TEST``) so operators can tune the cap without a code redeploy.
-# Consumed via the non-raising :func:`try_consume` (a throttled recipient is
-# skipped this tick, not rejected with an error). Key: ``rl:tg_send:<chat_id>``.
-LIMIT_TG_SEND_PER_CHAT = Limit(name="tg_send", capacity=20, window_seconds=60)
+# The connector's only limited surface is the machine API (ADR-0044 §5). The
+# pre-decommission table (login / set-password / account+admin CRUD / tags /
+# Telegram / webhooks / forwarding) was pruned with the env sweep (phase G,
+# TD-060) once phases A1/A3 removed the routes that consumed it.
+#
 # External PULL-API (ADR-0029 §1/§4): 120 req / 60 s per client IP. Consumed
 # FIRST in the router — before any work with the API key — so a brute-force /
 # flood of failed-auth attempts is rate-limited too (anti-bruteforce + DoS).
 # ``capacity`` is overridden at consume-time from
-# ``settings.EXTERNAL_API_RATE_LIMIT_PER_MINUTE`` (same pattern as
-# ``LIMIT_WEBHOOK_TEST`` / ``LIMIT_TG_SEND_PER_CHAT``) so operators can tune the
+# ``settings.EXTERNAL_API_RATE_LIMIT_PER_MINUTE`` so operators can tune the
 # cap without a code redeploy. The static value here is the default fallback.
 LIMIT_EXTERNAL_API = Limit(name="external_api", capacity=120, window_seconds=60)
 # External write API — mailboxes CRUD + OAuth + generic send (ADR-0039 §1): 60
@@ -173,33 +114,6 @@ async def consume(limit: Limit, key: str) -> None:
             "Rate limit exceeded.",
             retry_after=max(ttl, 1) if ttl > 0 else limit.window_seconds,
         )
-
-
-async def try_consume(limit: Limit, key: str) -> bool:
-    """Non-blocking fixed-window check (ADR-0022 §2.9).
-
-    Same ``INCR`` + ``EXPIRE(nx)`` mechanics as :func:`consume`, but instead
-    of raising :class:`RateLimitedError` when the window budget is exhausted it
-    returns ``False``; ``True`` while there is still budget (the counter is
-    incremented either way). An empty ``key`` yields ``True`` (fail-open — same
-    no-enforcement posture as :func:`consume`, which logs and returns).
-
-    Used for the per-chat Telegram send throttle: a ``False`` result means the
-    recipient is skipped this tick (the recovery scan picks the message up
-    later), so it must not abort the dispatch loop.
-    """
-    if not key:
-        # No key -> can't enforce; fail-open (don't drop the send).
-        log.warning("rate_limit_no_key", limit_name=limit.name)
-        return True
-    redis = get_redis()
-    redis_key = f"rl:{limit.name}:{key}"
-    async with redis.pipeline(transaction=False) as pipe:
-        pipe.incr(redis_key)
-        pipe.expire(redis_key, limit.window_seconds, nx=True)
-        results = await pipe.execute()
-    current = int(results[0])
-    return current <= limit.capacity
 
 
 def install_rate_limiter(_app: FastAPI) -> None:

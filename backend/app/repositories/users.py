@@ -13,14 +13,14 @@ Removed with the UI / groups / audit: ``get_admin`` (the worker audit writer),
 ``list_paged`` / ``list_in_group`` / ``list_user_ids_in_group`` (admin UI,
 ``users.group_id``), ``upsert_admin`` (``seed_super_admin``) and the
 login/lockout bookkeeping (``set_password_hash`` / ``reset_password`` /
-``record_login_*``).
+``record_login_*``). ``update_fields`` / ``delete`` went the same way (TD-060):
+the technical ``crm-service`` row is seeded once and never mutated or deleted
+— a delete would CASCADE every ``mail_accounts`` row off it.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
-
-from sqlalchemy import select, text, update
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -84,13 +84,3 @@ class UsersRepo:
             raise
         await self._s.refresh(user)
         return user
-
-    async def update_fields(self, user_id: int, **fields: object) -> None:
-        if not fields:
-            return
-        fields["updated_at"] = datetime.now(UTC)
-        await self._s.execute(update(User).where(User.id == user_id).values(**fields))
-
-    async def delete(self, user_id: int) -> None:
-        stmt = text("DELETE FROM users WHERE id = :id")
-        await self._s.execute(stmt, {"id": user_id})

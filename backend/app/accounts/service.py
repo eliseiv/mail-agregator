@@ -472,7 +472,7 @@ class MailAccountService:
         except OAuthRefreshInvalidError as exc:
             # The refresh token died between the consent and this probe — the
             # service has already flagged ``oauth_needs_consent``; surface the
-            # documented 409 so the UI prompts a reconnect (ADR-0025 §9.1).
+            # documented 409 so the CRM prompts a reconnect (ADR-0025 §9.1).
             raise OAuthReconsentRequiredError("Reconnect Outlook to test this account") from exc
         stage.value = "imap"
         await imap_test_oauth(

@@ -142,8 +142,6 @@ jobs:
       REDIS_URL: redis://localhost:6379/0
       # 32-byte test-only key. Regenerate with: python -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"
       MAIL_ENCRYPTION_KEY: HSoYMcwRZLguwQpz+kHPwifN9LvO/H86royMLyRgclo=
-      ADMIN_LOGIN: admin
-      ADMIN_PASSWORD: ci_admin_password_change_me
       PYTHONUNBUFFERED: "1"
 
     steps:

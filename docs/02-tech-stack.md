@@ -2,6 +2,8 @@
 
 Базовые решения зафиксированы в [ADR-0001](./adr/ADR-0001-tech-stack.md). Этот документ — нормативный список версий и обоснование на уровне таблицы. При обновлении версий — править здесь и оставлять changelog в нижней секции.
 
+> **⚠️ ДЕМОНТАЖ ВЫПОЛНЕН (2026-07-15) — часть стека ниже описывает СНЯТЫЕ подсистемы.** По [ADR-0043](./adr/ADR-0043-strip-to-connector-push-to-crm.md)/[ADR-0044](./adr/ADR-0044-decommission-runbook.md) агрегатор сведён к mail-connector'у. **MinIO/S3 сняты полностью** (Фаза G, коммиты `8e890a2`/`e0bccc3`): `aioboto3`, сервисы MinIO, bucket `mail-attachments`, S3-env — удалены (строки ниже помечены как исторические). Также сняты Telegram/webhooks/forwarding/tags/groups и Jinja-UI/static (записи `Jinja2`, `slowapi`, sessions-UI, httpx→Telegram Bot API — историчны в части UI/нотификаций; `httpx` остаётся для OAuth Microsoft). Посекционная вычистка этого документа ведётся под **`TD-050`(в)**; здесь помечены только MinIO/S3-строки (задача синхронизации реестров 2026-07-15).
+
 ---
 
 ## Backend
@@ -28,7 +30,7 @@
 | Email parsing/build | stdlib `email` + `imap-tools` | imap-tools **1.6** | IMAP fetch + парсинг (ADR-0002). **XOAUTH2 (ADR-0025):** через нижележащий `imaplib.authenticate("XOAUTH2", …)` — `imap-tools` `MailBox.client`; проверить совместимость версии (TD-030). |
 | SMTP | aiosmtplib | **3.0** | Async SMTP send (ADR-0002). **XOAUTH2 (ADR-0025):** через `AUTH XOAUTH2 <base64>`; проверить механизм в версии (TD-030). |
 | OAuth2 Microsoft | **без отдельной библиотеки (httpx)** | — | **ADR-0025:** authorize/token-flow реализуем вручную на `httpx` (tenant `common`). MSAL не вводим — flow простой (auth-code + refresh), а MSAL тянет лишние зависимости и кэш-абстракции, не нужные при хранении токенов в БД. |
-| MinIO/S3 client | aioboto3 | **13.2.0** | Async S3 API |
+| ~~MinIO/S3 client~~ | ~~aioboto3~~ | ~~**13.2.0**~~ | **СНЯТ (ADR-0044 Фаза G, 2026-07-15):** `aioboto3` удалён из зависимостей вместе с `shared/storage.py`. Историческая запись. |
 | Scheduler (worker) | APScheduler | **3.10** | Cron + interval triggers (ADR-0003) |
 
 ---
@@ -39,7 +41,7 @@
 | --- | --- | --- |
 | PostgreSQL | **16** (16.4+ recommended) | Основная БД (метаданные, аудит) |
 | Redis | **7.2** | Sessions, rate-limit, временные setup-сессии |
-| MinIO | `RELEASE.2024-08-29T01-40-52Z` | Object storage для вложений (точный тег зафиксирован в `07-deployment.md` sec. 1 и в init-контейнере `minio-bootstrap` sec. 12) |
+| ~~MinIO~~ | ~~`RELEASE.2024-08-29T01-40-52Z`~~ | **СНЯТ (ADR-0044 Фаза G, 2026-07-15):** сервисы `minio`/`minio-bootstrap`, volume `mas_minio_data`, bucket `mail-attachments` удалены. Коннектор не хранит вложений. Историческая запись. |
 
 ---
 
@@ -87,7 +89,7 @@
 
 - **Celery** — запрещён (overkill, см. ADR-0003).
 - **Frontend SPA-фреймворки (React/Vue/Svelte)** — не используются.
-- **Локальный диск для вложений** — нельзя; только MinIO.
+- ~~**Локальный диск для вложений** — нельзя; только MinIO.~~ **(неактуально с 2026-07-15, ADR-0044 Фаза G: вложения не хранятся — MinIO снят, коннектор пушит письма в CRM без вложений.)**
 - **Pickle для сессий/кэша** — нельзя (RCE-риск); только JSON.
 - **Логирование секретов** — запрещено (см. ADR-0014, redact-list).
 - **Создание ключей шифрования в коде** — запрещено; только из env.

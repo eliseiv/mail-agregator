@@ -7,9 +7,10 @@ Two scheduled jobs (see ``worker/app/main.py``):
   each under an :class:`asyncio.Semaphore` of size ``MAX_CONCURRENT_IMAP``.
 * ``force_sync_dispatch`` — every 10 seconds.
   Drains the ``force_sync:{account_id}`` Redis markers (set by the API
-  endpoint ``POST /accounts/{id}/sync``) and syncs ONLY those accounts,
-  giving users a sub-10-second feedback loop on the "Sync now" button
-  without driving the regular polling cadence below 5 minutes.
+  endpoint ``POST /api/external/mailboxes/{account_id}/sync``) and syncs
+  ONLY those accounts, giving the CRM a sub-10-second feedback loop on an
+  on-demand sync without driving the regular polling cadence below 5
+  minutes.
 
 The two jobs share :func:`_run_for_accounts` for the actual per-account
 fan-out so semaphore semantics, error handling and logging stay
@@ -115,7 +116,6 @@ async def sync_one_account(
     timeout_seconds: int,
     initial_sync_days: int,
     max_body_bytes: int,
-    max_att_bytes: int,
 ) -> _AccountResult:
     """Sync one account. Returns an :class:`_AccountResult`.
 
@@ -185,7 +185,6 @@ async def sync_one_account(
                 last_uidvalidity=account.last_uidvalidity,
                 initial_sync_days=initial_sync_days,
                 max_body_bytes=max_body_bytes,
-                max_att_bytes=max_att_bytes,
                 timeout=timeout_seconds,
             ),
             timeout=timeout_seconds,
@@ -591,7 +590,6 @@ async def _run_for_accounts(accounts: list[MailAccount]) -> tuple[int, int, int]
                 timeout_seconds=settings.IMAP_TIMEOUT_SECONDS,
                 initial_sync_days=settings.INITIAL_SYNC_DAYS,
                 max_body_bytes=settings.MAX_BODY_BYTES,
-                max_att_bytes=settings.MAX_ATTACHMENT_BYTES,
             )
 
     raw_results = await asyncio.gather(*[_bounded(a) for a in accounts], return_exceptions=True)

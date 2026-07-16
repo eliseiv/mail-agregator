@@ -35,8 +35,6 @@ from shared.config import get_settings
 from tests.integration.conftest import (  # noqa: F401
     _db_truncate_all,
     _redis_flush,
-    login_as_admin,
-    two_step_login,
 )
 
 # Mock Azure App credentials — *not* secrets, only used to flip the feature

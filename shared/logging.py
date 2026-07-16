@@ -39,30 +39,7 @@ REDACT_KEYS: frozenset[str] = frozenset(
         "MAIL_ENCRYPTION_KEY",
         "MAIL_ENCRYPTION_KEY_PREV",
         "ADMIN_PASSWORD",
-        "S3_SECRET_KEY",
         "POSTGRES_PASSWORD",
-        # Telegram launcher (ADR-0018, docs/06-security.md §1.8): bot token
-        # leak lets attacker impersonate the bot. Operator env var is
-        # ``BOT_TOKEN`` (see shared/config.py for naming note); legacy
-        # ``TELEGRAM_BOT_TOKEN`` covers any place still using the docs name.
-        "BOT_TOKEN",
-        "TELEGRAM_BOT_TOKEN",
-        # ADR-0027 §8: push-only per-team bot tokens — same leak risk as
-        # BOT_TOKEN (attacker could impersonate the bot to the admins).
-        "BOT_IVAN_TOKEN",
-        "BOT_ALEXANDRA_TOKEN",
-        "BOT_ANDREI_TOKEN",
-        # ADR-0027 §8 (round-44): fourth push bot ``business2`` token.
-        "BOT_BUSINESS2_TOKEN",
-        # ADR-0027 §8 (round-42): per-bot push-webhook secrets — same leak
-        # risk as TELEGRAM_WEBHOOK_SECRET (forged push-webhook updates).
-        "BOT_IVAN_WEBHOOK_SECRET",
-        "BOT_ALEXANDRA_WEBHOOK_SECRET",
-        "BOT_ANDREI_WEBHOOK_SECRET",
-        # ADR-0027 §8 (round-44): business2 push-webhook secret.
-        "BOT_BUSINESS2_WEBHOOK_SECRET",
-        "TELEGRAM_WEBHOOK_SECRET",
-        "X-Telegram-Bot-Api-Secret-Token",
         # OAuth2 Outlook (ADR-0025 §1.11, docs/06-security.md): never log the
         # authorization code, tokens, PKCE verifier or client secret.
         "OUTLOOK_CLIENT_SECRET",
@@ -80,9 +57,11 @@ REDACT_KEYS: frozenset[str] = frozenset(
         "EXTERNAL_API_KEY",
         "X-API-Key",
         "x-api-key",
-        # Forward SMTP relay (ADR-0034 §5, docs/06-security.md §1.14): the
-        # relay account password lets an attacker send mail as the relay.
-        # Same leak class as the mailbox SMTP passwords above.
+        # Forward SMTP relay password. The forwarding subsystem went away with
+        # the decommission (ADR-0044 A3), so nothing sets this key any more;
+        # the entry is KEPT deliberately — a redact list is a fail-safe
+        # denylist, and removing a name from it can only ever let a stray value
+        # through. Same leak class as the mailbox SMTP passwords above.
         "FORWARD_SMTP_PASSWORD",
         # CRM push connector (ADR-0043 §2): the shared HMAC secret signs every
         # push/status request to the CRM. A leak lets an attacker forge ingest
@@ -121,13 +100,14 @@ def configure_logging(level: str = "INFO", service: str = "api") -> None:
     for noisy in ("uvicorn.access", "asyncio"):
         logging.getLogger(noisy).setLevel(max(log_level, logging.INFO))
 
-    # ``httpx`` logs the full request URL at INFO via its internal logger,
-    # which would leak the Telegram Bot token embedded in the api.telegram.org
-    # URL (`bot<TOKEN>/<method>`) — see ADR-0018 §6 / docs/06-security.md
-    # §1.8. Silence it to WARNING; we still see real failures (4xx/5xx)
-    # via our own ``telegram_send_message_api_error`` event in
-    # ``backend/app/telegram/bot.py`` and via the redacted-aware
-    # ``_redact_processor`` for any structlog event we emit ourselves.
+    # ``httpx`` logs the full request URL at INFO via its internal logger.
+    # The original motive was the Telegram Bot token embedded in the
+    # api.telegram.org URL (`bot<TOKEN>/<method>`); that subsystem is gone
+    # (ADR-0044 A3), but httpx is still live on the OAuth token endpoint and
+    # the CRM push, whose URLs are not worth emitting at INFO either. Silence
+    # it to WARNING — we still see real failures (4xx/5xx) through the
+    # explicit error events our own callers emit, which go through the
+    # redaction-aware ``_redact_processor``.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 

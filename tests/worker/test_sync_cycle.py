@@ -114,7 +114,6 @@ class TestSyncOneAccount:
             timeout_seconds=1,
             initial_sync_days=30,
             max_body_bytes=1024,
-            max_att_bytes=1024,
         )
         assert result.new_count == 0 and result.conflict_count == 0
         assert result.outcome == "transient"
@@ -238,8 +237,6 @@ class TestSyncOneAccount:
                     body_present=True,
                     in_reply_to=None,
                     refs_header=None,
-                    x_forwarded_by=None,
-                    attachments=[],
                 )
             ],
         )
@@ -260,7 +257,6 @@ class TestSyncOneAccount:
             timeout_seconds=10,
             initial_sync_days=30,
             max_body_bytes=1024,
-            max_att_bytes=1024 * 1024,
         )
         assert res1.new_count == 1
         assert res1.conflict_count == 0
@@ -275,7 +271,6 @@ class TestSyncOneAccount:
             timeout_seconds=10,
             initial_sync_days=30,
             max_body_bytes=1024,
-            max_att_bytes=1024 * 1024,
         )
         assert res2.new_count == 0
         assert res2.conflict_count == 1

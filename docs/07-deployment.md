@@ -1,5 +1,7 @@
 # 07. Deployment
 
+> **⚠️ ДЕМОНТАЖ ВЫПОЛНЕН (2026-07-15) — этот документ описывает ДО-демонтажный агрегатор.** По [ADR-0043](./adr/ADR-0043-strip-to-connector-push-to-crm.md)/[ADR-0044](./adr/ADR-0044-decommission-runbook.md) агрегатор сведён к mail-connector'у. **MinIO/S3 СНЯТЫ полностью** (Фаза G, `8e890a2`/`e0bccc3`): сервисы `minio`/`minio-bootstrap`, volume `mas_minio_data`, bucket `mail-attachments`, S3-env, `deploy/minio-bootstrap.sh` — **удалены**. Все секции ниже про MinIO/S3 (сервис `minio`, `mas_minio_data`, «MinIO bootstrap» sec. 12, S3-env-переменные, MinIO-бэкап/restore) — **ИСТОРИЧЕСКИЕ, не отражают текущий compose/прод**. Также сняты Telegram/webhooks/forwarding/tags/groups и весь Jinja-UI/static (HTML-URL → 404; живы `/healthz`/`/readyz`/`/api/external/*`). Актуальный прод: 4 таблицы (`alembic_version`/`mail_accounts`/`messages`/`users`), ревизия `20260715_028`, без MinIO. Посекционная вычистка этого документа ведётся под **`TD-050`(в)** — до её завершения читать секции про снятые подсистемы как исторические.
+
 Целевая среда — single-host Linux (Ubuntu 22.04 LTS или новее) с Docker Engine 24+ и docker compose v2. Все компоненты упакованы в docker-compose.
 
 **Актуальный prod (с 2026-07-01):** выделенный сервер Hetzner `49.12.189.77`, Ubuntu 26.04, домен `postapp.store` (A-запись у reg.ru). Деплой по SSH под `root`, checkout в `/opt/mail-agregator`. До 2026-07-01 прод жил на общем сервере `132.243.113.117`; процедура переезда — секция 15 «Migration to a new server».
@@ -136,7 +138,9 @@ Server-блок отвечает `200 ok\n` на `/_health_nginx` (HTTP, не HT
 
 ## 4. Environment variables
 
-Полный список. Devops-агент создаёт `.env.example` со всеми переменными (без значений секретов).
+Полный список полей `Settings` (`shared/config.py`) — **этот раздел, а не `.env.example`, является нормативной сводкой env**.
+
+> **Соглашение о составе `.env.example` (зафиксировано 2026-07-16).** Шаблон `.env.example` — не зеркало `Settings`, а **чек-лист провижининга оператора**: в него входят ключи, которые оператор обязан или типично хочет задать (секреты, специфичные для инсталляции URL/домены, часто крутимые пороги). **Внутренние тюнеры с рабочим дефолтом и валидированным диапазоном в шаблон НЕ выносятся** — их место в таблицах этого раздела. Расхождение состава шаблона и `Settings` **само по себе НЕ является дефектом** и не заводится как долг: `Settings` читает окружение с `extra="ignore"`, отсутствующий в `.env` ключ берёт дефолт. Дефект — это (а) ключ, **обязательный** на старте (сегодня ровно один: `MAIL_ENCRYPTION_KEY`, `_enforce_required`) или нужный для связи с CRM, но отсутствующий в шаблоне; либо (б) ключ в шаблоне/CI, которого **уже нет** в `Settings` (рассинхрон env↔код — вот это заводится, см. `TD-060`). Прежняя формулировка требовала от `.env.example` «все переменные» и порождала ложные находки при сплошном свипе (напр. `MAX_BODY_BYTES`, 2026-07-16). **Сплошной свип 2026-07-16 (пересчитан после снятия `MAX_ATTACHMENT_BYTES`, `TD-060` группа C — было 45):** в `Settings` **44 поля**; в шаблоне отсутствуют 8 — `SERVICE_NAME` (внутреннее, воркер переопределяет в коде) и 7 тюнеров с дефолтами (`MAX_BODY_BYTES`, `SYNC_MAX_CONSECUTIVE_FAILURES`, `SYNC_MASS_FAILURE_RATIO`, `SYNC_MASS_FAILURE_MIN`, `SYNC_CONNECT_RETRIES`, `SYNC_TRANSIENT_SUPPRESS_MINUTES`, `SYNC_OAUTH_LOGIN_FAILED_TRANSIENT`); все 8 — штатное поведение по соглашению выше, правок `.env.example` **не требуется**.
 
 ### Общие
 
@@ -187,12 +191,9 @@ Server-блок отвечает `200 ok\n` на `/_health_nginx` (HTTP, не HT
 | `MAIL_ENCRYPTION_KEY` | (none) | **yes** | base64 32 байта. Генерация: см. `06-security.md` sec. 10. |
 | `MAIL_ENCRYPTION_KEY_PREV` | (none) | no | Только во время ротации. |
 
-### Admin seed
+### ~~Admin seed~~ — СНЯТО
 
-| Переменная | Default | Required | Описание |
-| --- | --- | --- | --- |
-| `ADMIN_LOGIN` | `admin` | yes | Username супер-админа. |
-| `ADMIN_PASSWORD` | (none) | yes | Пароль супер-админа (используется только при первом seed). |
+> **ИСТОРИЧЕСКОЕ. Полей `ADMIN_LOGIN`/`ADMIN_PASSWORD` в `Settings` больше нет** (`TD-060` (6d), рабочее дерево 2026-07-16). Интерактивный супер-админ ушёл вместе с cookie-UI ([ADR-0044](./adr/ADR-0044-decommission-runbook.md) A3/§5): `seed_super_admin` снят, единственный сидируемый аккаунт — технический `crm-service` с `password_hash=NULL` (`backend/app/auth/service.py:33-70`), интерактивного входа в коннекторе не существует. `ADMIN_PASSWORD` **больше не требуется на старте**: `_enforce_required` (`shared/config.py:271-277`) требует единственный ключ — `MAIL_ENCRYPTION_KEY`. Ключи удалены из `.env.example`/CI; легаси-значение в прод-`.env` безвредно (`extra="ignore"`). Провижинить и ротировать нечего — см. `docs/SERVER-SETUP.md` §A.8 / §H.2.
 
 ### Worker / sync
 
@@ -205,7 +206,8 @@ Server-блок отвечает `200 ok\n` на `/_health_nginx` (HTTP, не HT
 | `IMAP_TIMEOUT_SECONDS` | `60` | no | Per-account timeout воркера при синхронизации (см. ADR-0013). **Не** относится к connection-test — там `MAILBOX_TEST_DEADLINE_SECONDS`. |
 | `MAILBOX_TEST_DEADLINE_SECONDS` | `45` | no | **ADR-0047:** hard-deadline на **весь** connection-test ящика (host-assert + IMAP-логин + SMTP-логин), общий для `POST /mailboxes/test`, `POST /mailboxes` и `PATCH /mailboxes/{id}` при смене кредов. Это **единственная** верхняя граница **probe**. Исчерпание → доменная `422` (`imap_login_failed`/`smtp_login_failed`, `details.detail="timeout"`), НЕ `504` и НЕ зависание. Границы `ge=10, le=45` (`shared/config.py:169` — норма **применена в коде**): `le` **машинно** охраняет инвариант `deadline + teardown (≤ 5 с, ADR-0047 §2.3) + внепробная часть запроса (≤ 5 с) < proxy_read_timeout (60s)`; значение > 45 **не проходит** валидацию на старте. (Отменённые `le=50`/`le=55` были over-claim: `50 + 5 + 5 = 60` = ровно `proxy_read_timeout` → `504`.) **При изменении `proxy_read_timeout` пересчитать `le`** (формула — §6 / ADR-0047 §5). |
 | `INITIAL_SYNC_DAYS` | `30` | no | Окно при первом подключении. |
-| `MAX_ATTACHMENT_BYTES` | `26214400` | no | 25 MiB. |
+| ~~`MAX_ATTACHMENT_BYTES`~~ | — | — | **СНЯТО — поля в `Settings` больше нет** (`TD-060`, группа B/C, рабочее дерево 2026-07-16, НЕ задеплоено). Вложения демонтированы вместе с MinIO ([ADR-0044](./adr/ADR-0044-decommission-runbook.md) Фаза G): поле оставалось in-memory size-cap'ом мёртвого fetch-пути воркера, который снят целиком (`worker/app/imap_fetcher.py:227-230` — «Attachments are NOT extracted (ADR-0043 §4)»; grep `MAX_ATTACHMENT_BYTES|max_att_bytes` по `shared/`/`backend/`/`worker/` = **0**). Ключ удалён из `.env.example`; легаси-значение в прод-`.env` безвредно (`extra="ignore"`). **Не путать с `client_max_body_size`** — тот больше на этот ключ не опирается, см. §6. |
+| `MAX_BODY_BYTES` | `1048576` | no | 1 MiB — верхняя граница сохраняемого тела письма (читается воркером: `worker/app/sync_cycle.py:593`). Границы `ge=1024, le=10485760`. Внутренний тюнер: в `.env.example` намеренно отсутствует (см. соглашение в начале раздела). |
 | `SYNC_MAX_CONSECUTIVE_FAILURES` | `3` | no | ADR-0026: порог PERMANENT-ошибок подряд → auto-disable (`ge=1, le=20`). Заменяет хардкод `_DISABLE_AFTER_FAILS`. |
 | `SYNC_MASS_FAILURE_RATIO` | `0.5` | no | ADR-0026: доля PERMANENT-падений за цикл, при которой circuit-breaker подавляет массовый disable (`ge=0.0, le=1.0`). |
 | `SYNC_MASS_FAILURE_MIN` | `5` | no | ADR-0026: минимум аккаунтов в цикле для активации circuit-breaker (`ge=1, le=10000`). |
@@ -213,18 +215,13 @@ Server-блок отвечает `200 ok\n` на `/_health_nginx` (HTTP, не HT
 | `SYNC_TRANSIENT_SUPPRESS_MINUTES` | `60` | no | ADR-0026 (update): подавлять запись TRANSIENT `last_sync_error` в UI, если последний успешный sync был в пределах окна (`ge=0, le=10080`; `0` отключает). Распространяется на OAuth-`login failed` (ADR-0028 §6). |
 | `SYNC_OAUTH_LOGIN_FAILED_TRANSIENT` | `true` | no | ADR-0028 §7: **обязательный** kill-switch (default-on; `no` = переопределять не требуется, дефолт активирует фикс). При `true` (дефолт) IMAP-`login failed`/`authenticationfailed` у `oauth_outlook` = transient (retry + no-disable). `false` возвращает старое permanent-поведение (откат без редеплоя кода). |
 
-### Sessions / auth
+### ~~Sessions / auth~~ — СНЯТО
 
-| Переменная | Default | Required | Описание |
-| --- | --- | --- | --- |
-| `SESSION_TTL_SECONDS` | `43200` | no | 12 часов sliding. |
-| `SESSION_ABSOLUTE_TTL_SECONDS` | `604800` | no | 7 дней absolute. |
-| `SETUP_SESSION_TTL_SECONDS` | `900` | no | 15 минут. |
-| `COOKIE_DOMAIN` | (none) | no | Если задан — кладётся в Set-Cookie domain. |
+> **ИСТОРИЧЕСКОЕ. Пользовательских сессий и cookie-полей в `Settings` больше нет.** `SESSION_TTL_SECONDS` / `SESSION_ABSOLUTE_TTL_SECONDS` / `SETUP_SESSION_TTL_SECONDS` / `COOKIE_DOMAIN` (а также `LOGIN_FAILURE_THRESHOLD` / `LOGIN_LOCKOUT_MINUTES` / `SAFE_REDIRECT_AFTER_LOGIN` / `LOGIN_PATH`) сняты вместе с cookie-UI ([ADR-0044](./adr/ADR-0044-decommission-runbook.md) A3; гигиена — `TD-060` (1)/(6c), рабочее дерево 2026-07-16), ключи удалены из `.env.example`/CI. Аутентификация коннектора — **только машинная** (`EXTERNAL_API_KEY` через `X-API-Key`/`Bearer`); сессий, CSRF и form-fallback не существует. Единственный живой `SESSION_*`-ключ — `SESSION_GUARD_STRICT` ниже, и он **не про пользовательские сессии**.
 
 ### Session guards: рантайм-детектор потерянных статус-событий (ADR-0046 §2.1.1 / `TD-054`)
 
-Речь о **DB-сессии** (SQLAlchemy `AsyncSession`), а **не** о пользовательской сессии из блока «Sessions / auth» выше — совпадение префикса `SESSION_` случайно.
+Речь о **DB-сессии** (SQLAlchemy `AsyncSession`), а **не** о пользовательской сессии — совпадение префикса `SESSION_` случайно (тем более что пользовательские сессии сняты, см. блок выше).
 
 | Переменная | Default | Required | Описание |
 | --- | --- | --- | --- |
@@ -298,11 +295,15 @@ Server-блок отвечает `200 ok\n` на `/_health_nginx` (HTTP, не HT
 | `PUSH_NOTIFY_BATCH_SIZE` | `30` | no | **ADR-0027:** размер `LPOP`-батча `push_notify_dispatch` за тик. |
 | `OUTLOOK_CLIENT_ID` | (none) | yes (если OAuth enabled) | **ADR-0025 (Спринт B):** Azure App (Application/client) ID. Audience: «Accounts in any organizational directory and personal Microsoft accounts» (multitenant + personal — обязательно для tenant `common`). |
 | `OUTLOOK_CLIENT_SECRET` | (none) | yes (если OAuth enabled) | **ADR-0025:** Azure App client secret. Маскируется в structlog redact-list рядом с `MAIL_ENCRYPTION_KEY`/`TELEGRAM_BOT_TOKEN`. |
-| `OUTLOOK_REDIRECT_URI` | (none) | yes (если OAuth enabled) | **ADR-0025:** `{APP_BASE_URL}/api/oauth/outlook/callback` — точное совпадение с зарегистрированным в Azure. |
+| `OUTLOOK_REDIRECT_URI` | (none) | yes (если OAuth enabled) | **ADR-0045 §4** (амендмент к ADR-0025): `{APP_BASE_URL}/api/external/mailboxes/oauth/callback` — точное совпадение с зарегистрированным в Azure. **Session-callback `/api/oauth/outlook/callback` из ADR-0025 СНЯТ** вместе с cookie-UI (ADR-0044 A3); его заменил headless external-callback (`backend/app/external/router.py:550`). Значение обновлено на cut-over — код только читает env (`shared/config.py`). |
 | `OUTLOOK_TENANT` | `common` | no | **ADR-0025:** tenant для authorize/token endpoints `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/...`. Для личных ящиков — `common` (ранее `consumers`; `consumers` давал IMAP XOAUTH2 "User is authenticated but not connected"). `common` пускает и личные, и рабочие аккаунты. |
 | `OUTLOOK_OAUTH_STATE_TTL_SECONDS` | `600` | no | **ADR-0025:** TTL Redis-ключа `oauth_state:{state}` (CSRF/anti-fixation state + PKCE verifier). |
 
-OAuth включён (`OUTLOOK_OAUTH_ENABLED`, derived), когда заданы `OUTLOOK_CLIENT_ID` + `OUTLOOK_CLIENT_SECRET`; иначе `/api/oauth/outlook/*` отдают `404` (route скрыт). `OUTLOOK_CLIENT_SECRET` передаётся в **api** (authorize/callback/SMTP) и **worker** (refresh перед IMAP). `TELEGRAM_BOT_TOKEN` хранится в `.env` (`chmod 600`). **Изменение от ADR-0018:** `worker` теперь использует Telegram API для доставки push-нотификаций (ADR-0022 §2) — `TELEGRAM_BOT_TOKEN` передаётся **и** в `api`, **и** в `worker` контейнеры. Маскировка в логах гарантируется redact-list'ом structlog (одинаково для обоих контейнеров). **ADR-0027 (round-44, 4 push-бота):** токены push-only ботов по командам (`BOT_IVAN_TOKEN` / `BOT_ALEXANDRA_TOKEN` / `BOT_ANDREI_TOKEN` / `BOT_BUSINESS2_TOKEN`) + их `*_GROUP_ID` + `*_WEBHOOK_SECRET` + `ADMIN_TELEGRAM_IDS` передаются **и в `worker`** (диспатчер `push_notify_dispatch`), **и в `api`** (callback-webhook `/api/telegram/push-webhook/{name}`, round-42 §10). Все push-боты получают `.env` через `env_file: .env` обоих контейнеров (compose не перечисляет их поимённо в `environment:`) — добавление `business2` в `.env` автоматически прокидывается в api и worker, правка `docker-compose.yml` не требуется. Четыре токена + четыре webhook-secret добавлены в structlog redact-list рядом с `TELEGRAM_BOT_TOKEN`.
+OAuth включён (`outlook_oauth_enabled`, derived), когда заданы `OUTLOOK_CLIENT_ID` + `OUTLOOK_CLIENT_SECRET`; иначе `/api/external/mailboxes/oauth/*` отдают `404` (route скрыт). `OUTLOOK_CLIENT_SECRET` передаётся в **api** (authorize/callback/SMTP) и **worker** (refresh перед IMAP).
+
+> **Всё дальше в этом абзаце — ИСТОРИЧЕСКОЕ (Telegram снят демонтажём, ADR-0044 A3).** Полей `TELEGRAM_*`/`BOT_*`/`ADMIN_TELEGRAM_IDS` в `Settings` нет, роутов `/api/telegram/*` нет, диспатчера `push_notify_dispatch` нет; уведомления — целиком на стороне CRM. Оставлено как история конфигурации до демонтажа; вычистка — `TD-050`(в).
+
+`TELEGRAM_BOT_TOKEN` хранился в `.env` (`chmod 600`). **Изменение от ADR-0018:** `worker` теперь использует Telegram API для доставки push-нотификаций (ADR-0022 §2) — `TELEGRAM_BOT_TOKEN` передаётся **и** в `api`, **и** в `worker` контейнеры. Маскировка в логах гарантируется redact-list'ом structlog (одинаково для обоих контейнеров). **ADR-0027 (round-44, 4 push-бота):** токены push-only ботов по командам (`BOT_IVAN_TOKEN` / `BOT_ALEXANDRA_TOKEN` / `BOT_ANDREI_TOKEN` / `BOT_BUSINESS2_TOKEN`) + их `*_GROUP_ID` + `*_WEBHOOK_SECRET` + `ADMIN_TELEGRAM_IDS` передаются **и в `worker`** (диспатчер `push_notify_dispatch`), **и в `api`** (callback-webhook `/api/telegram/push-webhook/{name}`, round-42 §10). Все push-боты получают `.env` через `env_file: .env` обоих контейнеров (compose не перечисляет их поимённо в `environment:`) — добавление `business2` в `.env` автоматически прокидывается в api и worker, правка `docker-compose.yml` не требуется. Четыре токена + четыре webhook-secret добавлены в structlog redact-list рядом с `TELEGRAM_BOT_TOKEN`.
 
 ### External pull-API (ADR-0029)
 
@@ -363,7 +364,29 @@ TLS терминируется на контейнере `nginx`. Сертифи
 - Headers вверх: `Host`, `X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Proto: https`, `X-Forwarded-Host`, `X-Request-ID`. Backend полагается на эти headers для cookie Secure + audit IP + Message-ID URL-build.
 - HSTS: `Strict-Transport-Security: max-age=63072000; includeSubDomains; preload`.
 - gzip on для text/css, application/json, application/javascript, application/xml+rss, atom, image/svg+xml. text/html включается gzip-модулем по умолчанию — добавлять его в `gzip_types` нельзя (warning duplicate MIME type).
-- `client_max_body_size 30m` (под MAX_ATTACHMENT_BYTES=25 MiB + MIME overhead).
+- **`client_max_body_size 8m`** — норма зафиксирована 2026-07-16 (прежнее `30m` обосновывалось снятым `MAX_ATTACHMENT_BYTES`, см. врезку ниже). **Код приведён к норме** (2026-07-16): `deploy/nginx/nginx.conf:80` держит `client_max_body_size 8m`, обоснование в комментарии `:56-79` переписано по `ExternalSendRequest.body_text` без ссылки на снятое поле; `nginx -t` зелёный. **Не задеплоено** — на проде старый образ с `30m` до коммита+деплоя остатка `TD-060`.
+
+> **Обоснование `client_max_body_size 8m` (2026-07-16) — по фактическим схемам живых эндпоинтов, а не по снятому полю.**
+> За этим nginx живут ровно два роутера — `external_router` и `health_router` (`backend/app/main.py:99-100`); **вложений коннектор не принимает вовсе** (grep `attachment` по `backend/app/external/schemas.py` и `backend/app/send/mime.py` = **0**). Самое крупное принимаемое тело — `ExternalSendRequest` (`POST /api/external/mailboxes/{account_id}/send`, `backend/app/external/router.py:395`): `body_text: str = Field(..., max_length=1_048_576)` (`backend/app/external/schemas.py:231`), т.е. **1 MiB символов**. Pydantic считает `max_length` в **символах**, а не байтах, поэтому потолок запроса в байтах:
+> - UTF-8 worst case — 4 байта/код-поинт → 4 MiB;
+> - JSON-escape (`ensure_ascii`) — **6 байт/код-поинт для BMP** (`\uXXXX`, напр. кириллица `"я"`) → **6 MiB**; **12 байт/код-поинт для astral** (U+10000+, эмодзи: `json.dumps` даёт **surrogate-пару** `"😀"` — два `\uXXXX` на ОДИН код-поинт) → **12 MiB**. Существенно, что Pydantic `max_length` считает **код-поинты** (`len()`), а `len('😀') == 1`: тело из 1 048 576 эмодзи `max_length` **проходит** и даёт 12 MiB > `8m` → `413`. Лимит от этого не «маловат» — см. вывод ниже;
+> - остальные поля (пересчитано 2026-07-16 — прежняя оценка «≈ < 100 KiB» была **занижена вчетверо**, см. ниже), множитель 6 B/код-поинт (BMP; для astral — 12, но у `refs`/`subject`/`in_reply_to` это ASCII-заголовки RFC 5322):
+>   - `refs` — `max_length=_MAX_REFS_LEN` = **65 536** символов (`schemas.py:233`, константа `:167`) ⇒ **384 KiB**. Доминирующее слагаемое; именно оно опровергало прежнюю оценку;
+>   - `subject` ≤ 998 (`:230`) и `in_reply_to` ≤ `_MAX_IN_REPLY_TO_LEN` = 998 (`:232`, константа `:166`) ⇒ ≈ 6 KiB каждый;
+>   - `to`/`cc` — **схема НЕ ограничивает байты**: `Field(..., max_length=100)` (`:228-229`) ограничивает **длину списка** (≤ 100 элементов), а не длину элемента, и `_EMAIL_RE = ^[^@\s]+@[^@\s]+\.[^@\s]+$` (`backend/app/send/schemas.py:16`, применяется `_validate_addresses:19-28`) принимает адрес **любой длины**. Реалистичный потолок — 100 × 254 (RFC 5321 §4.5.3.1.3) × 6 ≈ **150 KiB**, но это свойство реальных адресов, **не гарантия кода**. Формально схема примет 100 «адресов» по мегабайту — такую форму запроса отсекает именно `client_max_body_size`, и в этом одна из его функций. Per-item bound как hardening — **`TD-061`** (открыт, не блокер).
+>
+> Сумма нормируемых схемой полей: 384 + 6 + 6 ≈ **396 KiB**, плюс реалистичные `to`/`cc` ≈ 150 KiB ⇒ **≈ 546 KiB < 1 MiB**, т.е. слагаемое «+ 1 MiB» формулы ниже покрывает их с запасом.
+>
+> **Итог — РЕАЛИСТИЧНЫЙ worst case (1 MiB текста письма любым живым языком, BMP): 6 MiB + ≈ 0.5 MiB ≈ 6.4 MiB < 8 MiB.** Формальный потолок схемы **выше `8m`** по двум независимым причинам (обе — один класс: схема допускает то, чего реальное письмо не содержит): (1) сплошной astral-текст — 12 MiB; (2) `to`/`cc` без per-item bound (`TD-061`). Ни одна не делает `8m` неверным — см. вывод.
+>
+> `8m` покрывает реалистичный worst case (6 MiB + поля) с запасом и при этом сжимает поверхность DoS вчетверо против `30m`. **Регрессии нет: `8m` строго больше любого РЕАЛИСТИЧНОГО валидного тела** (текст письма ≤ 1 MiB код-поинтов на живом языке + реальные адреса ≤ 254 октета) — такое тело отвергнуто быть не может.
+>
+> Оговорка «реалистичного» **существенна и не является ослаблением вывода**. Схема формально примет и тело сверх `8m` — сплошной astral-текст (12 MiB) или `to`/`cc` без per-item bound (`TD-061`); оба получат `413` на прокси. Это не дефект лимита, а его **прямое назначение**: письмо из миллиона эмодзи подряд или сотни мегабайтных «адресов» — не валидная почта, а мусор/DoS, и отсекать такое до приложения — ровно то, ради чего `client_max_body_size` существует. Класс тот же, что честно зафиксирован для `to`/`cc`: **граница схемы (код-поинты) и граница прокси (байты) меряют разные величины**, и там, где схема допускает больше байт, чем осмысленно, разницу добирает прокси. Поднимать `8m` под astral-worst-case (24 MiB) означало бы вернуть ту самую поверхность DoS, ради снятия которой лимит и опускали. Прежнее `30m` под 25 MiB вложений более ничего не защищает: путь, ради которого оно ставилось, физически отсутствует.
+> **При изменении `max_length` у `ExternalSendRequest.body_text` (или добавлении бинарного поля/upload'а) пересчитать `client_max_body_size` и обновить обе точки — эту строку и директиву `deploy/nginx/nginx.conf:80` (+ её обоснование в комментарии `:56-79`).** Формула — **`6 × max_length + 1 MiB`, и это ЯВНО BMP-оценка** (реалистичный worst case, по которому и выбран действующий `8m`), **а НЕ формальный потолок схемы**: множитель `6` верен только для BMP, у astral-код-поинтов он **`12`** (surrogate-пара). Полный потолок = `12 × max_length + 1 MiB`. Применять формулу вслепую нельзя — сначала решить, какой из двух случаев нормируется:
+> - оставляем BMP-оценку (как сейчас) ⇒ осознанно принимаем, что сплошной astral-текст получит `413`, и это by design (мусор/DoS отсекает прокси);
+> - хотим пропускать и astral ⇒ считать по `12 ×` и **удвоить** лимит, предварительно взвесив возврат поверхности DoS.
+>
+> Слагаемое «+ 1 MiB» — не запас «на глаз», а bound остальных полей (≈ 546 KiB, расчёт выше): **при подъёме `_MAX_REFS_LEN` (`backend/app/external/schemas.py:167`) выше ≈ 145 000 символов оно перестаёт покрывать `refs`, и формулу нужно пересчитывать целиком, а не только по `body_text`.**
 - `proxy_read_timeout 60s` / `proxy_send_timeout 60s` / `proxy_connect_timeout 5s` — выровнено с gunicorn `--timeout=60` в api Dockerfile.
 
 > **Инвариант цепочки бюджетов (ADR-0047 §2.1 + ADR-0032 follow-up) — `proxy_read_timeout` менять только вместе с ним.**
@@ -430,9 +453,10 @@ cd /opt/mail-agregator && docker compose --profile prod exec -T nginx nginx -s r
 git clone <repo>
 cd mail-agregator
 cp .env.example .env
-# Отредактировать .env: MAIL_ENCRYPTION_KEY, ADMIN_PASSWORD, POSTGRES_PASSWORD,
-#   MINIO_ROOT_USER, MINIO_ROOT_PASSWORD, MINIO_APP_ACCESS_KEY, MINIO_APP_SECRET_KEY,
+# Отредактировать .env: MAIL_ENCRYPTION_KEY (единственный обязательный на старте),
+#   POSTGRES_PASSWORD, EXTERNAL_API_KEY, CRM_INGEST_URL + CRM_PUSH_SECRET,
 #   SERVER_DOMAIN, ACME_EMAIL, APP_BASE_URL
+# ADMIN_PASSWORD / MINIO_* / S3_* — СНЯТЫ (ADR-0044 A3 + Фаза G), не задавать.
 docker compose up -d --build
 docker compose logs -f api worker
 ```
@@ -606,9 +630,11 @@ docker run --rm -v mas_minio_data:/data -v /backups/minio:/out alpine tar czf /o
 
 ## 11. Operational procedures
 
-### 11.1 Смена пароля супер-админа
+### 11.1 ~~Смена пароля супер-админа~~ — СНЯТО
 
-Супер-админ — единственный, заводится из env (`ADMIN_LOGIN` / `ADMIN_PASSWORD`). UI смены пароля для него отсутствует сознательно (см. `06-security.md` sec. 10). Процедура:
+> **ИСТОРИЧЕСКОЕ — процедуру НЕ выполнять, менять нечего.** Интерактивный супер-админ ушёл вместе с cookie-UI ([ADR-0044](./adr/ADR-0044-decommission-runbook.md) A3/§5): `seed_super_admin` снят, полей `ADMIN_LOGIN`/`ADMIN_PASSWORD` в `Settings` нет (`TD-060` (6d)), сессий/Redis-`session:*` не существует. Единственный сидируемый аккаунт — технический `crm-service` с `password_hash=NULL` (`backend/app/auth/service.py:33-70`); пароля у него нет и логин его не принимает. Аутентификация коннектора — только машинная (`EXTERNAL_API_KEY`); её ротация — `06-security.md` §10 / `SERVER-SETUP.md` §H.2. Текст ниже сохранён как история конфигурации до демонтажа.
+
+Супер-админ — единственный, заводился из env (`ADMIN_LOGIN` / `ADMIN_PASSWORD`). UI смены пароля для него отсутствовал сознательно (см. `06-security.md` sec. 10). Процедура **(недействительна)**:
 
 1. Обновить `.env` на сервере:
    ```
@@ -655,6 +681,8 @@ Builtin-теги (после [ADR-0040](./adr/ADR-0040-global-tags.md)) — **г
 ---
 
 ## 12. MinIO bootstrap (non-root service account для приложения)
+
+> **⚠️ ИСТОРИЧЕСКИЙ РАЗДЕЛ — MinIO bootstrap целиком (Фаза G, `8e890a2`/`e0bccc3`): сервисы `minio`/`minio-bootstrap`, volume `mas_minio_data`, bucket `mail-attachments`, `deploy/minio-bootstrap.sh` СНЯТО демонтажём ([ADR-0043](./adr/ADR-0043-strip-to-connector-push-to-crm.md) / [ADR-0044](./adr/ADR-0044-decommission-runbook.md), выполнено на проде 2026-07-15).** Описанное ниже в коде/проде агрегатора НЕ существует; текст сохранён как record исходного решения. НЕ реализовывать и не принимать за действующий контракт.
 
 См. также `06-security.md` sec. 12.
 
@@ -776,6 +804,8 @@ services:
 ---
 
 ## 14. Telegram bot setup (ADR-0018)
+
+> **⚠️ ИСТОРИЧЕСКИЙ РАЗДЕЛ — настройка ботов агрегатора (основной + 4 push-бота) СНЯТО демонтажём ([ADR-0043](./adr/ADR-0043-strip-to-connector-push-to-crm.md) / [ADR-0044](./adr/ADR-0044-decommission-runbook.md), выполнено на проде 2026-07-15).** Описанное ниже в коде/проде агрегатора НЕ существует; текст сохранён как record исходного решения. НЕ реализовывать и не принимать за действующий контракт. **Актуально:** боты обслуживаются CRM (вебхуки переключены на CRM — [ADR-0043](./adr/ADR-0043-strip-to-connector-push-to-crm.md) §5); у агрегатора Telegram-env/роутера нет.
 
 Бот создаётся одноразово через BotFather и подключается к prod-серверу webhook'ом. Никаких background-процессов — webhook обслуживает существующий `api` контейнер.
 

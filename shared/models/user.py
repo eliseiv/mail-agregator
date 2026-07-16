@@ -44,13 +44,13 @@ class User(Base):
     email: Mapped[str | None] = mapped_column(Text, nullable=True)
     display_name: Mapped[str | None] = mapped_column(Text, nullable=True)
     password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    # ADR-0038: reversible AES-256-GCM copy of the login password, kept ONLY
-    # so a super_admin can reveal it in the /admin "Password" column. NULL =
-    # no reversible copy (pre-ADR-0038 password unchanged, or reset in the
-    # self-set flow) → the UI column shows "—". Never participates in login
-    # verification (``password_hash`` remains the source of truth, ADR-0006);
-    # never logged. Blob format: version_byte || iv(12B) || ct+tag
-    # (``shared.crypto.encrypt_user_password``, AAD ``user_pw:{id}``).
+    # Rudiment (TD-051). ADR-0038 kept a reversible AES-256-GCM copy of the
+    # login password here so a super_admin could reveal it in the /admin
+    # "Password" column; the admin UI, interactive logins and the
+    # ``shared.crypto`` user-password branch all went away with the
+    # decommission (ADR-0044 A3, TD-060). Nothing writes this column any more
+    # — ``auth/service.py`` seeds the technical ``crm-service`` row with
+    # ``None`` — and the column itself is dropped only if TD-051 is taken.
     password_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     role: Mapped[str] = mapped_column(
         Text,

@@ -31,11 +31,7 @@ __all__ = [
     "InvalidTag",
     "MailPasswordCipher",
     "decrypt_mail_password",
-    "decrypt_user_password",
-    "decrypt_webhook_secret",
     "encrypt_mail_password",
-    "encrypt_user_password",
-    "encrypt_webhook_secret",
 ]
 
 VERSION_CURRENT = 0x01
@@ -43,36 +39,20 @@ VERSION_PREV = 0x00
 IV_LEN = 12
 HEADER_LEN = 1 + IV_LEN  # version + iv
 AAD_PREFIX = b"mail_account_password|"
-# ADR-0023 §4.1: webhook secrets reuse the same AES-256-GCM primitive but
-# bind AAD to ``webhook_id`` so an attacker with DB access cannot swap
-# ciphertexts between two webhook rows (decrypt fails with ``InvalidTag``).
-WEBHOOK_SECRET_AAD_PREFIX = b"webhook_secret|"
-# ADR-0038 §2: reversible copy of a user's login password reuses the same
-# AES-256-GCM primitive/key but binds AAD to ``user_id`` under a distinct
-# domain prefix. Domain separation from ``mail_account_password|`` /
-# ``webhook_secret|`` means a DB attacker cannot substitute a mail-password
-# or webhook-secret blob into ``users.password_encrypted`` (decrypt fails
-# with ``InvalidTag``), and the id-binding blocks swapping blobs between
-# users.
-USER_PASSWORD_AAD_PREFIX = b"user_pw:"
+
+# Removed with the decommissioned subsystems (TD-060): the webhook-secret
+# branch (``webhook_secret|`` AAD, ADR-0023 §4.1) went away with the webhooks
+# (TD-057), and the reversible user-login-password branch (``user_pw:`` AAD,
+# ADR-0038 §2) went away with the cookie UI — nothing writes
+# ``users.password_encrypted`` any more (``auth/service.py`` seeds it ``None``;
+# the column itself is a rudiment tracked by TD-051). Mail-account passwords
+# are the only secret this module still handles.
 
 
 def _aad_for(mail_account_id: int) -> bytes:
     if not mail_account_id or mail_account_id <= 0:
         raise ValueError("mail_account_id must be a positive integer for AAD")
     return AAD_PREFIX + str(mail_account_id).encode("ascii")
-
-
-def _webhook_aad(webhook_id: int) -> bytes:
-    if not webhook_id or webhook_id <= 0:
-        raise ValueError("webhook_id must be a positive integer for AAD")
-    return WEBHOOK_SECRET_AAD_PREFIX + str(webhook_id).encode("ascii")
-
-
-def _user_password_aad(user_id: int) -> bytes:
-    if not user_id or user_id <= 0:
-        raise ValueError("user_id must be a positive integer for AAD")
-    return USER_PASSWORD_AAD_PREFIX + str(user_id).encode("ascii")
 
 
 class MailPasswordCipher:
@@ -104,30 +84,6 @@ class MailPasswordCipher:
 
     def decrypt(self, blob: bytes, mail_account_id: int) -> str:
         return self._decrypt_with_aad(blob, _aad_for(mail_account_id))
-
-    def encrypt_webhook_secret(self, plaintext: str, webhook_id: int) -> bytes:
-        """Encrypt a webhook secret (ADR-0023 §4.1).
-
-        Uses the same envelope as :meth:`encrypt` but binds AAD to
-        ``webhook_id`` via :data:`WEBHOOK_SECRET_AAD_PREFIX`.
-        """
-        return self._encrypt_with_aad(plaintext, _webhook_aad(webhook_id))
-
-    def decrypt_webhook_secret(self, blob: bytes, webhook_id: int) -> str:
-        """Decrypt a webhook secret (ADR-0023 §4.1)."""
-        return self._decrypt_with_aad(blob, _webhook_aad(webhook_id))
-
-    def encrypt_user_password(self, plaintext: str, user_id: int) -> bytes:
-        """Encrypt a user's login password (ADR-0038 §2).
-
-        Uses the same envelope as :meth:`encrypt` but binds AAD to
-        ``user_id`` via :data:`USER_PASSWORD_AAD_PREFIX`.
-        """
-        return self._encrypt_with_aad(plaintext, _user_password_aad(user_id))
-
-    def decrypt_user_password(self, blob: bytes, user_id: int) -> str:
-        """Decrypt a user's login password (ADR-0038 §2)."""
-        return self._decrypt_with_aad(blob, _user_password_aad(user_id))
 
     # --- Internal AAD-parameterised primitives -----------------------------
 
@@ -178,40 +134,3 @@ def decrypt_mail_password(blob: bytes, mail_account_id: int) -> str:
     the row id, the blob is corrupted, or the wrong key is configured.
     """
     return MailPasswordCipher.from_settings().decrypt(blob, mail_account_id)
-
-
-def encrypt_webhook_secret(plaintext: str, webhook_id: int) -> bytes:
-    """Encrypt a webhook secret (ADR-0023 §4.1).
-
-    AAD binds the ciphertext to ``webhook_id`` so a DB attacker cannot
-    move a row's blob to another webhook.
-    """
-    return MailPasswordCipher.from_settings().encrypt_webhook_secret(plaintext, webhook_id)
-
-
-def decrypt_webhook_secret(blob: bytes, webhook_id: int) -> str:
-    """Decrypt a webhook secret blob (ADR-0023 §4.1).
-
-    Raises :class:`cryptography.exceptions.InvalidTag` on mismatch.
-    """
-    return MailPasswordCipher.from_settings().decrypt_webhook_secret(blob, webhook_id)
-
-
-def encrypt_user_password(plaintext: str, user_id: int) -> bytes:
-    """Encrypt a user's login password for reversible admin display (ADR-0038 §2).
-
-    AAD binds the ciphertext to ``user_id`` so a DB attacker cannot move a
-    row's blob to another user (or substitute a mail-password / webhook
-    secret blob — different AAD domain).
-    """
-    return MailPasswordCipher.from_settings().encrypt_user_password(plaintext, user_id)
-
-
-def decrypt_user_password(blob: bytes, user_id: int) -> str:
-    """Decrypt a user's login password blob (ADR-0038 §2).
-
-    Raises :class:`cryptography.exceptions.InvalidTag` if the AAD doesn't
-    match the ``user_id``, the blob is corrupted, or the wrong key is
-    configured.
-    """
-    return MailPasswordCipher.from_settings().decrypt_user_password(blob, user_id)

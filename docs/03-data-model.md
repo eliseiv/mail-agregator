@@ -1,5 +1,7 @@
 # 03. Data Model
 
+> **⚠️ ДЕМОНТАЖ ВЫПОЛНЕН (2026-07-15) — этот документ описывает ДО-демонтажную схему из 19 таблиц.** По [ADR-0043](./adr/ADR-0043-strip-to-connector-push-to-crm.md) / [ADR-0044](./adr/ADR-0044-decommission-runbook.md) (Фазы C–F, ревизия `20260715_028`) в прод-БД осталось **4 таблицы**: `alembic_version`, `users` (техническая, 1 ряд `crm-service`; `group_id` дропнут), `mail_accounts` (**без** `group_id`; все ряды принадлежат `crm-service`), `messages` (push-outbox, `+pushed_at`). **Дропнуты 16:** `sent_messages`, `sent_attachments`, `attachments`, `tags`, `tag_rules`, `message_tags`, `telegram_links`, `telegram_notifications`, `webhooks`, `webhook_deliveries`, `group_forwarding`, `message_forwards`, `user_groups`, `groups`, `users_settings`, `admin_audit`. Их DDL/описания ниже — **исторические**. Рудиментарные колонки `users` — `TD-051`. Разделы помечены посекционно (`TD-050`(в)).
+
 Основная БД — **PostgreSQL 16**. Имя БД: `mail_aggregator`. Кодировка: UTF-8. Часовые зоны — все TIMESTAMP-поля `TIMESTAMPTZ`, хранятся в UTC.
 
 Все ID — `BIGSERIAL`/`BIGINT` (кроме `users.id` — то же). UUID не используем (реляции компактнее на BIGINT). Если в будущем потребуется внешняя экспонируемая идентификация — добавим `public_id UUID`.
@@ -7,6 +9,8 @@
 ---
 
 ## ER-диаграмма
+
+> **⚠️ ИСТОРИЧЕСКИЙ РАЗДЕЛ — 16 из 19 таблиц (см. баннер файла) СНЯТО демонтажём ([ADR-0043](./adr/ADR-0043-strip-to-connector-push-to-crm.md) / [ADR-0044](./adr/ADR-0044-decommission-runbook.md), выполнено на проде 2026-07-15).** Описанное ниже в коде/проде агрегатора НЕ существует; текст сохранён как record исходного решения. НЕ реализовывать и не принимать за действующий контракт. **Актуальная схема — 4 таблицы:** `alembic_version`, `users` (1 ряд `crm-service`), `mail_accounts` (без `group_id`), `messages`.
 
 ```mermaid
 erDiagram
@@ -257,6 +261,12 @@ erDiagram
 ---
 
 ## Таблицы (DDL-friendly описание)
+
+> **⚠️ Смешанный раздел: 3 таблицы ЖИВЫ, 16 ДРОПНУТЫ ([ADR-0044](./adr/ADR-0044-decommission-runbook.md) Фазы C–F, ревизия `20260715_028`, применено на проде 2026-07-15).**
+>
+> **KEEP (действующие):** `users` — техническая, единственный ряд `crm-service`; колонки логина/ролей (`password_hash`, `password_encrypted`, `role`, `password_reset_required`, `lockout_until`, `failed_login_attempts`, `last_login_at`) рудиментарны и не читаются (`TD-051`), колонка `group_id` **дропнута** (Фаза E). · `mail_accounts` — **без** колонки `group_id` (дропнута, Фаза C); все ряды принадлежат `crm-service`. · `messages` — push-outbox (`+pushed_at`).
+>
+> **DROP (16 — описания ниже ИСТОРИЧНЫ, таблиц в БД НЕТ):** `sent_messages`, `sent_attachments`, `attachments`, `tags`, `tag_rules`, `message_tags`, `telegram_links`, `telegram_notifications`, `webhooks`, `webhook_deliveries`, `group_forwarding`, `message_forwards`, `user_groups`, `groups`, `users_settings`, `admin_audit`.
 
 ### `users`
 
@@ -819,6 +829,8 @@ BUILTIN_TAGS = [
 ---
 
 ## Каскады удаления — сводная таблица
+
+> **⚠️ ИСТОРИЧЕСКИЙ РАЗДЕЛ — каскады от 16 дропнутых таблиц (вложения в MinIO, теги, TG-нотификации, webhooks, forwarding, audit) СНЯТО демонтажём ([ADR-0043](./adr/ADR-0043-strip-to-connector-push-to-crm.md) / [ADR-0044](./adr/ADR-0044-decommission-runbook.md), выполнено на проде 2026-07-15).** Описанное ниже в коде/проде агрегатора НЕ существует; текст сохранён как record исходного решения. НЕ реализовывать и не принимать за действующий контракт. **Актуально:** единственный живой каскад — `mail_accounts` → `messages` (`ON DELETE CASCADE`) и `users` → `mail_accounts`; вложений/MinIO нет.
 
 | Удаление чего | Что каскадно удаляется (Postgres ON DELETE CASCADE) | Что чистится приложением |
 | --- | --- | --- |

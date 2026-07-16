@@ -148,14 +148,6 @@ def _is_retryable_imap_error(exc: BaseException, *, oauth: bool = False) -> bool
 
 
 @dataclass(slots=True)
-class FetchedAttachment:
-    filename: str
-    content_type: str | None
-    size_bytes: int
-    payload: bytes  # empty if oversized
-
-
-@dataclass(slots=True)
 class FetchedMessage:
     uid: int
     message_id_header: str | None
@@ -173,12 +165,6 @@ class FetchedMessage:
     body_present: bool
     in_reply_to: str | None
     refs_header: str | None
-    # ADR-0034 §3.2 loop-guard (enqueue-side): the raw ``X-Forwarded-By``
-    # header of the incoming message, if any. A message that already carries
-    # our ``mail-aggregator`` stamp is NOT enqueued for forwarding (breaks a
-    # potential loop). Not persisted — inspected live in ``save_message``.
-    x_forwarded_by: str | None
-    attachments: list[FetchedAttachment]
 
 
 @dataclass(slots=True)
@@ -202,7 +188,6 @@ def _from_imap_msg(
     msg: imap_tools.MailMessage,
     *,
     max_body_bytes: int,
-    max_att_bytes: int,
 ) -> FetchedMessage:
     """Extract our internal shape from one ``imap-tools`` message."""
     # Body: prefer text/plain, else html2text(html).
@@ -221,18 +206,17 @@ def _from_imap_msg(
         text = ""
 
     # Strip the zero-width / invisible padding mass-mail engines insert
-    # into the plain-text part — they survive html2text and bloat both
-    # ``body_text`` and Telegram messages.
+    # into the plain-text part — they survive html2text and bloat the
+    # ``body_text`` we store and push to the CRM.
     text = strip_invisible_padding(text)
 
     text_clamped, truncated = _truncate_body(text, max_body_bytes)
 
     # Round-12 bug B: keep the sanitised HTML body when the source has
-    # a ``text/html`` part — the inbox renders it for clickable links and
-    # tables, and the Telegram callback path converts it on the fly to
-    # the Bot-API HTML subset. We apply the same byte budget as the
-    # plain-text path so a 50 MB marketing email cannot blow up the DB
-    # row.
+    # a ``text/html`` part — it is pushed to the CRM alongside
+    # ``body_text`` (ADR-0043 §2), which renders it. We apply the same
+    # byte budget as the plain-text path so a 50 MB marketing email
+    # cannot blow up the DB row.
     body_html: str | None = None
     if msg.html:
         sanitised = sanitize_email_html(msg.html)
@@ -240,28 +224,10 @@ def _from_imap_msg(
             html_clamped, _html_truncated = _truncate_body(sanitised, max_body_bytes)
             body_html = html_clamped
 
-    # Attachments — skip oversized.
-    atts: list[FetchedAttachment] = []
-    for att in msg.attachments:
-        size = len(att.payload) if att.payload else 0
-        if size > max_att_bytes:
-            atts.append(
-                FetchedAttachment(
-                    filename=att.filename or "attachment",
-                    content_type=att.content_type,
-                    size_bytes=size,
-                    payload=b"",
-                )
-            )
-        else:
-            atts.append(
-                FetchedAttachment(
-                    filename=att.filename or "attachment",
-                    content_type=att.content_type,
-                    size_bytes=size,
-                    payload=att.payload or b"",
-                )
-            )
+    # Attachments are NOT extracted (ADR-0043 §4): the connector stores and
+    # pushes only headers + bodies. ``msg.attachments`` is a lazy imap-tools
+    # property — never touching it keeps the parsed payloads out of the
+    # worker's memory.
 
     # internal_date: imap-tools provides UTC naive datetimes; coerce to aware.
     idate = msg.date
@@ -292,8 +258,6 @@ def _from_imap_msg(
         body_present=body_present,
         in_reply_to=msg.headers.get("in-reply-to", (None,))[0] if msg.headers else None,
         refs_header=msg.headers.get("references", (None,))[0] if msg.headers else None,
-        x_forwarded_by=msg.headers.get("x-forwarded-by", (None,))[0] if msg.headers else None,
-        attachments=atts,
     )
 
 
@@ -381,7 +345,6 @@ def fetch_blocking(
     last_uidvalidity: int | None,
     initial_sync_days: int,
     max_body_bytes: int,
-    max_att_bytes: int,
     timeout: int,
 ) -> FetchedBox:
     """Sync IMAP fetch. Returns the new messages plus updated UID metadata.
@@ -438,11 +401,7 @@ def fetch_blocking(
         batch_size = 50
         for batched_uids in _chunks(uids, batch_size):
             for msg in _fetch_iter(mailbox, batched_uids):
-                fetched = _from_imap_msg(
-                    msg,
-                    max_body_bytes=max_body_bytes,
-                    max_att_bytes=max_att_bytes,
-                )
+                fetched = _from_imap_msg(msg, max_body_bytes=max_body_bytes)
                 new_messages.append(fetched)
 
         # Compute final uidnext per ADR-0008 step 8.

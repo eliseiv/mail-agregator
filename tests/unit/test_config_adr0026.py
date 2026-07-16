@@ -16,15 +16,12 @@ from shared.config import Settings
 
 _REQUIRED = {
     "MAIL_ENCRYPTION_KEY": base64.b64encode(b"x" * 32).decode(),
-    "ADMIN_PASSWORD": "admin-pass-123",
-    "S3_ACCESS_KEY": "ak",
-    "S3_SECRET_KEY": "sk",
     "APP_ENV": "dev",
 }
 
 
 def _make(**overrides: object) -> Settings:
-    return Settings(**{**_REQUIRED, **overrides})  # type: ignore[arg-type]
+    return Settings(_env_file=None, **{**_REQUIRED, **overrides})  # type: ignore[arg-type]
 
 
 class TestDefaults:

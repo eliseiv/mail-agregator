@@ -27,16 +27,13 @@ pytestmark = pytest.mark.unit
 _VALID_KEY = "HSoYMcwRZLguwQpz+kHPwifN9LvO/H86royMLyRgclo="
 _REQUIRED = {
     "MAIL_ENCRYPTION_KEY": _VALID_KEY,
-    "ADMIN_PASSWORD": "x",
-    "S3_ACCESS_KEY": "x",
-    "S3_SECRET_KEY": "x",
 }
 _URL = "https://crm.example/api/mail/oauth/ingest"
 _SECRET = "shared-oauth-hmac-secret-v1"
 
 
 def _settings(**overrides: object) -> Settings:
-    return Settings(**{**_REQUIRED, **overrides})  # type: ignore[arg-type]
+    return Settings(_env_file=None, **{**_REQUIRED, **overrides})  # type: ignore[arg-type]
 
 
 class _Recorder:

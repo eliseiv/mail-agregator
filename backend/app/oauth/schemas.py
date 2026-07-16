@@ -50,32 +50,23 @@ OAUTH_REFRESH_LOCK_PREFIX: Final[str] = "oauth_refresh_lock:"
 OAUTH_REFRESH_LOCK_TTL_SECONDS: Final[int] = 30
 
 
-class OAuthAuthorizeResponse(BaseModel):
-    """Body of ``GET /api/oauth/outlook/authorize`` (ADR-0025 §2).
-
-    ``authorize_url`` is shown to the user as a link (open in the right
-    OctoBrowser profile) — we deliberately do NOT 302-redirect. ``state`` is
-    echoed for clients that want to display / track it.
-    """
-
-    authorize_url: str
-    state: str
-
-
 class OAuthState(BaseModel):
     """Server-side state stored in Redis under ``oauth_state:{state}``.
 
-    Transition-safe payload carrying two mutually-exclusive flows (ADR-0045 §1):
+    Payload of the headless flow (ADR-0045 §1):
 
-    - ``user_id`` — the initiating session user (ADR-0025 session flow, served
-      by ``build_authorize_url`` / ``exchange_code``). Removed once the session
-      ``oauth/router.py`` is decommissioned.
     - ``crm_state`` — the opaque CRM token (ADR-0045 headless flow, served by
       ``build_authorize_url_headless`` / ``exchange_code_headless``). The
       aggregator NEVER interprets it — it only stores it alongside the PKCE
       verifier and echoes it back to the CRM ingest.
+    - ``user_id`` — legacy field of the ADR-0025 session flow, whose router
+      (``oauth/router.py``) was decommissioned with the cookie UI (ADR-0044
+      §5). Nothing populates it any more: the sole minting path
+      ``_mint_state_and_url`` is called only from
+      ``build_authorize_url_headless`` with ``user_id=None``
+      (``oauth/service.py:307``).
 
-    Exactly one of the two is set per state; ``code_verifier`` is always present.
+    ``code_verifier`` is always present.
     """
 
     code_verifier: str

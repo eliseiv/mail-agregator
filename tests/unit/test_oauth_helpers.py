@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 
 import pytest
 
@@ -24,14 +25,24 @@ pytestmark = pytest.mark.unit
 _VALID_KEY = base64.b64encode(b"\x00" * 32).decode()
 _REQUIRED = {
     "MAIL_ENCRYPTION_KEY": _VALID_KEY,
-    "ADMIN_PASSWORD": "x",
-    "S3_ACCESS_KEY": "x",
-    "S3_SECRET_KEY": "x",
 }
 
 
+# ``Settings`` declares ``env_file=".env"`` (shared/config.py) and also reads
+# ``os.environ``. Both are developer-machine state: a real ``.env`` (or an
+# exported ``OUTLOOK_*``) leaks live credentials into these pure unit tests and
+# flips ``outlook_oauth_enabled`` True where the test asserts False. This
+# fixture pins the inputs to exactly ``_REQUIRED`` + explicit overrides:
+# ``_env_file=None`` disables the dotenv source, and the ``OUTLOOK_*`` keys are
+# stripped from the process env.
+@pytest.fixture(autouse=True)
+def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in [k for k in os.environ if k.startswith("OUTLOOK_")]:
+        monkeypatch.delenv(key, raising=False)
+
+
 def _settings(**overrides: object) -> Settings:
-    return Settings(**{**_REQUIRED, **overrides})  # type: ignore[arg-type]
+    return Settings(_env_file=None, **{**_REQUIRED, **overrides})  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------

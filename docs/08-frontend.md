@@ -1,5 +1,7 @@
 # 08. Frontend
 
+> **⚠️ ДОКУМЕНТ ЦЕЛИКОМ ИСТОРИЧЕСКИЙ — собственного frontend'а у агрегатора БОЛЬШЕ НЕТ (демонтаж выполнен 2026-07-15).** По [ADR-0043](./adr/ADR-0043-strip-to-connector-push-to-crm.md) / [ADR-0044](./adr/ADR-0044-decommission-runbook.md) ([ADR-0041](./adr/ADR-0041-disable-jinja-ui.md), Фаза A3) удалены все HTML-роутеры, `templates/`, `static/`, `StaticFiles /static`, friendly-redirect `→ /login`, Telegram Mini App и bottom-navigation; **любой HTML-URL отдаёт `404`**. Агрегатор — headless mail-коннектор: живы только `/healthz`, `/readyz`, `/api/external/*`. UI почты (список/просмотр/отправка/теги/настройки) — **на стороне CRM**. Весь текст ниже (UX-карта, шаблоны Jinja2, JS-файлы, wireframes, CSS, a11y, локализация, no-JS-поведение, Mini App) — **record исходного решения**; НЕ реализовывать и не принимать за действующий контракт.
+
 Frontend сервиса — server-rendered HTML (Jinja2 в `api`-контейнере) + минимальный vanilla JS для UX-улучшений. Без SPA-фреймворков, без bundler'ов. Стиль — минималистичный, чистый, без лишних украшений.
 
 API-контракты — в [`04-api-contracts.md`](./04-api-contracts.md). Этот документ описывает **UX-флоу, страницы, компоненты, шаблоны**.

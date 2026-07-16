@@ -5,18 +5,21 @@ the eight call-sites) and ``docs/05-modules.md`` §9.2 п.4.
 
 The connection-test call-sites are covered behaviourally in
 ``test_mailbox_test_deadline_adr0047.py`` (a hung resolver must not stop
-``/healthz`` from answering). This module covers the OTHER four — the ones
+``/healthz`` from answering). This module covers the OTHERS — the ones
 TD-056 closed:
 
-- ``backend/app/send/service.py:228`` — ``smtp_send_message``;
-- ``backend/app/send/service.py:298`` — ``smtp_send_via_relay`` (forward relay);
-- ``backend/app/send/service.py:519`` — the IMAP APPEND to Sent;
-- ``worker/app/sync_cycle.py:212`` — ``sync_one_account`` (covered in
+- ``backend/app/send/service.py`` — ``smtp_send_message``;
+- ``backend/app/send/service.py`` — the IMAP APPEND to Sent;
+- ``worker/app/sync_cycle.py`` — ``sync_one_account`` (covered in
   ``tests/worker/test_sync_offloop_resolve_td056.py``).
 
-The two directly-callable send helpers get a behavioural loop-liveness test. The
-APPEND leg sits deep inside ``SendService.send`` (needs a persisted message, an
-SMTP peer and MinIO to reach), so it is guarded structurally instead: NO
+NB (ADR-0044 / TD-060): the forward relay leg (``smtp_send_via_relay`` +
+``FORWARD_SMTP_*``) was removed with forwarding, so its loop-liveness test went
+with it. The structural guard below still covers the whole class of defect.
+
+The directly-callable send helper gets a behavioural loop-liveness test. The
+APPEND leg sits deep inside ``SendService.send`` (needs a persisted message and
+an SMTP peer to reach), so it is guarded structurally instead: NO
 coroutine anywhere in the async code may call the SYNC ``assert_public_host`` —
 that is exactly the invariant ADR-0047 §4 states ("прямых вызовов синхронного
 ``assert_public_host`` из корутин не осталось"), and it covers the APPEND leg
@@ -92,18 +95,6 @@ class TestSendPathResolvesOffLoop:
                 ["to@example.com"],
                 session=cast("AsyncSession", None),
             )
-
-        await assert_loop_responsive_while(_call)
-
-    async def test_smtp_send_via_relay_does_not_block_the_loop(
-        self, prod_with_hung_dns: Any, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """``send/service.py:298`` — the forward relay host (TD-056)."""
-        monkeypatch.setattr(prod_with_hung_dns, "FORWARD_SMTP_HOST", "relay.example.com")
-        monkeypatch.setattr(prod_with_hung_dns, "FORWARD_SMTP_PORT", 587)
-
-        async def _call() -> None:
-            await snd_svc.smtp_send_via_relay(EmailMessage(), ["leader@example.com"])
 
         await assert_loop_responsive_while(_call)
 

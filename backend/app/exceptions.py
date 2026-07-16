@@ -4,8 +4,9 @@ Wire format: ``docs/04-api-contracts.md`` "Унифицированный фор
 
     {"error": {"code": "snake_case", "message": "...", "field": "...", "details": {...}}}
 
-HTML routes (no ``/api/`` prefix) get a Jinja-rendered error page when
-applicable; JSON routes always get JSON.
+Every route answers JSON. The HTML branch (a Jinja-rendered error page for
+non-``/api/`` routes) went away with the UI (ADR-0041 / ADR-0044 A3), and the
+``_is_json_route`` helper that selected it with it (TD-060).
 """
 
 from __future__ import annotations
@@ -114,11 +115,6 @@ class InvalidHostError(DomainError):
     code = "invalid_host"
 
 
-class AccountLockedError(DomainError):
-    status_code = 423
-    code = "account_locked"
-
-
 class RateLimitedError(DomainError):
     status_code = 429
     code = "rate_limited"
@@ -134,51 +130,6 @@ class DependencyUnavailableError(DomainError):
     code = "dependency_unavailable"
 
 
-class CannotResetAdminError(DomainError):
-    status_code = 400
-    code = "cannot_reset_admin"
-
-
-class CannotDeleteAdminError(DomainError):
-    status_code = 400
-    code = "cannot_delete_admin"
-
-
-class CannotDeleteBuiltinTagError(DomainError):
-    """User tried to ``DELETE /api/tags/{id}`` for a builtin tag (ADR-0017)."""
-
-    status_code = 400
-    code = "cannot_delete_builtin_tag"
-
-
-class TagApplyTooManyError(DomainError):
-    """``apply_to_existing=true`` rejected: user has > 100k messages.
-
-    See ADR-0017 §7. Surfaced as 422 with code ``tag_apply_too_many``.
-    """
-
-    status_code = 422
-    code = "tag_apply_too_many"
-
-
-class TelegramLinkLimitError(DomainError):
-    """User reached ``TG_MAX_LINKS_PER_USER`` active Telegram links
-    (ADR-0024 §3). Surfaced as 409 ``tg_link_limit``."""
-
-    status_code = 409
-    code = "tg_link_limit"
-
-
-class TelegramLinkOwnedByOtherError(DomainError):
-    """The ``telegram_user_id`` is already linked to a *different* internal
-    user; re-binding from an authenticated session is refused (ADR-0024 §4 —
-    only the password login-flow may re-bind). Surfaced as 409
-    ``tg_link_owned_by_other``."""
-
-    status_code = 409
-    code = "tg_link_owned_by_other"
-
-
 class OAuthReconsentRequiredError(DomainError):
     """Send/test attempted on an oauth_outlook account whose refresh token was
     invalidated (``oauth_needs_consent=true``) — ADR-0025 §9.1. The user must
@@ -188,86 +139,14 @@ class OAuthReconsentRequiredError(DomainError):
     code = "oauth_reconsent_required"
 
 
-class CannotAddSuperAdminToGroupError(DomainError):
-    """``POST /api/admin/users/{id}/groups`` targeted a super_admin (ADR-0030).
-
-    super_admin sees everything; memberships would break the invariant
-    ``super_admin → group_id IS NULL`` and "no rows in user_groups".
-    """
-
-    status_code = 400
-    code = "cannot_add_super_admin_to_group"
-
-
-class MembershipAlreadyExistsError(DomainError):
-    """``POST /api/admin/users/{id}/groups`` for an existing membership
-    (UNIQUE ``user_groups(user_id, group_id)``) — ADR-0030."""
-
-    status_code = 409
-    code = "membership_already_exists"
-
-
-class CannotRemoveHomeMembershipError(DomainError):
-    """``DELETE /api/admin/users/{id}/groups/{group_id}`` tried to remove the
-    home membership (``group_id == users.group_id``) — ADR-0030. Change the
-    home team via "move" (``PATCH /api/admin/users/{id}``)."""
-
-    status_code = 400
-    code = "cannot_remove_home_membership"
-
-
-class MembershipNotFoundError(DomainError):
-    """``DELETE /api/admin/users/{id}/groups/{group_id}`` for a membership the
-    user does not have — ADR-0030."""
-
-    status_code = 404
-    code = "membership_not_found"
-
-
-class CannotMoveGroupLeaderError(DomainError):
-    """ "Move" (``PATCH /api/admin/users/{id}`` changing ``group_id``) attempted
-    on a ``group_leader`` — ADR-0030. Would break the leader invariant; only
-    "add to team" (additional membership) is allowed for leaders."""
-
-    status_code = 409
-    code = "cannot_move_group_leader"
-
-
-class GroupNotFoundError(DomainError):
-    """A referenced ``group_id`` does not exist (ADR-0030 membership add)."""
-
-    status_code = 404
-    code = "group_not_found"
-
-
-class PasswordNotSetError(DomainError):
-    """``GET /api/admin/users/{id}/password``: the user has no reversible
-    login-password copy (``users.password_encrypted IS NULL``) — ADR-0038 §4.
-
-    The password predates the feature and was not changed, or create/reset
-    ran in the self-set flow. The admin UI column shows "—".
-    """
-
-    status_code = 404
-    code = "password_not_set"
-
-
-class WebhookUrlPrivateIpError(DomainError):
-    """Outbound webhook URL would target a private/loopback/link-local
-    address — ADR-0023 §4.3 SSRF protection.
-    """
-
-    status_code = 400
-    code = "webhook_url_private_ip"
+# ADR-0044 §5 (phases A1/A3) + TD-060: the admin/tags/groups/memberships/
+# Telegram-link/webhook domain errors went away with the routes that raised
+# them (session UI, tags, teams admin, outbound webhooks). Only the errors the
+# machine API (``/api/external/*``) and the sync/send path can still raise
+# remain above.
 
 
 # --- Helpers ----------------------------------------------------------------
-
-
-def _is_json_route(request: Request) -> bool:
-    """JSON for ``/api/...``, HTML otherwise."""
-    path = request.url.path or ""
-    return path.startswith("/api/")
 
 
 def _payload(err: DomainError) -> dict[str, Any]:

@@ -3,7 +3,6 @@
 ``crm_push_enabled`` / ``crm_status_enabled`` are derived flags: when
 ``CRM_INGEST_URL`` / ``CRM_MAILBOX_STATUS_URL`` / ``CRM_PUSH_SECRET`` are empty the
 matching jobs are NOT registered and ``sync_cycle`` does NOT enqueue.
-``TELEGRAM_DELIVERY_ENABLED`` gates only outbound delivery (default True).
 ``CRM_PUSH_SECRET`` is on the redact-list so its value never reaches a log line.
 
 Settings are built hermetically (``Settings(**_REQUIRED, **overrides)``) WITHOUT reading
@@ -22,14 +21,11 @@ pytestmark = pytest.mark.unit
 _VALID_KEY = "HSoYMcwRZLguwQpz+kHPwifN9LvO/H86royMLyRgclo="
 _REQUIRED = {
     "MAIL_ENCRYPTION_KEY": _VALID_KEY,
-    "ADMIN_PASSWORD": "x",
-    "S3_ACCESS_KEY": "x",
-    "S3_SECRET_KEY": "x",
 }
 
 
 def _settings(**overrides: object) -> Settings:
-    return Settings(**{**_REQUIRED, **overrides})  # type: ignore[arg-type]
+    return Settings(_env_file=None, **{**_REQUIRED, **overrides})  # type: ignore[arg-type]
 
 
 # --------------------------------------------------------------- crm_push_enabled
@@ -62,15 +58,6 @@ def test_status_disabled_with_only_url() -> None:
 def test_status_enabled_with_both() -> None:
     s = _settings(CRM_MAILBOX_STATUS_URL="https://crm.example", CRM_PUSH_SECRET="s")
     assert s.crm_status_enabled is True
-
-
-# ---------------------------------------------------- TELEGRAM_DELIVERY_ENABLED
-def test_telegram_delivery_default_true() -> None:
-    assert _settings().TELEGRAM_DELIVERY_ENABLED is True
-
-
-def test_telegram_delivery_can_disable() -> None:
-    assert _settings(TELEGRAM_DELIVERY_ENABLED=False).TELEGRAM_DELIVERY_ENABLED is False
 
 
 # --------------------------------------------------------- secret is not logged

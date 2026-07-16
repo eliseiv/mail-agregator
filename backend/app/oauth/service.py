@@ -1,10 +1,10 @@
 """Outlook OAuth2 services (ADR-0025).
 
 ``OutlookOAuthService``
-    - :meth:`build_authorize_url` — mint state + PKCE (S256), store in Redis,
-      assemble the Microsoft authorize URL.
-    - :meth:`exchange_code` — validate state (atomic GET+DEL), exchange the
-      authorization code for tokens, resolve the mailbox email, create or
+    - :meth:`build_authorize_url_headless` — mint state + PKCE (S256), store in
+      Redis, assemble the Microsoft authorize URL.
+    - :meth:`exchange_code_headless` — validate state (atomic GET+DEL), exchange
+      the authorization code for tokens, resolve the mailbox email, create or
       update the ``mail_accounts`` row (encrypted refresh token).
 
 ``OutlookTokenService``
@@ -13,8 +13,10 @@
       (handling refresh-token rotation and ``invalid_grant`` -> needs-consent).
 
 Security (docs/06-security.md §1.11 / §2.2):
-- ``state`` is a 32-byte URL-safe random, one-shot (GET+DEL), bound to the
-  initiating ``user_id``; PKCE ``code_verifier`` stored alongside.
+- ``state`` is a 32-byte URL-safe random, one-shot (GET+DEL); PKCE
+  ``code_verifier`` stored alongside. The headless flow (ADR-0045) has no
+  initiating session, so ``state`` carries ``user_id=None`` and is instead
+  correlated with the CRM via ``crm_state``.
 - refresh + access tokens are AES-256-GCM encrypted (MailPasswordCipher,
   AAD=account_id).
 - the authorization code, tokens, PKCE verifier and client secret are never

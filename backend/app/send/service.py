@@ -222,7 +222,7 @@ async def smtp_send_message(
     *,
     session: AsyncSession,
 ) -> None:
-    """Shared SMTP send core for ``send`` and ``forward`` (ADR-0034 §5).
+    """SMTP send core. Its only caller today is :func:`_send_transport`.
 
     Encapsulates both authentication branches:
 
@@ -233,10 +233,10 @@ async def smtp_send_message(
 
     Plus ``assert_public_host_async`` (SSRF re-check at send time), the shared
     TLS context and the fail-fast ``_SMTP_TIMEOUT``. Does **not** append to the
-    "Sent" folder — the caller decides (``send`` does a best-effort append;
-    ``forward`` does not, ADR-0034 §5). Raises :class:`SMTPSendFailedError`
-    on any SMTP/transport failure and :class:`OAuthReconsentRequiredError`
-    when an oauth account needs re-consent.
+    "Sent" folder — that is the caller's decision (``_send_transport`` does a
+    best-effort append). Raises :class:`SMTPSendFailedError` on any
+    SMTP/transport failure and :class:`OAuthReconsentRequiredError` when an
+    oauth account needs re-consent.
 
     TD-056: the SSRF guard resolves OFF the event loop. Its blocking
     ``getaddrinfo`` used to run in the loop thread — a hung resolver stalled the
@@ -415,7 +415,7 @@ class SendService:
             recipients.extend(bcc)
 
         # SMTP send via the shared helper (XOAUTH2 for oauth accounts, LOGIN
-        # otherwise). ADR-0034 §5 — reused by the forward dispatcher too.
+        # otherwise).
         await smtp_send_message(account, msg, recipients, session=self._db)
 
         # Best-effort IMAP APPEND to the Sent folder.

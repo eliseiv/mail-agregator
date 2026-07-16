@@ -77,14 +77,11 @@ def external_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[..., Any]
         key: str = TEST_API_KEY,
         write_enabled: bool = True,
         write_rate: int | None = None,
-        reply_enabled: bool | None = None,
     ) -> Any:
         monkeypatch.setenv("EXTERNAL_API_KEY", key)
         monkeypatch.setenv("EXTERNAL_WRITE_ENABLED", "true" if write_enabled else "false")
         if write_rate is not None:
             monkeypatch.setenv("EXTERNAL_WRITE_RATE_LIMIT_PER_MINUTE", str(write_rate))
-        if reply_enabled is not None:
-            monkeypatch.setenv("EXTERNAL_REPLY_ENABLED", "true" if reply_enabled else "false")
         get_settings.cache_clear()
         s = get_settings()
         assert key == s.EXTERNAL_API_KEY

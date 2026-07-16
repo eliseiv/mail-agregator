@@ -5,7 +5,7 @@ routes (``/api/external/teams``) and the ``group_id`` filter of
 ``GET /messages`` / ``GET /mailboxes`` went away with tags and teams
 (ADR-0043 §4).
 
-(ADR-0029 pull + ADR-0035 reply; ``docs/04-api-contracts.md`` §4d).
+(ADR-0029 pull; ``docs/04-api-contracts.md`` §4d.)
 
 ``GET /api/external/messages`` — a B2B partner incrementally pulls ALL system
 messages with a keyset cursor over ``messages.id`` (ADR-0029).
@@ -123,8 +123,9 @@ def _api_key_matches(provided: str, expected: str) -> bool:
 def _authenticate(request: Request, *, ip: str, settings: Settings) -> None:
     """Shared external-API auth: key extract + feature gate + constant-time compare.
 
-    Steps 2-4 of the auth flow (ADR-0029 §4), reused by the pull GET and the
-    reply POST (ADR-0035 §Migration step 4). Raises :class:`NotAuthenticatedError`
+    Steps 2-4 of the auth flow (ADR-0029 §4), shared by every route in this
+    router — the pull GETs and the WRITE section alike.
+    Raises :class:`NotAuthenticatedError`
     (opaque 401) when the feature is off OR the key is missing/wrong — the two
     are indistinguishable so the config is never disclosed. The rate-limit
     (step 1) is consumed by the caller BEFORE this, so a failed-auth flood is
@@ -185,7 +186,7 @@ async def list_external_messages(
     # 1. Rate-limit FIRST — before any key work (anti-bruteforce + DoS). 429.
     #    Capacity is operator-tunable at consume-time from
     #    ``settings.EXTERNAL_API_RATE_LIMIT_PER_MINUTE`` (same override pattern
-    #    as ``WEBHOOK_TEST_LIMIT`` / ``TG_SEND_PER_CHAT_PER_MINUTE``); the static
+    #    as ``EXTERNAL_WRITE_RATE_LIMIT_PER_MINUTE``); the static
     #    ``LIMIT_EXTERNAL_API`` only supplies the name + fixed 60 s window.
     #    Both modes share the SAME budget (ADR-0036 §6 — backward is read too).
     runtime_limit = Limit(
@@ -262,19 +263,19 @@ async def list_external_mailboxes(
 
 
 # ---------------------------------------------------------------------------
-# External WRITE section — mailboxes + global tags CRUD (ADR-0039 / ADR-0040).
+# External WRITE section — mailboxes (ADR-0039; the global tags CRUD it also
+# carried went away with tags, ADR-0044 §4 phase A1).
 #
-# Auth-flow (strict order, ADR-0029 §4 / ADR-0035 §3):
-#   1. consume(LIMIT_EXTERNAL_WRITE, ip) FIRST — a SEPARATE budget from read /
-#      reply so a write flood can't evict them (and a failed-auth flood is
-#      throttled too).
+# Auth-flow (strict order, ADR-0029 §4):
+#   1. consume(LIMIT_EXTERNAL_WRITE, ip) FIRST — a SEPARATE budget from read so
+#      a write flood can't evict it (and a failed-auth flood is throttled too).
 #   2-4. shared key auth (X-API-Key / Bearer, feature gate, constant-time).
 #   5. write-gate: EXTERNAL_WRITE_ENABLED false → 403 forbidden (even with a
-#      valid key). Read (GET /tags, /mailboxes, /messages) has NO write-gate.
+#      valid key). Read (GET /mailboxes, /messages) has NO write-gate.
 #   6. body parsed MANUALLY (``_parse_json_body``) AFTER 1-5 so a malformed /
 #      invalid body cannot pre-empt 401/403/429.
 # Path ids are plain ``int`` (no ``ge``) so an id < 1 resolves to 404 in the
-# service, not a pre-auth 400 (same precedent as the reply endpoint).
+# service, not a pre-auth 400.
 # All routes CSRF-exempt via the ``/api/external/`` prefix.
 # ---------------------------------------------------------------------------
 
@@ -455,7 +456,8 @@ async def external_mailbox_send(
 # External Outlook OAuth (headless) — ADR-0045 / 04-api-contracts §4f-oauth.
 #
 # Restores the Outlook consent flow for adding/reconnecting mailboxes from the
-# CRM after the session ``oauth/router.py`` is decommissioned. The
+# CRM: the session ``oauth/router.py`` was decommissioned with the cookie UI
+# (ADR-0044 §5) and these routes are now the only consent entry point. The
 # ``OUTLOOK_CLIENT_SECRET`` + code→token exchange + refresh-token AES-GCM stay
 # in the aggregator; the CRM only initiates (opaque ``crm_state``) and receives
 # the binding via a signed server-to-server notification (§3).

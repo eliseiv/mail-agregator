@@ -160,7 +160,6 @@ class TestSyncOneAccountOAuth:
             timeout_seconds=30,
             initial_sync_days=30,
             max_body_bytes=1_000_000,
-            max_att_bytes=1_000_000,
         )
         assert (result.new_count, result.conflict_count) == (0, 0)
         assert captured["access_token"] == "AT-worker"
@@ -187,7 +186,6 @@ class TestSyncOneAccountOAuth:
             timeout_seconds=30,
             initial_sync_days=30,
             max_body_bytes=1_000_000,
-            max_att_bytes=1_000_000,
         )
         assert (result.new_count, result.conflict_count) == (0, 0)
         assert called["fetch"] == 0  # never connected
@@ -221,7 +219,6 @@ class TestFetchBlockingXoauth2:
             last_uidvalidity=None,
             initial_sync_days=30,
             max_body_bytes=1000,
-            max_att_bytes=1000,
             timeout=30,
         )
         mb.xoauth2.assert_called_once_with("box@outlook.com", "AT-tok", initial_folder="INBOX")
@@ -240,7 +237,6 @@ class TestFetchBlockingXoauth2:
             last_uidvalidity=None,
             initial_sync_days=30,
             max_body_bytes=1000,
-            max_att_bytes=1000,
             timeout=30,
         )
         mb.login.assert_called_once()

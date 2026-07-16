@@ -1,12 +1,11 @@
 """Pydantic schemas for the external PULL-API (ADR-0029 §6).
 
-These DTOs are **deliberately separate** from the UI ``MessageDetail`` /
-``MessageService.get`` (module 10):
-
-- The UI DTO applies render-time normalisation (``collapse_blank_lines_*``,
-  ADR-0022 §2.10); the external contract must expose **raw stored** bodies.
-- The external contract is a stable, independently-versioned wire format —
-  fields evolve additively without touching the UI shape.
+These DTOs expose the **raw stored** body. The connector applies no
+render-time normalisation: the UI DTO that did (``MessageDetail`` /
+``MessageService.get``) went away with the Jinja inbox (ADR-0044 A3), and the
+``collapse_blank_lines_*`` helpers behind it (ADR-0022 §2.10) went with it
+(TD-060). The external contract is a stable, independently-versioned wire
+format — fields evolve additively.
 
 Field nullability mirrors the DB (``docs/03-data-model.md`` table ``messages``):
 ``subject`` / ``from_name`` / ``body_html`` / ``cc_addrs`` /
@@ -258,16 +257,14 @@ class ExternalSendRequest(BaseModel):
         # CR/LF / control char is refused as ``400 validation_error``.
         #
         # ``subject`` is included DELIBERATELY (it is a header like the other
-        # two): inbound mail carries mis-folded / multi-line subjects (see
-        # ``send/mime.py::_sanitize_header``) and the CRM builds ``"Re: " +
-        # <stored subject>``, so without this the value reached
-        # ``build_mime`` (``send/mime.py:62``), where ``EmailMessage`` raises
-        # ``ValueError`` → an unhandled 500, while §4f-send mandates a ``400
-        # validation_error`` for a malformed body. Rejecting (rather than
-        # sanitising, as the forward path does) keeps the external contract
-        # honest: the aggregator never silently rewrites a header the caller
-        # gave it. The common real case — a *folded* subject — is not rejected,
-        # it is unfolded and sent.
+        # two): inbound mail carries mis-folded / multi-line subjects and the
+        # CRM builds ``"Re: " + <stored subject>``, so without this the value
+        # reached ``build_mime`` (``send/mime.py``), where ``EmailMessage``
+        # raises ``ValueError`` → an unhandled 500, while §4f-send mandates a
+        # ``400 validation_error`` for a malformed body. Rejecting (rather than
+        # silently sanitising) keeps the external contract honest: the
+        # aggregator never rewrites a header the caller gave it. The common real
+        # case — a *folded* subject — is not rejected, it is unfolded and sent.
         return _clean_header(v)
 
     @model_validator(mode="after")

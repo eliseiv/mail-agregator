@@ -1,10 +1,14 @@
 # 01. Архитектура
 
+> **⚠️ ДЕМОНТАЖ ВЫПОЛНЕН (2026-07-15) — этот документ описывает ДО-демонтажный агрегатор.** По [ADR-0043](./adr/ADR-0043-strip-to-connector-push-to-crm.md) / [ADR-0044](./adr/ADR-0044-decommission-runbook.md) агрегатор сведён к headless mail-коннектору. **Актуальная архитектура:** `nginx` + `api` + `worker` + `postgres` + `redis` (**без MinIO** — снят Фазой G, `8e890a2`/`e0bccc3`); в `api` смонтированы только `external_router` (`/api/external/*`) и `health_router` (`backend/app/main.py:99-100`) — все HTML-URL отдают `404`; БД — **4 таблицы** (`alembic_version`/`mail_accounts`/`messages`/`users` с единственным рядом `crm-service`), ревизия `20260715_028`; единственный внешний потребитель — CRM. Сняты: теги, Telegram, webhooks, forwarding, группы/роли, Jinja-UI, вложения/MinIO, message-scoped reply. Разделы ниже помечены посекционно (`TD-050`(в)).
+
 Описание архитектуры в нотации [C4](https://c4model.com/) — три уровня (Context, Containers, Components) плюс sequence-диаграммы ключевых сценариев.
 
 ---
 
 ## C4 Level 1 — System Context
+
+> **⚠️ ИСТОРИЧЕСКИЙ РАЗДЕЛ — внешние акторы Telegram/webhook-receiver, человеческий web-UI и MinIO СНЯТО демонтажём ([ADR-0043](./adr/ADR-0043-strip-to-connector-push-to-crm.md) / [ADR-0044](./adr/ADR-0044-decommission-runbook.md), выполнено на проде 2026-07-15).** Описанное ниже в коде/проде агрегатора НЕ существует; текст сохранён как record исходного решения. НЕ реализовывать и не принимать за действующий контракт. **Актуально:** единственный внешний потребитель — CRM (`postapp.store` ↔ CRM по `/api/external/*` + push `POST /api/mail/ingest`); человеко-акторов у агрегатора нет.
 
 ```mermaid
 flowchart LR
@@ -28,6 +32,8 @@ flowchart LR
 ---
 
 ## C4 Level 2 — Containers
+
+> **⚠️ ИСТОРИЧЕСКИЙ РАЗДЕЛ — контейнеры `minio`/`minio-bootstrap` и Jinja-UI внутри `api` СНЯТО демонтажём ([ADR-0043](./adr/ADR-0043-strip-to-connector-push-to-crm.md) / [ADR-0044](./adr/ADR-0044-decommission-runbook.md), выполнено на проде 2026-07-15).** Описанное ниже в коде/проде агрегатора НЕ существует; текст сохранён как record исходного решения. НЕ реализовывать и не принимать за действующий контракт. **Актуально:** `nginx` + `api` + `worker` + `postgres` + `redis`; MinIO снят (Фаза G, `8e890a2`/`e0bccc3`).
 
 ```mermaid
 flowchart TB
@@ -72,6 +78,8 @@ flowchart TB
 ---
 
 ## C4 Level 3 — Components (внутри `api`)
+
+> **⚠️ ИСТОРИЧЕСКИЙ РАЗДЕЛ — компоненты `auth`(UI)/`messages`/`tags`/`admin`/`groups`/`telegram`/`webhooks`/`forwarding`/`audit`/`storage`/Jinja-templates СНЯТО демонтажём ([ADR-0043](./adr/ADR-0043-strip-to-connector-push-to-crm.md) / [ADR-0044](./adr/ADR-0044-decommission-runbook.md), выполнено на проде 2026-07-15).** Описанное ниже в коде/проде агрегатора НЕ существует; текст сохранён как record исходного решения. НЕ реализовывать и не принимать за действующий контракт. **Актуально (`backend/app/main.py:99-100`):** смонтированы только `external_router` (`/api/external/*`) и `health_router` (`/healthz`,`/readyz`). Живые модули: `accounts`, `send`, `oauth`, `crm_push`, `external`, `health`, `repositories`, `auth/service.py` (только сид `crm-service`).
 
 ```mermaid
 flowchart TB
@@ -129,6 +137,8 @@ flowchart TB
 
 ## Потоки данных (data flows)
 
+> **⚠️ ИСТОРИЧЕСКИЙ РАЗДЕЛ — потоки тегирования, Telegram-нотификаций, webhook-доставки, forwarding и загрузки вложений в MinIO СНЯТО демонтажём ([ADR-0043](./adr/ADR-0043-strip-to-connector-push-to-crm.md) / [ADR-0044](./adr/ADR-0044-decommission-runbook.md), выполнено на проде 2026-07-15).** Описанное ниже в коде/проде агрегатора НЕ существует; текст сохранён как record исходного решения. НЕ реализовывать и не принимать за действующий контракт. **Актуально:** IMAP-синк → `messages` → push-outbox в CRM (`crm_push_dispatch`/`crm_push_recovery`) + статус-канал ящика (ADR-0046); исходящее — `POST /api/external/mailboxes/{id}/send` (ADR-0048).
+
 ### F1. Чтение почты пользователем
 
 1. Browser -> `GET /` (HTML inbox).
@@ -173,6 +183,8 @@ flowchart TB
 ---
 
 ## Sequence-диаграммы
+
+> **⚠️ ИСТОРИЧЕСКИЙ РАЗДЕЛ — диаграммы login/сессий, тегов, Telegram SSO/нотификаций, webhooks, forwarding, вложений СНЯТО демонтажём ([ADR-0043](./adr/ADR-0043-strip-to-connector-push-to-crm.md) / [ADR-0044](./adr/ADR-0044-decommission-runbook.md), выполнено на проде 2026-07-15).** Описанное ниже в коде/проде агрегатора НЕ существует; текст сохранён как record исходного решения. НЕ реализовывать и не принимать за действующий контракт.
 
 ### S1. Login (обычный)
 
@@ -378,6 +390,8 @@ sequenceDiagram
 ---
 
 ## Deployment topology
+
+> **⚠️ ИСТОРИЧЕСКИЙ РАЗДЕЛ — сервисы `minio`/`minio-bootstrap` и volume `mas_minio_data` СНЯТО демонтажём ([ADR-0043](./adr/ADR-0043-strip-to-connector-push-to-crm.md) / [ADR-0044](./adr/ADR-0044-decommission-runbook.md), выполнено на проде 2026-07-15).** Описанное ниже в коде/проде агрегатора НЕ существует; текст сохранён как record исходного решения. НЕ реализовывать и не принимать за действующий контракт. **Актуально:** топология без MinIO; см. `07-deployment.md` §1.
 
 См. также `07-deployment.md`.
 

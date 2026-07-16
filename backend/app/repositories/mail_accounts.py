@@ -30,21 +30,16 @@ class MailAccountsRepo:
     async def get_by_id(self, account_id: int) -> MailAccount | None:
         return await self._s.get(MailAccount, account_id)
 
-    async def get_for_user(self, user_id: int, account_id: int) -> MailAccount | None:
-        stmt = select(MailAccount).where(
-            MailAccount.id == account_id, MailAccount.user_id == user_id
-        )
-        return (await self._s.execute(stmt)).scalar_one_or_none()
-
     async def get_for_user_ids(
         self, mail_account_ids: list[int] | None, account_id: int
     ) -> MailAccount | None:
-        """Visibility-aware get.
+        """Scope-aware get.
 
-        ``mail_account_ids=None`` means "no scope filter" (super-admin).
-        ``mail_account_ids=[]`` means nothing visible — returns ``None``.
-        FE-FIX round-10: the filter shifted from ``MailAccount.user_id``
-        to ``MailAccount.id`` so visibility follows ``mail_accounts.group_id``.
+        ``mail_account_ids=None`` means "no scope filter" — the only scope the
+        connector mints today (the synthetic ``crm-service`` super_admin, see
+        ``backend/app/deps.py``). ``mail_account_ids=[]`` means nothing visible
+        — returns ``None``. The filter is on ``MailAccount.id``, i.e. an
+        explicit id set passed by the caller.
         """
         if mail_account_ids is None:
             return await self.get_by_id(account_id)
@@ -55,28 +50,6 @@ class MailAccountsRepo:
         )
         return (await self._s.execute(stmt)).scalar_one_or_none()
 
-    async def list_for_user(self, user_id: int) -> list[MailAccount]:
-        stmt = select(MailAccount).where(MailAccount.user_id == user_id).order_by(MailAccount.id)
-        return list((await self._s.execute(stmt)).scalars().all())
-
-    async def list_for_user_ids(self, user_ids: list[int]) -> list[MailAccount]:
-        """Mail accounts for a set of users (legacy helper).
-
-        Returns a flat list ordered by ``(user_id, id)``. Pre round-10 this
-        was the visibility helper for non-super_admin callers; today it
-        survives as a generic "by-owner" lookup (used by group-rendering
-        on the admin page when we want every account of every member of a
-        group, regardless of where the account currently belongs).
-        """
-        if not user_ids:
-            return []
-        stmt = (
-            select(MailAccount)
-            .where(MailAccount.user_id.in_(user_ids))
-            .order_by(MailAccount.user_id, MailAccount.id)
-        )
-        return list((await self._s.execute(stmt)).scalars().all())
-
     async def list_by_ids(self, account_ids: list[int]) -> list[MailAccount]:
         """Bulk-load accounts by their primary key. FE-FIX round-10."""
         if not account_ids:
@@ -86,11 +59,6 @@ class MailAccountsRepo:
             .where(MailAccount.id.in_(account_ids))
             .order_by(MailAccount.user_id, MailAccount.id)
         )
-        return list((await self._s.execute(stmt)).scalars().all())
-
-    async def list_all(self) -> list[MailAccount]:
-        """All mail accounts (super-admin only). No pagination — small Ns."""
-        stmt = select(MailAccount).order_by(MailAccount.user_id, MailAccount.id)
         return list((await self._s.execute(stmt)).scalars().all())
 
     # ADR-0044 §3 (lock-step): every reader of ``mail_accounts.group_id`` is
@@ -172,9 +140,9 @@ class MailAccountsRepo:
         Round-16 bug fix: the historical ``UNIQUE (user_id, email)`` constraint
         allows the same address to be added by two different users (e.g. into
         two teams). Worker ``sync_cycle`` then polls IMAP independently for
-        each row, inserts duplicate ``messages`` rows, and the Inbox shows
-        every email twice — also resulting in duplicate auto-tags. Service
-        layer uses this method to reject duplicates before SMTP/IMAP probe.
+        each row, inserts duplicate ``messages`` rows, and every email is
+        pushed to the CRM twice. Service layer uses this method to reject
+        duplicates before SMTP/IMAP probe.
         """
         stmt = select(MailAccount).where(func.lower(MailAccount.email) == email.lower())
         return (await self._s.execute(stmt)).scalar_one_or_none()
@@ -322,7 +290,8 @@ class MailAccountsRepo:
         """Flag an oauth account as requiring re-consent (Microsoft invalid_grant).
 
         ADR-0025 §3 step 5: leave ``is_active`` untouched; the worker skips
-        sync while ``oauth_needs_consent`` is true and the UI shows "reconnect".
+        sync while ``oauth_needs_consent`` is true, and the mailbox-status
+        channel reports the box as needing a reconnect to the CRM (ADR-0046).
 
         ADR-0046 §3 (H7): additionally write ``last_sync_error`` in the SAME
         transaction. Without it the mailbox mirrors to the CRM as
@@ -412,15 +381,16 @@ class MailAccountsRepo:
         Combined guarded UPDATE (matches the ADR §2 SQL): sets
         ``is_active=false`` AND ``disabled_alert_sent_at=now()`` only when the
         stamp was still ``NULL``. Returns ``True`` when the stamp transitioned
-        ``NULL → now()`` (a clean Active→Disabled transition — the caller must
-        enqueue exactly one Telegram alert), ``False`` when a row was already
-        stamped (theoretical two-cycle race — no second alert).
+        ``NULL → now()`` (a clean Active→Disabled transition), ``False`` when a
+        row was already stamped (theoretical two-cycle race).
 
-        Called exclusively from ``worker.sync_cycle._disable_after_failures``
-        inside the same transaction as the ``account_auto_disabled`` audit row.
-        The stamp is written regardless of ``MAILBOX_DOWN_ALERT_ENABLED`` (the
-        enqueue is gated by that flag, not the stamp) so toggling the feature on
-        later never re-alerts a mailbox disabled while it was off.
+        Called exclusively from ``worker.sync_cycle._disable_after_failures``.
+        ADR-0044 §4 (phase A3): the aggregator no longer enqueues a Telegram
+        alert (that queue and the ``account_auto_disabled`` audit row are gone);
+        the down-alert itself is now the CRM's job (ADR-0043 §2). The
+        Active→Disabled transition reaches the CRM through the mailbox-status
+        channel, mirrored AFTER the COMMIT by the caller (ADR-0046 §3 H4). The
+        stamp is kept as the idempotency marker for that transition.
         """
         now = datetime.now(UTC)
         stmt = (

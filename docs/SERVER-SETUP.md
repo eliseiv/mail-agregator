@@ -134,18 +134,20 @@ Set, at a minimum:
 | `SERVER_DOMAIN` | `mail.example.com` (actual: `postapp.store`) |
 | `ACME_EMAIL` | a real address you monitor — Let's Encrypt sends expiry warnings |
 | `POSTGRES_PASSWORD` | `openssl rand -base64 32 \| tr -d '/+=' \| head -c 32` |
-| `MINIO_ROOT_USER` | `openssl rand -hex 16` |
-| `MINIO_ROOT_PASSWORD` | `openssl rand -base64 48 \| tr -d '/+=' \| head -c 40` |
-| `MINIO_APP_ACCESS_KEY` | `openssl rand -hex 16` |
-| `MINIO_APP_SECRET_KEY` | `openssl rand -base64 48 \| tr -d '/+=' \| head -c 40` |
-| `S3_ACCESS_KEY` | copy of `MINIO_APP_ACCESS_KEY` |
-| `S3_SECRET_KEY` | copy of `MINIO_APP_SECRET_KEY` |
-| `MAIL_ENCRYPTION_KEY` | `python3 -c "import os, base64; print(base64.b64encode(os.urandom(32)).decode())"` — **back this up off-host** |
-| `ADMIN_PASSWORD` | strong (>= 16 chars) — used once to seed the super-admin |
+| `MAIL_ENCRYPTION_KEY` | `python3 -c "import os, base64; print(base64.b64encode(os.urandom(32)).decode())"` — **the only env the app hard-requires at start** (`shared/config.py` `_enforce_required`); **back it up off-host** |
+| `EXTERNAL_API_KEY` | `openssl rand -hex 32` — machine auth for `/api/external/*` (`X-API-Key` / `Bearer`). Left empty the section answers `401` unenumerably (ADR-0029 §4), i.e. the connector is unreachable for the CRM. |
+| `CRM_PUSH_SECRET` | `openssl rand -hex 32` — HMAC secret shared with the CRM (= the CRM side's `MAIL_PUSH_SECRET`). Together with `CRM_INGEST_URL` gates the push channel (ADR-0043 §2). |
 | `IMAGE_REGISTRY` | `ghcr.io/<owner>/<repo>` (lowercase!) |
 | `IMAGE_TAG` | `latest` for now; CI/deploy.yml will rewrite to a sha later |
 
 `DATABASE_URL` defaults work — compose substitutes `${POSTGRES_PASSWORD}` automatically.
+
+> **Removed by the decommission — do NOT provision.** Listed so an operator holding an older `.env` (or an older copy of this runbook) can tell these keys are *dead*, not *forgotten*:
+>
+> - `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` / `MINIO_APP_ACCESS_KEY` / `MINIO_APP_SECRET_KEY` / `S3_ACCESS_KEY` / `S3_SECRET_KEY` — object storage removed with [ADR-0044](./adr/ADR-0044-decommission-runbook.md) Phase G (`8e890a2` / `e0bccc3`). No `minio` service, no `mas_minio_data` volume, no `S3_*` field in `Settings`.
+> - `ADMIN_LOGIN` / `ADMIN_PASSWORD` — the interactive super-admin went away with the cookie UI (ADR-0044 A3 / §5). The only seeded account is the technical `crm-service` owner, created with `password_hash=NULL` (`backend/app/auth/service.py:33-70`: *«No login password: interactive login does not exist in the connector»*). The fields were dropped from `Settings` and from `_enforce_required` under `TD-060` (6d).
+>
+> Leftover values in an existing `.env` are harmless — `Settings` ignores unknown env (`extra="ignore"`) — but they buy nothing and should be deleted at the next edit.
 
 ### A.9 GHCR access — no login needed (images are public)
 
@@ -176,14 +178,14 @@ The server is now ready, but no images are pulled and no cert exists. Order matt
 
 ```bash
 cd /opt/mail-agregator
-docker compose pull postgres redis minio                 # alpine images, fast
-docker compose up -d postgres redis minio minio-bootstrap
+docker compose pull postgres redis                       # alpine images, fast
+docker compose up -d postgres redis
 docker compose run --rm mas-migrations
 docker compose up -d api worker
 docker compose ps
 ```
 
-All five services should be reported `healthy` (or `exited (0)` for `mas-migrations` / `minio-bootstrap`). If `api` or `worker` won't start because the GHCR image isn't pulled yet:
+`postgres` / `redis` / `api` / `worker` should be reported `healthy` (`mas-migrations` — `exited (0)`). The `minio` / `minio-bootstrap` services of earlier revisions of this runbook no longer exist: object storage was removed with [ADR-0044](./adr/ADR-0044-decommission-runbook.md) Phase G. If `api` or `worker` won't start because the GHCR image isn't pulled yet:
 
 ```bash
 docker compose --profile prod pull api worker            # pulls ghcr.io/<owner>/<repo>/{api,worker}:latest
@@ -238,11 +240,22 @@ curl -sSI https://mail.example.com/healthz | grep -i strict-transport
 curl -sSI http://mail.example.com/ | head -1
 # Expect: HTTP/1.1 301 Moved Permanently
 
-# Login page renders.
-curl -sS https://mail.example.com/login | grep -o '<title>[^<]*</title>'
+# Readiness (DB + Redis reachable).
+curl -sSI https://mail.example.com/readyz | head -1
+# Expect: HTTP/2 200
+
+# The external API answers machine auth (the CRM's entry point).
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  -H "X-API-Key: $EXTERNAL_API_KEY" \
+  'https://mail.example.com/api/external/messages?limit=1'
+# Expect: 200   (401 => EXTERNAL_API_KEY not set / mismatched)
+
+# The removed HTML UI must NOT answer.
+curl -sS -o /dev/null -w '%{http_code}\n' https://mail.example.com/login
+# Expect: 404   (ADR-0044 A3 — the cookie UI is gone)
 ```
 
-The web UI is now live at `https://mail.example.com/login`.
+The aggregator is **headless** since the decommission ([ADR-0043](./adr/ADR-0043-strip-to-connector-push-to-crm.md) / [ADR-0044](./adr/ADR-0044-decommission-runbook.md) A3): there is no web UI to open. The live surface is `/healthz`, `/readyz` and `/api/external/*`; everything else returns `404`. Mail is operated from the CRM, which pulls/receives from this connector.
 
 ---
 
@@ -369,13 +382,9 @@ sudo install -d -o deploy -g deploy /opt/backups/pg
 
 Encrypt with `gpg --symmetric` before moving off-host (the dump contains user data and encrypted mail-account password ciphertexts; combined with `MAIL_ENCRYPTION_KEY` they are decryptable).
 
-### F.2 MinIO (attachments) — daily
+### F.2 ~~MinIO (attachments)~~ — nothing to back up
 
-```cron
-0 3 * * * docker run --rm -v mas_minio_data:/data:ro -v /opt/backups/minio:/out alpine tar czf /out/$(date +\%F).tar.gz -C /data . && find /opt/backups/minio -mtime +14 -delete
-```
-
-For larger installs, prefer `mc mirror` to a remote S3.
+**Removed.** Object storage was decommissioned with [ADR-0044](./adr/ADR-0044-decommission-runbook.md) Phase G (`8e890a2` / `e0bccc3`): there is no `minio` service and no `mas_minio_data` volume. The earlier daily `tar` of that volume must be **deleted from the host crontab** — it now fails every night on a non-existent volume. Attachments are not stored by the connector; they live in the CRM.
 
 ### F.3 .env
 
@@ -433,19 +442,32 @@ Certs are valid for 90 days; certbot renews at 30 days remaining; the deploy-hoo
 
 Follow the formal rotation procedure in `docs/06-security.md` sec. 10. **Do not** simply replace the value — the existing ciphertexts in postgres are encrypted with the old key and become un-decryptable.
 
-### H.2 `ADMIN_PASSWORD`
+### H.2 `EXTERNAL_API_KEY` / `CRM_PUSH_SECRET` — the two shared secrets
+
+Both are shared with the **CRM**, so rotation is a two-sided operation: change one side alone and the channel breaks.
+
+`EXTERNAL_API_KEY` (CRM → aggregator, machine auth on `/api/external/*`):
 
 ```bash
+openssl rand -hex 32                         # new value
 cd /opt/mail-agregator
-sudo -u deploy nano .env                     # set new ADMIN_PASSWORD
-docker compose restart api worker
+sudo -u deploy nano .env                     # set EXTERNAL_API_KEY
+docker compose up -d api                     # env is read at process start
 ```
 
-`seed_super_admin` runs at api start and upserts the new hash. The old session in Redis remains valid until its TTL — clear it explicitly if needed:
+Set the same value on the CRM side **in the same window**, then re-run the external-API check from B.4 (expect `200`, not `401`). There is no session/token cache to purge — the key is compared per request.
+
+`CRM_PUSH_SECRET` (aggregator → CRM, HMAC over the push body; must equal the CRM's `MAIL_PUSH_SECRET`):
 
 ```bash
-docker compose exec redis redis-cli --scan --pattern 'session:*' | xargs -r docker compose exec redis redis-cli DEL
+openssl rand -hex 32
+sudo -u deploy nano .env                     # set CRM_PUSH_SECRET
+docker compose up -d worker                  # the push channel lives in the worker
 ```
+
+Update the CRM's `MAIL_PUSH_SECRET` to the same value, then confirm delivery resumes (`mas-worker` logs must stop showing push rejections). While the two sides disagree the CRM rejects pushes; undelivered messages are retried by `crm_push_recovery`, so a short mismatch window is recoverable — a long one is not.
+
+> **~~`ADMIN_PASSWORD`~~ — no longer exists; nothing to rotate.** Earlier revisions of this runbook told the operator to edit `ADMIN_PASSWORD` and restart so that `seed_super_admin` would upsert the hash. Both are gone: the interactive super-admin went away with the cookie UI ([ADR-0044](./adr/ADR-0044-decommission-runbook.md) A3 / §5), and the fields were dropped from `Settings` under `TD-060` (6d). The only seeded account is the technical `crm-service` owner with `password_hash=NULL` (`backend/app/auth/service.py:33-70`) — it has no password to rotate, and no login accepts one. The companion `session:*` purge is likewise moot: sessions were removed in A3.
 
 ### H.3 `POSTGRES_PASSWORD`
 

@@ -231,7 +231,6 @@ async def _run_one(db_engine: AsyncEngine, account_id: int) -> Any:
         timeout_seconds=10,
         initial_sync_days=30,
         max_body_bytes=1024,
-        max_att_bytes=1024,
     )
 
 

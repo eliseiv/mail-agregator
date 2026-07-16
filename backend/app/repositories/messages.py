@@ -8,8 +8,6 @@ SQL ``nextval('attachments_id_seq')``, §9 caveat B) and the HTML inbox helpers.
 
 What survives is what the connector actually runs:
 
-- ``get_for_user_ids`` — resolve the original message for the external reply
-  (ADR-0035);
 - ``list_since_id`` / ``list_before_id`` — the external PULL (ADR-0029/0036);
 - ``insert_message_idempotent`` — the sync insert (ADR-0008);
 - ``list_for_crm_push`` / ``mark_pushed`` / ``list_pending_push`` — the CRM
@@ -33,29 +31,6 @@ class MessagesRepo:
         self._s = session
 
     # --- Reads -------------------------------------------------------------
-
-    async def get_for_user_ids(
-        self,
-        *,
-        message_id: int,
-        mail_account_ids: list[int] | None,
-    ) -> Message | None:
-        """Scope-aware get.
-
-        ``mail_account_ids=None`` = "no scope filter"; ``[]`` = nothing visible
-        (returns ``None``). The external reply passes the canonical mailbox set
-        (ADR-0029 §5), so a caller can only reply to a message it could have
-        pulled.
-        """
-        if mail_account_ids is None:
-            return await self._s.get(Message, message_id)
-        if not mail_account_ids:
-            return None
-        stmt = select(Message).where(
-            Message.id == message_id,
-            Message.mail_account_id.in_(mail_account_ids),
-        )
-        return (await self._s.execute(stmt)).scalar_one_or_none()
 
     async def list_since_id(
         self,

@@ -1,6 +1,14 @@
 # ADR-0039 — External write API (mailboxes + tags CRUD) + расширение read-фильтров для headless CRM
 
-Статус: `accepted` · Дата: 2026-07-09
+Статус: `accepted` — **сужен [ADR-0043](./ADR-0043-strip-to-connector-push-to-crm.md)** (2026-07-10; демонтаж выполнен на проде 2026-07-15 по [ADR-0044](./ADR-0044-decommission-runbook.md)) · Дата: 2026-07-09
+
+> **⚠️ Сужен ADR-0043 — часть этого ADR СНЯТА. Читатель этого ADR в отрыве не должен реализовывать снятое.**
+>
+> **В силе:** раздел `/api/external/mailboxes` write (`POST /mailboxes/test`, `POST /mailboxes`, `PATCH/DELETE /mailboxes/{id}`, `POST /mailboxes/{id}/sync`); гейт `EXTERNAL_WRITE_ENABLED` + отдельный budget `LIMIT_EXTERNAL_WRITE` (`EXTERNAL_WRITE_RATE_LIMIT_PER_MINUTE`); auth-flow (rate → key → gate → write-gate → body → delegate); владелец создаваемого ящика — техпользователь `crm-service` (после демонтажа — **единственный** владелец всех ящиков, ADR-0044 §1); повторяемый фильтр `mail_account_id` (`list[int]`) в `GET /messages`.
+>
+> **СНЯТО (НЕ реализовывать):** (а) раздел **`/api/external/tags` CRUD** — теги целиком уехали в CRM ([ADR-0017](./ADR-0017-tags.md)/[ADR-0040](./ADR-0040-global-tags.md) superseded by ADR-0043); (б) фильтр **`group_id`** в `GET /messages` и поле `group_id` в `GET /mailboxes` / `ExternalMailboxDTO` — групп в агрегаторе нет, колонка `mail_accounts.group_id` дропнута (ADR-0044 Фаза C). Поля `last_synced_at`/`last_sync_error`/`consecutive_failures` в `ExternalMailboxDTO` — **в силе**.
+>
+> **Дополнено:** обобщённый `POST /api/external/mailboxes/{id}/send` ([ADR-0048](./ADR-0048-external-send-contract-and-reply-restore.md), заменил reply ADR-0035) и external-OAuth-роуты ([ADR-0045](./ADR-0045-external-outlook-oauth-headless.md)) живут в том же write-разделе под тем же гейтом. Актуальный контракт — [04-api-contracts.md](../04-api-contracts.md) §4f.
 
 Extends [ADR-0029](./ADR-0029-external-pull-api.md) (pull) / [ADR-0035](./ADR-0035-external-reply-endpoint.md) (reply) / [ADR-0037](./ADR-0037-external-teams-mailboxes-message-filters.md) (teams/mailboxes/filters). Парный ADR в CRM — `ADR-038` (headless-интеграция). Глобальные теги — [ADR-0040](./ADR-0040-global-tags.md).
 

@@ -125,8 +125,6 @@ def _single_message_box(uid: int) -> Any:
                 body_present=True,
                 in_reply_to=None,
                 refs_header=None,
-                x_forwarded_by=None,
-                attachments=[],
             )
         ],
     )
@@ -151,7 +149,6 @@ async def _run_account(db_engine: AsyncEngine, account_id: int) -> Any:
         timeout_seconds=10,
         initial_sync_days=30,
         max_body_bytes=1024,
-        max_att_bytes=1024,
     )
 
 

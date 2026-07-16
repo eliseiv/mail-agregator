@@ -518,7 +518,7 @@ class TestContent:
         assert got["body_text"] == big
         assert len(got["body_text"]) == 20_000
 
-    async def test_body_is_raw_not_collapsed_unlike_ui(
+    async def test_body_is_raw_blank_line_runs_preserved(
         self,
         client: httpx.AsyncClient,
         api_key_on: str,
@@ -526,21 +526,22 @@ class TestContent:
         make_mail_account: Callable[..., Any],
         make_message: Callable[..., Any],
     ) -> None:
-        """External body is RAW — no ``collapse_blank_lines_text`` (which the
-        UI MessageDetail applies). A body with 3+ blank lines differs between
-        the two. ADR-0029 §3/§7."""
-        from shared.html_sanitize import collapse_blank_lines_text
+        """External body is RAW — the stored body is returned verbatim, with no
+        render-time normalisation applied. Runs of blank lines survive
+        byte-for-byte. ADR-0029 §3/§7.
 
+        TD-060: this case used to contrast the raw body against
+        ``collapse_blank_lines_text`` (the UI MessageDetail view). That helper
+        and the UI were removed with the Jinja/Telegram subsystems (ADR-0044);
+        the surviving guarantee — verbatim passthrough — is asserted directly.
+        """
         raw = "para one\n\n\n\n\npara two"  # 4 blank lines between paragraphs
         acc = await make_mail_account(owner.id, "blanks@example.com")
         m = await make_message(acc.id, uid=1, body_text=raw)
         got = await self._one(client, api_key_on, m.id)
-        # External returns the verbatim stored body.
+        # External returns the verbatim stored body — blank-line run intact.
         assert got["body_text"] == raw
-        # The UI DTO would collapse it — so the two MUST differ here.
-        ui_view = collapse_blank_lines_text(raw)
-        assert ui_view != raw, "test data should actually trigger collapse"
-        assert got["body_text"] != ui_view
+        assert "\n\n\n\n\n" in got["body_text"]
 
     async def test_body_present_false_empty_text_null_html(
         self,

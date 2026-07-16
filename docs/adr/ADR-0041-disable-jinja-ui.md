@@ -1,6 +1,14 @@
 # ADR-0041 — Отключение собственного Jinja-UI агрегатора (headless-режим)
 
-Статус: `accepted` · Дата: 2026-07-09 · Реализация: **спринт S5** (последним, после того как CRM-страница «Почты» заработает; не смешивать с функциональными изменениями ADR-0039/0040).
+Статус: `accepted` — **сужен [ADR-0043](./ADR-0043-strip-to-connector-push-to-crm.md)** (2026-07-10) и финализирован [ADR-0044](./ADR-0044-decommission-runbook.md); **реализован на проде 2026-07-15** (Фаза A3) · Дата: 2026-07-09
+
+> **⚠️ Сужен ADR-0043 / финализирован ADR-0044 — перечень §Decision УСТАРЕЛ. Читатель этого ADR в отрыве не должен принимать его за текущий.**
+>
+> **Выполнено (2026-07-15, Фаза A3 ADR-0044):** HTML-роутеры (`auth`/`messages`/`accounts`/`tags`/`admin`/`groups` UI + `send` form-fallback), `StaticFiles /static`, `templates/`+`static/`, friendly-redirect `→ /login` — **удалены**; все HTML-URL отдают `404`.
+>
+> **Отличие от §Decision этого ADR:** здесь перечень остающихся роутеров — `health_router` + `external_router` + **`telegram_router`**. `telegram_router` **тоже снят** ADR-0043 (Telegram целиком переехал в CRM). Фактически в `main.py::create_app` смонтированы **только два** роутера — `external_router` и `health_router` (`backend/app/main.py:99-100`).
+>
+> **Q-0041-1 решён:** session-`oauth_router` снят ([ADR-0044](./ADR-0044-decommission-runbook.md) §7); consent-flow восстановлен headless-роутами в `external/router.py` ([ADR-0045](./ADR-0045-external-outlook-oauth-headless.md)). CRUD `webhooks`/`forwarding` — не в `/api/external/*`, а **сняты целиком** (подсистемы демонтированы).
 
 Extends [ADR-0001](./ADR-0001-tech-stack.md) (Jinja2 в стеке) / [ADR-0015](./ADR-0015-no-js-fallback.md) / [ADR-0021](./ADR-0021-russian-localization.md). Парный CRM `ADR-038` (headless-интеграция).
 

@@ -13,9 +13,9 @@ Jobs (ADR-0003):
 - ``sync_cycle`` — every ``SYNC_INTERVAL_MINUTES`` (default 5). Polls all
   active mailboxes.
 - ``force_sync_dispatcher`` — every 10s. Drains ``force_sync:{id}`` Redis
-  markers written by ``POST /accounts/{id}/sync`` so the "Sync now" UI
-  button delivers sub-10-second latency without lowering the regular
-  poll cadence.
+  markers written by ``POST /api/external/mailboxes/{id}/sync`` so an
+  on-demand sync requested by the CRM lands in under 10 seconds without
+  lowering the regular poll cadence.
 - ``retention_cleanup`` — daily at 03:00 UTC.
 - ``alive_touch`` — every 30s; healthcheck reads ``mtime`` of ``/tmp/worker_alive``.
 
